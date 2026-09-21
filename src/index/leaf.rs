@@ -59,6 +59,19 @@ impl LeafNode {
         }
     }
 
+    /// Updates the `RecordId` for an existing `key`.
+    /// Returns `Some(old_record_id)` if updated, or `None` if `key` does not exist.
+    pub fn update(&mut self, key: Key, new_record_id: RecordId) -> Option<RecordId> {
+        match self.entries.binary_search_by_key(&key, |&(k, _)| k) {
+            Ok(idx) => {
+                let old = self.entries[idx].1;
+                self.entries[idx].1 = new_record_id;
+                Some(old)
+            }
+            Err(_) => None,
+        }
+    }
+
     /// Returns the number of entries currently stored in the leaf.
     pub fn key_count(&self) -> usize {
         self.entries.len()

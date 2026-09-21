@@ -21,7 +21,7 @@ pub use storage::{
     RECORD_PAGE_HEADER_SIZE, SLOT_SIZE,
 };
 pub use wal::{
-    crc32, LogManager, LogRecord, LogRecordBody, LogRecordType, Lsn, RecoveryEngine, RecoveryStats,
-    TxnId, TxnStatus, TxnTableEntry, WalHeader, CURRENT_WAL_VERSION, INVALID_LSN, NULL_LSN,
-    NULL_TXN, WAL_HEADER_SIZE, WAL_MAGIC_BYTES,
+    crc32, LogManager, LogRecord, LogRecordBody, LogRecordType, Lsn, RecoveryEngine, RecoveryFault,
+    RecoveryStats, TxnId, TxnStatus, TxnTableEntry, WalHeader, CURRENT_WAL_VERSION, INVALID_LSN,
+    NULL_LSN, NULL_TXN, WAL_HEADER_SIZE, WAL_MAGIC_BYTES,
 };

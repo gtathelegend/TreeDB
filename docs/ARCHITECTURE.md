@@ -66,18 +66,20 @@ v                                                             v
 ### `LogManager`
 * **Role:** Manages append-only write-ahead logging to the `.wal` file.
 * **Responsibilities:**
-  * Monotonic LSN allocation and transaction state tracking.
-  * Self-delimiting log record serialization with CRC32 integrity verification.
-  * Durable file synchronization (`sync_all`) through target LSNs.
-  * Sequential log scanning with graceful handling of crash-truncated log tails.
+  * Monotonic LSN allocation and transaction state tracking (`TxnId`, `prev_lsn`).
+  * Self-delimiting log record serialization with IEEE 802.3 CRC32 integrity verification.
+  * Durable file synchronization (`sync_all`) through target LSNs (`flushed_lsn`).
+  * Sequential log scanning distinguishing clean truncated crash tails from mid-log corruption (`Error::WalCorruption`).
 
 ### `RecoveryEngine`
-* **Role:** Implements ARIES 3-Phase Crash Recovery (Analysis, Redo, Undo).
+* **Role:** Implements an ARIES-inspired recovery pipeline with physical page-delta logging, PageLSNs, analysis, redo, undo, and compensation log records.
 * **Responsibilities:**
-  * **Analysis Pass:** Reconstructs the Transaction Table and Dirty Page Table to identify loser transactions.
-  * **Redo Pass:** Replays history forward for all `PageDelta` and `Clr` records where `page.lsn() < log_record.lsn`.
-  * **Undo Pass:** Reverses uncommitted loser transactions backward, writing Compensation Log Records (CLRs) and `Abort` markers.
-  * **Idempotence:** Guaranteed safe to run multiple times without corrupting state.
+  * **Analysis Pass:** Reconstructs the active Transaction Table and Dirty Page Table from the log to identify uncommitted loser transactions.
+  * **Redo Pass:** Replays history forward for all `PageDelta` and `Clr` records where `page.lsn() < log_record.lsn()`. Skips pages where `page.lsn() >= log_record.lsn()`.
+  * **Undo Pass:** Reverses uncommitted loser transactions backward in reverse LSN order, writing Compensation Log Records (CLRs) with `undo_next_lsn` pointers and `Abort` markers.
+  * **CLR Durability Order:** Enforces `append CLR -> flush WAL through CLR LSN -> write recovered page` so recovery modifications never precede their CLR on disk.
+  * **Fault Injection & Restartability:** Supports deterministic interruption via `RecoveryFault` (before recovery, during Redo, during Undo, after CLR append, after CLR flush, after page write). Recovery safely restarts, redoing durable CLRs and continuing Undo.
+  * **Multi-Pass Idempotence:** Multiple consecutive recovery passes produce byte-identical database files with no pin leaks or PageLSN regressions.
 
 ---
 
@@ -88,6 +90,7 @@ v                                                             v
 * **Responsibilities:**
   * Point lookup (`get`) via root-to-leaf binary search traversal.
   * Dynamic insertion (`insert`) with leaf and internal splits, separator propagation, and root elevation.
+  * In-place key update (`update`) modifying existing key mappings without allocating or collapsing nodes.
   * Dynamic deletion (`delete`) with leaf/internal underflow rebalancing, sibling redistribution, merging, and root collapse.
   * Ordered sequential range scanning (`scan`) utilizing leaf `next_leaf` chains.
   * Safe, leak-free unpinning of all visited pages across every operation path.
@@ -110,6 +113,7 @@ v                                                             v
 * **Responsibilities:**
   * `RecordStore`: Allocates record pages and manages `insert`, `get`, `delete`, and `compact_page` over `BufferPool`.
   * `RecordPage`: Slotted-page binary layout with bidirectional growth (slot directory grows upward, payloads grow downward), free-space tracking, logical deletion, and in-place payload compaction.
+  * **Record Size Limits:** Maximum single record payload is `MAX_RECORD_SIZE = 4070 bytes` (derived from `4096 - 16 page header - 6 record header - 4 slot directory`).
 
 ### `BufferPool`
 * **Role:** In-memory caching engine maintaining a fixed number of page frames and enforcing Write-Ahead order.
@@ -117,19 +121,36 @@ v                                                             v
   * Fast cache hit lookup via `PageId -> FrameId` page table.
   * Pin count management preventing eviction of actively referenced pages.
   * Dirty page tracking ensuring all modifications are written back before frame reuse.
-  * **Write-Ahead Rule Enforcement:** Enforces `LogManager::flush(page.lsn())` before flushing any dirty page to disk.
+  * **Automatic Physical Delta Logging:** Tracks `before_image` when frames are modified; generates and appends `PageDelta` log records upon frame unpinning.
+  * **Write-Ahead Rule Enforcement:** Enforces `LogManager::flush(page.lsn())` before flushing any dirty page to disk on both explicit `flush_page()` and `LRU eviction`.
   * Deterministic Least Recently Used (LRU) replacement policy.
 
 ### `PageManager`
-* **Role:** Manages reading and writing fixed-size (4096-byte) blocks to and from disk.
+* **Role:** Manages reading and writing fixed-size (4096-byte) blocks to and from disk with format version validation.
 
 ---
 
 ## 5. Critical Invariants
 
-* **Write-Ahead Rule:** A dirty page must never reach physical disk before its corresponding WAL records (`WAL.flush(page.lsn()) <= page.flush()`).
-* **PageLSN Stamping:** Every page modification is stamped with its corresponding log sequence number.
-* **No Layer Skipping:** Higher-level structures (`BPlusTree`, `RecordStore`) interact exclusively through the `BufferPool`.
-* **Pin Leak Prevention:** All fetched frames must be symmetrically unpinned.
-* **Bounded In-Memory Footprint:** The buffer pool never allocates more frames than its configured capacity.
-* **Recovery Idempotence:** Multiple recovery passes on a recovered database leave the state identical.
+* **Write-Ahead Invariant:** `append WAL record -> WAL durable -> page modification -> page flush`. A dirty page with `page_lsn > wal.flushed_lsn` cannot reach disk without its WAL records first being flushed.
+* **PageLSN Semantics:** Every page modification stamps the page with its corresponding LSN. During Redo:
+  * `page.lsn() < log_record.lsn()` => Redo applied.
+  * `page.lsn() >= log_record.lsn()` => Redo skipped.
+  PageLSN never regresses.
+* **CLR Durability Invariant:** `append CLR -> flush WAL through CLR LSN -> write recovered page`. Recovery-generated modifications are never durable before their CLR is durable on disk.
+* **Engine Atomicity Boundary:** `TreeDb::put` and `TreeDb::delete` operations wrap both RecordStore heap modifications and B+ Tree index mutations in a single transaction (`TxnId`). If an uncommitted operation crashes, both index and record mutations are undone atomically.
+* **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
+* **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
+* **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
+
+---
+
+## 6. Intentionally Deferred Items (Phase 8+)
+
+The following capabilities are intentionally deferred to subsequent phases and not implemented in Phase 7.1:
+* Free-page recycling across the database (freelist / free-page bitmap).
+* Multi-page overflow records for large BLOBs exceeding 4070 bytes.
+* Background fuzzy checkpointing and WAL truncation / log recycling.
+* Group commit and asynchronous WAL flush queues.
+* Multi-threading, concurrency control, and latching.
+* SQL query parser, execution engine, and MVCC.

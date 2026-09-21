@@ -87,6 +87,7 @@ impl TreeDb {
         if let Some(wal) = self.buffer_pool.wal_mut() {
             let txn_id = wal.begin_txn()?;
             self.active_txn = Some(txn_id);
+            self.buffer_pool.set_active_txn(txn_id);
             Ok(txn_id)
         } else {
             Ok(NULL_TXN)
@@ -99,6 +100,7 @@ impl TreeDb {
             let lsn = wal.commit_txn(txn_id)?;
             if self.active_txn == Some(txn_id) {
                 self.active_txn = None;
+                self.buffer_pool.clear_active_txn();
             }
             Ok(lsn)
         } else {
@@ -112,6 +114,7 @@ impl TreeDb {
             let lsn = wal.abort_txn(txn_id)?;
             if self.active_txn == Some(txn_id) {
                 self.active_txn = None;
+                self.buffer_pool.clear_active_txn();
             }
             Ok(lsn)
         } else {
@@ -148,14 +151,14 @@ impl TreeDb {
             None
         };
 
-        // If key already exists, delete old record from record store
         if let Some(old_rid) = self.tree.get(&mut self.buffer_pool, key)? {
-            self.tree.delete(&mut self.buffer_pool, key)?;
+            let record_id = self.record_store.insert(&mut self.buffer_pool, value)?;
+            self.tree.update(&mut self.buffer_pool, key, record_id)?;
             self.record_store.delete(&mut self.buffer_pool, old_rid)?;
+        } else {
+            let record_id = self.record_store.insert(&mut self.buffer_pool, value)?;
+            self.tree.insert(&mut self.buffer_pool, key, record_id)?;
         }
-
-        let record_id = self.record_store.insert(&mut self.buffer_pool, value)?;
-        self.tree.insert(&mut self.buffer_pool, key, record_id)?;
 
         if let Some(tid) = auto_txn {
             self.commit_txn(tid)?;

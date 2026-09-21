@@ -124,14 +124,67 @@ This document records key architectural and design choices, their rationale, and
 
 ---
 
-## Decision 13: Write-Ahead Logging (WAL), PageLSN, and ARIES Crash Recovery
+## Decision 13: Write-Ahead Logging (WAL), PageLSN, and ARIES-Inspired Crash Recovery
 
-* **Decision:** Implement a dedicated write-ahead logging subsystem with monotonic `Lsn` sequence numbers, 16-byte standard page headers storing `PageLSN`, physical page delta logging, and ARIES 3-Phase recovery (Analysis, Redo, Undo with CLRs).
+* **Decision:** Implement a dedicated write-ahead logging subsystem with monotonic `Lsn` sequence numbers, 16-byte standard page headers storing `PageLSN`, physical page delta logging, and an ARIES-inspired 3-Phase recovery pipeline (Analysis, Redo, Undo with CLRs).
 * **Rationale:**
   * **Write-Ahead Rule:** Enforces that dirty database pages are never written to physical disk before their corresponding log records are durably synced (`WAL.flush(page.lsn()) <= page.flush()`).
   * **Clean Storage Format Versioning:** Expanding page headers from 8 to 16 bytes to house the 64-bit `PageLSN` increments format version from `1` to `2`, cleanly rejecting unversioned files without silent misinterpretation.
   * **Physical Page Deltas:** Logging byte ranges (`offset`, `before_image`, `after_image`) keeps the WAL completely decoupled from higher-level B+ Tree and Record Store mechanics.
-  * **ARIES 3-Phase Recovery:**
+  * **ARIES-Inspired 3-Phase Recovery:**
     * *Analysis Pass:* Reconstructs active transaction table and dirty page table, identifying loser transactions.
     * *Redo Pass:* Repeats history from the earliest unreflected LSN, skipping pages where `page.lsn >= record.lsn`.
-    * *Undo Pass:* Rolls back loser transactions backward, writing Compensation Log Records (CLRs) to ensure crash-during-recovery is fully idempotent.
+    * *Undo Pass:* Rolls back loser transactions backward, writing Compensation Log Records (CLRs) to ensure crash-during-recovery is fully idempotent and restart-safe.
+
+---
+
+## Decision 14: WAL Ordering Invariant on Explicit Flush and LRU Eviction
+
+* **Decision:** In `BufferPool`, any frame written to disk (whether through explicit `flush_page` / `flush_all` or through `evict_lru_frame`) must first call `wal.flush(page.lsn())`.
+* **Rationale:**
+  * Proves the fundamental durability invariant: `append WAL record -> WAL durable -> page modification -> page flush`.
+  * If a dirty frame with `page_lsn > wal.flushed_lsn` is written to disk during LRU eviction or explicit flush, uncommitted or committed changes could exist on disk without durable WAL records, violating recoverability.
+  * Tying the WAL flush directly into `BufferPool::flush_frame_internal` guarantees that no page modification ever bypasses the WAL.
+
+---
+
+## Decision 15: Compensation Log Record (CLR) Durability Order
+
+* **Decision:** During the Undo phase of crash recovery, when a page modification is reversed:
+  1. Append the CLR to the log manager (`wal.append_clr(...)`).
+  2. Durably flush the WAL through the CLR's LSN (`wal.flush(clr_lsn)`).
+  3. Write the recovered page to the database file (`page_manager.write_page(...)`).
+* **Rationale:**
+  * A recovery-generated page modification must never become durable on disk before its CLR is durable in the log.
+  * If the system crashes after the page is written but before the CLR is durable, subsequent recovery would not know the undo had already been applied, risking double-undo or state corruption.
+  * Enforcing CLR flushing before writing recovered pages guarantees recovery restartability.
+
+---
+
+## Decision 16: Deterministic Recovery Fault Injection & Restartability
+
+* **Decision:** Provide a testable hook `RecoveryEngine::recover_with_fault(..., fault: RecoveryFault)` where `RecoveryFault` can inject interruptions before recovery, during Redo, during Undo, after CLR append, after CLR flush, or after recovered page writes.
+* **Rationale:**
+  * Avoids brittle, non-deterministic OS process termination in tests.
+  * Allows comprehensive verification that recovery is restart-safe: when interrupted during Undo, restarting recovery redos the durable CLRs, follows `undo_next_lsn` pointers, and cleanly rolls back remaining loser transactions to a consistent state.
+
+---
+
+## Decision 17: WAL Corruption Policy (Valid Prefix vs. Mid-Log Corruption)
+
+* **Decision:**
+  * Incomplete log records at the end of the log (e.g., partial tail writes from a crash) are safely ignored if they occur after the durable `flushed_lsn`.
+  * Mid-log corruptions (CRC mismatch, invalid record tag, payload length overflow, LSN non-monotonicity within the durable prefix) return `Error::WalCorruption`.
+* **Rationale:**
+  * Distinguishes expected trailing garbage from catastrophic mid-log corruption.
+  * A corrupted middle record indicates media or logical corruption and must NOT silently truncate valid subsequent history.
+
+---
+
+## Decision 18: In-Place B+ Tree Key Update for High-Level Engine Atomicity
+
+* **Decision:** Implement `LeafNode::update` and `BPlusTree::update` to update the `RecordId` of an existing key in-place, and use this in `TreeDb::put` when replacing existing values.
+* **Rationale:**
+  * Deleting and re-inserting a key inside `put` risks collapsing a 1-key tree into an empty root (`INVALID_PAGE_ID`) and re-allocating a new root page within the same transaction.
+  * In-place update keeps the B+ Tree structure stable and avoids unnecessary page allocations and root modifications while preserving transaction ownership (`TxnId`, `prev_lsn`) across index and record store mutations.
+

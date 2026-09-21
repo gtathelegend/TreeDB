@@ -142,6 +142,17 @@ The 4080-byte payload of a Record page is structured using a slotted-page layout
 * **Maximum Record Size:** `MAX_RECORD_SIZE = 4080 - 6 - 4 = 4070 bytes`.
 * **RecordId:** `(page_id: u32, slot_id: u32)`. Logical `RecordId`s remain stable across page compactions.
 
+### Maximum Record Size Evolution
+
+The maximum payload size of a single record is derived directly from the page layout:
+
+* **Phase 6 (Format Version 1):**
+  `4096 (page size) - 8 (page header) - 6 (record page header) - 4 (slot directory entry) = 4078 bytes`
+* **Phase 7 / 7.1 (Format Version 2):**
+  `4096 (page size) - 16 (page header with PageLSN) - 6 (record page header) - 4 (slot directory entry) = 4070 bytes`
+
+Attempting to insert a record larger than 4070 bytes returns `Error::RecordTooLarge(len, 4070)`.
+
 ---
 
 ## Write-Ahead Log File Format (`.wal`)

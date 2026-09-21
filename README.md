@@ -48,8 +48,8 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **B+ Tree Index (Delete & Scan)** | **Implemented** | Deletion, leaf/internal rebalance, root collapse, range scan |
 | **Record Store** | **Implemented** | Slotted-page tuple format, variable-length records, local compaction |
 | **TreeDB Engine API** | **Implemented** | High-level `TreeDb` interface for `put`, `get`, `delete`, `scan`, `sync` |
-| **Write-Ahead Logging** | **Implemented** | Monotonic `Lsn`, CRC32 log records, `.wal` file, durable syncing |
-| **Crash Recovery (ARIES)** | **Implemented** | 3-Phase recovery (Analysis, Redo, Undo with CLRs), idempotence |
+| **Write-Ahead Logging** | **Implemented** | Monotonic `Lsn`, CRC32 log records, `.wal` file, durable syncing, WAL ordering on flush/evict |
+| **Crash Recovery (ARIES-Inspired)** | **Implemented** | 3-Phase recovery (Analysis, Redo, Undo with CLRs), restart-safe, deterministic fault injection, idempotence |
 
 ---
 

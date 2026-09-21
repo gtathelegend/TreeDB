@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::storage::page::{Page, PageId, PageType};
+use crate::storage::page::{Page, PageId, PageType, PAGE_SIZE};
 use crate::storage::page_manager::PageManager;
 use crate::wal::log_manager::LogManager;
+use crate::wal::lsn::TxnId;
 
 /// Frame identifier within the buffer pool.
 pub type FrameId = usize;
@@ -13,6 +14,7 @@ pub type FrameId = usize;
 struct Frame {
     page_id: Option<PageId>,
     page: Option<Page>,
+    before_image: Option<[u8; PAGE_SIZE]>,
     pin_count: u32,
     dirty: bool,
     last_accessed: u64,
@@ -23,6 +25,7 @@ impl Frame {
         Self {
             page_id: None,
             page: None,
+            before_image: None,
             pin_count: 0,
             dirty: false,
             last_accessed: 0,
@@ -80,6 +83,7 @@ pub struct BufferPool {
     page_table: HashMap<PageId, FrameId>,
     page_manager: PageManager,
     wal: Option<LogManager>,
+    active_txn: Option<TxnId>,
     access_counter: u64,
     stats: BufferPoolStats,
 }
@@ -105,6 +109,7 @@ impl BufferPool {
             page_table: HashMap::with_capacity(capacity),
             page_manager,
             wal: None,
+            active_txn: None,
             access_counter: 0,
             stats: BufferPoolStats {
                 capacity,
@@ -138,6 +143,21 @@ impl BufferPool {
     /// Returns a mutable reference to the active `LogManager`, if attached.
     pub fn wal_mut(&mut self) -> Option<&mut LogManager> {
         self.wal.as_mut()
+    }
+
+    /// Sets the active transaction ID for automated page delta logging on dirty frames.
+    pub fn set_active_txn(&mut self, txn_id: TxnId) {
+        self.active_txn = Some(txn_id);
+    }
+
+    /// Clears the active transaction ID.
+    pub fn clear_active_txn(&mut self) {
+        self.active_txn = None;
+    }
+
+    /// Returns the currently active transaction ID, if set.
+    pub fn active_txn(&self) -> Option<TxnId> {
+        self.active_txn
     }
 
     /// Fetches a page by ID into the buffer pool and pins it for immutable reading.
@@ -183,6 +203,43 @@ impl BufferPool {
         }
 
         frame.pin_count -= 1;
+
+        // If marked dirty and an active transaction is present, log delta to WAL
+        if frame.dirty {
+            if let Some(txn_id) = self.active_txn {
+                if let (Some(ref mut page), Some(ref before)) =
+                    (&mut frame.page, &frame.before_image)
+                {
+                    let cur_bytes = *page.as_bytes();
+                    if &cur_bytes != before {
+                        let mut start = 0;
+                        while start < PAGE_SIZE && cur_bytes[start] == before[start] {
+                            start += 1;
+                        }
+                        let mut end = PAGE_SIZE;
+                        while end > start && cur_bytes[end - 1] == before[end - 1] {
+                            end -= 1;
+                        }
+                        if start < end {
+                            let before_slice = before[start..end].to_vec();
+                            let after_slice = cur_bytes[start..end].to_vec();
+                            if let Some(ref mut wal) = self.wal {
+                                let lsn = wal.append_page_delta(
+                                    txn_id,
+                                    page_id,
+                                    start as u16,
+                                    before_slice,
+                                    after_slice,
+                                )?;
+                                page.set_lsn(lsn);
+                            }
+                            frame.before_image = Some(cur_bytes);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -211,6 +268,66 @@ impl BufferPool {
         Ok(frame.page.as_mut().unwrap())
     }
 
+    /// Internal helper that logs pending page deltas and flushes a dirty frame to disk.
+    fn flush_frame_internal(&mut self, frame_id: usize) -> Result<()> {
+        let frame = &mut self.frames[frame_id];
+        if !frame.dirty {
+            return Ok(());
+        }
+
+        let page_id = match frame.page_id {
+            Some(pid) => pid,
+            None => return Ok(()),
+        };
+
+        // 1. If active transaction exists, ensure pending page delta is logged to WAL
+        if let Some(txn_id) = self.active_txn {
+            if let (Some(ref mut page), Some(ref before)) = (&mut frame.page, &frame.before_image) {
+                let cur_bytes = *page.as_bytes();
+                if &cur_bytes != before {
+                    let mut start = 0;
+                    while start < PAGE_SIZE && cur_bytes[start] == before[start] {
+                        start += 1;
+                    }
+                    let mut end = PAGE_SIZE;
+                    while end > start && cur_bytes[end - 1] == before[end - 1] {
+                        end -= 1;
+                    }
+                    if start < end {
+                        let before_slice = before[start..end].to_vec();
+                        let after_slice = cur_bytes[start..end].to_vec();
+                        if let Some(ref mut wal) = self.wal {
+                            let lsn = wal.append_page_delta(
+                                txn_id,
+                                page_id,
+                                start as u16,
+                                before_slice,
+                                after_slice,
+                            )?;
+                            page.set_lsn(lsn);
+                        }
+                        frame.before_image = Some(cur_bytes);
+                    }
+                }
+            }
+        }
+
+        // 2. Write-Ahead rule: ensure WAL is flushed up to page.lsn() before writing page to disk
+        if let Some(ref page) = frame.page {
+            if let Some(ref mut wal) = self.wal {
+                let lsn = page.lsn();
+                if lsn.is_valid() {
+                    wal.flush(lsn)?;
+                }
+            }
+            self.page_manager.write_page(page)?;
+            self.stats.dirty_flushes += 1;
+            frame.dirty = false;
+        }
+
+        Ok(())
+    }
+
     /// Flushes an individual dirty page to disk if resident, enforcing Write-Ahead order.
     ///
     /// If the page is clean, this is a no-op and returns `Ok(())`.
@@ -224,42 +341,13 @@ impl BufferPool {
             .copied()
             .ok_or(Error::PageNotResident(page_id))?;
 
-        let frame = &mut self.frames[frame_id];
-        if frame.dirty {
-            if let Some(ref page) = frame.page {
-                // Write-Ahead rule: ensure WAL is flushed up to page.lsn() before writing page
-                if let Some(ref mut wal) = self.wal {
-                    let lsn = page.lsn();
-                    if lsn.is_valid() {
-                        wal.flush(lsn)?;
-                    }
-                }
-                self.page_manager.write_page(page)?;
-                self.stats.dirty_flushes += 1;
-                frame.dirty = false;
-            }
-        }
-
-        Ok(())
+        self.flush_frame_internal(frame_id)
     }
 
     /// Flushes all resident dirty pages to disk through the `PageManager`, enforcing Write-Ahead order.
     pub fn flush_all(&mut self) -> Result<()> {
-        for frame in &mut self.frames {
-            if frame.dirty {
-                if let Some(ref page) = frame.page {
-                    // Write-Ahead rule
-                    if let Some(ref mut wal) = self.wal {
-                        let lsn = page.lsn();
-                        if lsn.is_valid() {
-                            wal.flush(lsn)?;
-                        }
-                    }
-                    self.page_manager.write_page(page)?;
-                    self.stats.dirty_flushes += 1;
-                    frame.dirty = false;
-                }
-            }
+        for frame_id in 0..self.frames.len() {
+            self.flush_frame_internal(frame_id)?;
         }
         Ok(())
     }
@@ -289,6 +377,7 @@ impl BufferPool {
         self.access_counter += 1;
         let frame = &mut self.frames[frame_id];
         frame.page_id = Some(new_page_id);
+        frame.before_image = Some([0u8; PAGE_SIZE]);
         frame.page = Some(new_page);
         frame.pin_count = 1;
         frame.dirty = true;
@@ -394,6 +483,7 @@ impl BufferPool {
 
         let frame = &mut self.frames[frame_id];
         frame.page_id = Some(page_id);
+        frame.before_image = Some(*page.as_bytes());
         frame.page = Some(page);
         frame.pin_count = 1;
         frame.dirty = mark_dirty;
@@ -427,27 +517,16 @@ impl BufferPool {
         let victim_id = victim_frame_id.ok_or(Error::NoEvictablePage)?;
 
         // 3. If victim is dirty, flush it to disk first (enforcing Write-Ahead rule)
-        let victim_frame = &mut self.frames[victim_id];
-        if victim_frame.dirty {
-            if let Some(ref page) = victim_frame.page {
-                if let Some(ref mut wal) = self.wal {
-                    let lsn = page.lsn();
-                    if lsn.is_valid() {
-                        wal.flush(lsn)?;
-                    }
-                }
-                self.page_manager.write_page(page)?;
-                self.stats.dirty_flushes += 1;
-                victim_frame.dirty = false;
-            }
-        }
+        self.flush_frame_internal(victim_id)?;
 
         // 4. Remove victim page from page table
+        let victim_frame = &mut self.frames[victim_id];
         if let Some(old_page_id) = victim_frame.page_id.take() {
             self.page_table.remove(&old_page_id);
             self.stats.evictions += 1;
         }
         victim_frame.page = None;
+        victim_frame.before_image = None;
         victim_frame.pin_count = 0;
         victim_frame.dirty = false;
 

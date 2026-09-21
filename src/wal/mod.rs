@@ -8,4 +8,4 @@ pub use log_manager::{
 };
 pub use log_record::{crc32, LogRecord, LogRecordBody, LogRecordType};
 pub use lsn::{Lsn, TxnId, INVALID_LSN, NULL_LSN, NULL_TXN};
-pub use recovery::{RecoveryEngine, RecoveryStats, TxnStatus, TxnTableEntry};
+pub use recovery::{RecoveryEngine, RecoveryFault, RecoveryStats, TxnStatus, TxnTableEntry};

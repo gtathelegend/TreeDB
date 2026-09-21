@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tempfile::tempdir;
 use treedb::{
     BufferPool, LeafNode, LogManager, LogRecordType, Lsn, Page, PageManager, PageType, RecordId,
-    RecordPage, RecoveryEngine, TreeDb, NULL_LSN, PAGE_HEADER_SIZE, PAGE_SIZE,
+    RecordPage, RecoveryEngine, RecoveryFault, TreeDb, NULL_LSN, PAGE_HEADER_SIZE, PAGE_SIZE,
 };
 
 fn create_test_db(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -487,4 +487,721 @@ fn test_record_store_structural_recovery() {
     let restored_rp = RecordPage::deserialize(&rec_page).unwrap();
     assert_eq!(restored_rp.get(s0), Some(&b"FirstRecordPayload"[..]));
     assert_eq!(restored_rp.get(s1), Some(&b"SecondRecordPayload"[..]));
+}
+
+#[test]
+fn test_wal_ordering_on_lru_eviction() {
+    let (_dir, db_path, wal_path) = create_test_db("lru_wal_order");
+
+    let pm = PageManager::create(&db_path).unwrap();
+    let wal = LogManager::create(&wal_path).unwrap();
+    // Capacity 2 frames
+    let mut pool = BufferPool::with_wal(2, pm, wal).unwrap();
+
+    let p1 = pool.allocate_page(PageType::Leaf).unwrap();
+    pool.unpin_page(p1, false).unwrap();
+    let p2 = pool.allocate_page(PageType::Leaf).unwrap();
+    pool.unpin_page(p2, false).unwrap();
+
+    // Start transaction and modify p1
+    let t1 = pool.wal_mut().unwrap().begin_txn().unwrap();
+    pool.set_active_txn(t1);
+
+    {
+        let page1 = pool.fetch_page_mut(p1).unwrap();
+        page1.payload_mut()[0..4].copy_from_slice(b"P1DD");
+    }
+    pool.unpin_page(p1, true).unwrap();
+
+    // Access p2 so p1 is the older frame in LRU
+    let _ = pool.fetch_page(p2).unwrap();
+    pool.unpin_page(p2, false).unwrap();
+
+    // Allocate p3 -> triggers LRU eviction of p1
+    let p3 = pool.allocate_page(PageType::Leaf).unwrap();
+    pool.unpin_page(p3, false).unwrap();
+
+    // Verify p1 was evicted and flushed to disk, and WAL flushed_lsn >= p1 disk LSN
+    let flushed_lsn = pool.wal().unwrap().flushed_lsn();
+    assert!(flushed_lsn.is_valid());
+
+    let mut pm_check = PageManager::open(&db_path).unwrap();
+    let disk_p1 = pm_check.read_page(p1).unwrap();
+    assert_eq!(&disk_p1.payload()[0..4], b"P1DD");
+    assert!(disk_p1.lsn() <= flushed_lsn);
+    assert_eq!(disk_p1.lsn(), flushed_lsn);
+}
+
+#[test]
+fn test_clr_durability_and_restart_ordering() {
+    let (_dir, db_path, wal_path) = create_test_db("clr_durability");
+
+    // 1. Initialize DB with page 1 modified by uncommitted loser T1
+    let mut pm = PageManager::create(&db_path).unwrap();
+    let p1 = pm.allocate_page().unwrap();
+    let mut wal = LogManager::create(&wal_path).unwrap();
+
+    let t1 = wal.begin_txn().unwrap();
+    let offset = PAGE_HEADER_SIZE as u16;
+    let before = b"ORIGINAL".to_vec();
+    let after = b"MUTATED_".to_vec();
+
+    let lsn_delta = wal
+        .append_page_delta(t1, p1, offset, before.clone(), after.clone())
+        .unwrap();
+    wal.flush(lsn_delta).unwrap();
+
+    // Flush dirty page to disk
+    let mut page1 = pm.read_page(p1).unwrap();
+    page1.payload_mut()[0..8].copy_from_slice(&after);
+    page1.set_lsn(lsn_delta);
+    pm.write_page(&page1).unwrap();
+    pm.sync().unwrap();
+
+    drop(pm);
+    drop(wal);
+
+    // 2. Fault injection: crash immediately after CLR flush before page write
+    {
+        let mut pm_rec = PageManager::open(&db_path).unwrap();
+        let mut wal_rec = LogManager::open(&wal_path).unwrap();
+        let err = RecoveryEngine::recover_with_fault(
+            &mut pm_rec,
+            &mut wal_rec,
+            Some(RecoveryFault::AfterClrFlushBeforePageWrite),
+        )
+        .unwrap_err();
+        assert!(matches!(err, treedb::Error::RecoveryInterrupted(_)));
+    }
+
+    // 3. Restart recovery cleanly: Redo should replay the durable CLR and finish undo
+    {
+        let mut pm_rec = PageManager::open(&db_path).unwrap();
+        let mut wal_rec = LogManager::open(&wal_path).unwrap();
+        let stats = RecoveryEngine::recover(&mut pm_rec, &mut wal_rec).unwrap();
+        assert!(stats.redo_count >= 1);
+
+        let recovered_page = pm_rec.read_page(p1).unwrap();
+        assert_eq!(&recovered_page.payload()[0..8], &before[..]);
+    }
+}
+
+#[test]
+fn test_crash_during_recovery_fault_matrix() {
+    let faults = [
+        RecoveryFault::BeforeAnalysis,
+        RecoveryFault::BeforeRedo,
+        RecoveryFault::DuringRedo(1),
+        RecoveryFault::BeforeUndo,
+        RecoveryFault::AfterClrFlushBeforePageWrite,
+        RecoveryFault::AfterRecoveredPageWrite(1),
+    ];
+
+    for (idx, fault) in faults.iter().enumerate() {
+        let (_dir, db_path, wal_path) = create_test_db(&format!("fault_matrix_{idx}"));
+
+        let mut pm = PageManager::create(&db_path).unwrap();
+        let p1 = pm.allocate_page().unwrap();
+        let mut wal = LogManager::create(&wal_path).unwrap();
+
+        // Committed T1
+        let t1 = wal.begin_txn().unwrap();
+        let _l1 = wal
+            .append_page_delta(
+                t1,
+                p1,
+                PAGE_HEADER_SIZE as u16,
+                vec![0; 4],
+                b"COMM".to_vec(),
+            )
+            .unwrap();
+        wal.commit_txn(t1).unwrap();
+
+        // Loser T2
+        let t2 = wal.begin_txn().unwrap();
+        let l2 = wal
+            .append_page_delta(
+                t2,
+                p1,
+                (PAGE_HEADER_SIZE + 10) as u16,
+                vec![0; 4],
+                b"LOSE".to_vec(),
+            )
+            .unwrap();
+        wal.flush(l2).unwrap();
+
+        // Leave page at LSN 0 on disk to ensure Redo executes
+        let mut p = pm.read_page(p1).unwrap();
+        p.payload_mut()[0..4].copy_from_slice(b"COMM");
+        p.payload_mut()[10..14].copy_from_slice(b"LOSE");
+        p.set_lsn(NULL_LSN);
+        pm.write_page(&p).unwrap();
+        pm.sync().unwrap();
+
+        drop(pm);
+        drop(wal);
+
+        // 1. Inject fault
+        {
+            let mut pm_rec = PageManager::open(&db_path).unwrap();
+            let mut wal_rec = LogManager::open(&wal_path).unwrap();
+            let err = RecoveryEngine::recover_with_fault(&mut pm_rec, &mut wal_rec, Some(*fault))
+                .unwrap_err();
+            assert!(matches!(err, treedb::Error::RecoveryInterrupted(_)));
+        }
+
+        // 2. Restart recovery cleanly
+        {
+            let mut pm_rec = PageManager::open(&db_path).unwrap();
+            let mut wal_rec = LogManager::open(&wal_path).unwrap();
+            let stats = RecoveryEngine::recover(&mut pm_rec, &mut wal_rec).unwrap();
+            assert!(stats.committed_txns >= 1);
+
+            let restored_page = pm_rec.read_page(p1).unwrap();
+            assert_eq!(&restored_page.payload()[0..4], b"COMM");
+            assert_eq!(&restored_page.payload()[10..14], &[0, 0, 0, 0]);
+        }
+    }
+}
+
+#[test]
+fn test_treedb_transaction_committed_and_uncommitted_put() {
+    let (_dir, db_path, _wal_path) = create_test_db("treedb_txn_put");
+
+    // 1. Committed put
+    {
+        let mut db = TreeDb::create(&db_path, 10).unwrap();
+        db.put(100, b"Val100_Committed").unwrap();
+        db.put(200, b"Val200_Committed").unwrap();
+        // Drop without explicit flush_all - WAL commit flushed log
+    }
+
+    // 2. Reopen: verify committed puts exist
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+        assert_eq!(db.get(100).unwrap(), Some(b"Val100_Committed".to_vec()));
+        assert_eq!(db.get(200).unwrap(), Some(b"Val200_Committed".to_vec()));
+
+        // 3. Uncommitted put: start transaction, insert key 300, flush frames to disk, crash
+        let t = db.begin_txn().unwrap();
+        db.put(300, b"Val300_Uncommitted").unwrap();
+        // Force dirty pages to disk before crash (simulating eviction)
+        db.buffer_pool_mut().flush_all().unwrap();
+        assert!(db.buffer_pool().wal().unwrap().flushed_lsn().is_valid());
+        // Do NOT commit! Crash.
+        let _ = t;
+    }
+
+    // 4. Reopen: verify uncommitted key 300 was undone and does NOT exist
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+        assert_eq!(db.get(100).unwrap(), Some(b"Val100_Committed".to_vec()));
+        assert_eq!(db.get(200).unwrap(), Some(b"Val200_Committed".to_vec()));
+        assert_eq!(db.get(300).unwrap(), None);
+    }
+}
+
+#[test]
+fn test_treedb_transaction_committed_and_uncommitted_delete() {
+    let (_dir, db_path, _wal_path) = create_test_db("treedb_txn_del");
+
+    // Initialize with keys 100, 200, 300
+    {
+        let mut db = TreeDb::create(&db_path, 10).unwrap();
+        db.put(100, b"Val100").unwrap();
+        db.put(200, b"Val200").unwrap();
+        db.put(300, b"Val300").unwrap();
+    }
+
+    // Committed delete of 100
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+        let deleted = db.delete(100).unwrap();
+        assert_eq!(deleted, Some(b"Val100".to_vec()));
+    }
+
+    // Verify 100 is absent, and perform uncommitted delete of 200
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+        assert_eq!(db.get(100).unwrap(), None);
+        assert_eq!(db.get(200).unwrap(), Some(b"Val200".to_vec()));
+
+        let _t = db.begin_txn().unwrap();
+        let deleted = db.delete(200).unwrap();
+        assert_eq!(deleted, Some(b"Val200".to_vec()));
+        db.buffer_pool_mut().flush_all().unwrap();
+        // Crash without commit
+    }
+
+    // Reopen: verify 200 was restored!
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+        assert_eq!(db.get(100).unwrap(), None);
+        assert_eq!(db.get(200).unwrap(), Some(b"Val200".to_vec()));
+        assert_eq!(db.get(300).unwrap(), Some(b"Val300".to_vec()));
+    }
+}
+
+#[test]
+fn test_treedb_transaction_committed_and_uncommitted_update() {
+    let (_dir, db_path, _wal_path) = create_test_db("treedb_txn_upd");
+
+    // Initialize key 500
+    {
+        let mut db = TreeDb::create(&db_path, 10).unwrap();
+        db.put(500, b"OriginalVal").unwrap();
+    }
+
+    // Committed update to "UpdatedVal"
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+        db.put(500, b"UpdatedVal").unwrap();
+    }
+
+    // Verify committed update, then perform uncommitted update to "DirtyVal"
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+        assert_eq!(db.get(500).unwrap(), Some(b"UpdatedVal".to_vec()));
+
+        let _t = db.begin_txn().unwrap();
+        db.put(500, b"DirtyVal").unwrap();
+        db.buffer_pool_mut().flush_all().unwrap();
+        // Crash without commit
+    }
+
+    // Reopen: verify 500 rolled back to "UpdatedVal"
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+        assert_eq!(db.get(500).unwrap(), Some(b"UpdatedVal".to_vec()));
+    }
+}
+
+#[test]
+fn test_index_data_atomicity_comprehensive() {
+    let (_dir, db_path, _wal_path) = create_test_db("atomicity_check");
+
+    // 1. Insert 40 initial committed keys
+    {
+        let mut db = TreeDb::create(&db_path, 10).unwrap();
+        for i in 1..=40 {
+            let val = format!("CommittedPayload_{i:04}");
+            db.put(i as u64, val.as_bytes()).unwrap();
+        }
+    }
+
+    // 2. Start loser transaction with interleaved mutations:
+    // - Insert 10 new keys (41..=50)
+    // - Update 10 existing keys (1..=10)
+    // - Delete 10 existing keys (11..=20)
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+        let _t = db.begin_txn().unwrap();
+
+        for i in 41..=50 {
+            let val = format!("UncommittedNew_{i:04}");
+            db.put(i as u64, val.as_bytes()).unwrap();
+        }
+        for i in 1..=10 {
+            let val = format!("UncommittedUpd_{i:04}");
+            db.put(i as u64, val.as_bytes()).unwrap();
+        }
+        for i in 11..=20 {
+            db.delete(i as u64).unwrap();
+        }
+
+        // Flush all pages to disk to simulate intermediate eviction
+        db.buffer_pool_mut().flush_all().unwrap();
+        // Crash without commit
+    }
+
+    // 3. Reopen and verify index/data atomicity
+    {
+        let mut db = TreeDb::open(&db_path, 10).unwrap();
+
+        // Check keys 1..=10 have original values
+        for i in 1..=10 {
+            let expected = format!("CommittedPayload_{i:04}").into_bytes();
+            assert_eq!(db.get(i as u64).unwrap(), Some(expected));
+        }
+
+        // Check keys 11..=20 exist with original values
+        for i in 11..=20 {
+            let expected = format!("CommittedPayload_{i:04}").into_bytes();
+            assert_eq!(db.get(i as u64).unwrap(), Some(expected));
+        }
+
+        // Check keys 21..=40 exist
+        for i in 21..=40 {
+            let expected = format!("CommittedPayload_{i:04}").into_bytes();
+            assert_eq!(db.get(i as u64).unwrap(), Some(expected));
+        }
+
+        // Check keys 41..=50 do not exist
+        for i in 41..=50 {
+            assert_eq!(db.get(i as u64).unwrap(), None);
+        }
+
+        // Invariant: scan all entries and ensure every RecordId points to a valid record
+        let scan_results = db.scan(None, None).unwrap();
+        assert_eq!(scan_results.len(), 40);
+        for (idx, (k, val)) in scan_results.into_iter().enumerate() {
+            let expected_key = (idx + 1) as u64;
+            assert_eq!(k, expected_key);
+            let expected_val = format!("CommittedPayload_{expected_key:04}").into_bytes();
+            assert_eq!(val, expected_val);
+        }
+
+        // Pin discipline
+        for pid in 0..db.buffer_pool().page_count() {
+            if db.buffer_pool().is_resident(pid) {
+                assert_eq!(db.buffer_pool().pin_count(pid).unwrap(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_transaction_identity_and_prev_lsn_chain() {
+    let (_dir, _db_path, wal_path) = create_test_db("txn_identity");
+
+    let mut wal = LogManager::create(&wal_path).unwrap();
+
+    let t1 = wal.begin_txn().unwrap();
+    let l1_1 = wal.append_page_delta(t1, 1, 0, vec![0], vec![1]).unwrap();
+    let l1_2 = wal.append_page_delta(t1, 1, 1, vec![0], vec![2]).unwrap();
+
+    let t2 = wal.begin_txn().unwrap();
+    let l2_1 = wal.append_page_delta(t2, 2, 0, vec![0], vec![9]).unwrap();
+
+    let l1_3 = wal.append_page_delta(t1, 1, 2, vec![0], vec![3]).unwrap();
+    let l1_c = wal.commit_txn(t1).unwrap();
+
+    let l2_a = wal.abort_txn(t2).unwrap();
+
+    drop(wal);
+
+    let mut wal_read = LogManager::open(&wal_path).unwrap();
+    let records = wal_read.read_all_records().unwrap();
+
+    // Map records by LSN
+    let by_lsn: std::collections::HashMap<Lsn, &treedb::LogRecord> =
+        records.iter().map(|r| (r.lsn, r)).collect();
+
+    // Verify T1 chain: l1_c -> l1_3 -> l1_2 -> l1_1 -> t1 (Begin) -> NULL_LSN
+    assert_eq!(by_lsn[&l1_c].prev_lsn, l1_3);
+    assert_eq!(by_lsn[&l1_3].prev_lsn, l1_2);
+    assert_eq!(by_lsn[&l1_2].prev_lsn, l1_1);
+    assert_eq!(by_lsn[&l1_1].prev_lsn, Lsn(1));
+    assert_eq!(by_lsn[&Lsn(1)].prev_lsn, NULL_LSN);
+
+    // Verify T2 chain: l2_a -> l2_1 -> t2 (Begin) -> NULL_LSN
+    assert_eq!(by_lsn[&l2_a].prev_lsn, l2_1);
+    assert_eq!(by_lsn[&l2_1].prev_lsn, Lsn(4));
+    assert_eq!(by_lsn[&Lsn(4)].prev_lsn, NULL_LSN);
+}
+
+#[test]
+fn test_wal_corruption_matrix() {
+    let (_dir, _db_path, wal_path) = create_test_db("corruption_matrix");
+
+    // 1. Empty WAL after header
+    {
+        let wal = LogManager::create(&wal_path).unwrap();
+        drop(wal);
+        let mut reopened = LogManager::open(&wal_path).unwrap();
+        let records = reopened.read_all_records().unwrap();
+        assert!(records.is_empty());
+    }
+
+    // 2. Truncated tail variations (un-flushed trailing garbage)
+    let tail_garbage = [
+        vec![0x01],                         // 1-byte truncated length
+        vec![0x10, 0x00],                   // 2-byte truncated length
+        vec![0x20, 0x00, 0x00, 0x00, 0x01], // truncated record header
+    ];
+
+    for (idx, garbage) in tail_garbage.iter().enumerate() {
+        let (_dir, _db_path, wpath) = create_test_db(&format!("tail_garbage_{idx}"));
+        let mut wal = LogManager::create(&wpath).unwrap();
+        let t1 = wal.begin_txn().unwrap();
+        wal.commit_txn(t1).unwrap();
+        drop(wal);
+
+        // Append trailing garbage
+        let mut file = OpenOptions::new().append(true).open(&wpath).unwrap();
+        file.write_all(garbage).unwrap();
+        drop(file);
+
+        let mut reopened = LogManager::open(&wpath).unwrap();
+        let records = reopened.read_all_records().unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    // 3. Mid-log corruption before flushed_lsn -> returns WalCorruption on open
+    {
+        let (_dir, _db_path, wpath) = create_test_db("mid_log_corrupt");
+        let mut wal = LogManager::create(&wpath).unwrap();
+        let t1 = wal.begin_txn().unwrap();
+        let lsn = wal.append_page_delta(t1, 1, 0, vec![1], vec![2]).unwrap();
+        wal.commit_txn(t1).unwrap();
+        wal.flush(lsn).unwrap();
+        drop(wal);
+
+        // Corrupt bytes inside the second record (page delta)
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wpath)
+            .unwrap();
+        // Seek past WAL header (32 bytes) + first record (approx 20 bytes)
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(45)).unwrap();
+        file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        drop(file);
+
+        let err = LogManager::open(&wpath).unwrap_err();
+        assert!(matches!(err, treedb::Error::WalCorruption(_)));
+    }
+}
+
+#[test]
+fn test_pagelsn_semantics_matrix() {
+    let (_dir, db_path, wal_path) = create_test_db("pagelsn_matrix");
+
+    let mut pm = PageManager::create(&db_path).unwrap();
+    let p1 = pm.allocate_page().unwrap();
+    let p2 = pm.allocate_page().unwrap();
+    let p3 = pm.allocate_page().unwrap();
+    let mut wal = LogManager::create(&wal_path).unwrap();
+
+    let t1 = wal.begin_txn().unwrap();
+    let lsn1 = wal
+        .append_page_delta(
+            t1,
+            p1,
+            PAGE_HEADER_SIZE as u16,
+            vec![0; 4],
+            b"RED1".to_vec(),
+        )
+        .unwrap();
+    let lsn2 = wal
+        .append_page_delta(
+            t1,
+            p2,
+            PAGE_HEADER_SIZE as u16,
+            vec![0; 4],
+            b"RED2".to_vec(),
+        )
+        .unwrap();
+    let _lsn3 = wal
+        .append_page_delta(
+            t1,
+            p3,
+            PAGE_HEADER_SIZE as u16,
+            vec![0; 4],
+            b"RED3".to_vec(),
+        )
+        .unwrap();
+    wal.commit_txn(t1).unwrap();
+
+    // Set page states on disk:
+    // p1: page_lsn == 0 (< lsn1) -> should be redone
+    let mut page1 = pm.read_page(p1).unwrap();
+    page1.set_lsn(NULL_LSN);
+    pm.write_page(&page1).unwrap();
+
+    // p2: page_lsn == lsn2 -> should be skipped
+    let mut page2 = pm.read_page(p2).unwrap();
+    page2.payload_mut()[0..4].copy_from_slice(b"RED2");
+    page2.set_lsn(lsn2);
+    pm.write_page(&page2).unwrap();
+
+    // p3: page_lsn > lsn3 (simulating higher LSN from later operation) -> should be skipped
+    let mut page3 = pm.read_page(p3).unwrap();
+    page3.payload_mut()[0..4].copy_from_slice(b"NEW3");
+    page3.set_lsn(Lsn(999));
+    pm.write_page(&page3).unwrap();
+    pm.sync().unwrap();
+
+    drop(pm);
+    drop(wal);
+
+    // Recover
+    let mut pm_rec = PageManager::open(&db_path).unwrap();
+    let mut wal_rec = LogManager::open(&wal_path).unwrap();
+    let stats = RecoveryEngine::recover(&mut pm_rec, &mut wal_rec).unwrap();
+    // Only p1 should be redone
+    assert_eq!(stats.redo_count, 1);
+
+    // Verify p1 received RED1 with PageLSN == lsn1
+    let recovered_p1 = pm_rec.read_page(p1).unwrap();
+    assert_eq!(&recovered_p1.payload()[0..4], b"RED1");
+    assert_eq!(recovered_p1.lsn(), lsn1);
+
+    // Verify p2 untouched
+    let recovered_p2 = pm_rec.read_page(p2).unwrap();
+    assert_eq!(&recovered_p2.payload()[0..4], b"RED2");
+    assert_eq!(recovered_p2.lsn(), lsn2);
+
+    // Verify p3 untouched (no LSN regression)
+    let recovered_p3 = pm_rec.read_page(p3).unwrap();
+    assert_eq!(&recovered_p3.payload()[0..4], b"NEW3");
+    assert_eq!(recovered_p3.lsn(), Lsn(999));
+}
+
+#[test]
+fn test_recovery_deep_idempotence_4_passes() {
+    let (_dir, db_path, wal_path) = create_test_db("deep_idempotence");
+
+    // 1. Setup DB with committed and uncommitted transactions
+    let p1 = {
+        let mut pm = PageManager::create(&db_path).unwrap();
+        let p1 = pm.allocate_page().unwrap();
+        let mut wal = LogManager::create(&wal_path).unwrap();
+
+        let t1 = wal.begin_txn().unwrap();
+        wal.append_page_delta(
+            t1,
+            p1,
+            PAGE_HEADER_SIZE as u16,
+            vec![0; 4],
+            b"PASS".to_vec(),
+        )
+        .unwrap();
+        wal.commit_txn(t1).unwrap();
+
+        let t2 = wal.begin_txn().unwrap();
+        let lsn_t2 = wal
+            .append_page_delta(
+                t2,
+                p1,
+                (PAGE_HEADER_SIZE + 10) as u16,
+                vec![0; 4],
+                b"DIRT".to_vec(),
+            )
+            .unwrap();
+        wal.flush(lsn_t2).unwrap();
+
+        let mut page = pm.read_page(p1).unwrap();
+        page.payload_mut()[0..4].copy_from_slice(b"PASS");
+        page.payload_mut()[10..14].copy_from_slice(b"DIRT");
+        page.set_lsn(lsn_t2);
+        pm.write_page(&page).unwrap();
+        pm.sync().unwrap();
+        p1
+    };
+
+    // Capture bytes across 4 passes
+    let mut page_snapshots = Vec::new();
+
+    for pass in 1..=4 {
+        let mut pm = PageManager::open(&db_path).unwrap();
+        let mut wal = LogManager::open(&wal_path).unwrap();
+
+        let stats = RecoveryEngine::recover(&mut pm, &mut wal).unwrap();
+        if pass > 1 {
+            assert_eq!(stats.loser_txns, 0);
+            assert_eq!(stats.undo_count, 0);
+        }
+
+        let p1_page = pm.read_page(p1).unwrap();
+        assert_eq!(&p1_page.payload()[0..4], b"PASS");
+        assert_eq!(&p1_page.payload()[10..14], &[0, 0, 0, 0]);
+
+        page_snapshots.push(p1_page.as_bytes().to_vec());
+    }
+
+    // Passes 2, 3, and 4 must have bit-for-bit identical page bytes
+    assert_eq!(page_snapshots[1], page_snapshots[2]);
+    assert_eq!(page_snapshots[2], page_snapshots[3]);
+}
+
+#[test]
+fn test_storage_format_v1_migration_rejection_and_v2_record_size() {
+    let (_dir, db_path, _wal_path) = create_test_db("format_migration");
+
+    // 1. Test that creating a v1 format file causes UnsupportedFormatVersion on open
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&db_path)
+            .unwrap();
+
+        let v1_header = treedb::DbHeader::new();
+        // Overwrite format version to 1
+        let mut header_bytes = v1_header.serialize();
+        header_bytes[8..12].copy_from_slice(&1u32.to_le_bytes()); // format_version = 1
+        file.write_all(&header_bytes).unwrap();
+
+        let metadata_page = Page::new(1, PageType::Metadata);
+        file.write_all(metadata_page.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let err = PageManager::open(&db_path).unwrap_err();
+        assert!(matches!(
+            err,
+            treedb::Error::UnsupportedFormatVersion {
+                found: 1,
+                supported: 2
+            }
+        ));
+    }
+
+    // 2. Test that v2 format works and validates record size boundary (4070 vs 4071)
+    let (_dir2, db_path2, _wal_path2) = create_test_db("record_size_bound");
+    {
+        let mut db = TreeDb::create(&db_path2, 10).unwrap();
+
+        // 4070 bytes: MAX_RECORD_SIZE (4096 - 16 header - 6 rec header - 4 slot)
+        let max_val = vec![0xAA; treedb::MAX_RECORD_SIZE];
+        db.put(1, &max_val).unwrap();
+        assert_eq!(db.get(1).unwrap(), Some(max_val));
+
+        // 4071 bytes: MAX_RECORD_SIZE + 1
+        let oversized = vec![0xBB; treedb::MAX_RECORD_SIZE + 1];
+        let err = db.put(2, &oversized).unwrap_err();
+        assert!(matches!(
+            err,
+            treedb::Error::ValueTooLarge {
+                size: 4071,
+                limit: 4070
+            }
+        ));
+    }
+}
+
+#[test]
+fn test_recovery_pin_discipline() {
+    let (_dir, db_path, _wal_path) = create_test_db("pin_discipline");
+
+    {
+        let mut db = TreeDb::create(&db_path, 5).unwrap();
+        for i in 1..=100 {
+            db.put(i as u64, format!("PinValue_{i}").as_bytes())
+                .unwrap();
+        }
+
+        // Verify all resident pages have pin count == 0
+        for pid in 0..db.buffer_pool().page_count() {
+            if db.buffer_pool().is_resident(pid) {
+                assert_eq!(db.buffer_pool().pin_count(pid).unwrap(), 0);
+            }
+        }
+    }
+
+    {
+        let mut db = TreeDb::open(&db_path, 5).unwrap();
+        for i in 1..=100 {
+            assert!(db.get(i as u64).unwrap().is_some());
+        }
+
+        for pid in 0..db.buffer_pool().page_count() {
+            if db.buffer_pool().is_resident(pid) {
+                assert_eq!(db.buffer_pool().pin_count(pid).unwrap(), 0);
+            }
+        }
+    }
 }

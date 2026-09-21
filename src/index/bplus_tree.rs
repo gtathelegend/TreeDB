@@ -102,6 +102,69 @@ impl BPlusTree {
         }
     }
 
+    /// Updates an existing `(Key, RecordId)` pair in the persistent B+ Tree.
+    ///
+    /// Returns `Ok(Some(old_record_id))` if updated, or `Ok(None)` if key does not exist.
+    pub fn update(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        key: Key,
+        new_record_id: RecordId,
+    ) -> Result<Option<RecordId>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+
+        let mut curr_page_id = self.root_page_id;
+
+        loop {
+            let page = buffer_pool.fetch_page(curr_page_id)?;
+            let page_type = page.page_type();
+
+            match page_type {
+                PageType::Leaf => {
+                    let mut leaf = match LeafNode::deserialize(page) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(curr_page_id, false);
+                            return Err(e);
+                        }
+                    };
+                    buffer_pool.unpin_page(curr_page_id, false)?;
+
+                    let old_rid = match leaf.update(key, new_record_id) {
+                        Some(old) => old,
+                        None => return Ok(None),
+                    };
+
+                    let page_mut = buffer_pool.fetch_page_mut(curr_page_id)?;
+                    leaf.serialize(page_mut)?;
+                    buffer_pool.unpin_page(curr_page_id, true)?;
+
+                    return Ok(Some(old_rid));
+                }
+                PageType::Internal => {
+                    let internal = match InternalNode::deserialize(page) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(curr_page_id, false);
+                            return Err(e);
+                        }
+                    };
+                    let next_page_id = internal.find_child(key);
+                    buffer_pool.unpin_page(curr_page_id, false)?;
+                    curr_page_id = next_page_id;
+                }
+                other => {
+                    buffer_pool.unpin_page(curr_page_id, false)?;
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_page_id} during B+ Tree traversal"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Inserts a `(Key, RecordId)` pair into the persistent B+ Tree.
     ///
     /// # Insertion Workflow

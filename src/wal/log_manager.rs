@@ -279,7 +279,8 @@ impl LogManager {
 
     /// Sequentially scans and reads all valid log records in the WAL file.
     ///
-    /// Handles partial/truncated records at the end of the log gracefully by stopping at the last valid record.
+    /// Distinguishes between un-flushed crash-truncated tails (which are gracefully ignored)
+    /// and mid-log corruption within the durable prefix (which returns `Error::WalCorruption`).
     pub fn read_all_records(&mut self) -> Result<Vec<LogRecord>> {
         self.file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
         let mut buffer = Vec::new();
@@ -287,16 +288,31 @@ impl LogManager {
 
         let mut records = Vec::new();
         let mut offset = 0;
+        let mut last_lsn = NULL_LSN;
 
         while offset < buffer.len() {
             let slice = &buffer[offset..];
             match LogRecord::deserialize(slice) {
                 Ok((record, consumed)) => {
+                    if record.lsn <= last_lsn {
+                        return Err(Error::WalCorruption(format!(
+                            "LSN monotonicity violation: record LSN {} <= previous LSN {}",
+                            record.lsn, last_lsn
+                        )));
+                    }
+                    last_lsn = record.lsn;
                     records.push(record);
                     offset += consumed;
                 }
-                Err(_) => {
-                    // Stop on truncated or corrupted trailing record at end of crash log
+                Err(err) => {
+                    // Check if corruption occurred within the durable prefix
+                    if self.header.flushed_lsn.is_valid() && last_lsn < self.header.flushed_lsn {
+                        return Err(Error::WalCorruption(format!(
+                            "Durable WAL corrupted before flushed_lsn {}: {err}",
+                            self.header.flushed_lsn
+                        )));
+                    }
+                    // Otherwise, stop gracefully on un-flushed trailing fragment
                     break;
                 }
             }

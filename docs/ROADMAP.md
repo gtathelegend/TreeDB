@@ -89,14 +89,33 @@ This roadmap outlines the planned development phases for TreeDB.
 * [x] Physical page delta logging (`before_image`, `after_image`)
 * [x] 16-byte standard page headers storing `PageLSN` (format version 2)
 * [x] Buffer Pool Write-Ahead rule enforcement (`WAL.flush(page.lsn()) <= page.flush()`)
-* [x] ARIES 3-Phase Crash Recovery (Analysis, Redo, Undo with CLRs)
+* [x] ARIES-inspired 3-Phase Crash Recovery (Analysis, Redo, Undo with CLRs)
 * [x] Crash simulation, idempotence, and truncated/corrupted WAL recovery tests
+
+---
+
+## Phase 7.1: WAL & Crash-Recovery Hardening (Completed)
+* [x] Explicit WAL write-ahead ordering verification on both `BufferPool::flush_page` and LRU eviction
+* [x] Compensation Log Record (CLR) durability ordering (`append CLR -> flush WAL -> write recovered page`)
+* [x] Deterministic crash-during-recovery fault injection hook (`RecoveryFault`)
+* [x] Recovery restartability validation across interrupted Undo and Redo passes
+* [x] TreeDb high-level transaction-level crash tests (committed/uncommitted `put`, `delete`, and `update`)
+* [x] B+ Tree and RecordStore index/data atomicity invariant verification
+* [x] Monotonic `TxnId` ownership and `prev_lsn` backlink integrity across operations
+* [x] Comprehensive WAL corruption matrix (valid prefix recovery, truncated tail tolerance, mid-log corruption rejection)
+* [x] Complete PageLSN comparison behavior matrix (`<`, `==`, `>`, `0`) and non-regression guarantees
+* [x] Multi-pass recovery idempotence verification (4+ consecutive recovery passes)
+* [x] Storage format version 2 migration tests (v1 rejection with `UnsupportedFormatVersion`, v2 success)
+* [x] 4070-byte maximum record boundary validation (`MAX_RECORD_SIZE = 4070 bytes`)
+* [x] Zero buffer pool pin leaks verified across all recovery and mutation paths
 
 ---
 
 ## Phase 8: Advanced Storage, Recycling & CLI (Next Phase)
 * [ ] Free-page recycling across the database (freelist / bitmap)
-* [ ] Multi-page overflow records for large BLOBs
-* [ ] Periodic background fuzzy checkpointing
+* [ ] Multi-page overflow records for large BLOBs exceeding 4070 bytes
+* [ ] Periodic background fuzzy checkpointing and WAL truncation
+* [ ] Group commit and asynchronous WAL flush queues
 * [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`)
 * [ ] Microbenchmarks and stress testing
+

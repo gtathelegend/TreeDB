@@ -70,4 +70,12 @@ pub enum Error {
     /// A duplicate key was rejected during B+ Tree insertion.
     #[error("Duplicate key error: key {0} already exists in B+ Tree")]
     DuplicateKey(u64),
+
+    /// Recovery operation was interrupted by simulated fault injection.
+    #[error("Recovery interrupted: {0}")]
+    RecoveryInterrupted(String),
+
+    /// WAL corruption detected during recovery scan.
+    #[error("WAL corruption detected: {0}")]
+    WalCorruption(String),
 }

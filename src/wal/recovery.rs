@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::storage::page::Page;
 use crate::storage::page_manager::PageManager;
 use crate::wal::log_manager::LogManager;
@@ -35,6 +35,25 @@ pub struct RecoveryStats {
     pub clrs_generated: usize,
 }
 
+/// Simulated crash / fault injection point during crash recovery testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryFault {
+    /// Crash before starting analysis.
+    BeforeAnalysis,
+    /// Crash after analysis but before redo.
+    BeforeRedo,
+    /// Crash during redo after replaying `N` records.
+    DuringRedo(usize),
+    /// Crash after redo but before undo.
+    BeforeUndo,
+    /// Crash immediately after appending CLR but before flushing WAL.
+    AfterClrAppendBeforeFlush,
+    /// Crash immediately after flushing CLR but before writing recovered page.
+    AfterClrFlushBeforePageWrite,
+    /// Crash immediately after writing recovered page for `N`-th undo.
+    AfterRecoveredPageWrite(usize),
+}
+
 /// ARIES-style Crash Recovery Engine executing Analysis, Redo, and Undo passes.
 pub struct RecoveryEngine;
 
@@ -44,6 +63,21 @@ impl RecoveryEngine {
         page_manager: &mut PageManager,
         log_manager: &mut LogManager,
     ) -> Result<RecoveryStats> {
+        Self::recover_with_fault(page_manager, log_manager, None)
+    }
+
+    /// Executes ARIES recovery with deterministic fault injection for crash simulation.
+    pub fn recover_with_fault(
+        page_manager: &mut PageManager,
+        log_manager: &mut LogManager,
+        fault: Option<RecoveryFault>,
+    ) -> Result<RecoveryStats> {
+        if fault == Some(RecoveryFault::BeforeAnalysis) {
+            return Err(Error::RecoveryInterrupted(
+                "simulated crash before analysis".into(),
+            ));
+        }
+
         let mut stats = RecoveryStats::default();
 
         // Load all log records from the WAL
@@ -131,6 +165,12 @@ impl RecoveryEngine {
         }
         stats.active_txns = txn_table.len();
 
+        if fault == Some(RecoveryFault::BeforeRedo) {
+            return Err(Error::RecoveryInterrupted(
+                "simulated crash before redo".into(),
+            ));
+        }
+
         // -------------------------------------------------------------------
         // 2. REDO PASS
         // -------------------------------------------------------------------
@@ -152,6 +192,12 @@ impl RecoveryEngine {
                             page.set_lsn(rec.lsn);
                             page_manager.write_page(&page)?;
                             stats.redo_count += 1;
+
+                            if fault == Some(RecoveryFault::DuringRedo(stats.redo_count)) {
+                                return Err(Error::RecoveryInterrupted(
+                                    "simulated crash during redo".into(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -170,11 +216,23 @@ impl RecoveryEngine {
                             page.set_lsn(rec.lsn);
                             page_manager.write_page(&page)?;
                             stats.redo_count += 1;
+
+                            if fault == Some(RecoveryFault::DuringRedo(stats.redo_count)) {
+                                return Err(Error::RecoveryInterrupted(
+                                    "simulated crash during redo".into(),
+                                ));
+                            }
                         }
                     }
                 }
                 _ => {}
             }
+        }
+
+        if fault == Some(RecoveryFault::BeforeUndo) {
+            return Err(Error::RecoveryInterrupted(
+                "simulated crash before undo".into(),
+            ));
         }
 
         // -------------------------------------------------------------------
@@ -223,11 +281,33 @@ impl RecoveryEngine {
                             before_image.clone(),
                             rec.prev_lsn,
                         )?;
+
+                        if fault == Some(RecoveryFault::AfterClrAppendBeforeFlush) {
+                            return Err(Error::RecoveryInterrupted(
+                                "simulated crash after CLR append before flush".into(),
+                            ));
+                        }
+
+                        // Enforce Write-Ahead ordering for CLRs before updating page on disk
+                        log_manager.flush(clr_lsn)?;
+
+                        if fault == Some(RecoveryFault::AfterClrFlushBeforePageWrite) {
+                            return Err(Error::RecoveryInterrupted(
+                                "simulated crash after CLR flush before page write".into(),
+                            ));
+                        }
+
                         page.set_lsn(clr_lsn);
                         page_manager.write_page(&page)?;
 
                         stats.undo_count += 1;
                         stats.clrs_generated += 1;
+
+                        if fault == Some(RecoveryFault::AfterRecoveredPageWrite(stats.undo_count)) {
+                            return Err(Error::RecoveryInterrupted(
+                                "simulated crash after recovered page write".into(),
+                            ));
+                        }
 
                         if rec.prev_lsn.is_valid() {
                             active_undo_lsns.push((rec.prev_lsn, txn_id));
