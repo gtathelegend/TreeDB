@@ -4,6 +4,7 @@ pub mod engine;
 pub mod error;
 pub mod index;
 pub mod storage;
+pub mod wal;
 
 pub use engine::TreeDb;
 pub use error::{Error, Result};
@@ -18,4 +19,9 @@ pub use storage::{
     RecordPage, RecordStore, Slot, CURRENT_FORMAT_VERSION, DEFAULT_METADATA_PAGE_ID,
     HEADER_PAGE_ID, MAGIC_BYTES, MAX_RECORD_SIZE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE,
     RECORD_PAGE_HEADER_SIZE, SLOT_SIZE,
+};
+pub use wal::{
+    crc32, LogManager, LogRecord, LogRecordBody, LogRecordType, Lsn, RecoveryEngine, RecoveryStats,
+    TxnId, TxnStatus, TxnTableEntry, WalHeader, CURRENT_WAL_VERSION, INVALID_LSN, NULL_LSN,
+    NULL_TXN, WAL_HEADER_SIZE, WAL_MAGIC_BYTES,
 };

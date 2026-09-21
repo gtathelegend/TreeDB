@@ -1,13 +1,15 @@
 # TreeDB On-Disk Storage Format
 
-TreeDB stores all data in a single file with fixed-size pages.
+TreeDB stores all data in a single primary database file (`.treedb`) and an associated write-ahead log file (`.treedb.wal`).
 
 * **Default Page Size:** 4096 bytes (4 KiB)
-* **Byte Ordering:** Little-Endian for all multi-byte fields
+* **Byte Ordering:** Little-Endian for all multi-byte integers
+* **Current Database Format Version:** `2`
+* **Current WAL Format Version:** `1`
 
 ---
 
-## Overall File Layout
+## Overall Database File Layout
 
 ```text
 +-----------------------+ offset 0x0000 (0 bytes)
@@ -30,7 +32,7 @@ Page 0 contains global configuration, integrity verification tokens, and allocat
 | Byte Offset | Length | Field Name | Type | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `0x00` | 8 bytes | `magic` | `[u8; 8]` | ASCII identifier `TREEDB01` |
-| `0x08` | 4 bytes | `format_version` | `u32` (LE) | On-disk format version (currently `1`) |
+| `0x08` | 4 bytes | `format_version` | `u32` (LE) | On-disk format version (`2`) |
 | `0x0C` | 4 bytes | `page_size` | `u32` (LE) | Page size in bytes (`4096`) |
 | `0x10` | 4 bytes | `page_count` | `u32` (LE) | Total number of allocated pages |
 | `0x14` | 4 bytes | `root_page_id` | `u32` (LE) | Page ID of B+ Tree root (`0` if uninitialized) |
@@ -41,7 +43,7 @@ Page 0 contains global configuration, integrity verification tokens, and allocat
 
 ## Standard Page Header (Page 1+)
 
-All pages other than Page 0 share a common 8-byte header:
+All pages other than Page 0 share a common 16-byte header:
 
 ```text
 +---------------------------------------------------------------+
@@ -49,7 +51,9 @@ All pages other than Page 0 share a common 8-byte header:
 +---------------------------------------------------------------+
 | Byte 4: Page Type Tag (u8) | Byte 5: Flags (u8) | Byte 6..7: 0|
 +---------------------------------------------------------------+
-| Byte 8..4095: Page Payload (4088 bytes)                       |
+| Byte 8..15: Page LSN (u64, LE) - Most recent WAL log sequence |
++---------------------------------------------------------------+
+| Byte 16..4095: Page Payload (4080 bytes)                      |
 +---------------------------------------------------------------+
 ```
 
@@ -67,38 +71,38 @@ All pages other than Page 0 share a common 8-byte header:
 
 ## B+ Tree Leaf Node Payload Layout (`PageType::Leaf`)
 
-The 4088-byte payload of a Leaf page is structured as:
+The 4080-byte payload of a Leaf page is structured as:
 
 | Byte Offset (in payload) | Length | Field Name | Type | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `0x00` | 2 bytes | `key_count` | `u16` (LE) | Number of active key-record entries (0..255) |
+| `0x00` | 2 bytes | `key_count` | `u16` (LE) | Number of active key-record entries (0..254) |
 | `0x02` | 4 bytes | `next_leaf` | `u32` (LE) | PageId of next sibling leaf (`0` if none) |
 | `0x06` | 16 bytes × `N` | `entries` | `[(Key, RecordId)]` | Array of `[Key (8B) \| RecordId (8B)]` |
 | `0x06 + (16 × N)` | Remainder | `padding` | `[u8]` | Unused space (zero-filled) |
 
-* **Capacity:** Max 255 entries = `6 + (255 × 16) = 4086 bytes` (2 bytes padding).
+* **Capacity:** Max 254 entries = `6 + (254 × 16) = 4070 bytes` (10 bytes padding).
 * **RecordId:** `(page_id: u32, slot_id: u32)` = 8 bytes.
 
 ---
 
 ## B+ Tree Internal Node Payload Layout (`PageType::Internal`)
 
-The 4088-byte payload of an Internal page is structured as:
+The 4080-byte payload of an Internal page is structured as:
 
 | Byte Offset (in payload) | Length | Field Name | Type | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `0x00` | 2 bytes | `key_count` | `u16` (LE) | Number of separator keys `N` (0..340) |
+| `0x00` | 2 bytes | `key_count` | `u16` (LE) | Number of separator keys `N` (0..339) |
 | `0x02` | 4 bytes | `first_child` | `u32` (LE) | PageId of leftmost child pointer `C0` |
 | `0x06` | 12 bytes × `N` | `entries` | `[(Key, PageId)]` | Array of `[SeparatorKey (8B) \| ChildPageId (4B)]` |
 | `0x06 + (12 × N)` | Remainder | `padding` | `[u8]` | Unused space (zero-filled) |
 
-* **Capacity:** Max 340 separator keys (341 children) = `6 + (340 × 12) = 4086 bytes` (2 bytes padding).
+* **Capacity:** Max 339 separator keys (340 children) = `6 + (339 × 12) = 4074 bytes` (6 bytes padding).
 
 ---
 
 ## Slotted Record Page Payload Layout (`PageType::Record`)
 
-The 4088-byte payload of a Record page is structured using a slotted-page layout:
+The 4080-byte payload of a Record page is structured using a slotted-page layout:
 
 ```text
 +---------------------------------------------------------------+
@@ -112,7 +116,7 @@ The 4088-byte payload of a Record page is structured using a slotted-page layout
 +---------------------------------------------------------------+
 | Byte free_start..free_end: Free Space Region (contiguous gap) |
 +---------------------------------------------------------------+
-| Byte free_end..4088: Record Payloads (grows DOWNWARD)         |
+| Byte free_end..4080: Record Payloads (grows DOWNWARD)         |
 |   Record N payload                                            |
 |   ...                                                         |
 |   Record 0 payload                                            |
@@ -134,6 +138,46 @@ The 4088-byte payload of a Record page is structured using a slotted-page layout
 | `offset` | 2 bytes | `u16` (LE) | Byte offset within page payload (`0` if deleted) |
 | `length` | 2 bytes | `u16` (LE) | Byte length of record payload |
 
-* **Deleted Slot Sentinel:** `offset == 0` marks an unused/deleted slot.
-* **Maximum Record Size:** `MAX_RECORD_SIZE = 4088 - 6 - 4 = 4078 bytes`.
+* **Deleted Slot Sentinel:** `offset == 0 && length == 0` marks an unused/deleted slot.
+* **Maximum Record Size:** `MAX_RECORD_SIZE = 4080 - 6 - 4 = 4070 bytes`.
 * **RecordId:** `(page_id: u32, slot_id: u32)`. Logical `RecordId`s remain stable across page compactions.
+
+---
+
+## Write-Ahead Log File Format (`.wal`)
+
+The WAL is stored in a separate file with extension `.wal` alongside the primary database file.
+
+### WAL Header (32 bytes)
+
+| Byte Offset | Length | Field Name | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x00` | 8 bytes | `magic` | `[u8; 8]` | ASCII identifier `TREEWAL1` |
+| `0x08` | 4 bytes | `version` | `u32` (LE) | WAL format version (`1`) |
+| `0x0C` | 8 bytes | `flushed_lsn` | `u64` (LE) | Highest LSN flushed to durable storage |
+| `0x14` | 12 bytes | `reserved` | `[u8; 12]` | Zero-padded reserved bytes |
+
+### Self-Delimiting Log Record Layout
+
+```text
++--------------------------------------------------------------------------------+
+| Total Payload Len (u32, 4B)                                                    |
++--------------------------------------------------------------------------------+
+| LSN (u64, 8B) | Prev LSN (u64, 8B) | Txn ID (u64, 8B) | Record Type Tag (u8, 1B)|
++--------------------------------------------------------------------------------+
+| Record Body Bytes (variable length)                                            |
++--------------------------------------------------------------------------------+
+| IEEE 802.3 CRC32 Checksum (u32, 4B)                                            |
++--------------------------------------------------------------------------------+
+```
+
+### Log Record Types
+
+| Tag (u8) | Type | Body Layout |
+| :--- | :--- | :--- |
+| `0x01` | `Begin` | Empty (0 bytes) |
+| `0x02` | `Commit` | Empty (0 bytes) |
+| `0x03` | `Abort` | Empty (0 bytes) |
+| `0x04` | `PageDelta` | `page_id (4B)` + `offset (2B)` + `before_len (2B)` + `before_bytes` + `after_len (2B)` + `after_bytes` |
+| `0x05` | `Clr` | `page_id (4B)` + `offset (2B)` + `undo_next_lsn (8B)` + `redo_len (2B)` + `redo_bytes` |
+| `0x06` | `Checkpoint`| `num_txns (4B)` + array of `[txn_id (8B) \| last_lsn (8B)]` |

@@ -16,11 +16,11 @@ fn create_test_pool(capacity: usize) -> (BufferPool, tempfile::TempDir, std::pat
 
 #[test]
 fn test_capacity_constants_exports() {
-    assert_eq!(LEAF_MAX_ENTRIES, 255);
+    assert_eq!(LEAF_MAX_ENTRIES, 254);
     assert_eq!(LEAF_MIN_ENTRIES, 127);
-    assert_eq!(INTERNAL_MAX_KEYS, 340);
-    assert_eq!(INTERNAL_MIN_KEYS, 170);
-    assert_eq!(INTERNAL_MIN_CHILDREN, 171);
+    assert_eq!(INTERNAL_MAX_KEYS, 339);
+    assert_eq!(INTERNAL_MIN_KEYS, 169);
+    assert_eq!(INTERNAL_MIN_CHILDREN, 170);
 }
 
 #[test]
@@ -280,8 +280,9 @@ fn test_insert_first_leaf_split_and_root_elevation() {
     assert_eq!(root_page.page_type(), PageType::Leaf);
     pool.unpin_page(tree.root_page_id(), false).unwrap();
 
-    // Insert 256th entry -> Forces first leaf split and root elevation!
-    tree.insert(&mut pool, 256, RecordId::new(256, 0))
+    // Insert next entry -> Forces first leaf split and root elevation!
+    let next_key = (LEAF_MAX_ENTRIES + 1) as u64;
+    tree.insert(&mut pool, next_key, RecordId::new(next_key as u32, 0))
         .expect("insert causing split");
 
     // Root must now be an Internal node
@@ -293,8 +294,8 @@ fn test_insert_first_leaf_split_and_root_elevation() {
     assert_eq!(internal.key_count(), 1);
     assert_eq!(internal.child_count(), 2);
 
-    // Verify all 256 keys
-    for i in 1..=256 {
+    // Verify all keys up to LEAF_MAX_ENTRIES + 1
+    for i in 1..=(LEAF_MAX_ENTRIES + 1) {
         assert_eq!(
             tree.get(&mut pool, i as u64).unwrap(),
             Some(RecordId::new(i as u32, 0)),

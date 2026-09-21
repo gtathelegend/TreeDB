@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::error::{Error, Result};
 use crate::storage::page::{Page, PageId, PageType};
 use crate::storage::page_manager::PageManager;
+use crate::wal::log_manager::LogManager;
 
 /// Frame identifier within the buffer pool.
 pub type FrameId = usize;
@@ -71,13 +72,14 @@ impl BufferPoolStats {
 ///
 /// Operates between higher-level storage components (such as B+ Trees) and the
 /// physical `PageManager`, handling page fetching, pinning, dirty tracking,
-/// and LRU-style eviction.
+/// LRU-style eviction, and Write-Ahead Logging flush ordering.
 #[derive(Debug)]
 pub struct BufferPool {
     capacity: usize,
     frames: Vec<Frame>,
     page_table: HashMap<PageId, FrameId>,
     page_manager: PageManager,
+    wal: Option<LogManager>,
     access_counter: u64,
     stats: BufferPoolStats,
 }
@@ -102,12 +104,40 @@ impl BufferPool {
             frames,
             page_table: HashMap::with_capacity(capacity),
             page_manager,
+            wal: None,
             access_counter: 0,
             stats: BufferPoolStats {
                 capacity,
                 ..Default::default()
             },
         })
+    }
+
+    /// Creates a new `BufferPool` attached with an active `LogManager` to enforce Write-Ahead ordering.
+    pub fn with_wal(capacity: usize, page_manager: PageManager, wal: LogManager) -> Result<Self> {
+        let mut pool = Self::new(capacity, page_manager)?;
+        pool.wal = Some(wal);
+        Ok(pool)
+    }
+
+    /// Attaches an active `LogManager` to this buffer pool.
+    pub fn attach_wal(&mut self, wal: LogManager) {
+        self.wal = Some(wal);
+    }
+
+    /// Detaches and returns the active `LogManager`, if attached.
+    pub fn detach_wal(&mut self) -> Option<LogManager> {
+        self.wal.take()
+    }
+
+    /// Returns a reference to the active `LogManager`, if attached.
+    pub fn wal(&self) -> Option<&LogManager> {
+        self.wal.as_ref()
+    }
+
+    /// Returns a mutable reference to the active `LogManager`, if attached.
+    pub fn wal_mut(&mut self) -> Option<&mut LogManager> {
+        self.wal.as_mut()
     }
 
     /// Fetches a page by ID into the buffer pool and pins it for immutable reading.
@@ -181,7 +211,7 @@ impl BufferPool {
         Ok(frame.page.as_mut().unwrap())
     }
 
-    /// Flushes an individual dirty page to disk if resident.
+    /// Flushes an individual dirty page to disk if resident, enforcing Write-Ahead order.
     ///
     /// If the page is clean, this is a no-op and returns `Ok(())`.
     ///
@@ -197,6 +227,13 @@ impl BufferPool {
         let frame = &mut self.frames[frame_id];
         if frame.dirty {
             if let Some(ref page) = frame.page {
+                // Write-Ahead rule: ensure WAL is flushed up to page.lsn() before writing page
+                if let Some(ref mut wal) = self.wal {
+                    let lsn = page.lsn();
+                    if lsn.is_valid() {
+                        wal.flush(lsn)?;
+                    }
+                }
                 self.page_manager.write_page(page)?;
                 self.stats.dirty_flushes += 1;
                 frame.dirty = false;
@@ -206,11 +243,18 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Flushes all resident dirty pages to disk through the `PageManager`.
+    /// Flushes all resident dirty pages to disk through the `PageManager`, enforcing Write-Ahead order.
     pub fn flush_all(&mut self) -> Result<()> {
         for frame in &mut self.frames {
             if frame.dirty {
                 if let Some(ref page) = frame.page {
+                    // Write-Ahead rule
+                    if let Some(ref mut wal) = self.wal {
+                        let lsn = page.lsn();
+                        if lsn.is_valid() {
+                            wal.flush(lsn)?;
+                        }
+                    }
                     self.page_manager.write_page(page)?;
                     self.stats.dirty_flushes += 1;
                     frame.dirty = false;
@@ -220,9 +264,15 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Flushes all dirty pages and synchronizes the underlying database file.
+    /// Flushes all dirty pages and synchronizes the underlying database and WAL files.
     pub fn sync(&mut self) -> Result<()> {
         self.flush_all()?;
+        if let Some(ref mut wal) = self.wal {
+            let flushed_lsn = wal.flushed_lsn();
+            if flushed_lsn.is_valid() {
+                wal.flush(flushed_lsn)?;
+            }
+        }
         self.page_manager.sync()?;
         Ok(())
     }
@@ -376,10 +426,16 @@ impl BufferPool {
 
         let victim_id = victim_frame_id.ok_or(Error::NoEvictablePage)?;
 
-        // 3. If victim is dirty, flush it to disk first
+        // 3. If victim is dirty, flush it to disk first (enforcing Write-Ahead rule)
         let victim_frame = &mut self.frames[victim_id];
         if victim_frame.dirty {
             if let Some(ref page) = victim_frame.page {
+                if let Some(ref mut wal) = self.wal {
+                    let lsn = page.lsn();
+                    if lsn.is_valid() {
+                        wal.flush(lsn)?;
+                    }
+                }
                 self.page_manager.write_page(page)?;
                 self.stats.dirty_flushes += 1;
                 victim_frame.dirty = false;

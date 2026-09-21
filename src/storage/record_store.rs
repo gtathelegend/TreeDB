@@ -44,7 +44,7 @@ impl RecordStore {
     /// page is allocated automatically through the `BufferPool`.
     ///
     /// # Errors
-    /// * `Error::ValueTooLarge` if `record.len() > MAX_RECORD_SIZE` (4078 bytes).
+    /// * `Error::ValueTooLarge` if `record.len() > MAX_RECORD_SIZE` (4070 bytes).
     /// * `Error::BufferPoolFull` or `Error::Io` on storage or capacity limits.
     pub fn insert(&mut self, buffer_pool: &mut BufferPool, record: &[u8]) -> Result<RecordId> {
         let record_len = record.len();

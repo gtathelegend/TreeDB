@@ -1,26 +1,42 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::index::bplus_tree::BPlusTree;
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::page::Key;
+use crate::storage::page::{Key, PageId};
 use crate::storage::page_manager::PageManager;
 use crate::storage::record_store::RecordStore;
+use crate::wal::log_manager::LogManager;
+use crate::wal::lsn::{Lsn, TxnId, NULL_LSN, NULL_TXN};
+use crate::wal::recovery::RecoveryEngine;
 
 /// High-level persistent database engine coordinating the B+ Tree index,
-/// slotted Record Store, and Buffer Pool.
+/// slotted Record Store, Buffer Pool, and Write-Ahead Logging.
 pub struct TreeDb {
     tree: BPlusTree,
     record_store: RecordStore,
     buffer_pool: BufferPool,
+    active_txn: Option<TxnId>,
 }
 
 impl TreeDb {
-    /// Opens an existing TreeDB database file with the specified buffer pool capacity.
+    /// Opens an existing TreeDB database file, recovering any pending WAL records if present.
     pub fn open(path: impl AsRef<Path>, pool_capacity: usize) -> Result<Self> {
-        let page_manager = PageManager::open(path)?;
+        let db_path = path.as_ref();
+        let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
+
+        let mut page_manager = PageManager::open(db_path)?;
+        let log_manager = if wal_path.exists() {
+            let mut log_mgr = LogManager::open(&wal_path)?;
+            // Execute ARIES crash recovery before initializing buffer pool
+            RecoveryEngine::recover(&mut page_manager, &mut log_mgr)?;
+            log_mgr
+        } else {
+            LogManager::create(&wal_path)?
+        };
+
         let root_page_id = page_manager.header().root_page_id;
-        let buffer_pool = BufferPool::new(pool_capacity, page_manager)?;
+        let buffer_pool = BufferPool::with_wal(pool_capacity, page_manager, log_manager)?;
         let tree = BPlusTree::from_root(root_page_id);
         let record_store = RecordStore::new();
 
@@ -28,14 +44,19 @@ impl TreeDb {
             tree,
             record_store,
             buffer_pool,
+            active_txn: None,
         })
     }
 
-    /// Creates and initializes a new TreeDB database file with the specified buffer pool capacity.
+    /// Creates and initializes a new TreeDB database file with an associated WAL.
     pub fn create(path: impl AsRef<Path>, pool_capacity: usize) -> Result<Self> {
-        let page_manager = PageManager::create(path)?;
+        let db_path = path.as_ref();
+        let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
+
+        let page_manager = PageManager::create(db_path)?;
+        let log_manager = LogManager::create(&wal_path)?;
         let root_page_id = page_manager.header().root_page_id;
-        let buffer_pool = BufferPool::new(pool_capacity, page_manager)?;
+        let buffer_pool = BufferPool::with_wal(pool_capacity, page_manager, log_manager)?;
         let tree = BPlusTree::from_root(root_page_id);
         let record_store = RecordStore::new();
 
@@ -43,6 +64,7 @@ impl TreeDb {
             tree,
             record_store,
             buffer_pool,
+            active_txn: None,
         })
     }
 
@@ -56,6 +78,63 @@ impl TreeDb {
             tree,
             record_store,
             buffer_pool,
+            active_txn: None,
+        }
+    }
+
+    /// Begins a new transaction in the WAL stream.
+    pub fn begin_txn(&mut self) -> Result<TxnId> {
+        if let Some(wal) = self.buffer_pool.wal_mut() {
+            let txn_id = wal.begin_txn()?;
+            self.active_txn = Some(txn_id);
+            Ok(txn_id)
+        } else {
+            Ok(NULL_TXN)
+        }
+    }
+
+    /// Commits the specified transaction, flushing the WAL through the commit LSN.
+    pub fn commit_txn(&mut self, txn_id: TxnId) -> Result<Lsn> {
+        if let Some(wal) = self.buffer_pool.wal_mut() {
+            let lsn = wal.commit_txn(txn_id)?;
+            if self.active_txn == Some(txn_id) {
+                self.active_txn = None;
+            }
+            Ok(lsn)
+        } else {
+            Ok(NULL_LSN)
+        }
+    }
+
+    /// Aborts the specified transaction and flushes the WAL.
+    pub fn abort_txn(&mut self, txn_id: TxnId) -> Result<Lsn> {
+        if let Some(wal) = self.buffer_pool.wal_mut() {
+            let lsn = wal.abort_txn(txn_id)?;
+            if self.active_txn == Some(txn_id) {
+                self.active_txn = None;
+            }
+            Ok(lsn)
+        } else {
+            Ok(NULL_LSN)
+        }
+    }
+
+    /// Appends a `PageDelta` log record and updates the target page's `page_lsn`.
+    pub fn log_page_delta(
+        &mut self,
+        txn_id: TxnId,
+        page_id: PageId,
+        offset: u16,
+        before_image: Vec<u8>,
+        after_image: Vec<u8>,
+    ) -> Result<Lsn> {
+        if let Some(wal) = self.buffer_pool.wal_mut() {
+            let lsn = wal.append_page_delta(txn_id, page_id, offset, before_image, after_image)?;
+            let page = self.buffer_pool.get_page_mut(page_id)?;
+            page.set_lsn(lsn);
+            Ok(lsn)
+        } else {
+            Ok(NULL_LSN)
         }
     }
 
@@ -63,6 +142,12 @@ impl TreeDb {
     ///
     /// Stores the variable-length value payload in the Record Store and updates the B+ Tree index.
     pub fn put(&mut self, key: Key, value: &[u8]) -> Result<()> {
+        let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
+            Some(self.begin_txn()?)
+        } else {
+            None
+        };
+
         // If key already exists, delete old record from record store
         if let Some(old_rid) = self.tree.get(&mut self.buffer_pool, key)? {
             self.tree.delete(&mut self.buffer_pool, key)?;
@@ -71,6 +156,11 @@ impl TreeDb {
 
         let record_id = self.record_store.insert(&mut self.buffer_pool, value)?;
         self.tree.insert(&mut self.buffer_pool, key, record_id)?;
+
+        if let Some(tid) = auto_txn {
+            self.commit_txn(tid)?;
+        }
+
         Ok(())
     }
 
@@ -88,14 +178,26 @@ impl TreeDb {
     ///
     /// Returns `Ok(Some(Vec<u8>))` with the deleted record bytes if present, or `Ok(None)` if absent.
     pub fn delete(&mut self, key: Key) -> Result<Option<Vec<u8>>> {
-        match self.tree.delete(&mut self.buffer_pool, key)? {
+        let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
+            Some(self.begin_txn()?)
+        } else {
+            None
+        };
+
+        let result = match self.tree.delete(&mut self.buffer_pool, key)? {
             Some(record_id) => {
                 let value = self.record_store.get(&mut self.buffer_pool, record_id)?;
                 self.record_store.delete(&mut self.buffer_pool, record_id)?;
                 Ok(value)
             }
             None => Ok(None),
+        };
+
+        if let Some(tid) = auto_txn {
+            self.commit_txn(tid)?;
         }
+
+        result
     }
 
     /// Performs an ordered range scan over keys in `[start, end)`, returning pairs of `(Key, Vec<u8>)`.

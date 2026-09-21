@@ -57,7 +57,7 @@ pub const LEAF_ENTRY_SIZE: usize = KEY_SIZE + RECORD_ID_SIZE; // 16 bytes
 
 /// Maximum number of key-record entries that fit in a Leaf page payload.
 ///
-/// Derived as: `(4088 - 6) / 16 = 255 entries` (4080 bytes used of 4088 available).
+/// Derived as: `(4080 - 6) / 16 = 254 entries` (4070 bytes used of 4080 available).
 pub const LEAF_MAX_ENTRIES: usize = (PAGE_PAYLOAD_SIZE - LEAF_HEADER_SIZE) / LEAF_ENTRY_SIZE;
 
 /// Internal node header size in payload: `key_count` (2 bytes) + `first_child` (4 bytes).
@@ -68,8 +68,8 @@ pub const INTERNAL_ENTRY_SIZE: usize = KEY_SIZE + PAGE_ID_SIZE; // 12 bytes
 
 /// Maximum number of separator keys that fit in an Internal page payload.
 ///
-/// Derived as: `(4088 - 6) / 12 = 340 keys` (4080 bytes used of 4088 available).
-/// An internal node with 340 keys routes to 341 child pages.
+/// Derived as: `(4080 - 6) / 12 = 339 keys` (4074 bytes used of 4080 available).
+/// An internal node with 339 keys routes to 340 child pages.
 pub const INTERNAL_MAX_KEYS: usize =
     (PAGE_PAYLOAD_SIZE - INTERNAL_HEADER_SIZE) / INTERNAL_ENTRY_SIZE;
 
@@ -80,12 +80,12 @@ pub const LEAF_MIN_ENTRIES: usize = LEAF_MAX_ENTRIES / 2;
 
 /// Minimum number of separator keys a non-root internal node must contain before underflowing.
 ///
-/// Derived as: `INTERNAL_MAX_KEYS / 2 = 170 keys`.
+/// Derived as: `INTERNAL_MAX_KEYS / 2 = 169 keys`.
 pub const INTERNAL_MIN_KEYS: usize = INTERNAL_MAX_KEYS / 2;
 
 /// Minimum number of child pointers a non-root internal node must route to.
 ///
-/// Derived as: `INTERNAL_MIN_KEYS + 1 = 171 children`.
+/// Derived as: `INTERNAL_MIN_KEYS + 1 = 170 children`.
 pub const INTERNAL_MIN_CHILDREN: usize = INTERNAL_MIN_KEYS + 1;
 
 #[cfg(test)]
@@ -102,13 +102,13 @@ mod tests {
 
     #[test]
     fn test_capacity_derivations() {
-        assert_eq!(LEAF_MAX_ENTRIES, 255);
+        assert_eq!(LEAF_MAX_ENTRIES, 254);
         assert_eq!(LEAF_MIN_ENTRIES, 127);
         const { assert!(LEAF_HEADER_SIZE + (LEAF_MAX_ENTRIES * LEAF_ENTRY_SIZE) <= PAGE_PAYLOAD_SIZE) };
 
-        assert_eq!(INTERNAL_MAX_KEYS, 340);
-        assert_eq!(INTERNAL_MIN_KEYS, 170);
-        assert_eq!(INTERNAL_MIN_CHILDREN, 171);
+        assert_eq!(INTERNAL_MAX_KEYS, 339);
+        assert_eq!(INTERNAL_MIN_KEYS, 169);
+        assert_eq!(INTERNAL_MIN_CHILDREN, 170);
         const {
             assert!(
                 INTERNAL_HEADER_SIZE + (INTERNAL_MAX_KEYS * INTERNAL_ENTRY_SIZE)

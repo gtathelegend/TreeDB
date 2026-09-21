@@ -4,8 +4,8 @@ use crate::storage::page::{PageId, PAGE_SIZE};
 /// Recognizable magic bytes for TreeDB database files.
 pub const MAGIC_BYTES: &[u8; 8] = b"TREEDB01";
 
-/// Format version 1.
-pub const CURRENT_FORMAT_VERSION: u32 = 1;
+/// Format version 2 (with 16-byte page headers containing PageLSN).
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
 
 /// Page ID for the Database Header.
 pub const HEADER_PAGE_ID: PageId = 0;
@@ -127,11 +127,14 @@ mod tests {
     #[test]
     fn test_unsupported_version() {
         let mut bytes = DbHeader::new().serialize();
-        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes()); // Old version 1
         let result = DbHeader::deserialize(&bytes);
         assert!(matches!(
             result,
-            Err(Error::UnsupportedFormatVersion { .. })
+            Err(Error::UnsupportedFormatVersion {
+                found: 1,
+                supported: 2
+            })
         ));
     }
 }

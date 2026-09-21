@@ -17,7 +17,7 @@ fn create_test_pool(capacity: usize) -> (BufferPool, tempfile::TempDir, std::pat
 fn test_record_constants() {
     assert_eq!(RECORD_PAGE_HEADER_SIZE, 6);
     assert_eq!(SLOT_SIZE, 4);
-    assert_eq!(MAX_RECORD_SIZE, 4078);
+    assert_eq!(MAX_RECORD_SIZE, 4070);
     let header = DbHeader::default();
     assert_eq!(header.page_size, 4096);
 }
@@ -27,8 +27,8 @@ fn test_record_page_creation_and_free_space() {
     let rp = RecordPage::new();
     assert_eq!(rp.slot_count(), 0);
     assert_eq!(rp.active_record_count(), 0);
-    assert_eq!(rp.contiguous_free_space(), 4082);
-    assert_eq!(rp.total_free_space(), 4082);
+    assert_eq!(rp.contiguous_free_space(), 4074);
+    assert_eq!(rp.total_free_space(), 4074);
 
     let mut page = Page::new(2, PageType::Record);
     rp.serialize(&mut page)
@@ -37,8 +37,8 @@ fn test_record_page_creation_and_free_space() {
     let restored = RecordPage::deserialize(&page).expect("deserialize record page");
     assert_eq!(restored.slot_count(), 0);
     assert_eq!(restored.active_record_count(), 0);
-    assert_eq!(restored.contiguous_free_space(), 4082);
-    assert_eq!(restored.total_free_space(), 4082);
+    assert_eq!(restored.contiguous_free_space(), 4074);
+    assert_eq!(restored.total_free_space(), 4074);
 }
 
 #[test]

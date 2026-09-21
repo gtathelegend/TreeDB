@@ -25,11 +25,13 @@ Application / CLI
         ▼
    Buffer Pool (Page Cache & Frame Table)
         │
-        ▼
-   Page Manager (Physical I/O)
-        │
-        ▼
-   Database File (4096-byte pages)
+   ┌────┴────────────────────────┐
+   │ (Write-Ahead Rule)          │
+   ▼                             ▼
+WAL Manager (Implemented)    Page Manager (Physical I/O)
+   │                             │
+   ▼                             ▼
+WAL File (.treedb.wal)       Database File (.treedb)
 ```
 
 ---
@@ -38,15 +40,16 @@ Application / CLI
 
 | Subsystem / Feature | Status | Description |
 | :--- | :--- | :--- |
-| **Database File & Header** | **Implemented** | 4096-byte pages, format verification, magic bytes `TREEDB01` |
+| **Database File & Header** | **Implemented** | 4096-byte pages, format verification, magic bytes `TREEDB01` (Version 2) |
 | **Page Manager** | **Implemented** | Page allocation, random-access I/O, file synchronization |
-| **Page Abstraction** | **Implemented** | Deterministic binary layout, header tags, structural validation |
-| **Buffer Pool Manager** | **Implemented** | LRU eviction, frame table, pin/unpin tracking, dirty flush |
+| **Page Abstraction** | **Implemented** | 16-byte header with `PageLSN`, structural validation, 4080-byte payload |
+| **Buffer Pool Manager** | **Implemented** | LRU eviction, frame table, pin/unpin tracking, dirty flush, WAL ordering |
 | **B+ Tree Index (Search & Insert)** | **Implemented** | Dynamic insertion, node splitting, root elevation, point search |
 | **B+ Tree Index (Delete & Scan)** | **Implemented** | Deletion, leaf/internal rebalance, root collapse, range scan |
 | **Record Store** | **Implemented** | Slotted-page tuple format, variable-length records, local compaction |
-| **TreeDB Engine API** | **Implemented** | High-level `TreeDb` interface for `put`, `get`, `delete`, `scan` |
-| **Write-Ahead Logging** | *Planned* | WAL frame serialization, crash recovery (Phase 7) |
+| **TreeDB Engine API** | **Implemented** | High-level `TreeDb` interface for `put`, `get`, `delete`, `scan`, `sync` |
+| **Write-Ahead Logging** | **Implemented** | Monotonic `Lsn`, CRC32 log records, `.wal` file, durable syncing |
+| **Crash Recovery (ARIES)** | **Implemented** | 3-Phase recovery (Analysis, Redo, Undo with CLRs), idempotence |
 
 ---
 
@@ -83,6 +86,7 @@ cargo run --bin treedb -- info test.treedb
 3. **Strict layer separation:** Higher-level abstractions (B+ Tree, Buffer Pool) interact exclusively through clean lower-level interfaces.
 4. **Deterministic persistent format:** On-disk binary representation is explicitly specified with little-endian integer encoding.
 5. **Safe Rust ownership:** Avoiding unsafe code wherever possible by leveraging Rust's ownership model for lifecycle management.
+6. **Write-Ahead Durability:** Dirty pages are never flushed before their corresponding WAL records.
 
 ---
 

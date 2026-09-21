@@ -67,10 +67,10 @@ This document records key architectural and design choices, their rationale, and
 
 ## Decision 7: B+ Tree Node Layouts and Derived Max Capacities
 
-* **Decision:** Fixed-width binary layouts for Leaf (`[Key (8B) | RecordId (8B)]`) and Internal (`[SeparatorKey (8B) | ChildPageId (4B)]`) nodes, with derived capacities (`LEAF_MAX_ENTRIES = 255`, `INTERNAL_MAX_KEYS = 340`).
+* **Decision:** Fixed-width binary layouts for Leaf (`[Key (8B) | RecordId (8B)]`) and Internal (`[SeparatorKey (8B) | ChildPageId (4B)]`) nodes, with derived capacities (`LEAF_MAX_ENTRIES = 254`, `INTERNAL_MAX_KEYS = 339`).
 * **Rationale:**
   * Eliminates fragmentation and slotted pointer overhead inside index nodes.
-  * Maximizes tree fanout (341 children per internal node).
+  * Maximizes tree fanout (340 children per internal node).
   * Explicit constants derived from page payload boundaries guarantee zero disk buffer overflows.
 
 ---
@@ -86,9 +86,9 @@ This document records key architectural and design choices, their rationale, and
 
 ## Decision 9: Minimum Occupancy & Sibling Redistribution Policies
 
-* **Decision:** Define minimum occupancy as `LEAF_MIN_ENTRIES = LEAF_MAX_ENTRIES / 2` (127) and `INTERNAL_MIN_KEYS = INTERNAL_MAX_KEYS / 2` (170). When underflow occurs, borrowing from the left sibling is preferred first, then right sibling, before merging.
+* **Decision:** Define minimum occupancy as `LEAF_MIN_ENTRIES = LEAF_MAX_ENTRIES / 2` (127) and `INTERNAL_MIN_KEYS = INTERNAL_MAX_KEYS / 2` (169). When underflow occurs, borrowing from the left sibling is preferred first, then right sibling, before merging.
 * **Rationale:**
-  * Strict mathematical derivation from page capacity ensures two underfull nodes can always merge into a single page without exceeding maximum capacity (`126 + 127 = 253 <= 255`).
+  * Strict mathematical derivation from page capacity ensures two underfull nodes can always merge into a single page without exceeding maximum capacity (`126 + 127 = 253 <= 254`).
   * Preferring borrowing over merging minimizes structural tree mutations and page allocations.
   * Deterministic sibling evaluation order guarantees reproducible tree states.
 
@@ -120,4 +120,18 @@ This document records key architectural and design choices, their rationale, and
   * **Stable Logical Identifier:** Because `RecordId` identifies the slot index rather than a byte offset, record payloads can be moved and compacted in-place on the page without modifying or invalidating index entries in the B+ Tree.
   * **Bidirectional Page Layout:** The slot directory grows upward from the page header while record payloads grow downward from the payload end. This maximizes contiguous free space without pre-allocating fixed partition boundaries.
   * **Local Page Compaction:** Payload fragmentation caused by record deletion is defragmented locally on a single page, avoiding multi-page locking or global compaction overhead.
-  * **Single-Page Payload Constraint:** For Phase 6, records are constrained to `MAX_RECORD_SIZE = 4078 bytes` (fitting on a single page). Overflow pages and large-object chunking are deferred to future phases.
+  * **Single-Page Payload Constraint:** Records are constrained to `MAX_RECORD_SIZE = 4070 bytes` (fitting on a single page). Overflow pages and large-object chunking are deferred to future phases.
+
+---
+
+## Decision 13: Write-Ahead Logging (WAL), PageLSN, and ARIES Crash Recovery
+
+* **Decision:** Implement a dedicated write-ahead logging subsystem with monotonic `Lsn` sequence numbers, 16-byte standard page headers storing `PageLSN`, physical page delta logging, and ARIES 3-Phase recovery (Analysis, Redo, Undo with CLRs).
+* **Rationale:**
+  * **Write-Ahead Rule:** Enforces that dirty database pages are never written to physical disk before their corresponding log records are durably synced (`WAL.flush(page.lsn()) <= page.flush()`).
+  * **Clean Storage Format Versioning:** Expanding page headers from 8 to 16 bytes to house the 64-bit `PageLSN` increments format version from `1` to `2`, cleanly rejecting unversioned files without silent misinterpretation.
+  * **Physical Page Deltas:** Logging byte ranges (`offset`, `before_image`, `after_image`) keeps the WAL completely decoupled from higher-level B+ Tree and Record Store mechanics.
+  * **ARIES 3-Phase Recovery:**
+    * *Analysis Pass:* Reconstructs active transaction table and dirty page table, identifying loser transactions.
+    * *Redo Pass:* Repeats history from the earliest unreflected LSN, skipping pages where `page.lsn >= record.lsn`.
+    * *Undo Pass:* Rolls back loser transactions backward, writing Compensation Log Records (CLRs) to ensure crash-during-recovery is fully idempotent.

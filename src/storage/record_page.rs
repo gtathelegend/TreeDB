@@ -13,7 +13,7 @@ pub const SLOT_SIZE: usize = 4;
 
 /// Maximum payload size in bytes for a single record fitting entirely on one page.
 ///
-/// Derived as: `PAGE_PAYLOAD_SIZE (4088) - RECORD_PAGE_HEADER_SIZE (6) - SLOT_SIZE (4) = 4078 bytes`.
+/// Derived as: `PAGE_PAYLOAD_SIZE (4080) - RECORD_PAGE_HEADER_SIZE (6) - SLOT_SIZE (4) = 4070 bytes`.
 pub const MAX_RECORD_SIZE: usize = PAGE_PAYLOAD_SIZE - RECORD_PAGE_HEADER_SIZE - SLOT_SIZE;
 
 /// Slot directory entry pointing to a variable-length record payload.
@@ -455,8 +455,8 @@ mod tests {
         let rp = RecordPage::new();
         assert_eq!(rp.slot_count(), 0);
         assert_eq!(rp.active_record_count(), 0);
-        assert_eq!(rp.contiguous_free_space(), 4082);
-        assert_eq!(rp.total_free_space(), 4082);
+        assert_eq!(rp.contiguous_free_space(), 4074);
+        assert_eq!(rp.total_free_space(), 4074);
 
         let mut page = Page::new(10, PageType::Record);
         rp.serialize(&mut page).expect("serialize");

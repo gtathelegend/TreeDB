@@ -30,8 +30,8 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ## Phase 3: B+ Tree Node Format & Read-Only Search (Completed)
 * [x] Fixed-width `RecordId` representation (`(PageId, SlotId)`)
-* [x] Leaf node format with derived capacity (255 entries) and sibling links
-* [x] Internal routing node format with derived capacity (340 keys / 341 children)
+* [x] Leaf node format with derived capacity (254 entries) and sibling links
+* [x] Internal routing node format with derived capacity (339 keys / 340 children)
 * [x] Right-inclusive separator routing convention
 * [x] Deterministic little-endian serialization and bounds/sorting validation
 * [x] `BPlusTree` handle with point lookup (`get(key) -> Option<RecordId>`)
@@ -82,9 +82,21 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 7: Durability & Advanced Systems (Next Phase)
-* [ ] Write-Ahead Logging (WAL) and log sequence numbers (LSN)
-* [ ] ARIES-style crash recovery (Analysis, Redo, Undo)
-* [ ] Free-page recycling (freelist / space bitmap)
+## Phase 7: Write-Ahead Logging & Crash Recovery (Completed)
+* [x] Monotonic Log Sequence Numbers (`Lsn`) and Transaction IDs (`TxnId`)
+* [x] Separate WAL file (`.wal`) with explicit `TREEWAL1` header
+* [x] Self-delimiting log record format with CRC32 integrity checksums
+* [x] Physical page delta logging (`before_image`, `after_image`)
+* [x] 16-byte standard page headers storing `PageLSN` (format version 2)
+* [x] Buffer Pool Write-Ahead rule enforcement (`WAL.flush(page.lsn()) <= page.flush()`)
+* [x] ARIES 3-Phase Crash Recovery (Analysis, Redo, Undo with CLRs)
+* [x] Crash simulation, idempotence, and truncated/corrupted WAL recovery tests
+
+---
+
+## Phase 8: Advanced Storage, Recycling & CLI (Next Phase)
+* [ ] Free-page recycling across the database (freelist / bitmap)
+* [ ] Multi-page overflow records for large BLOBs
+* [ ] Periodic background fuzzy checkpointing
 * [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`)
 * [ ] Microbenchmarks and stress testing

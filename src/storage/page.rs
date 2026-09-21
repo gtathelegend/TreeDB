@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::wal::lsn::{Lsn, NULL_LSN};
 
 /// Size of each page in bytes (4 KiB).
 pub const PAGE_SIZE: usize = 4096;
@@ -9,10 +10,17 @@ pub type PageId = u32;
 /// Standard key type for index structures.
 pub type Key = u64;
 
-/// Standard page header size (8 bytes).
-pub const PAGE_HEADER_SIZE: usize = 8;
+/// Standard page header size (16 bytes).
+///
+/// Layout:
+/// - `0..4`: `page_id: u32` (little-endian)
+/// - `4`: `page_type: u8`
+/// - `5`: `flags: u8`
+/// - `6..8`: `reserved: u16`
+/// - `8..16`: `page_lsn: u64` (little-endian)
+pub const PAGE_HEADER_SIZE: usize = 16;
 
-/// Available payload capacity in a standard page.
+/// Available payload capacity in a standard page (4080 bytes).
 pub const PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 
 /// Identifies the role and layout of a database page.
@@ -61,6 +69,7 @@ impl Page {
         };
         page.set_id(id);
         page.set_page_type(page_type);
+        page.set_lsn(NULL_LSN);
         page
     }
 
@@ -99,7 +108,6 @@ impl Page {
 
     /// Returns the `PageType` from the page header.
     pub fn page_type(&self) -> PageType {
-        // Fallback to Free if corrupted or uninitialized, but validate() checks this explicitly.
         PageType::from_u8(self.data[4]).unwrap_or(PageType::Free)
     }
 
@@ -116,6 +124,18 @@ impl Page {
     /// Sets the page flags byte.
     pub fn set_flags(&mut self, flags: u8) {
         self.data[5] = flags;
+    }
+
+    /// Returns the `page_lsn` from the page header.
+    pub fn lsn(&self) -> Lsn {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.data[8..16]);
+        Lsn::from_bytes(bytes)
+    }
+
+    /// Sets the `page_lsn` in the page header.
+    pub fn set_lsn(&mut self, lsn: Lsn) {
+        self.data[8..16].copy_from_slice(&lsn.to_bytes());
     }
 
     /// Returns an immutable reference to the full 4096-byte buffer.
@@ -145,6 +165,7 @@ impl std::fmt::Debug for Page {
             .field("id", &self.id())
             .field("page_type", &self.page_type())
             .field("flags", &self.flags())
+            .field("lsn", &self.lsn())
             .finish()
     }
 }
@@ -159,9 +180,13 @@ mod tests {
         assert_eq!(page.id(), 42);
         assert_eq!(page.page_type(), PageType::Leaf);
         assert_eq!(page.flags(), 0);
+        assert_eq!(page.lsn(), NULL_LSN);
 
         page.set_flags(0b0000_0001);
         assert_eq!(page.flags(), 1);
+
+        page.set_lsn(Lsn::new(999));
+        assert_eq!(page.lsn(), Lsn::new(999));
 
         page.payload_mut()[0..4].copy_from_slice(b"test");
         assert_eq!(&page.payload()[0..4], b"test");
@@ -171,6 +196,7 @@ mod tests {
         assert_eq!(restored.id(), 42);
         assert_eq!(restored.page_type(), PageType::Leaf);
         assert_eq!(restored.flags(), 1);
+        assert_eq!(restored.lsn(), Lsn::new(999));
         assert_eq!(&restored.payload()[0..4], b"test");
     }
 
