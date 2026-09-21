@@ -17,7 +17,7 @@ Application / CLI
    TreeDB API (Planned)
         │
         ▼
-     B+ Tree (Read-only Traversal Implemented, Insertion Next)
+     B+ Tree (Search & Insertion Implemented)
         │
         ▼
    Record Store (Planned)
@@ -42,8 +42,8 @@ Application / CLI
 | **Page Manager** | **Implemented** | Page allocation, random-access I/O, file synchronization |
 | **Page Abstraction** | **Implemented** | Deterministic binary layout, header tags, structural validation |
 | **Buffer Pool Manager** | **Implemented** | LRU eviction, frame table, pin/unpin tracking, dirty flush |
-| **B+ Tree Index (Search)** | **Implemented** | Leaf & internal node layouts, derived capacity, point search |
-| **B+ Tree Index (Insert)** | *Planned* | Leaf & internal node splitting, root elevation (Phase 4) |
+| **B+ Tree Index (Search & Insert)** | **Implemented** | Dynamic insertion, node splitting, root elevation, point search |
+| **B+ Tree Index (Deletion)** | *Planned* | Key deletion, node redistribution/merging (Phase 5) |
 | **Record Store** | *Planned* | Slotted-page tuple format, variable-length records (Phase 6) |
 | **Write-Ahead Logging** | *Experimental* | WAL frame serialization, crash recovery (future phase) |
 

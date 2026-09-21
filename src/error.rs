@@ -66,4 +66,8 @@ pub enum Error {
     /// Invariant violation or corruption within the B+ Tree structure.
     #[error("Tree corruption detected: {0}")]
     TreeCorruption(String),
+
+    /// A duplicate key was rejected during B+ Tree insertion.
+    #[error("Duplicate key error: key {0} already exists in B+ Tree")]
+    DuplicateKey(u64),
 }

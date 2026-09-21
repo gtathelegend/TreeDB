@@ -61,6 +61,67 @@ impl InternalNode {
         self.keys.len() >= INTERNAL_MAX_KEYS
     }
 
+    /// Inserts a `(separator_key, right_child)` entry into a non-full internal node.
+    ///
+    /// Locates the sorted position for `separator_key` and places `right_child` at `idx + 1`.
+    pub fn insert(&mut self, separator_key: Key, right_child: PageId) -> Result<()> {
+        if self.is_full() {
+            return Err(Error::ValueTooLarge {
+                size: self.keys.len() + 1,
+                limit: INTERNAL_MAX_KEYS,
+            });
+        }
+
+        match self.keys.binary_search(&separator_key) {
+            Ok(_) => Err(Error::TreeCorruption(format!(
+                "internal node already contains separator key {separator_key}"
+            ))),
+            Err(idx) => {
+                self.keys.insert(idx, separator_key);
+                self.children.insert(idx + 1, right_child);
+                Ok(())
+            }
+        }
+    }
+
+    /// Inserts a `(separator_key, right_child)` entry into a full internal node and splits it.
+    ///
+    /// The separator at `mid` is promoted to the parent (not retained in either child node).
+    /// Returns `(promoted_key, right_internal_node)`.
+    pub fn split_insert(
+        &mut self,
+        separator_key: Key,
+        right_child: PageId,
+    ) -> Result<(Key, InternalNode)> {
+        match self.keys.binary_search(&separator_key) {
+            Ok(_) => Err(Error::TreeCorruption(format!(
+                "internal node already contains separator key {separator_key}"
+            ))),
+            Err(idx) => {
+                self.keys.insert(idx, separator_key);
+                self.children.insert(idx + 1, right_child);
+
+                let mid = self.keys.len() / 2;
+                let promoted_key = self.keys[mid];
+
+                let right_keys = self.keys.split_off(mid + 1);
+                let right_children = self.children.split_off(mid + 1);
+
+                self.keys.pop();
+
+                let right_node = InternalNode {
+                    keys: right_keys,
+                    children: right_children,
+                };
+
+                self.validate()?;
+                right_node.validate()?;
+
+                Ok((promoted_key, right_node))
+            }
+        }
+    }
+
     /// Validates internal node structural invariants.
     pub fn validate(&self) -> Result<()> {
         if self.children.is_empty() {

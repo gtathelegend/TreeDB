@@ -40,18 +40,20 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 4: B+ Tree Insertion (Next Phase)
-* [ ] Leaf node key-record insertion
-* [ ] Leaf node splitting and sibling pointer chaining
-* [ ] Separator key propagation to parent internal nodes
-* [ ] Internal node splitting and recursive parent updates
-* [ ] Root node splitting and root elevation
-* [ ] Duplicate key handling policy
-* [ ] Multi-page transaction-safe insertion persistence tests
+## Phase 4: B+ Tree Insertion, Splitting & Root Growth (Completed)
+* [x] Insertion into non-full leaf nodes
+* [x] Duplicate key policy (`Error::DuplicateKey`)
+* [x] Leaf node splitting and sibling pointer chaining
+* [x] Separator key promotion to parent internal nodes
+* [x] Internal node splitting and recursive parent updates
+* [x] Root node splitting and root elevation
+* [x] Root page metadata persistence on Page 0
+* [x] Zero pin leak verification across multi-level splits
+* [x] Structural invariant validator (`validate_tree`)
 
 ---
 
-## Phase 5: B+ Tree Deletion & Range Scans
+## Phase 5: B+ Tree Deletion & Range Scans (Next Phase)
 * [ ] Key deletion in leaf nodes
 * [ ] Leaf and internal node underflow handling (borrowing / redistribution)
 * [ ] Node merging and separator demotion

@@ -103,10 +103,6 @@ fn test_leaf_node_corruption_and_ordering_validation() {
 
 #[test]
 fn test_internal_node_routing_boundaries() {
-    // Keys: [50, 100], Children: [10, 20, 30]
-    // key < 50 => child 10
-    // 50 <= key < 100 => child 20
-    // key >= 100 => child 30
     let node = InternalNode::with_keys_and_children(vec![50, 100], vec![10, 20, 30])
         .expect("valid internal node");
 
@@ -150,20 +146,16 @@ fn test_internal_node_max_capacity_boundary() {
 
 #[test]
 fn test_internal_node_invariants_rejected() {
-    // Unsorted keys
     let err_unsorted =
         InternalNode::with_keys_and_children(vec![50, 20], vec![1, 2, 3]).unwrap_err();
     assert!(matches!(err_unsorted, Error::TreeCorruption(_)));
 
-    // Duplicate keys
     let err_dup = InternalNode::with_keys_and_children(vec![50, 50], vec![1, 2, 3]).unwrap_err();
     assert!(matches!(err_dup, Error::TreeCorruption(_)));
 
-    // Child count != key count + 1
     let err_mismatch = InternalNode::with_keys_and_children(vec![50, 100], vec![1, 2]).unwrap_err();
     assert!(matches!(err_mismatch, Error::TreeCorruption(_)));
 
-    // Invalid child page ID 0
     let err_invalid_child = InternalNode::with_keys_and_children(vec![50], vec![0, 2]).unwrap_err();
     assert!(matches!(err_invalid_child, Error::TreeCorruption(_)));
 }
@@ -186,7 +178,6 @@ fn test_empty_tree_lookup() {
 fn test_single_leaf_root_tree() {
     let (mut pool, _dir, _path) = create_test_pool(5);
 
-    // Allocate page 2 as a Leaf root
     let root_id = pool.allocate_page(PageType::Leaf).expect("alloc root");
     assert_eq!(root_id, 2);
 
@@ -198,8 +189,8 @@ fn test_single_leaf_root_tree() {
         let page_mut = pool.fetch_page_mut(root_id).expect("fetch root");
         leaf.serialize(page_mut).expect("serialize leaf");
     }
-    pool.unpin_page(root_id, false).expect("unpin"); // unpin allocate_page
-    pool.unpin_page(root_id, true).expect("unpin mut"); // unpin fetch_page_mut
+    pool.unpin_page(root_id, false).expect("unpin");
+    pool.unpin_page(root_id, true).expect("unpin mut");
 
     let tree = BPlusTree::from_root(root_id);
     assert_eq!(
@@ -215,311 +206,253 @@ fn test_single_leaf_root_tree() {
     assert_eq!(tree.get(&mut pool, 300).unwrap(), None);
 }
 
+// ---------------------------------------------------------------------------
+// 4. B+ Tree Insertion Tests (Phase 4)
+// ---------------------------------------------------------------------------
+
 #[test]
-fn test_two_level_tree_traversal() {
+fn test_insert_empty_tree() {
     let (mut pool, _dir, _path) = create_test_pool(5);
+    let mut tree = BPlusTree::new_empty();
 
-    // Layout:
-    // Page 2: Internal Root [50] -> Left: Page 3 (Leaf A), Right: Page 4 (Leaf B)
-    // Page 3 (Leaf A): [10, 20]
-    // Page 4 (Leaf B): [50, 70, 90]
+    assert!(tree.is_empty());
+    tree.insert(&mut pool, 42, RecordId::new(10, 1))
+        .expect("insert first key");
 
-    let root_id = pool.allocate_page(PageType::Internal).expect("alloc root"); // page 2
-    let leaf_a_id = pool.allocate_page(PageType::Leaf).expect("alloc leaf a"); // page 3
-    let leaf_b_id = pool.allocate_page(PageType::Leaf).expect("alloc leaf b"); // page 4
+    assert!(!tree.is_empty());
+    assert_ne!(tree.root_page_id(), INVALID_PAGE_ID);
 
-    // Setup Leaf A
-    let mut leaf_a = LeafNode::with_next_leaf(leaf_b_id);
-    leaf_a.entries.push((10, RecordId::new(100, 1)));
-    leaf_a.entries.push((20, RecordId::new(100, 2)));
-    {
-        let page = pool.fetch_page_mut(leaf_a_id).expect("fetch a");
-        leaf_a.serialize(page).expect("serialize a");
-    }
-    pool.unpin_page(leaf_a_id, false).expect("unpin a1");
-    pool.unpin_page(leaf_a_id, true).expect("unpin a2");
-
-    // Setup Leaf B
-    let mut leaf_b = LeafNode::new();
-    leaf_b.entries.push((50, RecordId::new(200, 1)));
-    leaf_b.entries.push((70, RecordId::new(200, 2)));
-    leaf_b.entries.push((90, RecordId::new(200, 3)));
-    {
-        let page = pool.fetch_page_mut(leaf_b_id).expect("fetch b");
-        leaf_b.serialize(page).expect("serialize b");
-    }
-    pool.unpin_page(leaf_b_id, false).expect("unpin b1");
-    pool.unpin_page(leaf_b_id, true).expect("unpin b2");
-
-    // Setup Internal Root
-    let root_node =
-        InternalNode::with_keys_and_children(vec![50], vec![leaf_a_id, leaf_b_id]).expect("root");
-    {
-        let page = pool.fetch_page_mut(root_id).expect("fetch root");
-        root_node.serialize(page).expect("serialize root");
-    }
-    pool.unpin_page(root_id, false).expect("unpin root1");
-    pool.unpin_page(root_id, true).expect("unpin root2");
-
-    let tree = BPlusTree::new(root_id);
-
-    // Hits
-    assert_eq!(
-        tree.get(&mut pool, 10).unwrap(),
-        Some(RecordId::new(100, 1))
-    );
-    assert_eq!(
-        tree.get(&mut pool, 20).unwrap(),
-        Some(RecordId::new(100, 2))
-    );
-    assert_eq!(
-        tree.get(&mut pool, 50).unwrap(),
-        Some(RecordId::new(200, 1))
-    ); // Exact separator key
-    assert_eq!(
-        tree.get(&mut pool, 70).unwrap(),
-        Some(RecordId::new(200, 2))
-    );
-    assert_eq!(
-        tree.get(&mut pool, 90).unwrap(),
-        Some(RecordId::new(200, 3))
-    );
-
-    // Misses
-    assert_eq!(tree.get(&mut pool, 5).unwrap(), None);
-    assert_eq!(tree.get(&mut pool, 15).unwrap(), None);
-    assert_eq!(tree.get(&mut pool, 25).unwrap(), None);
-    assert_eq!(tree.get(&mut pool, 55).unwrap(), None);
-    assert_eq!(tree.get(&mut pool, 80).unwrap(), None);
+    assert_eq!(tree.get(&mut pool, 42).unwrap(), Some(RecordId::new(10, 1)));
     assert_eq!(tree.get(&mut pool, 100).unwrap(), None);
-}
-
-#[test]
-fn test_three_level_deep_tree_traversal() {
-    let (mut pool, _dir, _path) = create_test_pool(10);
-
-    // Level 1: Root Internal (Page 2) [100] -> [Page 3, Page 4]
-    // Level 2: Child Internal A (Page 3) [50] -> [Leaf A1: Page 5, Leaf A2: Page 6]
-    // Level 2: Child Internal B (Page 4) [150] -> [Leaf B1: Page 7, Leaf B2: Page 8]
-    // Level 3: Leaf Nodes
-    //   Leaf A1 (Page 5): [10, 20]
-    //   Leaf A2 (Page 6): [50, 60]
-    //   Leaf B1 (Page 7): [100, 120]
-    //   Leaf B2 (Page 8): [150, 180]
-
-    let p2_root = pool.allocate_page(PageType::Internal).unwrap();
-    let p3_int_a = pool.allocate_page(PageType::Internal).unwrap();
-    let p4_int_b = pool.allocate_page(PageType::Internal).unwrap();
-    let p5_leaf_a1 = pool.allocate_page(PageType::Leaf).unwrap();
-    let p6_leaf_a2 = pool.allocate_page(PageType::Leaf).unwrap();
-    let p7_leaf_b1 = pool.allocate_page(PageType::Leaf).unwrap();
-    let p8_leaf_b2 = pool.allocate_page(PageType::Leaf).unwrap();
-
-    // Leaf A1
-    let mut leaf_a1 = LeafNode::with_next_leaf(p6_leaf_a2);
-    leaf_a1.entries.push((10, RecordId::new(5, 1)));
-    leaf_a1.entries.push((20, RecordId::new(5, 2)));
-    {
-        let p = pool.fetch_page_mut(p5_leaf_a1).unwrap();
-        leaf_a1.serialize(p).unwrap();
-    }
-    pool.unpin_page(p5_leaf_a1, false).unwrap();
-    pool.unpin_page(p5_leaf_a1, true).unwrap();
-
-    // Leaf A2
-    let mut leaf_a2 = LeafNode::with_next_leaf(p7_leaf_b1);
-    leaf_a2.entries.push((50, RecordId::new(6, 1)));
-    leaf_a2.entries.push((60, RecordId::new(6, 2)));
-    {
-        let p = pool.fetch_page_mut(p6_leaf_a2).unwrap();
-        leaf_a2.serialize(p).unwrap();
-    }
-    pool.unpin_page(p6_leaf_a2, false).unwrap();
-    pool.unpin_page(p6_leaf_a2, true).unwrap();
-
-    // Leaf B1
-    let mut leaf_b1 = LeafNode::with_next_leaf(p8_leaf_b2);
-    leaf_b1.entries.push((100, RecordId::new(7, 1)));
-    leaf_b1.entries.push((120, RecordId::new(7, 2)));
-    {
-        let p = pool.fetch_page_mut(p7_leaf_b1).unwrap();
-        leaf_b1.serialize(p).unwrap();
-    }
-    pool.unpin_page(p7_leaf_b1, false).unwrap();
-    pool.unpin_page(p7_leaf_b1, true).unwrap();
-
-    // Leaf B2
-    let mut leaf_b2 = LeafNode::new();
-    leaf_b2.entries.push((150, RecordId::new(8, 1)));
-    leaf_b2.entries.push((180, RecordId::new(8, 2)));
-    {
-        let p = pool.fetch_page_mut(p8_leaf_b2).unwrap();
-        leaf_b2.serialize(p).unwrap();
-    }
-    pool.unpin_page(p8_leaf_b2, false).unwrap();
-    pool.unpin_page(p8_leaf_b2, true).unwrap();
-
-    // Internal A
-    let int_a =
-        InternalNode::with_keys_and_children(vec![50], vec![p5_leaf_a1, p6_leaf_a2]).unwrap();
-    {
-        let p = pool.fetch_page_mut(p3_int_a).unwrap();
-        int_a.serialize(p).unwrap();
-    }
-    pool.unpin_page(p3_int_a, false).unwrap();
-    pool.unpin_page(p3_int_a, true).unwrap();
-
-    // Internal B
-    let int_b =
-        InternalNode::with_keys_and_children(vec![150], vec![p7_leaf_b1, p8_leaf_b2]).unwrap();
-    {
-        let p = pool.fetch_page_mut(p4_int_b).unwrap();
-        int_b.serialize(p).unwrap();
-    }
-    pool.unpin_page(p4_int_b, false).unwrap();
-    pool.unpin_page(p4_int_b, true).unwrap();
-
-    // Root
-    let root = InternalNode::with_keys_and_children(vec![100], vec![p3_int_a, p4_int_b]).unwrap();
-    {
-        let p = pool.fetch_page_mut(p2_root).unwrap();
-        root.serialize(p).unwrap();
-    }
-    pool.unpin_page(p2_root, false).unwrap();
-    pool.unpin_page(p2_root, true).unwrap();
-
-    let tree = BPlusTree::new(p2_root);
-
-    assert_eq!(tree.get(&mut pool, 10).unwrap(), Some(RecordId::new(5, 1)));
-    assert_eq!(tree.get(&mut pool, 20).unwrap(), Some(RecordId::new(5, 2)));
-    assert_eq!(tree.get(&mut pool, 50).unwrap(), Some(RecordId::new(6, 1)));
-    assert_eq!(tree.get(&mut pool, 60).unwrap(), Some(RecordId::new(6, 2)));
-    assert_eq!(tree.get(&mut pool, 100).unwrap(), Some(RecordId::new(7, 1)));
-    assert_eq!(tree.get(&mut pool, 120).unwrap(), Some(RecordId::new(7, 2)));
-    assert_eq!(tree.get(&mut pool, 150).unwrap(), Some(RecordId::new(8, 1)));
-    assert_eq!(tree.get(&mut pool, 180).unwrap(), Some(RecordId::new(8, 2)));
-
     assert_eq!(tree.get(&mut pool, 0).unwrap(), None);
-    assert_eq!(tree.get(&mut pool, 35).unwrap(), None);
-    assert_eq!(tree.get(&mut pool, 80).unwrap(), None);
-    assert_eq!(tree.get(&mut pool, 130).unwrap(), None);
-    assert_eq!(tree.get(&mut pool, 200).unwrap(), None);
+
+    tree.validate_tree(&mut pool).expect("tree valid");
 }
 
-// ---------------------------------------------------------------------------
-// 4. Persistence Across Database Reopen
-// ---------------------------------------------------------------------------
+#[test]
+fn test_insert_sequential_no_split() {
+    let (mut pool, _dir, _path) = create_test_pool(5);
+    let mut tree = BPlusTree::new_empty();
+
+    // Insert 100 entries (well within LEAF_MAX_ENTRIES = 255)
+    for i in 1..=100 {
+        tree.insert(&mut pool, i as u64, RecordId::new(i as u32, 1))
+            .expect("insert");
+    }
+
+    // Root should still be a leaf
+    let root_page = pool.fetch_page(tree.root_page_id()).expect("fetch root");
+    assert_eq!(root_page.page_type(), PageType::Leaf);
+    pool.unpin_page(tree.root_page_id(), false).expect("unpin");
+
+    for i in 1..=100 {
+        assert_eq!(
+            tree.get(&mut pool, i as u64).unwrap(),
+            Some(RecordId::new(i as u32, 1))
+        );
+    }
+    assert_eq!(tree.get(&mut pool, 0).unwrap(), None);
+    assert_eq!(tree.get(&mut pool, 101).unwrap(), None);
+
+    tree.validate_tree(&mut pool).expect("tree valid");
+}
 
 #[test]
-fn test_btree_persistence_and_reopen() {
-    let (mut pool, _dir, db_path) = create_test_pool(5);
+fn test_insert_first_leaf_split_and_root_elevation() {
+    let (mut pool, _dir, _path) = create_test_pool(10);
+    let mut tree = BPlusTree::new_empty();
 
-    let root_id = pool.allocate_page(PageType::Internal).unwrap();
-    let leaf_a_id = pool.allocate_page(PageType::Leaf).unwrap();
-    let leaf_b_id = pool.allocate_page(PageType::Leaf).unwrap();
-
-    let mut leaf_a = LeafNode::with_next_leaf(leaf_b_id);
-    leaf_a.entries.push((10, RecordId::new(1, 1)));
-    {
-        let p = pool.fetch_page_mut(leaf_a_id).unwrap();
-        leaf_a.serialize(p).unwrap();
+    // Insert exactly LEAF_MAX_ENTRIES (255) entries
+    for i in 1..=LEAF_MAX_ENTRIES {
+        tree.insert(&mut pool, i as u64, RecordId::new(i as u32, 0))
+            .expect("insert up to capacity");
     }
-    pool.unpin_page(leaf_a_id, false).unwrap();
-    pool.unpin_page(leaf_a_id, true).unwrap();
 
-    let mut leaf_b = LeafNode::new();
-    leaf_b.entries.push((50, RecordId::new(2, 1)));
-    {
-        let p = pool.fetch_page_mut(leaf_b_id).unwrap();
-        leaf_b.serialize(p).unwrap();
+    // Root must still be a Leaf
+    let root_page = pool.fetch_page(tree.root_page_id()).unwrap();
+    assert_eq!(root_page.page_type(), PageType::Leaf);
+    pool.unpin_page(tree.root_page_id(), false).unwrap();
+
+    // Insert 256th entry -> Forces first leaf split and root elevation!
+    tree.insert(&mut pool, 256, RecordId::new(256, 0))
+        .expect("insert causing split");
+
+    // Root must now be an Internal node
+    let root_page = pool.fetch_page(tree.root_page_id()).unwrap();
+    assert_eq!(root_page.page_type(), PageType::Internal);
+    let internal = InternalNode::deserialize(root_page).unwrap();
+    pool.unpin_page(tree.root_page_id(), false).unwrap();
+
+    assert_eq!(internal.key_count(), 1);
+    assert_eq!(internal.child_count(), 2);
+
+    // Verify all 256 keys
+    for i in 1..=256 {
+        assert_eq!(
+            tree.get(&mut pool, i as u64).unwrap(),
+            Some(RecordId::new(i as u32, 0)),
+            "failed to find key {i}"
+        );
     }
-    pool.unpin_page(leaf_b_id, false).unwrap();
-    pool.unpin_page(leaf_b_id, true).unwrap();
 
-    let root = InternalNode::with_keys_and_children(vec![50], vec![leaf_a_id, leaf_b_id]).unwrap();
-    {
-        let p = pool.fetch_page_mut(root_id).unwrap();
-        root.serialize(p).unwrap();
+    tree.validate_tree(&mut pool).expect("tree valid");
+}
+
+#[test]
+fn test_insert_duplicate_key_rejected() {
+    let (mut pool, _dir, _path) = create_test_pool(5);
+    let mut tree = BPlusTree::new_empty();
+
+    tree.insert(&mut pool, 42, RecordId::new(1, 1))
+        .expect("first insert");
+    let err = tree.insert(&mut pool, 42, RecordId::new(2, 2)).unwrap_err();
+
+    assert!(matches!(err, Error::DuplicateKey(42)));
+    // Original value remains intact
+    assert_eq!(tree.get(&mut pool, 42).unwrap(), Some(RecordId::new(1, 1)));
+
+    tree.validate_tree(&mut pool).expect("tree valid");
+}
+
+#[test]
+fn test_insert_multiple_leaf_splits() {
+    let (mut pool, _dir, _path) = create_test_pool(20);
+    let mut tree = BPlusTree::new_empty();
+
+    // Insert 1000 keys
+    for i in 1..=1000 {
+        tree.insert(&mut pool, (i * 2) as u64, RecordId::new(i as u32, 5))
+            .expect("insert");
     }
-    pool.unpin_page(root_id, false).unwrap();
-    pool.unpin_page(root_id, true).unwrap();
 
-    // Set root in DbHeader via PageManager
-    pool.page_manager_mut().set_root_page_id(root_id).unwrap();
+    for i in 1..=1000 {
+        let key = (i * 2) as u64;
+        assert_eq!(
+            tree.get(&mut pool, key).unwrap(),
+            Some(RecordId::new(i as u32, 5)),
+            "key {key} missing"
+        );
+        // Odd numbers are missing
+        assert_eq!(tree.get(&mut pool, key - 1).unwrap(), None);
+    }
 
-    // Flush and sync to disk
-    pool.sync().unwrap();
+    tree.validate_tree(&mut pool).expect("tree valid");
+}
+
+#[test]
+fn test_insert_random_order() {
+    let (mut pool, _dir, _path) = create_test_pool(30);
+    let mut tree = BPlusTree::new_empty();
+
+    // Generate deterministic pseudorandom permutation using simple LCG
+    let count = 800;
+    let mut keys: Vec<u64> = (1..=count).collect();
+
+    // Simple deterministic Fisher-Yates shuffle with fixed seed
+    let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+    for i in (1..keys.len()).rev() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let j = (seed >> 32) as usize % (i + 1);
+        keys.swap(i, j);
+    }
+
+    for &key in &keys {
+        tree.insert(&mut pool, key, RecordId::new(key as u32, (key % 10) as u32))
+            .expect("insert random");
+    }
+
+    for &key in &keys {
+        assert_eq!(
+            tree.get(&mut pool, key).unwrap(),
+            Some(RecordId::new(key as u32, (key % 10) as u32))
+        );
+    }
+    assert_eq!(tree.get(&mut pool, count + 1).unwrap(), None);
+    assert_eq!(tree.get(&mut pool, 0).unwrap(), None);
+
+    tree.validate_tree(&mut pool).expect("tree valid");
+}
+
+#[test]
+fn test_insert_deep_tree_recursive_splits() {
+    let (mut pool, _dir, _path) = create_test_pool(50);
+    let mut tree = BPlusTree::new_empty();
+
+    // Insert 2000 keys to force multiple leaf and internal splits
+    for i in 1..=2000 {
+        tree.insert(&mut pool, i as u64, RecordId::new(i as u32, 1))
+            .expect("insert deep");
+    }
+
+    for i in 1..=2000 {
+        assert_eq!(
+            tree.get(&mut pool, i as u64).unwrap(),
+            Some(RecordId::new(i as u32, 1))
+        );
+    }
+
+    tree.validate_tree(&mut pool).expect("tree valid");
+}
+
+#[test]
+fn test_insert_persistence_across_reopen() {
+    let (mut pool, _dir, db_path) = create_test_pool(20);
+    let mut tree = BPlusTree::new_empty();
+
+    // Insert 600 keys (multiple leaf splits)
+    for i in 1..=600 {
+        tree.insert(&mut pool, (i * 3) as u64, RecordId::new(i as u32, 7))
+            .expect("insert persist");
+    }
+
+    let root_page_id = tree.root_page_id();
+    assert_ne!(root_page_id, INVALID_PAGE_ID);
+
+    // Sync all dirty pages to physical media
+    pool.sync().expect("sync pool");
     drop(pool);
 
-    // Reopen from disk
+    // Reopen database from disk
     let pm = PageManager::open(&db_path).expect("reopen pm");
-    let persisted_root_id = pm.header().root_page_id;
-    assert_eq!(persisted_root_id, root_id);
+    let persisted_root = pm.header().root_page_id;
+    assert_eq!(persisted_root, root_page_id);
 
-    let mut new_pool = BufferPool::new(5, pm).expect("new pool");
-    let tree = BPlusTree::from_root(persisted_root_id);
+    let mut new_pool = BufferPool::new(20, pm).expect("new pool");
+    let reopened_tree = BPlusTree::from_root(persisted_root);
 
-    assert_eq!(
-        tree.get(&mut new_pool, 10).unwrap(),
-        Some(RecordId::new(1, 1))
-    );
-    assert_eq!(
-        tree.get(&mut new_pool, 50).unwrap(),
-        Some(RecordId::new(2, 1))
-    );
-    assert_eq!(tree.get(&mut new_pool, 999).unwrap(), None);
+    // Verify all keys
+    for i in 1..=600 {
+        let key = (i * 3) as u64;
+        assert_eq!(
+            reopened_tree.get(&mut new_pool, key).unwrap(),
+            Some(RecordId::new(i as u32, 7))
+        );
+        assert_eq!(reopened_tree.get(&mut new_pool, key - 1).unwrap(), None);
+    }
+
+    reopened_tree
+        .validate_tree(&mut new_pool)
+        .expect("reopened tree valid");
 }
 
-// ---------------------------------------------------------------------------
-// 5. Buffer Pool Interaction & Pin Discipline
-// ---------------------------------------------------------------------------
-
 #[test]
-fn test_pinning_discipline_and_no_pin_leaks() {
-    let (mut pool, _dir, _path) = create_test_pool(3);
+fn test_insert_pin_discipline_and_no_pin_leaks() {
+    let (mut pool, _dir, _path) = create_test_pool(10);
+    let mut tree = BPlusTree::new_empty();
 
-    let root_id = pool.allocate_page(PageType::Internal).unwrap();
-    let leaf_id = pool.allocate_page(PageType::Leaf).unwrap();
+    for i in 1..=300 {
+        tree.insert(&mut pool, i as u64, RecordId::new(i as u32, 0))
+            .expect("insert");
 
-    let mut leaf = LeafNode::new();
-    leaf.entries.push((42, RecordId::new(9, 9)));
-    {
-        let p = pool.fetch_page_mut(leaf_id).unwrap();
-        leaf.serialize(p).unwrap();
+        // Verify that after every insert, NO frames remain pinned
+        for pid in 0..pool.page_count() {
+            if pool.is_resident(pid) {
+                assert_eq!(
+                    pool.pin_count(pid).unwrap(),
+                    0,
+                    "page {pid} leaked a pin after inserting key {i}"
+                );
+            }
+        }
     }
-    pool.unpin_page(leaf_id, false).unwrap();
-    pool.unpin_page(leaf_id, true).unwrap();
-
-    let root = InternalNode::with_keys_and_children(vec![], vec![leaf_id]).unwrap();
-    {
-        let p = pool.fetch_page_mut(root_id).unwrap();
-        root.serialize(p).unwrap();
-    }
-    pool.unpin_page(root_id, false).unwrap();
-    pool.unpin_page(root_id, true).unwrap();
-
-    let tree = BPlusTree::new(root_id);
-
-    // Verify initial pin state is 0 for all pages
-    assert_eq!(pool.pin_count(root_id).unwrap(), 0);
-    assert_eq!(pool.pin_count(leaf_id).unwrap(), 0);
-
-    // Perform multiple lookups
-    for _ in 0..10 {
-        let res = tree.get(&mut pool, 42).unwrap();
-        assert_eq!(res, Some(RecordId::new(9, 9)));
-
-        // Verify no pin leaks after get() completes
-        assert_eq!(pool.pin_count(root_id).unwrap(), 0);
-        assert_eq!(pool.pin_count(leaf_id).unwrap(), 0);
-        assert!(!pool.is_pinned(root_id).unwrap());
-        assert!(!pool.is_pinned(leaf_id).unwrap());
-    }
-
-    // Repeated lookups should hit cache
-    assert!(pool.stats().hits > 0);
-
-    // Because pin count is 0, eviction can occur without error
-    let p_extra = pool.allocate_page(PageType::Leaf).unwrap();
-    pool.unpin_page(p_extra, false).unwrap();
 }

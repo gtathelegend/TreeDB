@@ -1,8 +1,6 @@
 # TreeDB B+ Tree Index Engine
 
-This document details the persistent B+ Tree node formats, routing rules, capacity calculations, and read-only traversal algorithms implemented in Phase 3.
-
-> **Phase 3 Scope Notice:** Phase 3 implements persistent node structures and read-only point search/traversal. Mutation (insertion, splitting, deletion, merging) and range iterators are planned for Phase 4.
+This document details the persistent B+ Tree node formats, routing rules, capacity calculations, point search traversal, and dynamic insertion algorithms implemented in TreeDB.
 
 ---
 
@@ -96,7 +94,7 @@ For separators `[K0, K1, ..., Kn-1]` and child pointers `[C0, C1, ..., Cn]`:
 
 ---
 
-## 5. Search Algorithm & Pinning Discipline
+## 5. Point Search Algorithm & Pinning Discipline
 
 Point lookup (`BPlusTree::get(&self, buffer_pool, key) -> Result<Option<RecordId>>`):
 
@@ -120,5 +118,61 @@ Point lookup (`BPlusTree::get(&self, buffer_pool, key) -> Result<Option<RecordId
           return Err(Error::TreeCorruption(...))
 ```
 
-### Pinning Guarantee:
-Every page fetched during traversal is strictly unpinned before descending to its child or returning. This prevents buffer frame pin leaks and keeps the Buffer Pool evictable.
+---
+
+## 6. Insertion & Splitting Algorithm (`insert`)
+
+TreeDB supports dynamic insertion with recursive parent propagation and root growth:
+
+```text
+insert(key, record_id)
+        │
+        ▼
+   Tree Empty? ─────────► Yes ──► Allocate Leaf Root ──► Set DbHeader Root ──► Done
+        │ No
+        ▼
+Traverse to Target Leaf (recording internal PageId path stack)
+        │
+        ▼
+Target Leaf Full? (count == 255)
+   ├─► No:  Insert key in sorted position ──► Write dirty leaf ──► Done
+   └─► Yes: Split Leaf:
+              - Combined entries = 256
+              - Left leaf keeps 128 entries
+              - Right leaf (allocated) gets 128 entries
+              - next_leaf links updated (Left -> Right -> OldNext)
+              - Promoted separator = right_leaf.entries[0].key
+              - Propagate (sep_key, right_leaf_id) up path stack
+                    │
+                    ▼
+     Parent Full? (keys == 340)
+        ├─► No:  Insert (sep_key, right_child) in parent ──► Done
+        └─► Yes: Split Internal:
+                   - Combined keys = 341, children = 342
+                   - mid = 170
+                   - Promoted key = keys[170]
+                   - Left node keeps keys[0..170], children[0..=170]
+                   - Right node gets keys[171..341], children[171..342]
+                   - Propagate (promoted_key, right_int_id) up
+                         │
+                         ▼
+        Path Empty? (Root Split)
+           └─► Allocate new Internal root with [promoted_key] and [old_root, right_child]
+           └─► Update self.root_page_id and persist in Page 0 DbHeader
+```
+
+### Duplicate Key Policy
+Attempting to insert a key that already exists returns `Err(Error::DuplicateKey(key))` and leaves the existing entry and tree structure unmodified.
+
+### Persistence & Durability
+* All modified and allocated pages are marked dirty in the `BufferPool`.
+* When the tree root splits, `set_root_page_id` updates and persists Page 0 immediately.
+* Invoking `buffer_pool.sync()` flushes all dirty frames to disk and calls `sync_all()`.
+
+---
+
+## 7. Current Limitations & Scope
+
+* **No WAL / Crash Recovery:** Multi-page splits are not transaction-logged; crash recovery is deferred to a future phase.
+* **No Deletion or Redistribution:** Key removal and node underflow merging are planned for Phase 5.
+* **Single-Threaded:** Synchronization and concurrency control will be introduced after single-threaded verification.

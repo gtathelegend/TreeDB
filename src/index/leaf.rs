@@ -65,6 +65,61 @@ impl LeafNode {
         self.entries.len() >= LEAF_MAX_ENTRIES
     }
 
+    /// Inserts a `(Key, RecordId)` entry into a non-full leaf node in sorted order.
+    ///
+    /// # Errors
+    /// * `Error::DuplicateKey` if `key` already exists.
+    /// * `Error::ValueTooLarge` if the leaf is already full.
+    pub fn insert(&mut self, key: Key, record_id: RecordId) -> Result<()> {
+        match self.entries.binary_search_by_key(&key, |&(k, _)| k) {
+            Ok(_) => Err(Error::DuplicateKey(key)),
+            Err(idx) => {
+                if self.is_full() {
+                    return Err(Error::ValueTooLarge {
+                        size: self.entries.len() + 1,
+                        limit: LEAF_MAX_ENTRIES,
+                    });
+                }
+                self.entries.insert(idx, (key, record_id));
+                Ok(())
+            }
+        }
+    }
+
+    /// Inserts a `(Key, RecordId)` entry into a full leaf node and splits it into two balanced leaves.
+    ///
+    /// Returns the separator key promoted to the parent (which is the first key of the new right leaf)
+    /// and the newly created `LeafNode` (right half).
+    ///
+    /// Updates `self.next_leaf` to point to `right_page_id`, and `right_leaf.next_leaf` receives
+    /// the old `self.next_leaf`.
+    pub fn split_insert(
+        &mut self,
+        key: Key,
+        record_id: RecordId,
+        right_page_id: PageId,
+    ) -> Result<(Key, LeafNode)> {
+        match self.entries.binary_search_by_key(&key, |&(k, _)| k) {
+            Ok(_) => Err(Error::DuplicateKey(key)),
+            Err(idx) => {
+                self.entries.insert(idx, (key, record_id));
+
+                let mid = self.entries.len() / 2;
+                let right_entries = self.entries.split_off(mid);
+
+                let right_leaf = LeafNode {
+                    next_leaf: self.next_leaf,
+                    entries: right_entries,
+                };
+
+                self.next_leaf = right_page_id;
+                let sep_key = right_leaf.entries[0].0;
+
+                Ok((sep_key, right_leaf))
+            }
+        }
+    }
+
     /// Serializes the leaf node into the provided `Page` buffer.
     ///
     /// # Layout (Payload bytes 8..4096)
