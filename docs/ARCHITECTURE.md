@@ -14,8 +14,8 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
                                |
                                v
 +-------------------------------------------------------------+
-|                   B+ Tree Index (Planned)                   |
-|          (Leaf / Internal Nodes, Split/Merge Logic)         |
+|              B+ Tree Index Engine (Implemented)             |
+|     (Leaf / Internal Nodes, Binary Search, Point Lookup)    |
 +-------------------------------------------------------------+
                                |
                                v
@@ -45,7 +45,28 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
 
 ---
 
-## 1. Storage Layer (`src/storage`)
+## 1. Index Layer (`src/index`)
+
+### `BPlusTree`
+* **Role:** Read-only point lookup and root page coordinator.
+* **Responsibilities:**
+  * Root navigation down to leaf level via `BufferPool`.
+  * Safe unpinning of all visited internal and leaf nodes.
+  * Empty-tree handling (`root_page_id == INVALID_PAGE_ID`).
+
+### `InternalNode` & `LeafNode`
+* **Role:** In-memory structured representation of interior routing and leaf data pages.
+* **Responsibilities:**
+  * `InternalNode`: Stores up to 340 separator keys routing to 341 children via binary search.
+  * `LeafNode`: Stores up to 255 sorted `(Key, RecordId)` entries with sibling links.
+  * Structural validation during deterministic serialization and deserialization.
+
+### `RecordId`
+* **Role:** Fixed-width 8-byte pointer `(page_id: u32, slot_id: u32)` referencing tuples in the storage engine.
+
+---
+
+## 2. Storage Layer (`src/storage`)
 
 ### `BufferPool`
 * **Role:** In-memory caching engine maintaining a fixed number of page frames.
@@ -64,29 +85,15 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
   * Allocating new sequential pages (append-only allocation for Phase 1).
   * Ensuring physical disk sync via `sync()`.
 
-### `Page`
-* **Role:** In-memory representation of a physical database page.
-* **Responsibilities:**
-  * Fixed byte size: 4096 bytes (`PAGE_SIZE`).
-  * Header layout: Page ID (4 bytes), Page Type tag (1 byte), Flags (1 byte), Reserved (2 bytes).
-  * Payload area: 4088 bytes (`PAGE_PAYLOAD_SIZE`).
-  * Self-validation against page corruption and invalid type tags.
-
-### `DbHeader`
-* **Role:** Database identification and global metadata stored on Page 0.
-* **Fields:**
-  * Magic identifier (`TREEDB01`)
-  * Format version (currently 1)
-  * Page size (4096)
-  * Total page count
-  * Root Page ID (points to B+ Tree root page)
-  * Metadata Page ID (points to Page 1 catalog)
+### `Page` & `DbHeader`
+* **Role:** Block-level in-memory representations and on-disk Page 0 metadata.
 
 ---
 
-## 2. Layer Invariants
+## 3. Layer Invariants
 
-* **No Layer Skipping:** Higher-level structures (such as future B+ Trees) must interact exclusively through the `BufferPool` and never perform raw disk I/O directly.
+* **No Layer Skipping:** Higher-level structures (`BPlusTree`) interact exclusively through the `BufferPool` and never perform raw disk I/O directly.
+* **Pin Leak Prevention:** Traversal routines must strictly unpin each page before descending or returning.
 * **Bounded In-Memory Footprint:** The buffer pool never allocates more memory frames than its configured capacity.
 * **Eviction Safety:** Pinned frames (`pin_count > 0`) are strictly protected from eviction.
 * **Dirty Eviction Durability:** Dirty pages selected for eviction are flushed and verified on disk before their frame is recycled.

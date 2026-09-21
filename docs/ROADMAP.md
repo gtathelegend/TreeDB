@@ -28,33 +28,48 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 3: Slotted Page Record Store
+## Phase 3: B+ Tree Node Format & Read-Only Search (Completed)
+* [x] Fixed-width `RecordId` representation (`(PageId, SlotId)`)
+* [x] Leaf node format with derived capacity (255 entries) and sibling links
+* [x] Internal routing node format with derived capacity (340 keys / 341 children)
+* [x] Right-inclusive separator routing convention
+* [x] Deterministic little-endian serialization and bounds/sorting validation
+* [x] `BPlusTree` handle with point lookup (`get(key) -> Option<RecordId>`)
+* [x] Zero-leak buffer pool pinning discipline during tree traversal
+* [x] Multi-level tree traversal and database reopen persistence test suite
+
+---
+
+## Phase 4: B+ Tree Insertion (Next Phase)
+* [ ] Leaf node key-record insertion
+* [ ] Leaf node splitting and sibling pointer chaining
+* [ ] Separator key propagation to parent internal nodes
+* [ ] Internal node splitting and recursive parent updates
+* [ ] Root node splitting and root elevation
+* [ ] Duplicate key handling policy
+* [ ] Multi-page transaction-safe insertion persistence tests
+
+---
+
+## Phase 5: B+ Tree Deletion & Range Scans
+* [ ] Key deletion in leaf nodes
+* [ ] Leaf and internal node underflow handling (borrowing / redistribution)
+* [ ] Node merging and separator demotion
+* [ ] Root collapse on underflow
+* [ ] Bidirectional range scan iterator (`scan(start_key..end_key)`)
+
+---
+
+## Phase 6: Slotted Page Record Store & Engine API
 * [ ] Slotted-page binary layout for variable-length tuples
 * [ ] Record insertion, retrieval, and deletion within pages
-* [ ] Slot array management and page compaction / defragmentation
-* [ ] Record IDs (`RID: (PageId, SlotId)`)
+* [ ] Slot array management and page defragmentation
+* [ ] High-level unified `TreeDb` interface coordinating B+ Tree and Record Store
+* [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`)
 
 ---
 
-## Phase 4: B+ Tree Index Engine
-* [ ] B+ Tree leaf and internal node layouts
-* [ ] Point search (`get(key) -> Option<Value>`)
-* [ ] Key-value insertion and leaf node splitting
-* [ ] Internal node splitting and root elevation
-* [ ] Deletion with node redistribution and merging
-* [ ] Bidirectional range scan iterator (`scan(start..end)`)
-
----
-
-## Phase 5: High-Level TreeDB Engine & CLI
-* [ ] Unified `TreeDb` database handle coordinating buffer pool and index
-* [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`, `validate`)
-* [ ] Statistics reporting (cache hit ratio, page allocations, tree depth)
-* [ ] Integrity validator checking all B+ Tree invariants on disk
-
----
-
-## Phase 6: Durability & Advanced Systems (Future)
+## Phase 7: Durability & Advanced Systems (Future)
 * [ ] Write-Ahead Logging (WAL) and log sequence numbers (LSN)
 * [ ] ARIES-style crash recovery (Analysis, Redo, Undo)
 * [ ] Free-page recycling (freelist / space bitmap)

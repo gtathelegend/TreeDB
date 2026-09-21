@@ -62,3 +62,22 @@ This document records key architectural and design choices, their rationale, and
   * Clear pin count tracking prevents eviction of actively used frames while avoiding borrow-checker deadlocks.
   * Dirty page state is sticky: clean unpins cannot accidentally clear an already-dirty page.
   * Isolates disk writes exclusively to dirty evictions and explicit flush calls.
+
+---
+
+## Decision 7: B+ Tree Node Layouts and Derived Max Capacities
+
+* **Decision:** Fixed-width binary layouts for Leaf (`[Key (8B) | RecordId (8B)]`) and Internal (`[SeparatorKey (8B) | ChildPageId (4B)]`) nodes, with derived capacities (`LEAF_MAX_ENTRIES = 255`, `INTERNAL_MAX_KEYS = 340`).
+* **Rationale:**
+  * Eliminates fragmentation and slotted pointer overhead inside index nodes.
+  * Maximizes tree fanout (341 children per internal node).
+  * Explicit constants derived from page payload boundaries guarantee zero disk buffer overflows.
+
+---
+
+## Decision 8: Routing Convention & RecordId Indirection
+
+* **Decision:** Use standard right-inclusive separator routing (`key < K0 -> C0`, `Ki <= key < Ki+1 -> Ci+1`, `key >= Kn-1 -> Cn`) and map `Key -> RecordId` (where `RecordId = (page_id, slot_id)`).
+* **Rationale:**
+  * Keeps the B+ Tree index decoupled from variable-sized record/tuple payloads.
+  * Enables high-performance binary search routing without page table thrashing.

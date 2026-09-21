@@ -39,7 +39,7 @@ Page 0 contains global configuration, integrity verification tokens, and allocat
 
 ---
 
-## Standard Page Layout (Page 1+)
+## Standard Page Header (Page 1+)
 
 All pages other than Page 0 share a common 8-byte header:
 
@@ -62,3 +62,34 @@ All pages other than Page 0 share a common 8-byte header:
 | `0x03` | `Leaf` | B+ Tree leaf node storing keys and record pointers |
 | `0x04` | `Record` | Slotted data page holding tuple data |
 | `0x05` | `Free` | Unallocated / recycled page |
+
+---
+
+## B+ Tree Leaf Node Payload Layout (`PageType::Leaf`)
+
+The 4088-byte payload of a Leaf page is structured as:
+
+| Byte Offset (in payload) | Length | Field Name | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x00` | 2 bytes | `key_count` | `u16` (LE) | Number of active key-record entries (0..255) |
+| `0x02` | 4 bytes | `next_leaf` | `u32` (LE) | PageId of next sibling leaf (`0` if none) |
+| `0x06` | 16 bytes × `N` | `entries` | `[(Key, RecordId)]` | Array of `[Key (8B) \| RecordId (8B)]` |
+| `0x06 + (16 × N)` | Remainder | `padding` | `[u8]` | Unused space (zero-filled) |
+
+* **Capacity:** Max 255 entries = `6 + (255 × 16) = 4086 bytes` (2 bytes padding).
+* **RecordId:** `(page_id: u32, slot_id: u32)` = 8 bytes.
+
+---
+
+## B+ Tree Internal Node Payload Layout (`PageType::Internal`)
+
+The 4088-byte payload of an Internal page is structured as:
+
+| Byte Offset (in payload) | Length | Field Name | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x00` | 2 bytes | `key_count` | `u16` (LE) | Number of separator keys `N` (0..340) |
+| `0x02` | 4 bytes | `first_child` | `u32` (LE) | PageId of leftmost child pointer `C0` |
+| `0x06` | 12 bytes × `N` | `entries` | `[(Key, PageId)]` | Array of `[SeparatorKey (8B) \| ChildPageId (4B)]` |
+| `0x06 + (12 × N)` | Remainder | `padding` | `[u8]` | Unused space (zero-filled) |
+
+* **Capacity:** Max 340 separator keys (341 children) = `6 + (340 × 12) = 4086 bytes` (2 bytes padding).
