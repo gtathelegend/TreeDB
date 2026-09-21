@@ -103,16 +103,17 @@ This document records key architectural and design choices, their rationale, and
 
 ---
 
-## Decision 11: Orphaned Page Handling on Merges (No Free-Page Reclamation Yet)
-
-* **Decision:** Pages made unreachable by B+ Tree merges remain orphaned in the database file and are not immediately reclaimed.
+## Decision 11: Free-Page Reclamation on B+ Tree Merges & Collapses
+ 
+* **Decision:** Pages made unreachable by B+ Tree leaf merges, internal node merges, root collapses, and empty tree transitions are actively freed via `BufferPool::free_page()` and returned to the persistent freelist.
 * **Rationale:**
-  * TreeDB currently uses an append-only page manager. Introducing free-page recycling or freelist bitmaps belongs to a future dedicated storage-management phase.
-  * Explicitly documenting this limitation maintains single-responsibility boundaries for Phase 5.
+  * Avoids dead-space fragmentation and unbounded database file growth under heavy delete workloads.
+  * Reclaims freed space immediately for subsequent page allocations across both index and record store components.
 
 ---
 
 ## Decision 12: Slotted-Page Record Store & Stable RecordId Indirection
+
 
 * **Decision:** Implement a slotted-page architecture (`PageType::Record`) where `RecordId = (page_id, slot_id)` serves as an indirect logical reference to variable-length payload bytes.
 * **Rationale:**
@@ -187,4 +188,33 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * Deleting and re-inserting a key inside `put` risks collapsing a 1-key tree into an empty root (`INVALID_PAGE_ID`) and re-allocating a new root page within the same transaction.
   * In-place update keeps the B+ Tree structure stable and avoids unnecessary page allocations and root modifications while preserving transaction ownership (`TxnId`, `prev_lsn`) across index and record store mutations.
+
+---
+
+## Decision 19: Persistent Singly-Linked Freelist with LIFO Allocation Policy
+
+* **Decision:** Implement free page tracking using an on-disk singly-linked list anchored by `DbHeader::freelist_head` and `DbHeader::free_page_count` on Page 0, where each free page (`PageType::Free`) stores its `next_free: PageId` in the first 4 bytes of its payload.
+* **Rationale:**
+  * **$O(1)$ Operations:** Pushing a freed page and popping a reusable page take constant time ($O(1)$) without scanning the database file or maintaining large in-memory bitmaps.
+  * **Minimal Overhead:** Fits cleanly into the existing page structure without requiring auxiliary allocation files or dynamic resizing structures.
+  * **Cache Locality:** LIFO reuse favors recently freed pages that are likely still warm in operating system disk caches.
+
+---
+
+## Decision 20: Explicit Zero-Leak Reinitialization on Reuse
+
+* **Decision:** When a page is popped from the freelist in `BufferPool::allocate_page()`, the entire 4080-byte payload is zeroed out, `next_free` is cleared, and `page_type` is initialized to the requested target type before returning the pinned frame.
+* **Rationale:**
+  * Prevents stale data remnants from previous lifecycles leaking into new index or record pages.
+  * Ensures deterministic page state and reproducible binary representations.
+
+---
+
+## Decision 21: WAL Delta Logging on Page Free Operations
+
+* **Decision:** When `BufferPool::free_page(page_id)` is invoked with an active transaction context, it constructs a `PageDelta` capturing the transition from the page's prior content to `PageType::Free`, stamps the free page's `page_lsn`, and updates the header.
+* **Rationale:**
+  * Maintains the fundamental ARIES invariant that all physical state transitions are recorded in the WAL.
+  * Stamping `page_lsn` prevents Redo replay from incorrectly applying older pre-free log records over a freed/recycled page.
+
 

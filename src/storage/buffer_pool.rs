@@ -365,7 +365,7 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Allocates a new page on disk via `PageManager` and installs it in the buffer pool with pin_count = 1.
+    /// Allocates a page (reusing from freelist if available, or appending to file) and installs it in the buffer pool with pin_count = 1.
     pub fn allocate_page(&mut self, page_type: PageType) -> Result<PageId> {
         // Ensure a frame is available or can be evicted before allocating on disk.
         let frame_id = self.find_or_evict_frame()?;
@@ -386,6 +386,93 @@ impl BufferPool {
         self.page_table.insert(new_page_id, frame_id);
 
         Ok(new_page_id)
+    }
+
+    /// Reclaims an unlinked page into the persistent freelist, logging deltas if a transaction is active.
+    ///
+    /// # Errors
+    /// * `Error::CannotFreeReservedPage` if attempting to free Page 0 or Page 1.
+    /// * `Error::InvalidPage` if `page_id >= page_count`.
+    /// * `Error::PageCorruption` if the page is resident and actively pinned.
+    pub fn free_page(&mut self, page_id: PageId) -> Result<()> {
+        if crate::storage::metadata::is_reserved_page(page_id) {
+            return Err(Error::CannotFreeReservedPage(page_id));
+        }
+        if page_id >= self.page_manager.page_count() {
+            return Err(Error::InvalidPage(page_id));
+        }
+
+        // 1. If page is resident in buffer pool, ensure it is unpinned and extract its before-image
+        let before_bytes = if let Some(&frame_id) = self.page_table.get(&page_id) {
+            let frame = &mut self.frames[frame_id];
+            if frame.pin_count > 0 {
+                return Err(Error::PageCorruption {
+                    page_id,
+                    reason: "cannot free currently pinned page",
+                });
+            }
+            let bytes = frame.page.as_ref().map(|p| *p.as_bytes());
+            self.page_table.remove(&page_id);
+            frame.page_id = None;
+            frame.page = None;
+            frame.before_image = None;
+            frame.pin_count = 0;
+            frame.dirty = false;
+            bytes
+        } else {
+            None
+        };
+
+        // 2. Check if already in freelist to reject double-free
+        if crate::storage::freelist::FreePageManager::is_free(&mut self.page_manager, page_id)? {
+            return Err(Error::PageAlreadyFree(page_id));
+        }
+
+        // 3. Read current page before-bytes from disk if not resident
+        let before = match before_bytes {
+            Some(b) => b,
+            None => *self.page_manager.read_page(page_id)?.as_bytes(),
+        };
+
+        // 4. Construct Free page
+        let curr_head = self.page_manager.header().freelist_head;
+        let mut free_page = Page::new(page_id, PageType::Free);
+        crate::storage::freelist::FreePageLayout::write_next_free(&mut free_page, curr_head);
+
+        // 5. If active transaction and WAL exist, append PageDelta and stamp LSN
+        if let Some(txn_id) = self.active_txn {
+            if let Some(ref mut wal) = self.wal {
+                let lsn = wal.append_page_delta(
+                    txn_id,
+                    page_id,
+                    0,
+                    before.to_vec(),
+                    free_page.as_bytes().to_vec(),
+                )?;
+                free_page.set_lsn(lsn);
+            }
+        } else if let Some(ref wal) = self.wal {
+            let next_lsn = wal.next_lsn();
+            if next_lsn.is_valid() {
+                free_page.set_lsn(next_lsn);
+            }
+        }
+
+        // 6. Write free page to disk
+        self.page_manager.write_page(&free_page)?;
+
+        // 7. Update DbHeader
+        self.page_manager.header_mut().freelist_head = page_id;
+        self.page_manager.header_mut().free_page_count += 1;
+        self.page_manager.write_header_to_disk()?;
+
+        Ok(())
+    }
+
+    /// Validates the structural integrity of the persistent freelist after flushing dirty pages.
+    pub fn validate_freelist(&mut self) -> Result<()> {
+        self.flush_all()?;
+        self.page_manager.validate_freelist()
     }
 
     /// Returns whether a page is currently resident in memory.

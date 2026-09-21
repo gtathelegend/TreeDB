@@ -117,10 +117,18 @@ impl PageManager {
         Ok(())
     }
 
-    /// Allocates a new page in the database via append-only allocation.
+    /// Allocates a page by reusing a free page from the freelist, or appending to the file if empty.
     ///
-    /// Updates the Database Header on disk and initializes the allocated page.
+    /// Updates the Database Header on disk.
     pub fn allocate_page(&mut self) -> Result<PageId> {
+        // 1. Try recycling a free page from the freelist first
+        if let Some(reused_page_id) =
+            crate::storage::freelist::FreePageManager::allocate_page(self)?
+        {
+            return Ok(reused_page_id);
+        }
+
+        // 2. Fall back to appending a new page at the end of the file
         let new_page_id = self.header.page_count;
         let new_page = Page::new(new_page_id, PageType::Free);
 
@@ -132,6 +140,16 @@ impl PageManager {
         self.write_header_to_disk()?;
 
         Ok(new_page_id)
+    }
+
+    /// Reclaims a page into the persistent freelist.
+    pub fn free_page(&mut self, page_id: PageId) -> Result<()> {
+        crate::storage::freelist::FreePageManager::free_page(self, page_id)
+    }
+
+    /// Validates the structural integrity of the persistent freelist.
+    pub fn validate_freelist(&mut self) -> Result<()> {
+        crate::storage::freelist::FreePageManager::validate(self)
     }
 
     /// Flushes all pending writes and synchronizes file state to physical media.
@@ -150,6 +168,11 @@ impl PageManager {
         &self.header
     }
 
+    /// Returns a mutable reference to the active Database Header.
+    pub fn header_mut(&mut self) -> &mut DbHeader {
+        &mut self.header
+    }
+
     /// Returns the path to the database file.
     pub fn path(&self) -> &Path {
         &self.path
@@ -165,7 +188,7 @@ impl PageManager {
     }
 
     /// Writes the serialized header directly to Page 0 on disk.
-    fn write_header_to_disk(&mut self) -> Result<()> {
+    pub fn write_header_to_disk(&mut self) -> Result<()> {
         let header_bytes = self.header.serialize();
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&header_bytes)?;

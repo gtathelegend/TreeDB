@@ -456,6 +456,7 @@ impl BPlusTree {
                 buffer_pool
                     .page_manager_mut()
                     .set_root_page_id(INVALID_PAGE_ID)?;
+                buffer_pool.free_page(target_leaf_id)?;
             } else {
                 let page_mut = buffer_pool.fetch_page_mut(target_leaf_id)?;
                 leaf.serialize(page_mut)?;
@@ -584,7 +585,7 @@ impl BPlusTree {
         }
 
         // 6c. Neither sibling can donate -> MERGE!
-        if child_idx > 0 {
+        let freed_leaf_id = if child_idx > 0 {
             // Merge target_leaf into left sibling
             let left_sibling_id = parent.children[child_idx - 1];
             let mut left_sibling = {
@@ -611,6 +612,8 @@ impl BPlusTree {
                 left_sibling.serialize(p)?;
             }
             buffer_pool.unpin_page(left_sibling_id, true)?;
+
+            target_leaf_id
         } else {
             // Merge right sibling into target_leaf
             let right_sibling_id = parent.children[1];
@@ -638,7 +641,9 @@ impl BPlusTree {
                 leaf.serialize(p)?;
             }
             buffer_pool.unpin_page(target_leaf_id, true)?;
-        }
+
+            right_sibling_id
+        };
 
         // Serialize parent
         {
@@ -647,7 +652,11 @@ impl BPlusTree {
         }
         buffer_pool.unpin_page(parent_id, true)?;
 
+        // Free merged-away leaf page now that it is completely unlinked
+        buffer_pool.free_page(freed_leaf_id)?;
+
         // 7. Recursively rebalance internal ancestors
+
         self.rebalance_internal_path(buffer_pool, path)?;
 
         Ok(Some(old_record_id))
@@ -677,11 +686,13 @@ impl BPlusTree {
 
                 if root_node.keys.is_empty() {
                     // Internal root has 0 keys and 1 child -> collapse root!
+                    let old_root_id = self.root_page_id;
                     let new_root_id = root_node.children[0];
                     self.root_page_id = new_root_id;
                     buffer_pool
                         .page_manager_mut()
                         .set_root_page_id(new_root_id)?;
+                    buffer_pool.free_page(old_root_id)?;
                 }
                 return Ok(());
             }
@@ -824,7 +835,7 @@ impl BPlusTree {
             }
 
             // Neither sibling can donate -> MERGE Internal Nodes!
-            if p_idx > 0 {
+            let freed_internal_id = if p_idx > 0 {
                 // Merge curr_node into left sibling
                 let left_sibling_id = grandparent.children[p_idx - 1];
                 let mut left_sibling = {
@@ -852,6 +863,8 @@ impl BPlusTree {
                     left_sibling.serialize(p)?;
                 }
                 buffer_pool.unpin_page(left_sibling_id, true)?;
+
+                curr_id
             } else {
                 // Merge right sibling into curr_node
                 let right_sibling_id = grandparent.children[1];
@@ -880,7 +893,9 @@ impl BPlusTree {
                     curr_node.serialize(p)?;
                 }
                 buffer_pool.unpin_page(curr_id, true)?;
-            }
+
+                right_sibling_id
+            };
 
             // Save updated grandparent
             {
@@ -888,6 +903,9 @@ impl BPlusTree {
                 grandparent.serialize(p)?;
             }
             buffer_pool.unpin_page(grandparent_id, true)?;
+
+            // Free merged-away internal node
+            buffer_pool.free_page(freed_internal_id)?;
         }
 
         // Finally check root collapse if root was modified
@@ -904,9 +922,11 @@ impl BPlusTree {
                 buffer_pool.unpin_page(self.root_page_id, false)?;
 
                 if root_node.keys.is_empty() {
+                    let old_root_id = self.root_page_id;
                     let new_root = root_node.children[0];
                     self.root_page_id = new_root;
                     buffer_pool.page_manager_mut().set_root_page_id(new_root)?;
+                    buffer_pool.free_page(old_root_id)?;
                 }
             } else {
                 buffer_pool.unpin_page(self.root_page_id, false)?;

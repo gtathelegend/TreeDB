@@ -125,8 +125,13 @@ v                                                             v
   * **Write-Ahead Rule Enforcement:** Enforces `LogManager::flush(page.lsn())` before flushing any dirty page to disk on both explicit `flush_page()` and `LRU eviction`.
   * Deterministic Least Recently Used (LRU) replacement policy.
 
-### `PageManager`
-* **Role:** Manages reading and writing fixed-size (4096-byte) blocks to and from disk with format version validation.
+### `FreePageManager` & `FreePageLayout`
+* **Role:** Manages the persistent singly-linked freelist anchored by `DbHeader::freelist_head` on Page 0.
+* **Responsibilities:**
+  * LIFO free-page stack push (`free_page`) and pop (`allocate_page`).
+  * Explicit page lifecycle management: `NEW -> ALLOCATED -> REACHABLE -> UNLINKED -> FREE -> REUSED -> ALLOCATED`.
+  * Reinitialization on reuse: zeroes the entire 4080-byte payload, clears `next_free`, and sets the target `PageType`.
+  * Freelist validation (`validate`): checks total count matches `DbHeader::free_page_count`, verifies all nodes have `PageType::Free`, detects cycles via Floyd's tortoise-and-hare algorithm, and enforces that reserved pages (Page 0 and Page 1) and active roots are never present.
 
 ---
 
@@ -142,15 +147,16 @@ v                                                             v
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
+* **Page Reachability & Reservation Invariant:** Page 0 (Header) and Page 1 (Metadata) are strictly reserved (`is_reserved_page(page_id) == true`) and can never be freed or recycled. Every page ID in the database is either reachable via index/metadata/heap or tracked in the persistent freelist.
 
 ---
 
-## 6. Intentionally Deferred Items (Phase 8+)
+## 6. Intentionally Deferred Items (Phase 9+)
 
-The following capabilities are intentionally deferred to subsequent phases and not implemented in Phase 7.1:
-* Free-page recycling across the database (freelist / free-page bitmap).
+The following capabilities are intentionally deferred to subsequent phases and not implemented in Phase 8:
 * Multi-page overflow records for large BLOBs exceeding 4070 bytes.
 * Background fuzzy checkpointing and WAL truncation / log recycling.
 * Group commit and asynchronous WAL flush queues.
 * Multi-threading, concurrency control, and latching.
 * SQL query parser, execution engine, and MVCC.
+

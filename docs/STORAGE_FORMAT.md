@@ -37,7 +37,9 @@ Page 0 contains global configuration, integrity verification tokens, and allocat
 | `0x10` | 4 bytes | `page_count` | `u32` (LE) | Total number of allocated pages |
 | `0x14` | 4 bytes | `root_page_id` | `u32` (LE) | Page ID of B+ Tree root (`0` if uninitialized) |
 | `0x18` | 4 bytes | `metadata_page_id` | `u32` (LE) | Page ID of catalog/metadata page (`1`) |
-| `0x1C` | 4068 bytes | `reserved` | `[u8; 4068]`| Zero-padded reserved space for future extensions |
+| `0x1C` | 4 bytes | `freelist_head` | `u32` (LE) | Page ID of first free page in linked freelist (`0` if empty) |
+| `0x20` | 4 bytes | `free_page_count` | `u32` (LE) | Total number of free pages currently in freelist |
+| `0x24` | 4060 bytes | `reserved` | `[u8; 4060]`| Zero-padded reserved space for future extensions |
 
 ---
 
@@ -65,7 +67,19 @@ All pages other than Page 0 share a common 16-byte header:
 | `0x02` | `Internal` | B+ Tree interior routing node |
 | `0x03` | `Leaf` | B+ Tree leaf node storing keys and record pointers |
 | `0x04` | `Record` | Slotted data page holding tuple data |
-| `0x05` | `Free` | Unallocated / recycled page |
+| `0x05` | `Free` | Unallocated / recycled page in persistent freelist |
+
+---
+
+## Free Page Payload Layout (`PageType::Free`)
+
+The 4080-byte payload of a Free page is structured as:
+
+| Byte Offset (in payload) | Length | Field Name | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x00` | 4 bytes | `next_free` | `u32` (LE) | PageId of next free page in singly-linked freelist (`0` if end of list) |
+| `0x04` | 4076 bytes | `padding` | `[u8; 4076]` | Zero-filled padding |
+
 
 ---
 

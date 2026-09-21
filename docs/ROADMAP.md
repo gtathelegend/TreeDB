@@ -111,11 +111,26 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 8: Advanced Storage, Recycling & CLI (Next Phase)
-* [ ] Free-page recycling across the database (freelist / bitmap)
+## Phase 8: Free-Page Recycling & Persistent Freelist (Completed)
+* [x] Standard reserved page predicates (`is_reserved_page(page_id)`) protecting Page 0 and Page 1
+* [x] Persistent singly-linked freelist anchored by `DbHeader::freelist_head` and `DbHeader::free_page_count` on Page 0
+* [x] `FreePageLayout` binary format storing `next_free: PageId` in payload
+* [x] `FreePageManager` with LIFO push (`free_page`), LIFO pop (`allocate_page`), and double-free protection (`Error::PageAlreadyFree`)
+* [x] `PageManager` integration: freelist pop prior to EOF file expansion, and synchronous header persistence
+* [x] `BufferPool::allocate_page()` reinitialization: clears `next_free`, zeroes payload, sets target `PageType`, preserves frame safety
+* [x] `BufferPool::free_page()`: evicts resident frames, logs `PageDelta` with active transaction to WAL, stamps `page_lsn`, updates `DbHeader`
+* [x] B+ Tree integration: leaf merge, internal node merge, root collapse, and empty root transitions reclaim unlinked pages
+* [x] Freelist structural integrity validator (`validate_freelist`): verifies total count, page types, cycle detection, reserved/root exclusion
+* [x] Crash recovery integration: PageLSN tracking prevents Redo from overwriting recycled or free pages with obsolete states
+* [x] 14 dedicated integration tests covering persistence, recycling, bounded file size, B+ Tree reclamation, and pin discipline
+
+---
+
+## Phase 9: Multi-Page Overflow Records & Advanced Storage (Next Phase)
 * [ ] Multi-page overflow records for large BLOBs exceeding 4070 bytes
 * [ ] Periodic background fuzzy checkpointing and WAL truncation
 * [ ] Group commit and asynchronous WAL flush queues
-* [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`)
-* [ ] Microbenchmarks and stress testing
+* [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`, `inspect-freelist`)
+* [ ] Microbenchmarks and high-throughput stress testing
+
 

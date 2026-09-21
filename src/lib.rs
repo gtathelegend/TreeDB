@@ -15,11 +15,13 @@ pub use index::{
     RECORD_ID_SIZE,
 };
 pub use storage::{
-    BufferPool, BufferPoolStats, DbHeader, FrameId, Key, Page, PageId, PageManager, PageType,
-    RecordPage, RecordStore, Slot, CURRENT_FORMAT_VERSION, DEFAULT_METADATA_PAGE_ID,
-    HEADER_PAGE_ID, MAGIC_BYTES, MAX_RECORD_SIZE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE,
-    RECORD_PAGE_HEADER_SIZE, SLOT_SIZE,
+    is_reserved_page, BufferPool, BufferPoolStats, DbHeader, FrameId, FreePageLayout,
+    FreePageManager, Key, Page, PageId, PageManager, PageType, RecordPage, RecordStore, Slot,
+    CURRENT_FORMAT_VERSION, DEFAULT_METADATA_PAGE_ID, HEADER_PAGE_ID, MAGIC_BYTES, MAX_RECORD_SIZE,
+    NO_FREE_PAGE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE, RECORD_PAGE_HEADER_SIZE,
+    SLOT_SIZE,
 };
+
 pub use wal::{
     crc32, LogManager, LogRecord, LogRecordBody, LogRecordType, Lsn, RecoveryEngine, RecoveryFault,
     RecoveryStats, TxnId, TxnStatus, TxnTableEntry, WalHeader, CURRENT_WAL_VERSION, INVALID_LSN,

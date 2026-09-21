@@ -50,6 +50,8 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **TreeDB Engine API** | **Implemented** | High-level `TreeDb` interface for `put`, `get`, `delete`, `scan`, `sync` |
 | **Write-Ahead Logging** | **Implemented** | Monotonic `Lsn`, CRC32 log records, `.wal` file, durable syncing, WAL ordering on flush/evict |
 | **Crash Recovery (ARIES-Inspired)** | **Implemented** | 3-Phase recovery (Analysis, Redo, Undo with CLRs), restart-safe, deterministic fault injection, idempotence |
+| **Free-Page Recycling & Freelist** | **Implemented** | Persistent singly-linked freelist, $O(1)$ LIFO reuse, B+ Tree merge/collapse reclamation, integrity validation |
+
 
 ---
 

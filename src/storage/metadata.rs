@@ -13,6 +13,14 @@ pub const HEADER_PAGE_ID: PageId = 0;
 /// Page ID for the initial Database Metadata/Catalog.
 pub const DEFAULT_METADATA_PAGE_ID: PageId = 1;
 
+/// Sentinel indicating that no free page exists in the freelist.
+pub const NO_FREE_PAGE: PageId = 0;
+
+/// Authoritative helper determining if a page ID is permanently reserved and cannot enter the freelist.
+pub const fn is_reserved_page(page_id: PageId) -> bool {
+    page_id == HEADER_PAGE_ID || page_id == DEFAULT_METADATA_PAGE_ID
+}
+
 /// In-memory representation of the Database Header stored on Page 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbHeader {
@@ -28,6 +36,10 @@ pub struct DbHeader {
     pub root_page_id: PageId,
     /// Page ID of the metadata/catalog page.
     pub metadata_page_id: PageId,
+    /// Head page ID of the persistent free-page list (0 if empty).
+    pub freelist_head: PageId,
+    /// Total number of free pages currently in the freelist.
+    pub free_page_count: u32,
 }
 
 impl Default for DbHeader {
@@ -46,6 +58,8 @@ impl DbHeader {
             page_count: 2, // Page 0 (Header) + Page 1 (Metadata)
             root_page_id: 0,
             metadata_page_id: DEFAULT_METADATA_PAGE_ID,
+            freelist_head: NO_FREE_PAGE,
+            free_page_count: 0,
         }
     }
 
@@ -58,6 +72,8 @@ impl DbHeader {
         bytes[16..20].copy_from_slice(&self.page_count.to_le_bytes());
         bytes[20..24].copy_from_slice(&self.root_page_id.to_le_bytes());
         bytes[24..28].copy_from_slice(&self.metadata_page_id.to_le_bytes());
+        bytes[28..32].copy_from_slice(&self.freelist_head.to_le_bytes());
+        bytes[32..36].copy_from_slice(&self.free_page_count.to_le_bytes());
         bytes
     }
 
@@ -89,6 +105,8 @@ impl DbHeader {
         let page_count = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
         let root_page_id = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
         let metadata_page_id = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+        let freelist_head = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        let free_page_count = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
 
         Ok(Self {
             magic,
@@ -97,6 +115,8 @@ impl DbHeader {
             page_count,
             root_page_id,
             metadata_page_id,
+            freelist_head,
+            free_page_count,
         })
     }
 }
@@ -110,10 +130,22 @@ mod tests {
         let mut header = DbHeader::new();
         header.page_count = 10;
         header.root_page_id = 4;
+        header.freelist_head = 7;
+        header.free_page_count = 3;
 
         let bytes = header.serialize();
         let restored = DbHeader::deserialize(&bytes).expect("deserialization should succeed");
         assert_eq!(restored, header);
+        assert_eq!(restored.freelist_head, 7);
+        assert_eq!(restored.free_page_count, 3);
+    }
+
+    #[test]
+    fn test_reserved_pages() {
+        assert!(is_reserved_page(0));
+        assert!(is_reserved_page(1));
+        assert!(!is_reserved_page(2));
+        assert!(!is_reserved_page(99));
     }
 
     #[test]

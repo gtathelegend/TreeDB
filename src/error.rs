@@ -78,4 +78,16 @@ pub enum Error {
     /// WAL corruption detected during recovery scan.
     #[error("WAL corruption detected: {0}")]
     WalCorruption(String),
+
+    /// Attempted to free a permanently reserved page (e.g. Page 0 Header or Page 1 Metadata).
+    #[error("Cannot free reserved page {0}")]
+    CannotFreeReservedPage(PageId),
+
+    /// Attempted to free a page that is already marked as free.
+    #[error("Page {0} is already free")]
+    PageAlreadyFree(PageId),
+
+    /// Structural corruption or invariant violation in the freelist.
+    #[error("Freelist corruption detected: {0}")]
+    FreelistCorruption(String),
 }
