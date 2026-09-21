@@ -73,6 +73,21 @@ pub const INTERNAL_ENTRY_SIZE: usize = KEY_SIZE + PAGE_ID_SIZE; // 12 bytes
 pub const INTERNAL_MAX_KEYS: usize =
     (PAGE_PAYLOAD_SIZE - INTERNAL_HEADER_SIZE) / INTERNAL_ENTRY_SIZE;
 
+/// Minimum number of entries a non-root leaf node must contain before underflowing.
+///
+/// Derived as: `LEAF_MAX_ENTRIES / 2 = 127 entries`.
+pub const LEAF_MIN_ENTRIES: usize = LEAF_MAX_ENTRIES / 2;
+
+/// Minimum number of separator keys a non-root internal node must contain before underflowing.
+///
+/// Derived as: `INTERNAL_MAX_KEYS / 2 = 170 keys`.
+pub const INTERNAL_MIN_KEYS: usize = INTERNAL_MAX_KEYS / 2;
+
+/// Minimum number of child pointers a non-root internal node must route to.
+///
+/// Derived as: `INTERNAL_MIN_KEYS + 1 = 171 children`.
+pub const INTERNAL_MIN_CHILDREN: usize = INTERNAL_MIN_KEYS + 1;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,9 +103,12 @@ mod tests {
     #[test]
     fn test_capacity_derivations() {
         assert_eq!(LEAF_MAX_ENTRIES, 255);
+        assert_eq!(LEAF_MIN_ENTRIES, 127);
         const { assert!(LEAF_HEADER_SIZE + (LEAF_MAX_ENTRIES * LEAF_ENTRY_SIZE) <= PAGE_PAYLOAD_SIZE) };
 
         assert_eq!(INTERNAL_MAX_KEYS, 340);
+        assert_eq!(INTERNAL_MIN_KEYS, 170);
+        assert_eq!(INTERNAL_MIN_CHILDREN, 171);
         const {
             assert!(
                 INTERNAL_HEADER_SIZE + (INTERNAL_MAX_KEYS * INTERNAL_ENTRY_SIZE)

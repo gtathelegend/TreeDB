@@ -171,8 +171,93 @@ Attempting to insert a key that already exists returns `Err(Error::DuplicateKey(
 
 ---
 
-## 7. Current Limitations & Scope
+## 7. Deletion & Rebalancing Algorithm (`delete`)
 
-* **No WAL / Crash Recovery:** Multi-page splits are not transaction-logged; crash recovery is deferred to a future phase.
-* **No Deletion or Redistribution:** Key removal and node underflow merging are planned for Phase 5.
-* **Single-Threaded:** Synchronization and concurrency control will be introduced after single-threaded verification.
+TreeDB supports persistent B+ Tree key deletion with leaf and internal node rebalancing, sibling borrowing/redistribution, node merging, and root collapse:
+
+```text
+delete(key) -> Option<RecordId>
+       │
+       ▼
+  Tree Empty? ─────────► Yes ──► Return Ok(None)
+       │ No
+       ▼
+Traverse to Target Leaf (recording internal PageId path stack)
+       │
+       ▼
+  Key Exists? ─────────► No ───► Return Ok(None) (Tree unmodified)
+       │ Yes
+       ▼
+Remove (Key, RecordId) entry from Leaf
+       │
+       ▼
+  Is Root Leaf? (path stack is empty)
+   ├─► Yes: If empty -> root_page_id = INVALID_PAGE_ID (0) in DbHeader
+   │        Else -> write dirty leaf -> Done
+   │
+   └─► No: Is Leaf Underfull? (entries.len() < LEAF_MIN_ENTRIES = 127)
+         ├─► No:  Write dirty leaf ──► Done
+         └─► Yes: Rebalance with Siblings via Parent:
+                    1. Try Borrow from Left Sibling (if entries > 127):
+                       - Move left_sibling's last entry to front of leaf
+                       - Update parent separator: parent.keys[child_idx - 1] = leaf.entries[0].key
+                       - Done
+                    2. Try Borrow from Right Sibling (if entries > 127):
+                       - Move right_sibling's first entry to back of leaf
+                       - Update parent separator: parent.keys[child_idx] = right_sibling.entries[0].key
+                       - Done
+                    3. Sibling cannot donate -> MERGE Leaves:
+                       - Merge into Left Sibling (or with Right Sibling if leftmost)
+                       - Update next_leaf pointer
+                       - Remove separator and child from Parent
+                       - Rebalance Parent Node upward recursively
+```
+
+### Minimum Occupancy Rules:
+* **Leaf Nodes:** `LEAF_MIN_ENTRIES = LEAF_MAX_ENTRIES / 2 = 127 entries`.
+* **Internal Nodes:** `INTERNAL_MIN_KEYS = INTERNAL_MAX_KEYS / 2 = 170 keys` (routes to at least 171 children).
+* **Root Exemption:** The root node (leaf or internal) is exempt from minimum occupancy rules.
+
+### Sibling Preference & Determinism:
+* Left sibling is checked and preferred first if it exists and can donate (`can_donate() == true`).
+* Otherwise, right sibling is checked.
+* If neither can donate, merge is performed with the left sibling (or right sibling if at index 0).
+
+### Internal Node Redistribution & Merging:
+* **Borrowing Left:** Demotes parent separator `grandparent.keys[p_idx - 1]` to the front of `curr_node.keys`, moves `left_sibling.children.pop()` to `curr_node.children[0]`, and promotes `left_sibling.keys.pop()` into `grandparent.keys[p_idx - 1]`.
+* **Borrowing Right:** Demotes parent separator `grandparent.keys[p_idx]` to the back of `curr_node.keys`, moves `right_sibling.children.remove(0)` to `curr_node.children.push()`, and promotes `right_sibling.keys.remove(0)` into `grandparent.keys[p_idx]`.
+* **Internal Merge:** Pulls down the parent separator between the two nodes into the merged node, appends all keys and children, and removes the separator and child pointer from the parent.
+
+### Root Collapse:
+* **Internal Root:** If an internal root's keys become empty (`children.len() == 1`), the root collapses to its single child (`new_root = children[0]`). Tree height decreases by 1, and `DbHeader.root_page_id` is updated.
+* **Leaf Root:** If a leaf root becomes empty, `root_page_id` transitions to `INVALID_PAGE_ID` (0). Subsequent insertions re-initialize a new leaf root.
+
+---
+
+## 8. Ordered Range Scan (`scan`)
+
+TreeDB provides an ordered range scan API over keys in `[start, end)`:
+
+```rust
+pub fn scan(
+    &self,
+    buffer_pool: &mut BufferPool,
+    start: Option<Key>,
+    end: Option<Key>,
+) -> Result<Vec<(Key, RecordId)>>;
+```
+
+### Range Semantics:
+* `start: Option<Key>`: Inclusive lower bound, or `None` to start from the minimum key in the tree.
+* `end: Option<Key>`: Exclusive upper bound, or `None` to scan to the maximum key in the tree.
+* If `start >= end` (when both are `Some`), returns an empty vector immediately.
+* **Traversal:** Traverses from the root once to find the leaf containing the lower bound, binary-searches the starting offset within that leaf, and then follows `next_leaf` sibling pointers sequentially until `k >= end` or end of tree.
+* **Pin Discipline:** Each leaf page is fetched, copied into the output vector, and immediately unpinned before advancing to the next leaf, guaranteeing zero leaked pins.
+
+---
+
+## 9. Current Limitations & Scope
+
+* **No Free-Page Reclamation:** TreeDB currently does not reclaim pages made unreachable by B+ Tree merges. Orphaned pages remain in the database file and will be managed by a future freelist/allocator phase.
+* **No WAL / Crash Atomicity:** While modifications are safely persisted on disk through `buffer_pool.sync()`, deletion is not crash-atomic without a Write-Ahead Log.
+* **Single-Threaded:** Synchronization and concurrency control are deferred to future phases.

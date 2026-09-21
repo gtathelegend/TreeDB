@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::index::node::{
-    INTERNAL_ENTRY_SIZE, INTERNAL_HEADER_SIZE, INTERNAL_MAX_KEYS, INVALID_PAGE_ID,
+    INTERNAL_ENTRY_SIZE, INTERNAL_HEADER_SIZE, INTERNAL_MAX_KEYS, INTERNAL_MIN_KEYS,
+    INVALID_PAGE_ID,
 };
 use crate::storage::page::{Key, Page, PageId, PageType};
 
@@ -59,6 +60,16 @@ impl InternalNode {
     /// Returns true if the internal node has reached maximum separator key capacity.
     pub fn is_full(&self) -> bool {
         self.keys.len() >= INTERNAL_MAX_KEYS
+    }
+
+    /// Returns true if the internal node has fewer separator keys than minimum occupancy.
+    pub fn is_underfull(&self) -> bool {
+        self.keys.len() < INTERNAL_MIN_KEYS
+    }
+
+    /// Returns true if the internal node has more separator keys than minimum occupancy and can donate.
+    pub fn can_donate(&self) -> bool {
+        self.keys.len() > INTERNAL_MIN_KEYS
     }
 
     /// Inserts a `(separator_key, right_child)` entry into a non-full internal node.
@@ -327,5 +338,36 @@ mod tests {
     fn test_internal_mismatched_children_rejected() {
         let err = InternalNode::with_keys_and_children(vec![100, 200], vec![1, 2]).unwrap_err();
         assert!(matches!(err, Error::TreeCorruption(_)));
+    }
+
+    #[test]
+    fn test_internal_underflow_and_donation() {
+        let mut keys = Vec::new();
+        let mut children = vec![1];
+        for i in 0..INTERNAL_MIN_KEYS {
+            keys.push(i as u64 * 10);
+            children.push(i as u32 + 2);
+        }
+        let node = InternalNode::with_keys_and_children(keys.clone(), children.clone()).unwrap();
+        assert_eq!(node.key_count(), INTERNAL_MIN_KEYS);
+        assert!(!node.is_underfull());
+        assert!(!node.can_donate());
+
+        // With one more key: can donate
+        keys.push(9999);
+        children.push(9999);
+        let node_donate =
+            InternalNode::with_keys_and_children(keys.clone(), children.clone()).unwrap();
+        assert!(!node_donate.is_underfull());
+        assert!(node_donate.can_donate());
+
+        // With one fewer key: underfull
+        keys.pop();
+        keys.pop();
+        children.pop();
+        children.pop();
+        let node_underfull = InternalNode::with_keys_and_children(keys, children).unwrap();
+        assert!(node_underfull.is_underfull());
+        assert!(!node_underfull.can_donate());
     }
 }

@@ -43,7 +43,7 @@ Application / CLI
 | **Page Abstraction** | **Implemented** | Deterministic binary layout, header tags, structural validation |
 | **Buffer Pool Manager** | **Implemented** | LRU eviction, frame table, pin/unpin tracking, dirty flush |
 | **B+ Tree Index (Search & Insert)** | **Implemented** | Dynamic insertion, node splitting, root elevation, point search |
-| **B+ Tree Index (Deletion)** | *Planned* | Key deletion, node redistribution/merging (Phase 5) |
+| **B+ Tree Index (Delete & Scan)** | **Implemented** | Deletion, leaf/internal rebalance, root collapse, range scan |
 | **Record Store** | *Planned* | Slotted-page tuple format, variable-length records (Phase 6) |
 | **Write-Ahead Logging** | *Experimental* | WAL frame serialization, crash recovery (future phase) |
 

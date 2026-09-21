@@ -7,8 +7,9 @@ pub mod storage;
 pub use error::{Error, Result};
 pub use index::{
     BPlusTree, InternalNode, LeafNode, RecordId, INTERNAL_ENTRY_SIZE, INTERNAL_HEADER_SIZE,
-    INTERNAL_MAX_KEYS, INVALID_PAGE_ID, KEY_SIZE, LEAF_ENTRY_SIZE, LEAF_HEADER_SIZE,
-    LEAF_MAX_ENTRIES, PAGE_ID_SIZE, RECORD_ID_SIZE,
+    INTERNAL_MAX_KEYS, INTERNAL_MIN_CHILDREN, INTERNAL_MIN_KEYS, INVALID_PAGE_ID, KEY_SIZE,
+    LEAF_ENTRY_SIZE, LEAF_HEADER_SIZE, LEAF_MAX_ENTRIES, LEAF_MIN_ENTRIES, PAGE_ID_SIZE,
+    RECORD_ID_SIZE,
 };
 pub use storage::{
     BufferPool, BufferPoolStats, DbHeader, FrameId, Key, Page, PageId, PageManager, PageType,

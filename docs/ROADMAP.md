@@ -53,16 +53,23 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 5: B+ Tree Deletion & Range Scans (Next Phase)
-* [ ] Key deletion in leaf nodes
-* [ ] Leaf and internal node underflow handling (borrowing / redistribution)
-* [ ] Node merging and separator demotion
-* [ ] Root collapse on underflow
-* [ ] Bidirectional range scan iterator (`scan(start_key..end_key)`)
+## Phase 5: B+ Tree Deletion & Range Scans (Completed)
+* [x] Key deletion in leaf nodes (`delete(key) -> Option<RecordId>`)
+* [x] Leaf underflow detection and sibling borrowing / redistribution
+* [x] Leaf node merging and sibling link updates
+* [x] Internal node underflow detection, separator rotation, and child borrowing
+* [x] Internal node merging with parent separator demotion
+* [x] Recursive path rebalancing toward root
+* [x] Root collapse (height reduction and empty tree transition)
+* [x] Empty tree handling and re-insertion safety
+* [x] Root metadata persistence across database reopen
+* [x] Ordered range scans (`scan(start, end)`) via leaf sibling chains
+* [x] Deterministic randomized mutation testing vs BTreeMap oracle
+* [x] Zero pin leak verification across all mutation paths
 
 ---
 
-## Phase 6: Slotted Page Record Store & Engine API
+## Phase 6: Slotted Page Record Store & Engine API (Next Phase)
 * [ ] Slotted-page binary layout for variable-length tuples
 * [ ] Record insertion, retrieval, and deletion within pages
 * [ ] Slot array management and page defragmentation

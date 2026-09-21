@@ -308,6 +308,656 @@ impl BPlusTree {
         Ok(())
     }
 
+    /// Deletes a key from the B+ Tree.
+    ///
+    /// # Semantics
+    /// * If the key exists: removes it, rebalances the tree as necessary (borrowing or merging),
+    ///   and returns `Ok(Some(old_record_id))`.
+    /// * If the key does not exist: returns `Ok(None)` without modifying the tree.
+    ///
+    /// # Rebalancing Policy
+    /// * Leaves underflow if `entries.len() < LEAF_MIN_ENTRIES` (127).
+    /// * Internal nodes underflow if `keys.len() < INTERNAL_MIN_KEYS` (170).
+    /// * The root node is exempt from minimum occupancy rules.
+    /// * Redistribution (borrowing from left sibling first, then right sibling) is preferred over merging.
+    /// * If neither sibling can donate, merging is performed (with left sibling preferred).
+    /// * Internal nodes rotate separator keys through the parent during borrowing and demote parent separators during merging.
+    /// * Root collapse: An internal root with a single child collapses to that child. A leaf root that becomes empty sets the root to `INVALID_PAGE_ID`.
+    pub fn delete(&mut self, buffer_pool: &mut BufferPool, key: Key) -> Result<Option<RecordId>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+
+        // 1. Traverse to target leaf, recording the path of internal node page IDs.
+        let mut path: Vec<PageId> = Vec::new();
+        let mut curr_page_id = self.root_page_id;
+
+        loop {
+            let page = buffer_pool.fetch_page(curr_page_id)?;
+            let page_type = page.page_type();
+
+            match page_type {
+                PageType::Internal => {
+                    let internal = match InternalNode::deserialize(page) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(curr_page_id, false);
+                            return Err(e);
+                        }
+                    };
+                    let next_page_id = internal.find_child(key);
+                    buffer_pool.unpin_page(curr_page_id, false)?;
+                    path.push(curr_page_id);
+                    curr_page_id = next_page_id;
+                }
+                PageType::Leaf => {
+                    buffer_pool.unpin_page(curr_page_id, false)?;
+                    break;
+                }
+                other => {
+                    buffer_pool.unpin_page(curr_page_id, false)?;
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_page_id} during delete traversal"
+                    )));
+                }
+            }
+        }
+
+        let target_leaf_id = curr_page_id;
+
+        // 2. Fetch and deserialize leaf
+        let mut leaf = {
+            let page = buffer_pool.fetch_page(target_leaf_id)?;
+            let l = match LeafNode::deserialize(page) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(target_leaf_id, false);
+                    return Err(e);
+                }
+            };
+            buffer_pool.unpin_page(target_leaf_id, false)?;
+            l
+        };
+
+        // 3. Search and remove key
+        let old_record_id = match leaf.remove(key) {
+            Some(rid) => rid,
+            None => return Ok(None),
+        };
+
+        // 4. Handle Root Leaf (path is empty)
+        if path.is_empty() {
+            if leaf.is_empty() {
+                // Leaf root is empty -> tree becomes empty
+                self.root_page_id = INVALID_PAGE_ID;
+                buffer_pool
+                    .page_manager_mut()
+                    .set_root_page_id(INVALID_PAGE_ID)?;
+            } else {
+                let page_mut = buffer_pool.fetch_page_mut(target_leaf_id)?;
+                leaf.serialize(page_mut)?;
+                buffer_pool.unpin_page(target_leaf_id, true)?;
+            }
+            return Ok(Some(old_record_id));
+        }
+
+        // 5. Leaf is not root -> Check underflow
+        if !leaf.is_underfull() {
+            let page_mut = buffer_pool.fetch_page_mut(target_leaf_id)?;
+            leaf.serialize(page_mut)?;
+            buffer_pool.unpin_page(target_leaf_id, true)?;
+            return Ok(Some(old_record_id));
+        }
+
+        // 6. Leaf underflowed! Rebalance with sibling
+        let parent_id = *path.last().unwrap();
+        let mut parent = {
+            let p = buffer_pool.fetch_page(parent_id)?;
+            let n = match InternalNode::deserialize(p) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(parent_id, false);
+                    return Err(e);
+                }
+            };
+            buffer_pool.unpin_page(parent_id, false)?;
+            n
+        };
+
+        let child_idx = parent
+            .children
+            .iter()
+            .position(|&c| c == target_leaf_id)
+            .ok_or_else(|| {
+                Error::TreeCorruption(format!(
+                    "parent {parent_id} does not contain child leaf {target_leaf_id}"
+                ))
+            })?;
+
+        // 6a. Try borrow from left sibling
+        if child_idx > 0 {
+            let left_sibling_id = parent.children[child_idx - 1];
+            let mut left_sibling = {
+                let p = buffer_pool.fetch_page(left_sibling_id)?;
+                let n = match LeafNode::deserialize(p) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = buffer_pool.unpin_page(left_sibling_id, false);
+                        return Err(e);
+                    }
+                };
+                buffer_pool.unpin_page(left_sibling_id, false)?;
+                n
+            };
+
+            if left_sibling.can_donate() {
+                let donated = left_sibling.entries.pop().unwrap();
+                leaf.entries.insert(0, donated);
+                parent.keys[child_idx - 1] = leaf.entries[0].0;
+
+                {
+                    let p = buffer_pool.fetch_page_mut(left_sibling_id)?;
+                    left_sibling.serialize(p)?;
+                }
+                buffer_pool.unpin_page(left_sibling_id, true)?;
+
+                {
+                    let p = buffer_pool.fetch_page_mut(target_leaf_id)?;
+                    leaf.serialize(p)?;
+                }
+                buffer_pool.unpin_page(target_leaf_id, true)?;
+
+                {
+                    let p = buffer_pool.fetch_page_mut(parent_id)?;
+                    parent.serialize(p)?;
+                }
+                buffer_pool.unpin_page(parent_id, true)?;
+
+                return Ok(Some(old_record_id));
+            }
+        }
+
+        // 6b. Try borrow from right sibling
+        if child_idx + 1 < parent.children.len() {
+            let right_sibling_id = parent.children[child_idx + 1];
+            let mut right_sibling = {
+                let p = buffer_pool.fetch_page(right_sibling_id)?;
+                let n = match LeafNode::deserialize(p) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = buffer_pool.unpin_page(right_sibling_id, false);
+                        return Err(e);
+                    }
+                };
+                buffer_pool.unpin_page(right_sibling_id, false)?;
+                n
+            };
+
+            if right_sibling.can_donate() {
+                let donated = right_sibling.entries.remove(0);
+                leaf.entries.push(donated);
+                parent.keys[child_idx] = right_sibling.entries[0].0;
+
+                {
+                    let p = buffer_pool.fetch_page_mut(right_sibling_id)?;
+                    right_sibling.serialize(p)?;
+                }
+                buffer_pool.unpin_page(right_sibling_id, true)?;
+
+                {
+                    let p = buffer_pool.fetch_page_mut(target_leaf_id)?;
+                    leaf.serialize(p)?;
+                }
+                buffer_pool.unpin_page(target_leaf_id, true)?;
+
+                {
+                    let p = buffer_pool.fetch_page_mut(parent_id)?;
+                    parent.serialize(p)?;
+                }
+                buffer_pool.unpin_page(parent_id, true)?;
+
+                return Ok(Some(old_record_id));
+            }
+        }
+
+        // 6c. Neither sibling can donate -> MERGE!
+        if child_idx > 0 {
+            // Merge target_leaf into left sibling
+            let left_sibling_id = parent.children[child_idx - 1];
+            let mut left_sibling = {
+                let p = buffer_pool.fetch_page(left_sibling_id)?;
+                let n = match LeafNode::deserialize(p) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = buffer_pool.unpin_page(left_sibling_id, false);
+                        return Err(e);
+                    }
+                };
+                buffer_pool.unpin_page(left_sibling_id, false)?;
+                n
+            };
+
+            left_sibling.entries.extend(leaf.entries);
+            left_sibling.next_leaf = leaf.next_leaf;
+
+            parent.keys.remove(child_idx - 1);
+            parent.children.remove(child_idx);
+
+            {
+                let p = buffer_pool.fetch_page_mut(left_sibling_id)?;
+                left_sibling.serialize(p)?;
+            }
+            buffer_pool.unpin_page(left_sibling_id, true)?;
+        } else {
+            // Merge right sibling into target_leaf
+            let right_sibling_id = parent.children[1];
+            let right_sibling = {
+                let p = buffer_pool.fetch_page(right_sibling_id)?;
+                let n = match LeafNode::deserialize(p) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = buffer_pool.unpin_page(right_sibling_id, false);
+                        return Err(e);
+                    }
+                };
+                buffer_pool.unpin_page(right_sibling_id, false)?;
+                n
+            };
+
+            leaf.entries.extend(right_sibling.entries);
+            leaf.next_leaf = right_sibling.next_leaf;
+
+            parent.keys.remove(0);
+            parent.children.remove(1);
+
+            {
+                let p = buffer_pool.fetch_page_mut(target_leaf_id)?;
+                leaf.serialize(p)?;
+            }
+            buffer_pool.unpin_page(target_leaf_id, true)?;
+        }
+
+        // Serialize parent
+        {
+            let p = buffer_pool.fetch_page_mut(parent_id)?;
+            parent.serialize(p)?;
+        }
+        buffer_pool.unpin_page(parent_id, true)?;
+
+        // 7. Recursively rebalance internal ancestors
+        self.rebalance_internal_path(buffer_pool, path)?;
+
+        Ok(Some(old_record_id))
+    }
+
+    /// Recursively rebalances internal nodes along the path from parent toward the root.
+    fn rebalance_internal_path(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        mut path: Vec<PageId>,
+    ) -> Result<()> {
+        while let Some(curr_id) = path.pop() {
+            if curr_id == self.root_page_id {
+                // Root is an internal node. Check for root collapse:
+                let root_node = {
+                    let page = buffer_pool.fetch_page(curr_id)?;
+                    let node = match InternalNode::deserialize(page) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(curr_id, false);
+                            return Err(e);
+                        }
+                    };
+                    buffer_pool.unpin_page(curr_id, false)?;
+                    node
+                };
+
+                if root_node.keys.is_empty() {
+                    // Internal root has 0 keys and 1 child -> collapse root!
+                    let new_root_id = root_node.children[0];
+                    self.root_page_id = new_root_id;
+                    buffer_pool
+                        .page_manager_mut()
+                        .set_root_page_id(new_root_id)?;
+                }
+                return Ok(());
+            }
+
+            let mut curr_node = {
+                let page = buffer_pool.fetch_page(curr_id)?;
+                let node = match InternalNode::deserialize(page) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = buffer_pool.unpin_page(curr_id, false);
+                        return Err(e);
+                    }
+                };
+                buffer_pool.unpin_page(curr_id, false)?;
+                node
+            };
+
+            if !curr_node.is_underfull() {
+                // Node meets minimum occupancy -> rebalancing complete!
+                return Ok(());
+            }
+
+            // Node is underfull! Fetch grandparent to access siblings
+            let grandparent_id = *path.last().unwrap();
+            let mut grandparent = {
+                let page = buffer_pool.fetch_page(grandparent_id)?;
+                let node = match InternalNode::deserialize(page) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = buffer_pool.unpin_page(grandparent_id, false);
+                        return Err(e);
+                    }
+                };
+                buffer_pool.unpin_page(grandparent_id, false)?;
+                node
+            };
+
+            let p_idx = grandparent
+                .children
+                .iter()
+                .position(|&c| c == curr_id)
+                .ok_or_else(|| {
+                    Error::TreeCorruption(format!(
+                        "grandparent {grandparent_id} does not contain child internal node {curr_id}"
+                    ))
+                })?;
+
+            // Try borrow from left internal sibling
+            if p_idx > 0 {
+                let left_sibling_id = grandparent.children[p_idx - 1];
+                let mut left_sibling = {
+                    let page = buffer_pool.fetch_page(left_sibling_id)?;
+                    let node = match InternalNode::deserialize(page) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(left_sibling_id, false);
+                            return Err(e);
+                        }
+                    };
+                    buffer_pool.unpin_page(left_sibling_id, false)?;
+                    node
+                };
+
+                if left_sibling.can_donate() {
+                    let demoted_key = grandparent.keys[p_idx - 1];
+                    let donated_child = left_sibling.children.pop().unwrap();
+                    let donated_key = left_sibling.keys.pop().unwrap();
+
+                    grandparent.keys[p_idx - 1] = donated_key;
+                    curr_node.keys.insert(0, demoted_key);
+                    curr_node.children.insert(0, donated_child);
+
+                    {
+                        let p = buffer_pool.fetch_page_mut(left_sibling_id)?;
+                        left_sibling.serialize(p)?;
+                    }
+                    buffer_pool.unpin_page(left_sibling_id, true)?;
+
+                    {
+                        let p = buffer_pool.fetch_page_mut(curr_id)?;
+                        curr_node.serialize(p)?;
+                    }
+                    buffer_pool.unpin_page(curr_id, true)?;
+
+                    {
+                        let p = buffer_pool.fetch_page_mut(grandparent_id)?;
+                        grandparent.serialize(p)?;
+                    }
+                    buffer_pool.unpin_page(grandparent_id, true)?;
+
+                    return Ok(());
+                }
+            }
+
+            // Try borrow from right internal sibling
+            if p_idx + 1 < grandparent.children.len() {
+                let right_sibling_id = grandparent.children[p_idx + 1];
+                let mut right_sibling = {
+                    let page = buffer_pool.fetch_page(right_sibling_id)?;
+                    let node = match InternalNode::deserialize(page) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(right_sibling_id, false);
+                            return Err(e);
+                        }
+                    };
+                    buffer_pool.unpin_page(right_sibling_id, false)?;
+                    node
+                };
+
+                if right_sibling.can_donate() {
+                    let demoted_key = grandparent.keys[p_idx];
+                    let donated_child = right_sibling.children.remove(0);
+                    let donated_key = right_sibling.keys.remove(0);
+
+                    grandparent.keys[p_idx] = donated_key;
+                    curr_node.keys.push(demoted_key);
+                    curr_node.children.push(donated_child);
+
+                    {
+                        let p = buffer_pool.fetch_page_mut(right_sibling_id)?;
+                        right_sibling.serialize(p)?;
+                    }
+                    buffer_pool.unpin_page(right_sibling_id, true)?;
+
+                    {
+                        let p = buffer_pool.fetch_page_mut(curr_id)?;
+                        curr_node.serialize(p)?;
+                    }
+                    buffer_pool.unpin_page(curr_id, true)?;
+
+                    {
+                        let p = buffer_pool.fetch_page_mut(grandparent_id)?;
+                        grandparent.serialize(p)?;
+                    }
+                    buffer_pool.unpin_page(grandparent_id, true)?;
+
+                    return Ok(());
+                }
+            }
+
+            // Neither sibling can donate -> MERGE Internal Nodes!
+            if p_idx > 0 {
+                // Merge curr_node into left sibling
+                let left_sibling_id = grandparent.children[p_idx - 1];
+                let mut left_sibling = {
+                    let page = buffer_pool.fetch_page(left_sibling_id)?;
+                    let node = match InternalNode::deserialize(page) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(left_sibling_id, false);
+                            return Err(e);
+                        }
+                    };
+                    buffer_pool.unpin_page(left_sibling_id, false)?;
+                    node
+                };
+
+                let demoted_sep = grandparent.keys.remove(p_idx - 1);
+                grandparent.children.remove(p_idx);
+
+                left_sibling.keys.push(demoted_sep);
+                left_sibling.keys.extend(curr_node.keys);
+                left_sibling.children.extend(curr_node.children);
+
+                {
+                    let p = buffer_pool.fetch_page_mut(left_sibling_id)?;
+                    left_sibling.serialize(p)?;
+                }
+                buffer_pool.unpin_page(left_sibling_id, true)?;
+            } else {
+                // Merge right sibling into curr_node
+                let right_sibling_id = grandparent.children[1];
+                let right_sibling = {
+                    let page = buffer_pool.fetch_page(right_sibling_id)?;
+                    let node = match InternalNode::deserialize(page) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(right_sibling_id, false);
+                            return Err(e);
+                        }
+                    };
+                    buffer_pool.unpin_page(right_sibling_id, false)?;
+                    node
+                };
+
+                let demoted_sep = grandparent.keys.remove(0);
+                grandparent.children.remove(1);
+
+                curr_node.keys.push(demoted_sep);
+                curr_node.keys.extend(right_sibling.keys);
+                curr_node.children.extend(right_sibling.children);
+
+                {
+                    let p = buffer_pool.fetch_page_mut(curr_id)?;
+                    curr_node.serialize(p)?;
+                }
+                buffer_pool.unpin_page(curr_id, true)?;
+            }
+
+            // Save updated grandparent
+            {
+                let p = buffer_pool.fetch_page_mut(grandparent_id)?;
+                grandparent.serialize(p)?;
+            }
+            buffer_pool.unpin_page(grandparent_id, true)?;
+        }
+
+        // Finally check root collapse if root was modified
+        if self.root_page_id != INVALID_PAGE_ID {
+            let page = buffer_pool.fetch_page(self.root_page_id)?;
+            if page.page_type() == PageType::Internal {
+                let root_node = match InternalNode::deserialize(page) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = buffer_pool.unpin_page(self.root_page_id, false);
+                        return Err(e);
+                    }
+                };
+                buffer_pool.unpin_page(self.root_page_id, false)?;
+
+                if root_node.keys.is_empty() {
+                    let new_root = root_node.children[0];
+                    self.root_page_id = new_root;
+                    buffer_pool.page_manager_mut().set_root_page_id(new_root)?;
+                }
+            } else {
+                buffer_pool.unpin_page(self.root_page_id, false)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Performs an ordered range scan over keys in `[start, end)`.
+    ///
+    /// # Range Semantics
+    /// * `start`: Inclusive lower bound, or `None` to start from the minimum key in the tree.
+    /// * `end`: Exclusive upper bound, or `None` to scan up to the maximum key in the tree.
+    /// * If `start >= end` (when both are `Some`), returns an empty `Vec`.
+    /// * Sequentially traverses leaf nodes using their `next_leaf` sibling pointers.
+    ///
+    /// # Pinning Discipline
+    /// Guarantees that each leaf page is promptly unpinned before advancing to `next_leaf`
+    /// or returning, holding zero Buffer Pool pins on exit.
+    pub fn scan(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<Key>,
+        end: Option<Key>,
+    ) -> Result<Vec<(Key, RecordId)>> {
+        if self.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if let (Some(s), Some(e)) = (start, end) {
+            if s >= e {
+                return Ok(Vec::new());
+            }
+        }
+
+        // Find the starting leaf page and entry offset
+        let (mut curr_leaf_id, mut start_idx) = match start {
+            Some(start_key) => {
+                let mut curr_page_id = self.root_page_id;
+                loop {
+                    let page = buffer_pool.fetch_page(curr_page_id)?;
+                    match page.page_type() {
+                        PageType::Internal => {
+                            let internal = match InternalNode::deserialize(page) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    let _ = buffer_pool.unpin_page(curr_page_id, false);
+                                    return Err(e);
+                                }
+                            };
+                            let next_id = internal.find_child(start_key);
+                            buffer_pool.unpin_page(curr_page_id, false)?;
+                            curr_page_id = next_id;
+                        }
+                        PageType::Leaf => {
+                            let leaf = match LeafNode::deserialize(page) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let _ = buffer_pool.unpin_page(curr_page_id, false);
+                                    return Err(e);
+                                }
+                            };
+                            buffer_pool.unpin_page(curr_page_id, false)?;
+                            let idx =
+                                match leaf.entries.binary_search_by_key(&start_key, |&(k, _)| k) {
+                                    Ok(i) => i,
+                                    Err(i) => i,
+                                };
+                            break (curr_page_id, idx);
+                        }
+                        other => {
+                            let _ = buffer_pool.unpin_page(curr_page_id, false);
+                            return Err(Error::TreeCorruption(format!(
+                                "unexpected page type {other:?} at page {curr_page_id} during scan traversal"
+                            )));
+                        }
+                    }
+                }
+            }
+            None => (self.find_leftmost_leaf(buffer_pool)?, 0),
+        };
+
+        let mut results = Vec::new();
+
+        while curr_leaf_id != INVALID_PAGE_ID {
+            let page = buffer_pool.fetch_page(curr_leaf_id)?;
+            let leaf = match LeafNode::deserialize(page) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(curr_leaf_id, false);
+                    return Err(e);
+                }
+            };
+
+            for &(k, rid) in &leaf.entries[start_idx..] {
+                if let Some(end_key) = end {
+                    if k >= end_key {
+                        buffer_pool.unpin_page(curr_leaf_id, false)?;
+                        return Ok(results);
+                    }
+                }
+                results.push((k, rid));
+            }
+
+            let next_leaf = leaf.next_leaf;
+            buffer_pool.unpin_page(curr_leaf_id, false)?;
+            curr_leaf_id = next_leaf;
+            start_idx = 0;
+        }
+
+        Ok(results)
+    }
+
     /// Recursively validates all structural invariants of the B+ Tree on disk.
     ///
     /// Verifies:
@@ -316,6 +966,7 @@ impl BPlusTree {
     /// 3. All internal nodes satisfy `children.len() == keys.len() + 1`.
     /// 4. Routing boundaries match key ranges recursively.
     /// 5. Leaf sibling chain (`next_leaf`) is sorted and contains all leaves exactly once without cycles.
+    /// 6. Non-root nodes respect minimum occupancy invariants.
     pub fn validate_tree(&self, buffer_pool: &mut BufferPool) -> Result<()> {
         if self.is_empty() {
             return Ok(());
@@ -456,6 +1107,14 @@ impl BPlusTree {
                     *expected_leaf_depth = Some(depth);
                 }
 
+                // Check minimum occupancy for non-root leaf nodes
+                if depth > 0 && leaf.is_underfull() {
+                    return Err(Error::TreeCorruption(format!(
+                        "non-root leaf node {page_id} is underfull with {} entries",
+                        leaf.entries.len()
+                    )));
+                }
+
                 // Check bounds against parent separators
                 for &(k, _) in &leaf.entries {
                     if let Some(lb) = lower_bound {
@@ -485,6 +1144,21 @@ impl BPlusTree {
                     }
                 };
                 buffer_pool.unpin_page(page_id, false)?;
+
+                // Check minimum occupancy for non-root internal nodes
+                if depth > 0 && internal.is_underfull() {
+                    return Err(Error::TreeCorruption(format!(
+                        "non-root internal node {page_id} is underfull with {} keys",
+                        internal.keys.len()
+                    )));
+                }
+
+                // Check root internal node has >= 1 key
+                if depth == 0 && internal.keys.is_empty() {
+                    return Err(Error::TreeCorruption(format!(
+                        "root internal node {page_id} has 0 keys"
+                    )));
+                }
 
                 // Recursively validate each child branch with updated bounds
                 for i in 0..internal.children.len() {

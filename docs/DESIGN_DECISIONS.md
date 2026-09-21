@@ -81,3 +81,31 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * Keeps the B+ Tree index decoupled from variable-sized record/tuple payloads.
   * Enables high-performance binary search routing without page table thrashing.
+
+---
+
+## Decision 9: Minimum Occupancy & Sibling Redistribution Policies
+
+* **Decision:** Define minimum occupancy as `LEAF_MIN_ENTRIES = LEAF_MAX_ENTRIES / 2` (127) and `INTERNAL_MIN_KEYS = INTERNAL_MAX_KEYS / 2` (170). When underflow occurs, borrowing from the left sibling is preferred first, then right sibling, before merging.
+* **Rationale:**
+  * Strict mathematical derivation from page capacity ensures two underfull nodes can always merge into a single page without exceeding maximum capacity (`126 + 127 = 253 <= 255`).
+  * Preferring borrowing over merging minimizes structural tree mutations and page allocations.
+  * Deterministic sibling evaluation order guarantees reproducible tree states.
+
+---
+
+## Decision 10: Range Scan API and Leaf Chaining
+
+* **Decision:** Implement `scan(&self, buffer_pool, start, end) -> Result<Vec<(Key, RecordId)>>` with `[start, end)` inclusive/exclusive bounds.
+* **Rationale:**
+  * Traverses root-to-leaf once to find the lower bound, then sequentially follows `LeafNode.next_leaf` sibling pointers without re-traversing the tree from the root for every key.
+  * Yields zero pin leaks by unpinning each leaf frame immediately after copying qualifying records.
+
+---
+
+## Decision 11: Orphaned Page Handling on Merges (No Free-Page Reclamation Yet)
+
+* **Decision:** Pages made unreachable by B+ Tree merges remain orphaned in the database file and are not immediately reclaimed.
+* **Rationale:**
+  * TreeDB currently uses an append-only page manager. Introducing free-page recycling or freelist bitmaps belongs to a future dedicated storage-management phase.
+  * Explicitly documenting this limitation maintains single-responsibility boundaries for Phase 5.

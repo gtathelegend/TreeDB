@@ -1,7 +1,8 @@
 use crate::error::{Error, Result};
 use crate::index::node::RecordId;
 use crate::index::node::{
-    INVALID_PAGE_ID, LEAF_ENTRY_SIZE, LEAF_HEADER_SIZE, LEAF_MAX_ENTRIES, RECORD_ID_SIZE,
+    INVALID_PAGE_ID, LEAF_ENTRY_SIZE, LEAF_HEADER_SIZE, LEAF_MAX_ENTRIES, LEAF_MIN_ENTRIES,
+    RECORD_ID_SIZE,
 };
 use crate::storage::page::{Key, Page, PageId, PageType};
 
@@ -50,6 +51,14 @@ impl LeafNode {
         }
     }
 
+    /// Removes a key from the leaf node if present, returning the associated `RecordId`.
+    pub fn remove(&mut self, key: Key) -> Option<RecordId> {
+        match self.entries.binary_search_by_key(&key, |&(k, _)| k) {
+            Ok(idx) => Some(self.entries.remove(idx).1),
+            Err(_) => None,
+        }
+    }
+
     /// Returns the number of entries currently stored in the leaf.
     pub fn key_count(&self) -> usize {
         self.entries.len()
@@ -63,6 +72,16 @@ impl LeafNode {
     /// Returns true if the leaf has reached its maximum entry capacity.
     pub fn is_full(&self) -> bool {
         self.entries.len() >= LEAF_MAX_ENTRIES
+    }
+
+    /// Returns true if the leaf has fewer entries than the minimum occupancy requirement.
+    pub fn is_underfull(&self) -> bool {
+        self.entries.len() < LEAF_MIN_ENTRIES
+    }
+
+    /// Returns true if the leaf has more entries than the minimum occupancy and can donate an entry.
+    pub fn can_donate(&self) -> bool {
+        self.entries.len() > LEAF_MIN_ENTRIES
     }
 
     /// Inserts a `(Key, RecordId)` entry into a non-full leaf node in sorted order.
@@ -297,5 +316,33 @@ mod tests {
         leaf.entries.push((9999, RecordId::new(2, 9999)));
         let err = leaf.serialize(&mut page).unwrap_err();
         assert!(matches!(err, Error::ValueTooLarge { .. }));
+    }
+
+    #[test]
+    fn test_leaf_remove_and_underflow() {
+        let mut leaf = LeafNode::new();
+        for i in 0..=LEAF_MIN_ENTRIES {
+            leaf.entries
+                .push((i as u64 * 10, RecordId::new(1, i as u32)));
+        }
+        assert!(!leaf.is_underfull());
+        assert!(leaf.can_donate());
+
+        // Remove non-existent key
+        assert_eq!(leaf.remove(9999), None);
+        assert!(!leaf.is_underfull());
+        assert!(leaf.can_donate());
+
+        // Remove 1 key -> now exactly LEAF_MIN_ENTRIES
+        assert_eq!(leaf.remove(0), Some(RecordId::new(1, 0)));
+        assert_eq!(leaf.key_count(), LEAF_MIN_ENTRIES);
+        assert!(!leaf.is_underfull());
+        assert!(!leaf.can_donate());
+
+        // Remove 1 more key -> underflow
+        assert_eq!(leaf.remove(10), Some(RecordId::new(1, 1)));
+        assert_eq!(leaf.key_count(), LEAF_MIN_ENTRIES - 1);
+        assert!(leaf.is_underfull());
+        assert!(!leaf.can_donate());
     }
 }

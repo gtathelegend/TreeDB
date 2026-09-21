@@ -15,7 +15,7 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
                                v
 +-------------------------------------------------------------+
 |              B+ Tree Index Engine (Implemented)             |
-|     (Leaf / Internal Nodes, Binary Search, Point Lookup)    |
+|  (Search, Insert, Delete, Rebalance, Collapse, Range Scan)  |
 +-------------------------------------------------------------+
                                |
                                v
@@ -48,11 +48,14 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
 ## 1. Index Layer (`src/index`)
 
 ### `BPlusTree`
-* **Role:** Read-only point lookup and root page coordinator.
+* **Role:** Persistent B+ Tree coordinator managing index operations through the `BufferPool`.
 * **Responsibilities:**
-  * Root navigation down to leaf level via `BufferPool`.
-  * Safe unpinning of all visited internal and leaf nodes.
-  * Empty-tree handling (`root_page_id == INVALID_PAGE_ID`).
+  * Point lookup (`get`) via root-to-leaf binary search traversal.
+  * Dynamic insertion (`insert`) with leaf and internal splits, separator propagation, and root elevation.
+  * Dynamic deletion (`delete`) with leaf/internal underflow rebalancing, sibling redistribution, merging, and root collapse.
+  * Ordered sequential range scanning (`scan`) utilizing leaf `next_leaf` chains.
+  * Safe, leak-free unpinning of all visited pages across every operation path.
+  * Empty-tree state handling (`root_page_id == INVALID_PAGE_ID`).
 
 ### `InternalNode` & `LeafNode`
 * **Role:** In-memory structured representation of interior routing and leaf data pages.
