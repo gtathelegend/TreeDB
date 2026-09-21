@@ -1,0 +1,400 @@
+use std::collections::HashMap;
+
+use crate::error::{Error, Result};
+use crate::storage::page::{Page, PageId, PageType};
+use crate::storage::page_manager::PageManager;
+
+/// Frame identifier within the buffer pool.
+pub type FrameId = usize;
+
+/// Internal representation of a single frame in the buffer pool.
+#[derive(Debug)]
+struct Frame {
+    page_id: Option<PageId>,
+    page: Option<Page>,
+    pin_count: u32,
+    dirty: bool,
+    last_accessed: u64,
+}
+
+impl Frame {
+    fn empty() -> Self {
+        Self {
+            page_id: None,
+            page: None,
+            pin_count: 0,
+            dirty: false,
+            last_accessed: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.page_id.is_none()
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.pin_count > 0
+    }
+}
+
+/// Runtime statistics and metrics for the Buffer Pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BufferPoolStats {
+    /// Maximum number of page frames held in memory.
+    pub capacity: usize,
+    /// Total number of page fetch requests served from memory.
+    pub hits: u64,
+    /// Total number of page fetch requests that required reading from disk.
+    pub misses: u64,
+    /// Total number of page evictions performed.
+    pub evictions: u64,
+    /// Total number of dirty pages written to disk due to eviction or explicit flushes.
+    pub dirty_flushes: u64,
+    /// Number of resident pages currently marked as dirty.
+    pub current_dirty_pages: usize,
+}
+
+impl BufferPoolStats {
+    /// Calculates cache hit rate as a fraction between 0.0 and 1.0.
+    /// Returns 0.0 if there have been zero total page accesses.
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
+/// Buffer Pool Manager caching disk pages in a bounded number of memory frames.
+///
+/// Operates between higher-level storage components (such as B+ Trees) and the
+/// physical `PageManager`, handling page fetching, pinning, dirty tracking,
+/// and LRU-style eviction.
+#[derive(Debug)]
+pub struct BufferPool {
+    capacity: usize,
+    frames: Vec<Frame>,
+    page_table: HashMap<PageId, FrameId>,
+    page_manager: PageManager,
+    access_counter: u64,
+    stats: BufferPoolStats,
+}
+
+impl BufferPool {
+    /// Creates a new `BufferPool` with a fixed frame capacity over the given `PageManager`.
+    ///
+    /// # Errors
+    /// Returns `Error::InvalidCapacity` if `capacity == 0`.
+    pub fn new(capacity: usize, page_manager: PageManager) -> Result<Self> {
+        if capacity == 0 {
+            return Err(Error::InvalidCapacity(0));
+        }
+
+        let mut frames = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            frames.push(Frame::empty());
+        }
+
+        Ok(Self {
+            capacity,
+            frames,
+            page_table: HashMap::with_capacity(capacity),
+            page_manager,
+            access_counter: 0,
+            stats: BufferPoolStats {
+                capacity,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Fetches a page by ID into the buffer pool and pins it for immutable reading.
+    ///
+    /// Increments the page's pin count and updates its LRU access timestamp.
+    /// The caller must eventually call `unpin_page(page_id, false)` when done.
+    pub fn fetch_page(&mut self, page_id: PageId) -> Result<&Page> {
+        let frame_id = self.fetch_frame_internal(page_id, false)?;
+        Ok(self.frames[frame_id].page.as_ref().unwrap())
+    }
+
+    /// Fetches a page by ID into the buffer pool, marks it dirty, and pins it for mutable writing.
+    ///
+    /// Increments the page's pin count, marks the frame dirty, and updates its LRU timestamp.
+    /// The caller must eventually call `unpin_page(page_id, true)` when done.
+    pub fn fetch_page_mut(&mut self, page_id: PageId) -> Result<&mut Page> {
+        let frame_id = self.fetch_frame_internal(page_id, true)?;
+        Ok(self.frames[frame_id].page.as_mut().unwrap())
+    }
+
+    /// Unpins a resident page, decrementing its pin count.
+    ///
+    /// If `dirty` is true, the frame is marked as dirty. If `dirty` is false,
+    /// an already-dirty page remains dirty.
+    ///
+    /// # Errors
+    /// * `Error::PageNotResident` if the page is not in the buffer pool.
+    /// * `Error::PinCountUnderflow` if the page was already at pin count 0.
+    pub fn unpin_page(&mut self, page_id: PageId, dirty: bool) -> Result<()> {
+        let frame_id = self
+            .page_table
+            .get(&page_id)
+            .copied()
+            .ok_or(Error::PageNotResident(page_id))?;
+
+        let frame = &mut self.frames[frame_id];
+        if frame.pin_count == 0 {
+            return Err(Error::PinCountUnderflow(page_id));
+        }
+
+        if dirty {
+            frame.dirty = true;
+        }
+
+        frame.pin_count -= 1;
+        Ok(())
+    }
+
+    /// Gets an immutable reference to a currently resident page without changing pin count.
+    pub fn get_page(&self, page_id: PageId) -> Result<&Page> {
+        let frame_id = self
+            .page_table
+            .get(&page_id)
+            .copied()
+            .ok_or(Error::PageNotResident(page_id))?;
+
+        Ok(self.frames[frame_id].page.as_ref().unwrap())
+    }
+
+    /// Gets a mutable reference to a currently resident page without changing pin count,
+    /// marking the frame as dirty.
+    pub fn get_page_mut(&mut self, page_id: PageId) -> Result<&mut Page> {
+        let frame_id = self
+            .page_table
+            .get(&page_id)
+            .copied()
+            .ok_or(Error::PageNotResident(page_id))?;
+
+        let frame = &mut self.frames[frame_id];
+        frame.dirty = true;
+        Ok(frame.page.as_mut().unwrap())
+    }
+
+    /// Flushes an individual dirty page to disk if resident.
+    ///
+    /// If the page is clean, this is a no-op and returns `Ok(())`.
+    ///
+    /// # Errors
+    /// Returns `Error::PageNotResident` if the page is not in the buffer pool.
+    pub fn flush_page(&mut self, page_id: PageId) -> Result<()> {
+        let frame_id = self
+            .page_table
+            .get(&page_id)
+            .copied()
+            .ok_or(Error::PageNotResident(page_id))?;
+
+        let frame = &mut self.frames[frame_id];
+        if frame.dirty {
+            if let Some(ref page) = frame.page {
+                self.page_manager.write_page(page)?;
+                self.stats.dirty_flushes += 1;
+                frame.dirty = false;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Flushes all resident dirty pages to disk through the `PageManager`.
+    pub fn flush_all(&mut self) -> Result<()> {
+        for frame in &mut self.frames {
+            if frame.dirty {
+                if let Some(ref page) = frame.page {
+                    self.page_manager.write_page(page)?;
+                    self.stats.dirty_flushes += 1;
+                    frame.dirty = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Flushes all dirty pages and synchronizes the underlying database file.
+    pub fn sync(&mut self) -> Result<()> {
+        self.flush_all()?;
+        self.page_manager.sync()?;
+        Ok(())
+    }
+
+    /// Allocates a new page on disk via `PageManager` and installs it in the buffer pool with pin_count = 1.
+    pub fn allocate_page(&mut self, page_type: PageType) -> Result<PageId> {
+        // Ensure a frame is available or can be evicted before allocating on disk.
+        let frame_id = self.find_or_evict_frame()?;
+
+        let new_page_id = self.page_manager.allocate_page()?;
+        let mut new_page = Page::new(new_page_id, page_type);
+        new_page.set_page_type(page_type);
+
+        self.access_counter += 1;
+        let frame = &mut self.frames[frame_id];
+        frame.page_id = Some(new_page_id);
+        frame.page = Some(new_page);
+        frame.pin_count = 1;
+        frame.dirty = true;
+        frame.last_accessed = self.access_counter;
+
+        self.page_table.insert(new_page_id, frame_id);
+
+        Ok(new_page_id)
+    }
+
+    /// Returns whether a page is currently resident in memory.
+    pub fn is_resident(&self, page_id: PageId) -> bool {
+        self.page_table.contains_key(&page_id)
+    }
+
+    /// Returns whether a resident page is currently pinned.
+    pub fn is_pinned(&self, page_id: PageId) -> Result<bool> {
+        let frame_id = self
+            .page_table
+            .get(&page_id)
+            .copied()
+            .ok_or(Error::PageNotResident(page_id))?;
+        Ok(self.frames[frame_id].is_pinned())
+    }
+
+    /// Returns the active pin count of a resident page.
+    pub fn pin_count(&self, page_id: PageId) -> Result<u32> {
+        let frame_id = self
+            .page_table
+            .get(&page_id)
+            .copied()
+            .ok_or(Error::PageNotResident(page_id))?;
+        Ok(self.frames[frame_id].pin_count)
+    }
+
+    /// Returns whether a resident page is marked dirty.
+    pub fn is_dirty(&self, page_id: PageId) -> Result<bool> {
+        let frame_id = self
+            .page_table
+            .get(&page_id)
+            .copied()
+            .ok_or(Error::PageNotResident(page_id))?;
+        Ok(self.frames[frame_id].dirty)
+    }
+
+    /// Returns current Buffer Pool statistics.
+    pub fn stats(&self) -> BufferPoolStats {
+        let current_dirty_pages = self.frames.iter().filter(|f| f.dirty).count();
+        BufferPoolStats {
+            current_dirty_pages,
+            ..self.stats
+        }
+    }
+
+    /// Returns the capacity of the buffer pool.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns total number of database pages on disk.
+    pub fn page_count(&self) -> u32 {
+        self.page_manager.page_count()
+    }
+
+    /// Returns a reference to the underlying `PageManager`.
+    pub fn page_manager(&self) -> &PageManager {
+        &self.page_manager
+    }
+
+    /// Returns a mutable reference to the underlying `PageManager`.
+    pub fn page_manager_mut(&mut self) -> &mut PageManager {
+        &mut self.page_manager
+    }
+
+    // --- Internal Helpers ---
+
+    /// Internal routine to fetch/load a frame and update access metadata.
+    fn fetch_frame_internal(&mut self, page_id: PageId, mark_dirty: bool) -> Result<FrameId> {
+        if page_id >= self.page_manager.page_count() {
+            return Err(Error::InvalidPage(page_id));
+        }
+
+        self.access_counter += 1;
+
+        // Case 1: Cache Hit
+        if let Some(&frame_id) = self.page_table.get(&page_id) {
+            self.stats.hits += 1;
+            let frame = &mut self.frames[frame_id];
+            frame.pin_count += 1;
+            frame.last_accessed = self.access_counter;
+            if mark_dirty {
+                frame.dirty = true;
+            }
+            return Ok(frame_id);
+        }
+
+        // Case 2: Cache Miss
+        self.stats.misses += 1;
+        let frame_id = self.find_or_evict_frame()?;
+
+        // Read page from disk
+        let page = self.page_manager.read_page(page_id)?;
+
+        let frame = &mut self.frames[frame_id];
+        frame.page_id = Some(page_id);
+        frame.page = Some(page);
+        frame.pin_count = 1;
+        frame.dirty = mark_dirty;
+        frame.last_accessed = self.access_counter;
+
+        self.page_table.insert(page_id, frame_id);
+
+        Ok(frame_id)
+    }
+
+    /// Finds an empty frame or selects and evicts an unpinned victim frame using LRU.
+    fn find_or_evict_frame(&mut self) -> Result<FrameId> {
+        // 1. Check for an empty frame slot
+        for (idx, frame) in self.frames.iter().enumerate() {
+            if frame.is_empty() {
+                return Ok(idx);
+            }
+        }
+
+        // 2. Find unpinned frame with smallest last_accessed timestamp (LRU)
+        let mut victim_frame_id: Option<FrameId> = None;
+        let mut oldest_access = u64::MAX;
+
+        for (idx, frame) in self.frames.iter().enumerate() {
+            if !frame.is_pinned() && frame.last_accessed < oldest_access {
+                oldest_access = frame.last_accessed;
+                victim_frame_id = Some(idx);
+            }
+        }
+
+        let victim_id = victim_frame_id.ok_or(Error::NoEvictablePage)?;
+
+        // 3. If victim is dirty, flush it to disk first
+        let victim_frame = &mut self.frames[victim_id];
+        if victim_frame.dirty {
+            if let Some(ref page) = victim_frame.page {
+                self.page_manager.write_page(page)?;
+                self.stats.dirty_flushes += 1;
+                victim_frame.dirty = false;
+            }
+        }
+
+        // 4. Remove victim page from page table
+        if let Some(old_page_id) = victim_frame.page_id.take() {
+            self.page_table.remove(&old_page_id);
+            self.stats.evictions += 1;
+        }
+        victim_frame.page = None;
+        victim_frame.pin_count = 0;
+        victim_frame.dirty = false;
+
+        Ok(victim_id)
+    }
+}

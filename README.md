@@ -23,7 +23,7 @@ Application / CLI
    Record Store (Planned)
         │
         ▼
-   Buffer Pool (Planned)
+   Buffer Pool (Implemented)
         │
         ▼
    Page Manager (Implemented)
@@ -41,7 +41,7 @@ Application / CLI
 | **Database File & Header** | **Implemented** | 4096-byte pages, format verification, magic bytes `TREEDB01` |
 | **Page Manager** | **Implemented** | Page allocation, random-access I/O, file synchronization |
 | **Page Abstraction** | **Implemented** | Deterministic binary layout, header tags, structural validation |
-| **Buffer Pool Manager** | *Planned* | LRU/Clock eviction, frame table, pin/unpin tracking |
+| **Buffer Pool Manager** | **Implemented** | LRU eviction, frame table, pin/unpin tracking, dirty flush |
 | **Record Store** | *Planned* | Slotted-page tuple format, variable-length records |
 | **B+ Tree Index** | *Planned* | Node splitting, key-value lookup, range scan iterators |
 | **Write-Ahead Logging** | *Experimental* | WAL frame serialization, crash recovery (future phase) |
@@ -87,6 +87,7 @@ cargo run --bin treedb -- info test.treedb
 ## Documentation
 
 * [Architecture Overview](docs/ARCHITECTURE.md)
+* [Buffer Pool Manager](docs/BUFFER_POOL.md)
 * [On-Disk Storage Format](docs/STORAGE_FORMAT.md)
 * [Design Decisions](docs/DESIGN_DECISIONS.md)
 * [Project Roadmap](docs/ROADMAP.md)

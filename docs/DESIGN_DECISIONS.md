@@ -51,3 +51,14 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * Enables callers and higher-level layers to programmatically inspect and handle specific database faults.
   * Avoids loss of context or brittle string matching.
+
+---
+
+## Decision 6: Safe Pinning & Single-Threaded Buffer Pool Ownership
+
+* **Decision:** Implement `BufferPool` with an explicit `fetch_page` / `unpin_page` / `get_page` lifecycle using 100% safe Rust (no `unsafe`, `Mutex`, or `RefCell`).
+* **Rationale:**
+  * By tracking logical monotonic timestamps on each frame access, LRU eviction is fully deterministic.
+  * Clear pin count tracking prevents eviction of actively used frames while avoiding borrow-checker deadlocks.
+  * Dirty page state is sticky: clean unpins cannot accidentally clear an already-dirty page.
+  * Isolates disk writes exclusively to dirty evictions and explicit flush calls.

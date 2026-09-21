@@ -26,7 +26,7 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
                                |
                                v
 +-------------------------------------------------------------+
-|                Buffer Pool Manager (Planned)                |
+|              Buffer Pool Manager (Implemented)              |
 |             (Page Cache, Pinning, LRU Eviction)             |
 +-------------------------------------------------------------+
                                |
@@ -46,6 +46,15 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
 ---
 
 ## 1. Storage Layer (`src/storage`)
+
+### `BufferPool`
+* **Role:** In-memory caching engine maintaining a fixed number of page frames.
+* **Responsibilities:**
+  * Fast cache hit lookup via `PageId -> FrameId` page table.
+  * Pin count management preventing eviction of actively referenced pages.
+  * Dirty page tracking ensuring all modifications are written back before frame reuse.
+  * Deterministic Least Recently Used (LRU) replacement policy.
+  * Tracking hit/miss/eviction/flush statistics and hit rate.
 
 ### `PageManager`
 * **Role:** Manages reading and writing fixed-size (4096-byte) blocks to and from disk.
@@ -77,6 +86,9 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
 
 ## 2. Layer Invariants
 
-* **No Layer Skipping:** Higher-level structures (such as future B+ Trees) must never perform raw file operations or compute physical byte offsets. All page reads and allocations pass through the lower storage management layers.
+* **No Layer Skipping:** Higher-level structures (such as future B+ Trees) must interact exclusively through the `BufferPool` and never perform raw disk I/O directly.
+* **Bounded In-Memory Footprint:** The buffer pool never allocates more memory frames than its configured capacity.
+* **Eviction Safety:** Pinned frames (`pin_count > 0`) are strictly protected from eviction.
+* **Dirty Eviction Durability:** Dirty pages selected for eviction are flushed and verified on disk before their frame is recycled.
 * **Bounded Page Size:** All structures stored inside a page must strictly fit within `PAGE_SIZE` (4096 bytes).
 * **Deterministic Encoding:** Multi-byte integers are serialized exclusively in little-endian format.

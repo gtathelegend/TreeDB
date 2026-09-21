@@ -1,7 +1,9 @@
+pub mod buffer_pool;
 pub mod metadata;
 pub mod page;
 pub mod page_manager;
 
+pub use buffer_pool::{BufferPool, BufferPoolStats, FrameId};
 pub use metadata::{
     DbHeader, CURRENT_FORMAT_VERSION, DEFAULT_METADATA_PAGE_ID, HEADER_PAGE_ID, MAGIC_BYTES,
 };

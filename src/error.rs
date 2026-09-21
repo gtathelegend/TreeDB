@@ -35,6 +35,18 @@ pub enum Error {
     #[error("Page not found: {0}")]
     PageNotFound(PageId),
 
+    /// The requested page is not resident in the buffer pool.
+    #[error("Page {0} is not resident in the buffer pool")]
+    PageNotResident(PageId),
+
+    /// Attempted to unpin a page that has a pin count of zero.
+    #[error("Pin count underflow for page {0}: page is already unpinned")]
+    PinCountUnderflow(PageId),
+
+    /// Buffer pool capacity must be greater than zero.
+    #[error("Invalid buffer pool capacity: {0} (must be greater than 0)")]
+    InvalidCapacity(usize),
+
     /// No unpinned/evictable page available in the buffer pool.
     #[error("No evictable page available in buffer pool")]
     NoEvictablePage,

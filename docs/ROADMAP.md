@@ -4,7 +4,7 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 1: Foundation & Storage Layer (Current Phase)
+## Phase 1: Foundation & Storage Layer (Completed)
 * [x] Project architecture and directory structure
 * [x] Standard storage constants (`PAGE_SIZE = 4096`, `PageId`, `Key`)
 * [x] Page abstraction and structural validation
@@ -16,13 +16,15 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 2: Buffer Pool Manager
-* [ ] In-memory frame table and page descriptor state
-* [ ] Pinning / unpinning lifecycle mechanics
-* [ ] Dirty page tracking and background/explicit flushing
-* [ ] LRU / Clock eviction policy
-* [ ] Buffer pool capacity limits and `BufferPoolFull` / `NoEvictablePage` handling
-* [ ] Concurrency-ready frame management
+## Phase 2: Buffer Pool Manager (Completed)
+* [x] In-memory frame table and page descriptor state (`FrameId`, `Frame`)
+* [x] Page table mapping (`PageId -> FrameId`)
+* [x] Pinning / unpinning lifecycle mechanics and underflow protection
+* [x] Dirty page tracking, sticky dirty state, and explicit/eviction flushing
+* [x] Deterministic LRU replacement policy protecting pinned pages
+* [x] Buffer pool capacity limits and `NoEvictablePage` handling
+* [x] Buffer pool metrics and hit rate computation
+* [x] Comprehensive test suite covering single-capacity boundaries and persistence
 
 ---
 
