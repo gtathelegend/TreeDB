@@ -93,3 +93,47 @@ The 4088-byte payload of an Internal page is structured as:
 | `0x06 + (12 × N)` | Remainder | `padding` | `[u8]` | Unused space (zero-filled) |
 
 * **Capacity:** Max 340 separator keys (341 children) = `6 + (340 × 12) = 4086 bytes` (2 bytes padding).
+
+---
+
+## Slotted Record Page Payload Layout (`PageType::Record`)
+
+The 4088-byte payload of a Record page is structured using a slotted-page layout:
+
+```text
++---------------------------------------------------------------+
+| Byte 0..5: Record Page Header (6 bytes)                       |
+|   slot_count: u16 (2B) | free_start: u16 (2B) | free_end: u16 |
++---------------------------------------------------------------+
+| Byte 6..free_start: Slot Directory (grows UPWARD)             |
+|   Slot 0: [offset: u16 (2B) | length: u16 (2B)]               |
+|   Slot 1: [offset: u16 (2B) | length: u16 (2B)]               |
+|   ...                                                         |
++---------------------------------------------------------------+
+| Byte free_start..free_end: Free Space Region (contiguous gap) |
++---------------------------------------------------------------+
+| Byte free_end..4088: Record Payloads (grows DOWNWARD)         |
+|   Record N payload                                            |
+|   ...                                                         |
+|   Record 0 payload                                            |
++---------------------------------------------------------------+
+```
+
+### Record Page Header Fields
+
+| Byte Offset (in payload) | Length | Field Name | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x00` | 2 bytes | `slot_count` | `u16` (LE) | Total number of slots in directory |
+| `0x02` | 2 bytes | `free_space_start` | `u16` (LE) | Offset of free space beginning (`6 + slot_count * 4`) |
+| `0x04` | 2 bytes | `free_space_end` | `u16` (LE) | Offset of free space end (top of record payloads) |
+
+### Slot Directory Entry Format (4 bytes each)
+
+| Field Name | Length | Type | Description |
+| :--- | :--- | :--- | :--- |
+| `offset` | 2 bytes | `u16` (LE) | Byte offset within page payload (`0` if deleted) |
+| `length` | 2 bytes | `u16` (LE) | Byte length of record payload |
+
+* **Deleted Slot Sentinel:** `offset == 0` marks an unused/deleted slot.
+* **Maximum Record Size:** `MAX_RECORD_SIZE = 4088 - 6 - 4 = 4078 bytes`.
+* **RecordId:** `(page_id: u32, slot_id: u32)`. Logical `RecordId`s remain stable across page compactions.

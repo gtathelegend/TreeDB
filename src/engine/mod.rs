@@ -1,0 +1,139 @@
+use std::path::Path;
+
+use crate::error::Result;
+use crate::index::bplus_tree::BPlusTree;
+use crate::storage::buffer_pool::BufferPool;
+use crate::storage::page::Key;
+use crate::storage::page_manager::PageManager;
+use crate::storage::record_store::RecordStore;
+
+/// High-level persistent database engine coordinating the B+ Tree index,
+/// slotted Record Store, and Buffer Pool.
+pub struct TreeDb {
+    tree: BPlusTree,
+    record_store: RecordStore,
+    buffer_pool: BufferPool,
+}
+
+impl TreeDb {
+    /// Opens an existing TreeDB database file with the specified buffer pool capacity.
+    pub fn open(path: impl AsRef<Path>, pool_capacity: usize) -> Result<Self> {
+        let page_manager = PageManager::open(path)?;
+        let root_page_id = page_manager.header().root_page_id;
+        let buffer_pool = BufferPool::new(pool_capacity, page_manager)?;
+        let tree = BPlusTree::from_root(root_page_id);
+        let record_store = RecordStore::new();
+
+        Ok(Self {
+            tree,
+            record_store,
+            buffer_pool,
+        })
+    }
+
+    /// Creates and initializes a new TreeDB database file with the specified buffer pool capacity.
+    pub fn create(path: impl AsRef<Path>, pool_capacity: usize) -> Result<Self> {
+        let page_manager = PageManager::create(path)?;
+        let root_page_id = page_manager.header().root_page_id;
+        let buffer_pool = BufferPool::new(pool_capacity, page_manager)?;
+        let tree = BPlusTree::from_root(root_page_id);
+        let record_store = RecordStore::new();
+
+        Ok(Self {
+            tree,
+            record_store,
+            buffer_pool,
+        })
+    }
+
+    /// Creates a `TreeDb` instance from an existing `BufferPool` and root `PageId`.
+    pub fn from_components(
+        tree: BPlusTree,
+        record_store: RecordStore,
+        buffer_pool: BufferPool,
+    ) -> Self {
+        Self {
+            tree,
+            record_store,
+            buffer_pool,
+        }
+    }
+
+    /// Inserts or updates a key-value mapping in the database.
+    ///
+    /// Stores the variable-length value payload in the Record Store and updates the B+ Tree index.
+    pub fn put(&mut self, key: Key, value: &[u8]) -> Result<()> {
+        // If key already exists, delete old record from record store
+        if let Some(old_rid) = self.tree.get(&mut self.buffer_pool, key)? {
+            self.tree.delete(&mut self.buffer_pool, key)?;
+            self.record_store.delete(&mut self.buffer_pool, old_rid)?;
+        }
+
+        let record_id = self.record_store.insert(&mut self.buffer_pool, value)?;
+        self.tree.insert(&mut self.buffer_pool, key, record_id)?;
+        Ok(())
+    }
+
+    /// Retrieves an owned copy of the value bytes associated with `key`.
+    ///
+    /// Returns `Ok(Some(Vec<u8>))` if the key exists, or `Ok(None)` if absent.
+    pub fn get(&mut self, key: Key) -> Result<Option<Vec<u8>>> {
+        match self.tree.get(&mut self.buffer_pool, key)? {
+            Some(record_id) => self.record_store.get(&mut self.buffer_pool, record_id),
+            None => Ok(None),
+        }
+    }
+
+    /// Deletes the key and its associated record from the database.
+    ///
+    /// Returns `Ok(Some(Vec<u8>))` with the deleted record bytes if present, or `Ok(None)` if absent.
+    pub fn delete(&mut self, key: Key) -> Result<Option<Vec<u8>>> {
+        match self.tree.delete(&mut self.buffer_pool, key)? {
+            Some(record_id) => {
+                let value = self.record_store.get(&mut self.buffer_pool, record_id)?;
+                self.record_store.delete(&mut self.buffer_pool, record_id)?;
+                Ok(value)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Performs an ordered range scan over keys in `[start, end)`, returning pairs of `(Key, Vec<u8>)`.
+    pub fn scan(&mut self, start: Option<Key>, end: Option<Key>) -> Result<Vec<(Key, Vec<u8>)>> {
+        let rids = self.tree.scan(&mut self.buffer_pool, start, end)?;
+        let mut results = Vec::with_capacity(rids.len());
+
+        for (k, rid) in rids {
+            if let Some(val) = self.record_store.get(&mut self.buffer_pool, rid)? {
+                results.push((k, val));
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Synchronizes all dirty buffer pool frames and flushes file changes to physical storage.
+    pub fn sync(&mut self) -> Result<()> {
+        self.buffer_pool.sync()
+    }
+
+    /// Returns a reference to the underlying B+ Tree handle.
+    pub const fn tree(&self) -> &BPlusTree {
+        &self.tree
+    }
+
+    /// Returns a reference to the underlying RecordStore.
+    pub const fn record_store(&self) -> &RecordStore {
+        &self.record_store
+    }
+
+    /// Returns a reference to the underlying BufferPool.
+    pub const fn buffer_pool(&self) -> &BufferPool {
+        &self.buffer_pool
+    }
+
+    /// Returns a mutable reference to the underlying BufferPool.
+    pub fn buffer_pool_mut(&mut self) -> &mut BufferPool {
+        &mut self.buffer_pool
+    }
+}

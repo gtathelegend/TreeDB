@@ -14,22 +14,22 @@ It is built for educational, research, and deep-systems exploration. It is not i
 Application / CLI
         │
         ▼
-   TreeDB API (Planned)
+   TreeDB API (Implemented)
         │
         ▼
-     B+ Tree (Search & Insertion Implemented)
+     B+ Tree (Index: Key → RID)
         │
         ▼
-   Record Store (Planned)
+   Record Store (Heap: RID → Bytes)
         │
         ▼
-   Buffer Pool (Implemented)
+   Buffer Pool (Page Cache & Frame Table)
         │
         ▼
-   Page Manager (Implemented)
+   Page Manager (Physical I/O)
         │
         ▼
-   Database File (Implemented)
+   Database File (4096-byte pages)
 ```
 
 ---
@@ -44,8 +44,9 @@ Application / CLI
 | **Buffer Pool Manager** | **Implemented** | LRU eviction, frame table, pin/unpin tracking, dirty flush |
 | **B+ Tree Index (Search & Insert)** | **Implemented** | Dynamic insertion, node splitting, root elevation, point search |
 | **B+ Tree Index (Delete & Scan)** | **Implemented** | Deletion, leaf/internal rebalance, root collapse, range scan |
-| **Record Store** | *Planned* | Slotted-page tuple format, variable-length records (Phase 6) |
-| **Write-Ahead Logging** | *Experimental* | WAL frame serialization, crash recovery (future phase) |
+| **Record Store** | **Implemented** | Slotted-page tuple format, variable-length records, local compaction |
+| **TreeDB Engine API** | **Implemented** | High-level `TreeDb` interface for `put`, `get`, `delete`, `scan` |
+| **Write-Ahead Logging** | *Planned* | WAL frame serialization, crash recovery (Phase 7) |
 
 ---
 

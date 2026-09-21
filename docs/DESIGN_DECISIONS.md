@@ -109,3 +109,15 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * TreeDB currently uses an append-only page manager. Introducing free-page recycling or freelist bitmaps belongs to a future dedicated storage-management phase.
   * Explicitly documenting this limitation maintains single-responsibility boundaries for Phase 5.
+
+---
+
+## Decision 12: Slotted-Page Record Store & Stable RecordId Indirection
+
+* **Decision:** Implement a slotted-page architecture (`PageType::Record`) where `RecordId = (page_id, slot_id)` serves as an indirect logical reference to variable-length payload bytes.
+* **Rationale:**
+  * **Decoupled Index & Data:** Keeps B+ Tree nodes purely fixed-width, maximizing index fanout and eliminating memory fragmentation within index nodes.
+  * **Stable Logical Identifier:** Because `RecordId` identifies the slot index rather than a byte offset, record payloads can be moved and compacted in-place on the page without modifying or invalidating index entries in the B+ Tree.
+  * **Bidirectional Page Layout:** The slot directory grows upward from the page header while record payloads grow downward from the payload end. This maximizes contiguous free space without pre-allocating fixed partition boundaries.
+  * **Local Page Compaction:** Payload fragmentation caused by record deletion is defragmented locally on a single page, avoiding multi-page locking or global compaction overhead.
+  * **Single-Page Payload Constraint:** For Phase 6, records are constrained to `MAX_RECORD_SIZE = 4078 bytes` (fitting on a single page). Overflow pages and large-object chunking are deferred to future phases.

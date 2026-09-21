@@ -69,17 +69,22 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 6: Slotted Page Record Store & Engine API (Next Phase)
-* [ ] Slotted-page binary layout for variable-length tuples
-* [ ] Record insertion, retrieval, and deletion within pages
-* [ ] Slot array management and page defragmentation
-* [ ] High-level unified `TreeDb` interface coordinating B+ Tree and Record Store
-* [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`)
+## Phase 6: Slotted Page Record Store & Engine API (Completed)
+* [x] Slotted-page binary layout for variable-length tuples (`RecordPage`)
+* [x] Bidirectional free-space tracking (upward slot directory, downward payloads)
+* [x] Record insertion, retrieval, and deletion within pages
+* [x] In-place page-level payload compaction with stable `RecordId` references
+* [x] Slot reuse on deletion
+* [x] Multi-page record store management (`RecordStore`)
+* [x] High-level unified `TreeDb` interface coordinating B+ Tree and Record Store (`put`, `get`, `delete`, `scan`, `sync`)
+* [x] Deterministic randomized mutation testing with reference oracle
+* [x] Multi-page allocation and reopen persistence test suite
 
 ---
 
-## Phase 7: Durability & Advanced Systems (Future)
+## Phase 7: Durability & Advanced Systems (Next Phase)
 * [ ] Write-Ahead Logging (WAL) and log sequence numbers (LSN)
 * [ ] ARIES-style crash recovery (Analysis, Redo, Undo)
 * [ ] Free-page recycling (freelist / space bitmap)
+* [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`)
 * [ ] Microbenchmarks and stress testing

@@ -9,7 +9,8 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
                                |
                                v
 +-------------------------------------------------------------+
-|                  TreeDB Engine API (Planned)                |
+|               TreeDb Engine API (Implemented)               |
+|            (put, get, delete, scan, sync, open)             |
 +-------------------------------------------------------------+
                                |
                                v
@@ -20,8 +21,8 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
                                |
                                v
 +-------------------------------------------------------------+
-|                  Record Store (Planned)                     |
-|           (Slotted Pages, Variable Length Tuples)           |
+|                Record Store (Implemented)                   |
+|     (Slotted Pages, Variable-Length Payloads, Compaction)   |
 +-------------------------------------------------------------+
                                |
                                v
@@ -45,7 +46,18 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
 
 ---
 
-## 1. Index Layer (`src/index`)
+## 1. Engine Layer (`src/engine`)
+
+### `TreeDb`
+* **Role:** High-level unified database interface coordinating the index, record storage, and buffer pool.
+* **Responsibilities:**
+  * Key-value operations: `put(key, value)`, `get(key)`, `delete(key)`, `scan(start, end)`.
+  * Coordinating `Key -> RecordId` mapping via `BPlusTree` and `RecordId -> Value` storage via `RecordStore`.
+  * Explicit buffer pool synchronization via `sync()`.
+
+---
+
+## 2. Index Layer (`src/index`)
 
 ### `BPlusTree`
 * **Role:** Persistent B+ Tree coordinator managing index operations through the `BufferPool`.
@@ -69,7 +81,13 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
 
 ---
 
-## 2. Storage Layer (`src/storage`)
+## 3. Storage Layer (`src/storage`)
+
+### `RecordStore` & `RecordPage`
+* **Role:** Persistent variable-length record storage manager and slotted-page layout.
+* **Responsibilities:**
+  * `RecordStore`: Allocates record pages and manages `insert`, `get`, `delete`, and `compact_page` over `BufferPool`.
+  * `RecordPage`: Slotted-page binary layout with bidirectional growth (slot directory grows upward, payloads grow downward), free-space tracking, logical deletion, and in-place payload compaction.
 
 ### `BufferPool`
 * **Role:** In-memory caching engine maintaining a fixed number of page frames.
@@ -93,7 +111,7 @@ TreeDB is structured into clear, decoupled layers of abstraction. Each layer has
 
 ---
 
-## 3. Layer Invariants
+## 4. Layer Invariants
 
 * **No Layer Skipping:** Higher-level structures (`BPlusTree`) interact exclusively through the `BufferPool` and never perform raw disk I/O directly.
 * **Pin Leak Prevention:** Traversal routines must strictly unpin each page before descending or returning.
