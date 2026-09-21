@@ -1,0 +1,20 @@
+[package]
+name = "treedb"
+version = "0.1.0"
+edition = "2021"
+authors = ["TreeDB Contributors"]
+description = "A persistent single-node storage engine built from first principles in Rust."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/gtathelegend/TreeDB"
+
+[dependencies]
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.17"
+
+[[bin]]
+name = "treedb"
+path = "src/bin/treedb.rs"
+required-features = []
