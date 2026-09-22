@@ -217,4 +217,16 @@ This document records key architectural and design choices, their rationale, and
   * Maintains the fundamental ARIES invariant that all physical state transitions are recorded in the WAL.
   * Stamping `page_lsn` prevents Redo replay from incorrectly applying older pre-free log records over a freed/recycled page.
 
+---
+
+## Decision 22: Multi-Page Overflow Records and Capacity Derivation
+
+* **Decision:** Values exceeding `MAX_RECORD_SIZE = 4070 bytes` are stored across a singly-linked chain of `PageType::Overflow` pages (`OVERFLOW_PAYLOAD_SIZE = 4072 bytes` per page) referenced by an 8-byte descriptor (`head_page_id: u32`, `total_length: u32`) in a `RecordPage` slot with bit 15 (`OVERFLOW_FLAG = 0x8000`) set in `Slot.length`.
+* **Rationale:**
+  * **Opaque Abstraction:** `RecordId { page_id, slot_id }` remains unchanged and stable; callers and the B+ Tree index never need to know whether a record is inline or overflow-backed.
+  * **Backward Compatibility:** All existing inline records (`length <= 4070`) have bit 15 clear, allowing seamless reading and writing of existing format version 2 files without migrations.
+  * **Explicit Little-Endian Serialization:** Overflow headers (`next_page_id: u32`, `bytes_used: u16`, `reserved: u16`) are strictly little-endian encoded.
+  * **Freelist Integration:** Deleting an overflow record reclaims all pages in its chain directly into the persistent freelist.
+  * **Defensive Integrity Validation:** Bounded traversal and cycle detection protect against infinite loops in corrupted databases.
+
 

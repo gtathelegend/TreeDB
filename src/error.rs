@@ -90,4 +90,8 @@ pub enum Error {
     /// Structural corruption or invariant violation in the freelist.
     #[error("Freelist corruption detected: {0}")]
     FreelistCorruption(String),
+
+    /// Structural corruption or invariant violation in an overflow chain.
+    #[error("Overflow corruption detected: {0}")]
+    OverflowCorruption(String),
 }

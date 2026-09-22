@@ -16,9 +16,11 @@ pub use index::{
 };
 pub use storage::{
     is_reserved_page, BufferPool, BufferPoolStats, DbHeader, FrameId, FreePageLayout,
-    FreePageManager, Key, Page, PageId, PageManager, PageType, RecordPage, RecordStore, Slot,
-    CURRENT_FORMAT_VERSION, DEFAULT_METADATA_PAGE_ID, HEADER_PAGE_ID, MAGIC_BYTES, MAX_RECORD_SIZE,
-    NO_FREE_PAGE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE, RECORD_PAGE_HEADER_SIZE,
+    FreePageManager, Key, OverflowDescriptor, OverflowPage, Page, PageId, PageManager, PageType,
+    RecordLocation, RecordPage, RecordStore, Slot, CURRENT_FORMAT_VERSION,
+    DEFAULT_METADATA_PAGE_ID, HEADER_PAGE_ID, MAGIC_BYTES, MAX_RECORD_SIZE, NO_FREE_PAGE,
+    NO_OVERFLOW_PAGE, OVERFLOW_DESCRIPTOR_SIZE, OVERFLOW_FLAG, OVERFLOW_HEADER_SIZE,
+    OVERFLOW_PAYLOAD_SIZE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE, RECORD_PAGE_HEADER_SIZE,
     SLOT_SIZE,
 };
 

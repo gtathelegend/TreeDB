@@ -47,6 +47,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **B+ Tree Index (Search & Insert)** | **Implemented** | Dynamic insertion, node splitting, root elevation, point search |
 | **B+ Tree Index (Delete & Scan)** | **Implemented** | Deletion, leaf/internal rebalance, root collapse, range scan |
 | **Record Store** | **Implemented** | Slotted-page tuple format, variable-length records, local compaction |
+| **Multi-Page Overflow Records** | **Implemented** | Singly-linked overflow chains (`PageType::Overflow`), arbitrary value sizes, stable `RecordId`s, freelist recycling |
 | **TreeDB Engine API** | **Implemented** | High-level `TreeDb` interface for `put`, `get`, `delete`, `scan`, `sync` |
 | **Write-Ahead Logging** | **Implemented** | Monotonic `Lsn`, CRC32 log records, `.wal` file, durable syncing, WAL ordering on flush/evict |
 | **Crash Recovery (ARIES-Inspired)** | **Implemented** | 3-Phase recovery (Analysis, Redo, Undo with CLRs), restart-safe, deterministic fault injection, idempotence |

@@ -32,6 +32,7 @@ pub enum PageType {
     Leaf = 3,
     Record = 4,
     Free = 5,
+    Overflow = 6,
 }
 
 impl PageType {
@@ -43,6 +44,7 @@ impl PageType {
             3 => Ok(PageType::Leaf),
             4 => Ok(PageType::Record),
             5 => Ok(PageType::Free),
+            6 => Ok(PageType::Overflow),
             _ => Err(Error::SerializationFailure(format!(
                 "invalid page type tag: {value}"
             ))),

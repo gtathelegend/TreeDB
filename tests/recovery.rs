@@ -1150,7 +1150,18 @@ fn test_storage_format_v1_migration_rejection_and_v2_record_size() {
         ));
     }
 
-    // 2. Test that v2 format works and validates record size boundary (4070 vs 4071)
+    // 2. Test that v2 format works and validates record size boundary (4070 inline vs 4071 overflow)
+    let mut rp = treedb::RecordPage::new();
+    let oversized = vec![0xBB; treedb::MAX_RECORD_SIZE + 1];
+    let err = rp.insert(&oversized).unwrap_err();
+    assert!(matches!(
+        err,
+        treedb::Error::ValueTooLarge {
+            size: 4071,
+            limit: 4070
+        }
+    ));
+
     let (_dir2, db_path2, _wal_path2) = create_test_db("record_size_bound");
     {
         let mut db = TreeDb::create(&db_path2, 10).unwrap();
@@ -1160,16 +1171,9 @@ fn test_storage_format_v1_migration_rejection_and_v2_record_size() {
         db.put(1, &max_val).unwrap();
         assert_eq!(db.get(1).unwrap(), Some(max_val));
 
-        // 4071 bytes: MAX_RECORD_SIZE + 1
-        let oversized = vec![0xBB; treedb::MAX_RECORD_SIZE + 1];
-        let err = db.put(2, &oversized).unwrap_err();
-        assert!(matches!(
-            err,
-            treedb::Error::ValueTooLarge {
-                size: 4071,
-                limit: 4070
-            }
-        ));
+        // 4071 bytes: MAX_RECORD_SIZE + 1 stored via multi-page overflow
+        db.put(2, &oversized).unwrap();
+        assert_eq!(db.get(2).unwrap(), Some(oversized));
     }
 }
 

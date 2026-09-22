@@ -126,11 +126,28 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 9: Multi-Page Overflow Records & Advanced Storage (Next Phase)
-* [ ] Multi-page overflow records for large BLOBs exceeding 4070 bytes
-* [ ] Periodic background fuzzy checkpointing and WAL truncation
+## Phase 9: Multi-Page Overflow Records (Completed)
+* [x] Dedicated overflow page type (`PageType::Overflow = 6`) with explicit 8-byte payload header (`next_page_id: u32`, `bytes_used: u16`, `reserved: u16`)
+* [x] Usable overflow payload capacity calculation (`OVERFLOW_PAYLOAD_SIZE = 4072 bytes`)
+* [x] In-page overflow descriptor encoding in slotted record pages (`OVERFLOW_FLAG = 0x8000`, 8-byte descriptor `[head_page_id: u32 | total_length: u32]`)
+* [x] Stable `RecordId` abstraction maintained for both inline ($\le 4070$ bytes) and overflow ($> 4070$ bytes) records
+* [x] RecordStore multi-page allocation, sequential chaining, and transparent value reassembly
+* [x] Transparent range scans and CRUD operations across mixed inline and multi-page records
+* [x] Size transition handling (small $\to$ small, small $\to$ large, large $\to$ small, large $\to$ large)
+* [x] Overflow chain freeing and full persistent freelist recycling integration
+* [x] Recycled overflow page reinitialization and zero-leak guarantees
+* [x] Slotted record page compaction preserving on-page overflow descriptors and stable `RecordId`s
+* [x] Defensive overflow validation: out-of-bounds page detection, partial intermediate page detection, and cycle detection
+* [x] WAL/ARIES crash recovery integration with transaction atomicity across index, record slot, and overflow pages
+* [x] 17 dedicated overflow integration tests plus randomized oracle comparison
+
+---
+
+## Phase 10: Checkpointing, WAL Truncation & System Maturation (Next Phase)
+* [ ] Periodic background fuzzy checkpointing and WAL truncation / log recycling
 * [ ] Group commit and asynchronous WAL flush queues
 * [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`, `inspect-freelist`)
 * [ ] Microbenchmarks and high-throughput stress testing
+* [ ] Multi-threading, concurrency control, and latching
 
 

@@ -68,6 +68,7 @@ All pages other than Page 0 share a common 16-byte header:
 | `0x03` | `Leaf` | B+ Tree leaf node storing keys and record pointers |
 | `0x04` | `Record` | Slotted data page holding tuple data |
 | `0x05` | `Free` | Unallocated / recycled page in persistent freelist |
+| `0x06` | `Overflow` | Multi-page overflow chunk for values > 4070 bytes |
 
 ---
 
@@ -80,6 +81,33 @@ The 4080-byte payload of a Free page is structured as:
 | `0x00` | 4 bytes | `next_free` | `u32` (LE) | PageId of next free page in singly-linked freelist (`0` if end of list) |
 | `0x04` | 4076 bytes | `padding` | `[u8; 4076]` | Zero-filled padding |
 
+---
+
+## Overflow Page Payload Layout (`PageType::Overflow`)
+
+The 4080-byte payload of an Overflow page is structured as:
+
+```text
++---------------------------------------------------------------+
+| Byte 0..3: next_page_id (u32, LE) - Next page in chain (0=end)|
++---------------------------------------------------------------+
+| Byte 4..5: bytes_used (u16, LE) | Byte 6..7: reserved (u16=0) |
++---------------------------------------------------------------+
+| Byte 8..8+bytes_used: Usable Payload Data (up to 4072 bytes)  |
++---------------------------------------------------------------+
+| Remainder: Zero-filled padding                                |
++---------------------------------------------------------------+
+```
+
+| Byte Offset (in payload) | Length | Field Name | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x00` | 4 bytes | `next_page_id` | `u32` (LE) | PageId of next overflow page in singly-linked chain (`0` if final page) |
+| `0x04` | 2 bytes | `bytes_used` | `u16` (LE) | Number of valid payload bytes on this page (0..=4072) |
+| `0x06` | 2 bytes | `reserved` | `u16` (LE) | Zero-filled reserved field |
+| `0x08` | `bytes_used` bytes | `data` | `[u8]` | Chunk payload data (max `OVERFLOW_PAYLOAD_SIZE = 4072 bytes`) |
+| `0x08 + bytes_used` | Remainder | `padding` | `[u8]` | Zero-filled padding |
+
+* **Usable Capacity:** `OVERFLOW_PAYLOAD_SIZE = 4080 (page payload) - 8 (overflow header) = 4072 bytes`.
 
 ---
 
@@ -124,14 +152,14 @@ The 4080-byte payload of a Record page is structured using a slotted-page layout
 |   slot_count: u16 (2B) | free_start: u16 (2B) | free_end: u16 |
 +---------------------------------------------------------------+
 | Byte 6..free_start: Slot Directory (grows UPWARD)             |
-|   Slot 0: [offset: u16 (2B) | length: u16 (2B)]               |
+|   Slot 0: [offset: u16 (2B) | length: u16 (2B, bit 15 flag)]  |
 |   Slot 1: [offset: u16 (2B) | length: u16 (2B)]               |
 |   ...                                                         |
 +---------------------------------------------------------------+
 | Byte free_start..free_end: Free Space Region (contiguous gap) |
 +---------------------------------------------------------------+
-| Byte free_end..4080: Record Payloads (grows DOWNWARD)         |
-|   Record N payload                                            |
+| Byte free_end..4080: Payloads & Descriptors (grows DOWNWARD)  |
+|   Record N payload / [head_page_id: u32 | total_len: u32]     |
 |   ...                                                         |
 |   Record 0 payload                                            |
 +---------------------------------------------------------------+
@@ -150,11 +178,13 @@ The 4080-byte payload of a Record page is structured using a slotted-page layout
 | Field Name | Length | Type | Description |
 | :--- | :--- | :--- | :--- |
 | `offset` | 2 bytes | `u16` (LE) | Byte offset within page payload (`0` if deleted) |
-| `length` | 2 bytes | `u16` (LE) | Byte length of record payload |
+| `length` | 2 bytes | `u16` (LE) | Byte length of record payload or overflow descriptor with `OVERFLOW_FLAG` (`0x8000`) |
 
 * **Deleted Slot Sentinel:** `offset == 0 && length == 0` marks an unused/deleted slot.
-* **Maximum Record Size:** `MAX_RECORD_SIZE = 4080 - 6 - 4 = 4070 bytes`.
-* **RecordId:** `(page_id: u32, slot_id: u32)`. Logical `RecordId`s remain stable across page compactions.
+* **Inline Record Encoding:** `length & 0x8000 == 0`, where `length <= 4070` bytes. The payload at `offset..offset+length` is the inline record value.
+* **Overflow Record Encoding:** `length & 0x8000 != 0` (`0x8008`). The on-page payload is an 8-byte descriptor `[head_page_id: u32 (4B) | total_length: u32 (4B)]`.
+* **Maximum Single-Page Inline Size:** `MAX_RECORD_SIZE = 4080 - 6 - 4 = 4070 bytes`.
+* **RecordId:** `(page_id: u32, slot_id: u32)`. Logical `RecordId`s remain stable across page compactions for both inline and overflow records.
 
 ### Maximum Record Size Evolution
 
@@ -162,10 +192,10 @@ The maximum payload size of a single record is derived directly from the page la
 
 * **Phase 6 (Format Version 1):**
   `4096 (page size) - 8 (page header) - 6 (record page header) - 4 (slot directory entry) = 4078 bytes`
-* **Phase 7 / 7.1 (Format Version 2):**
-  `4096 (page size) - 16 (page header with PageLSN) - 6 (record page header) - 4 (slot directory entry) = 4070 bytes`
-
-Attempting to insert a record larger than 4070 bytes returns `Error::RecordTooLarge(len, 4070)`.
+* **Phase 7 / 7.1 / Phase 8 (Format Version 2):**
+  `4096 (page size) - 16 (page header with PageLSN) - 6 (record page header) - 4 (slot directory entry) = 4070 bytes` (single-page limit)
+* **Phase 9 (Format Version 2 with Multi-Page Overflow):**
+  Values $\le 4070$ bytes are stored inline on slotted record pages. Values $> 4070$ bytes span an arbitrary number of `PageType::Overflow` pages (4072 bytes per page), referenced by an 8-byte on-page descriptor. Single-page limitation is eliminated.
 
 ---
 

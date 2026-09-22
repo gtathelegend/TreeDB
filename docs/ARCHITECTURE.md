@@ -108,12 +108,17 @@ v                                                             v
 
 ## 4. Storage Layer (`src/storage`)
 
-### `RecordStore` & `RecordPage`
-* **Role:** Persistent variable-length record storage manager and slotted-page layout.
+### `RecordStore`, `RecordPage` & `OverflowPage`
+* **Role:** Persistent variable-length record storage manager, slotted-page layout, and multi-page overflow chains.
 * **Responsibilities:**
-  * `RecordStore`: Allocates record pages and manages `insert`, `get`, `delete`, and `compact_page` over `BufferPool`.
-  * `RecordPage`: Slotted-page binary layout with bidirectional growth (slot directory grows upward, payloads grow downward), free-space tracking, logical deletion, and in-place payload compaction.
-  * **Record Size Limits:** Maximum single record payload is `MAX_RECORD_SIZE = 4070 bytes` (derived from `4096 - 16 page header - 6 record header - 4 slot directory`).
+  * `RecordStore`: Coordinates `insert`, `get`, `delete`, `compact_page`, and `validate_overflow_chain` over `BufferPool`.
+  * `RecordPage`: Slotted-page binary layout with bidirectional growth (slot directory grows upward, payloads/descriptors grow downward), free-space tracking, logical deletion, and in-place payload compaction.
+  * `OverflowPage`: Singly-linked overflow page format (`PageType::Overflow`) storing up to 4072 bytes per page (`OVERFLOW_PAYLOAD_SIZE`).
+  * **Inline vs Overflow Storage:**
+    * Values $\le \text{MAX\_RECORD\_SIZE}$ (4070 bytes) are stored inline in slotted record pages.
+    * Values $> 4070$ bytes are stored across a singly-linked chain of `Overflow` pages, referenced by an 8-byte descriptor `[head_page_id: u32 | total_length: u32]` on a `RecordPage`.
+    * `RecordId { page_id, slot_id }` remains stable and opaque to callers and the B+ Tree index.
+  * **Deletion & Recycling:** Deleting an overflow-backed record frees all pages in its overflow chain directly into the persistent freelist for subsequent reuse.
 
 ### `BufferPool`
 * **Role:** In-memory caching engine maintaining a fixed number of page frames and enforcing Write-Ahead order.
@@ -143,7 +148,7 @@ v                                                             v
   * `page.lsn() >= log_record.lsn()` => Redo skipped.
   PageLSN never regresses.
 * **CLR Durability Invariant:** `append CLR -> flush WAL through CLR LSN -> write recovered page`. Recovery-generated modifications are never durable before their CLR is durable on disk.
-* **Engine Atomicity Boundary:** `TreeDb::put` and `TreeDb::delete` operations wrap both RecordStore heap modifications and B+ Tree index mutations in a single transaction (`TxnId`). If an uncommitted operation crashes, both index and record mutations are undone atomically.
+* **Engine Atomicity Boundary:** `TreeDb::put` and `TreeDb::delete` operations wrap both RecordStore heap modifications (inline and overflow) and B+ Tree index mutations in a single transaction (`TxnId`). If an uncommitted operation crashes, both index and record mutations are undone atomically.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -151,10 +156,9 @@ v                                                             v
 
 ---
 
-## 6. Intentionally Deferred Items (Phase 9+)
+## 6. Intentionally Deferred Items (Phase 10+)
 
-The following capabilities are intentionally deferred to subsequent phases and not implemented in Phase 8:
-* Multi-page overflow records for large BLOBs exceeding 4070 bytes.
+The following capabilities are intentionally deferred to subsequent phases and not implemented in Phase 9:
 * Background fuzzy checkpointing and WAL truncation / log recycling.
 * Group commit and asynchronous WAL flush queues.
 * Multi-threading, concurrency control, and latching.
