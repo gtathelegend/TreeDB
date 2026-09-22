@@ -131,6 +131,12 @@ impl RecoveryEngine {
 
             if let LogRecordBody::Checkpoint { active_txns } = &cp_rec.body {
                 for &(txn_id, last_lsn) in active_txns {
+                    if !txn_id.is_valid() || !last_lsn.is_valid() || last_lsn >= last_checkpoint_lsn
+                    {
+                        return Err(Error::WalCorruption(format!(
+                            "corrupted active transaction entry (txn_id={txn_id}, last_lsn={last_lsn}) in checkpoint record {last_checkpoint_lsn}"
+                        )));
+                    }
                     txn_table.insert(
                         txn_id,
                         TxnTableEntry {

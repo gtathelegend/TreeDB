@@ -159,11 +159,28 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
+## Phase 10.1: WAL Lifecycle & Checkpoint Hardening (Completed)
+* [x] Formalized and verified fundamental WAL retention invariant: a record is removed only when unreachable from every Redo, Undo, and restart path
+* [x] Active transactions spanning multiple checkpoints preserve entire historical Undo chains back to `Begin`
+* [x] Strict LSN monotonicity guaranteed after truncation (newly allocated LSNs strictly exceed all pre-truncation LSNs)
+* [x] Non-zero WAL starting LSN accepted seamlessly by recovery scanner
+* [x] Seamless append operations immediately following prefix truncation without offset or byte corruptions
+* [x] Crash-safe temporary WAL replacement and deterministic `.wal.bak` fallback recovery on Windows filesystem
+* [x] Comprehensive checkpoint metadata & record validation (detects and rejects impossible LSNs and corrupted active txn entries with structured `Error::WalCorruption`)
+* [x] Validated PageLSN older than truncated WAL (flushed durable pages with `PageLSN < first_retained_lsn` are valid)
+* [x] Free-page and multi-page overflow recycling safety across multiple checkpoint/truncation cycles
+* [x] Repeated multi-cycle checkpoint/truncation idempotence testing (25+ continuous cycles)
+* [x] Four-path recovery equivalence matrix (No Checkpoint, Checkpoint Only, Checkpoint + Truncate, Checkpoint + Truncate + Crash)
+* [x] 21 dedicated checkpoint and lifecycle hardening tests (178 total test suite)
+
+---
+
 ## Phase 11: Group Commit, Concurrency & CLI (Future)
 * [ ] Group commit and asynchronous WAL flush queues
 * [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`, `inspect-freelist`)
 * [ ] Microbenchmarks and high-throughput stress testing
 * [ ] Multi-threading, concurrency control, and latching
+
 
 
 

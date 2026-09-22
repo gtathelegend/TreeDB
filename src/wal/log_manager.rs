@@ -129,17 +129,35 @@ impl LogManager {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        // If crash happened during rename, restore from .bak if .wal is missing
+        // If crash happened during rename, restore from .bak if .wal is missing or truncated
         let bak_path = PathBuf::from(format!("{}.bak", path.display()));
-        if !path.exists() && bak_path.exists() {
-            std::fs::rename(&bak_path, &path)?;
-        }
         let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
         if tmp_path.exists() {
             let _ = std::fs::remove_file(&tmp_path);
         }
 
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        if !path.exists() && bak_path.exists() {
+            std::fs::rename(&bak_path, &path)?;
+        }
+
+        let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => {
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                if len < WAL_HEADER_SIZE as u64 && bak_path.exists() {
+                    drop(f);
+                    let _ = std::fs::remove_file(&path);
+                    std::fs::rename(&bak_path, &path)?;
+                    OpenOptions::new().read(true).write(true).open(&path)?
+                } else {
+                    f
+                }
+            }
+            Err(_) if bak_path.exists() => {
+                std::fs::rename(&bak_path, &path)?;
+                OpenOptions::new().read(true).write(true).open(&path)?
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         let mut header_bytes = [0u8; WAL_HEADER_SIZE];
         file.read_exact(&mut header_bytes)?;
@@ -389,6 +407,11 @@ impl LogManager {
             Some(min_active) => std::cmp::min(min_active, last_checkpoint_lsn),
             None => last_checkpoint_lsn,
         }
+    }
+
+    /// Diagnostic helper returning the current WAL retention LSN for a given checkpoint LSN.
+    pub fn retention_lsn(&self, last_checkpoint_lsn: Lsn) -> Lsn {
+        self.calculate_retention_lsn(last_checkpoint_lsn)
     }
 
     /// Truncates the WAL prefix by safely removing records with `LSN < min_lsn`.

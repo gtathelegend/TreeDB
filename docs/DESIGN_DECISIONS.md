@@ -253,5 +253,19 @@ This document records key architectural and design choices, their rationale, and
   * **Undo Chain Preservation:** Active loser transactions spanning checkpoints require their complete historical Undo chains (back to `Begin`). Truncating only before `retention_lsn` guarantees loser transactions can always be undone.
   * **Cross-Platform Crash-Safety:** Releasing file handles and using atomic renames prevents Windows sharing violations and ensures that even if a crash occurs during truncation, either the original or the replacement WAL is completely valid.
 
+---
+
+## Decision 25: Deterministic Backup WAL Fallback and Hardened Lifecycle Semantics
+
+* **Decision:** When opening the WAL (`LogManager::open`):
+  1. If `.wal` is missing or truncated below `WAL_HEADER_SIZE` (32 bytes) but `.wal.bak` exists, `.wal.bak` is atomically restored to `.wal` and used for recovery.
+  2. If both `.wal` and `.wal.bak` are missing or corrupted, structured error `Error::WalCorruption` is returned.
+  3. LSN allocation maintains strict global monotonicity across file truncations: newly allocated LSNs are always $> \text{max}(\text{retained LSNs}, \text{pre-truncation LSNs})$.
+  4. Non-zero starting LSNs are explicitly accepted: recovery scans from the first retained record and does not require LSN 1 to be present.
+* **Rationale:**
+  * Handles all crash interruption scenarios during atomic WAL replacement on Windows filesystems without data loss.
+  * Guarantees that truncated WAL suffixes can be immediately appended to and reopened without LSN collisions or offset confusion.
+
+
 
 
