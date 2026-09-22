@@ -266,6 +266,18 @@ This document records key architectural and design choices, their rationale, and
   * Handles all crash interruption scenarios during atomic WAL replacement on Windows filesystems without data loss.
   * Guarantees that truncated WAL suffixes can be immediately appended to and reopened without LSN collisions or offset confusion.
 
+---
+
+## Decision 26: Explicit Transaction Abstraction, Lifecycle State Machine & CLR-Based Runtime Rollback
+
+* **Decision:** Introduce `Transaction<'db>` with an explicit state machine (`Active`, `Committed`, `Aborted`), mapping directly to a single WAL `TxnId`. Runtime `abort()` (and `Drop` of an active transaction) performs a full physical rollback by following the transaction's `prev_lsn` chain in reverse order, applying `before_image` byte diffs, writing Compensation Log Records (CLRs), and flushing the WAL.
+* **Rationale:**
+  * **Unified Recovery Invariant:** Runtime abort and crash-recovery undo share identical ARIES CLR principles: every undo operation produces durable CLR records, guaranteeing idempotence even if a crash interrupts runtime abort.
+  * **Safe Rust Ownership:** `Transaction<'db>` borrows `&'db mut TreeDb`, statically preventing concurrent access while dynamic tracking (`Error::TransactionActive`) rejects attempts to begin nested transactions.
+  * **Read-Your-Writes:** Modifications directly update the buffer pool and index, ensuring immediate read visibility within the same transaction without duplicate buffering layers.
+
+
+
 
 
 

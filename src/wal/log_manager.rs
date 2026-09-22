@@ -501,6 +501,16 @@ impl LogManager {
         &self.path
     }
 
+    /// Returns a reference to the active transactions' previous LSN mapping.
+    pub fn txn_prev_lsn(&self) -> &HashMap<TxnId, Lsn> {
+        &self.txn_prev_lsn
+    }
+
+    /// Returns a reference to the active transactions' first LSN mapping.
+    pub fn txn_first_lsn(&self) -> &HashMap<TxnId, Lsn> {
+        &self.txn_first_lsn
+    }
+
     // --- Internal Helpers ---
 
     fn allocate_lsn(&mut self) -> Lsn {

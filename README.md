@@ -54,6 +54,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **Free-Page Recycling & Freelist** | **Implemented** | Persistent singly-linked freelist, $O(1)$ LIFO reuse, B+ Tree merge/collapse reclamation, integrity validation |
 | **Checkpointing & WAL Lifecycle** | **Implemented** | Synchronous checkpoints, durable Page 0 metadata, DPT Redo optimization, safe retention boundary, bounded WAL growth |
 | **WAL Lifecycle & Checkpoint Hardening** | **Implemented** | Fundamental retention invariant, active txn Undo preservation, monotonic LSN continuity, non-zero start LSN, crash-safe atomic replacement, .wal.bak fallback, 4-path equivalence |
+| **Transaction Manager & Atomic Multi-Op Txns** | **Implemented** | Explicit `Transaction<'db>` RAII API, multi-operation atomic commit/abort, CLR runtime rollback, drop safety, read-your-writes, crash recovery |
 
 
 ---

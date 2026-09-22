@@ -94,4 +94,20 @@ pub enum Error {
     /// Structural corruption or invariant violation in an overflow chain.
     #[error("Overflow corruption detected: {0}")]
     OverflowCorruption(String),
+
+    /// Attempted to mutate or commit an already committed transaction.
+    #[error("Transaction {0} has already been committed")]
+    TransactionAlreadyCommitted(crate::wal::lsn::TxnId),
+
+    /// Attempted to mutate, commit, or abort an already aborted transaction.
+    #[error("Transaction {0} has already been aborted")]
+    TransactionAlreadyAborted(crate::wal::lsn::TxnId),
+
+    /// Transaction is not in active state.
+    #[error("Transaction {0} is not active")]
+    TransactionNotActive(crate::wal::lsn::TxnId),
+
+    /// Attempted to begin a transaction while another is already active.
+    #[error("A transaction ({0}) is already active on the engine")]
+    TransactionActive(crate::wal::lsn::TxnId),
 }

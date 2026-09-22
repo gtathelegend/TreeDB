@@ -6,7 +6,7 @@ pub mod index;
 pub mod storage;
 pub mod wal;
 
-pub use engine::TreeDb;
+pub use engine::{Transaction, TreeDb, TxnState};
 pub use error::{Error, Result};
 pub use index::{
     BPlusTree, InternalNode, LeafNode, RecordId, INTERNAL_ENTRY_SIZE, INTERNAL_HEADER_SIZE,

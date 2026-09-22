@@ -175,11 +175,27 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 11: Group Commit, Concurrency & CLI (Future)
+## Phase 11: Transaction Manager & Atomic Multi-Operation Transactions (Completed)
+* [x] Explicit `Transaction<'db>` abstraction with state machine (`Active`, `Committed`, `Aborted`)
+* [x] Single WAL transaction context (`TxnId`) mapping across multiple CRUD operations (`put`, `update`, `delete`, `get`, `scan`)
+* [x] Read-your-writes consistency within an active transaction
+* [x] Strict WAL commit durability ordering (`append commit -> flush WAL through commit LSN`)
+* [x] Comprehensive runtime rollback with Compensation Log Records (CLRs) on explicit `abort()`
+* [x] Deterministic automatic rollback on `Drop` for uncommitted active transactions
+* [x] Complete isolation from concurrent transactions (single-threaded engine discipline)
+* [x] Multi-key atomicity and same-key repeated mutation handling
+* [x] Interaction across checkpoints, WAL prefix truncation, page reuse, and multi-page overflow records
+* [x] Deterministic randomized transaction oracle comparison vs in-memory `BTreeMap`
+* [x] 15 dedicated transaction integration tests (193 total test suite)
+
+---
+
+## Phase 12: Group Commit, Concurrency & CLI (Future)
 * [ ] Group commit and asynchronous WAL flush queues
 * [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`, `inspect-freelist`)
 * [ ] Microbenchmarks and high-throughput stress testing
 * [ ] Multi-threading, concurrency control, and latching
+
 
 
 

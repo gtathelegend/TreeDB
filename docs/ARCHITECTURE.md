@@ -54,10 +54,41 @@ v                                                             v
 ### `TreeDb`
 * **Role:** High-level unified database interface coordinating the index, record storage, buffer pool, and transactions.
 * **Responsibilities:**
-  * Key-value operations: `put(key, value)`, `get(key)`, `delete(key)`, `scan(start, end)`.
-  * Transaction lifecycle: `begin_txn()`, `commit_txn(txn_id)`, `abort_txn(txn_id)`.
+  * Key-value operations: `put(key, value)`, `update(key, value)`, `get(key)`, `delete(key)`, `scan(start, end)`.
+  * Transaction coordination: `begin() -> Result<Transaction<'_>>`, `begin_txn()`, `commit_txn(txn_id)`, `abort_txn(txn_id)`.
   * Automatic ARIES crash recovery upon opening existing database and WAL files.
   * Explicit buffer pool and WAL synchronization via `sync()`.
+  * Synchronous checkpointing and WAL prefix recycling (`checkpoint()`, `checkpoint_and_truncate_wal()`).
+
+### `Transaction` & `TxnState`
+* **Role:** Explicit atomic transaction abstraction coordinating multi-operation units of work under a single WAL transaction identifier (`TxnId`).
+* **Responsibilities:**
+  * **State Machine:** Governed by explicit `TxnState` (`Active`, `Committed`, `Aborted`). Mutations on closed transactions return structured errors (`TransactionAlreadyCommitted`, `TransactionAlreadyAborted`).
+  * **Single-Transaction Exclusivity:** Enforces single-threaded mutual exclusion on `TreeDb` via Rust's mutable borrowing and dynamic tracking (`Error::TransactionActive`).
+  * **Read-Your-Writes:** Immediate visibility of uncommitted inserts, updates, and deletes for subsequent in-transaction reads (`get`) and range scans (`scan`).
+  * **Commit Durability:** Commits all mutations atomically, ensuring WAL commit record is durably flushed before acknowledging completion.
+  * **Runtime Rollback with CLRs:** On explicit `abort()`, walks the transaction's `PageDelta` history backward in reverse chronological order via `prev_lsn`, applies `before_image` byte slices, appends Compensation Log Records (CLRs), and flushes the WAL.
+  * **Deterministic Drop Behavior:** Uncommitted transactions dropped out of scope automatically invoke rollback to maintain memory/disk cleanliness.
+
+```text
+                  TreeDb
+                    │
+                 begin()
+                    │
+               Transaction
+                    │
+          ┌─────────┼─────────┐
+          │         │         │
+         get       put      delete
+          │         │         │
+          └─────────┼─────────┘
+                    │
+                WAL TxnId
+                    │
+              Commit / Abort
+                    │
+              WAL + Recovery
+```
 
 ---
 

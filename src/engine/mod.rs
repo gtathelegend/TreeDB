@@ -1,6 +1,9 @@
+pub mod transaction;
+pub use transaction::{Transaction, TxnState};
+
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::{Key, PageId};
@@ -83,6 +86,28 @@ impl TreeDb {
         }
     }
 
+    /// Begins an explicit atomic transaction.
+    ///
+    /// # Errors
+    /// * `Error::TransactionActive` if a transaction is already active on this database.
+    pub fn begin(&mut self) -> Result<Transaction<'_>> {
+        if let Some(active) = self.active_txn {
+            return Err(Error::TransactionActive(active));
+        }
+
+        let txn_id = self.begin_txn()?;
+        let header = self.buffer_pool.page_manager().header().clone();
+
+        Ok(Transaction::new(
+            self,
+            txn_id,
+            header.root_page_id,
+            header.freelist_head,
+            header.free_page_count,
+            header.page_count,
+        ))
+    }
+
     /// Begins a new transaction in the WAL stream.
     pub fn begin_txn(&mut self) -> Result<TxnId> {
         if let Some(wal) = self.buffer_pool.wal_mut() {
@@ -109,18 +134,15 @@ impl TreeDb {
         }
     }
 
-    /// Aborts the specified transaction and flushes the WAL.
+    /// Aborts the specified transaction, rolling back physical page modifications
+    /// using Compensation Log Records (CLRs) and flushing WAL through the abort LSN.
     pub fn abort_txn(&mut self, txn_id: TxnId) -> Result<Lsn> {
-        if let Some(wal) = self.buffer_pool.wal_mut() {
-            let lsn = wal.abort_txn(txn_id)?;
-            if self.active_txn == Some(txn_id) {
-                self.active_txn = None;
-                self.buffer_pool.clear_active_txn();
-            }
-            Ok(lsn)
-        } else {
-            Ok(NULL_LSN)
+        let lsn = self.buffer_pool.abort_txn(txn_id)?;
+        if self.active_txn == Some(txn_id) {
+            self.active_txn = None;
+            self.buffer_pool.clear_active_txn();
         }
+        Ok(lsn)
     }
 
     /// Appends a `PageDelta` log record and updates the target page's `page_lsn`.
@@ -166,6 +188,11 @@ impl TreeDb {
         }
 
         Ok(())
+    }
+
+    /// Updates an existing key-value mapping in the database.
+    pub fn update(&mut self, key: Key, value: &[u8]) -> Result<()> {
+        self.put(key, value)
     }
 
     /// Retrieves an owned copy of the value bytes associated with `key`.
@@ -256,5 +283,10 @@ impl TreeDb {
     /// Returns a mutable reference to the underlying BufferPool.
     pub fn buffer_pool_mut(&mut self) -> &mut BufferPool {
         &mut self.buffer_pool
+    }
+
+    /// Validates the structural invariants of the B+ Tree.
+    pub fn validate_tree(&mut self) -> Result<()> {
+        self.tree.validate_tree(&mut self.buffer_pool)
     }
 }
