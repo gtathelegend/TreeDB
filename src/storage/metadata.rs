@@ -1,10 +1,11 @@
 use crate::error::{Error, Result};
 use crate::storage::page::{PageId, PAGE_SIZE};
+use crate::wal::lsn::{Lsn, NULL_LSN};
 
 /// Recognizable magic bytes for TreeDB database files.
 pub const MAGIC_BYTES: &[u8; 8] = b"TREEDB01";
 
-/// Format version 2 (with 16-byte page headers containing PageLSN).
+/// Format version 2 (with 16-byte page headers containing PageLSN and checkpoint metadata).
 pub const CURRENT_FORMAT_VERSION: u32 = 2;
 
 /// Page ID for the Database Header.
@@ -40,6 +41,8 @@ pub struct DbHeader {
     pub freelist_head: PageId,
     /// Total number of free pages currently in the freelist.
     pub free_page_count: u32,
+    /// LSN of the most recent completed durable checkpoint (0 if none).
+    pub last_checkpoint_lsn: Lsn,
 }
 
 impl Default for DbHeader {
@@ -60,6 +63,7 @@ impl DbHeader {
             metadata_page_id: DEFAULT_METADATA_PAGE_ID,
             freelist_head: NO_FREE_PAGE,
             free_page_count: 0,
+            last_checkpoint_lsn: NULL_LSN,
         }
     }
 
@@ -74,6 +78,7 @@ impl DbHeader {
         bytes[24..28].copy_from_slice(&self.metadata_page_id.to_le_bytes());
         bytes[28..32].copy_from_slice(&self.freelist_head.to_le_bytes());
         bytes[32..36].copy_from_slice(&self.free_page_count.to_le_bytes());
+        bytes[36..44].copy_from_slice(&self.last_checkpoint_lsn.to_bytes());
         bytes
     }
 
@@ -107,6 +112,7 @@ impl DbHeader {
         let metadata_page_id = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
         let freelist_head = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
         let free_page_count = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+        let last_checkpoint_lsn = Lsn::from_bytes(bytes[36..44].try_into().unwrap());
 
         Ok(Self {
             magic,
@@ -117,6 +123,7 @@ impl DbHeader {
             metadata_page_id,
             freelist_head,
             free_page_count,
+            last_checkpoint_lsn,
         })
     }
 }
@@ -132,12 +139,14 @@ mod tests {
         header.root_page_id = 4;
         header.freelist_head = 7;
         header.free_page_count = 3;
+        header.last_checkpoint_lsn = Lsn(42);
 
         let bytes = header.serialize();
         let restored = DbHeader::deserialize(&bytes).expect("deserialization should succeed");
         assert_eq!(restored, header);
         assert_eq!(restored.freelist_head, 7);
         assert_eq!(restored.free_page_count, 3);
+        assert_eq!(restored.last_checkpoint_lsn, Lsn(42));
     }
 
     #[test]

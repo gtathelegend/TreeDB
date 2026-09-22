@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::storage::page::{Page, PageId, PageType, PAGE_SIZE};
 use crate::storage::page_manager::PageManager;
 use crate::wal::log_manager::LogManager;
-use crate::wal::lsn::TxnId;
+use crate::wal::lsn::{Lsn, TxnId, NULL_LSN};
 
 /// Frame identifier within the buffer pool.
 pub type FrameId = usize;
@@ -363,6 +363,54 @@ impl BufferPool {
         }
         self.page_manager.sync()?;
         Ok(())
+    }
+
+    /// Executes a synchronous checkpoint of the database.
+    ///
+    /// 1. Flushes all resident dirty pages to disk, enforcing WAL write-ahead ordering for each page.
+    /// 2. Queries active transactions from the WAL log manager.
+    /// 3. Appends a `Checkpoint` log record to the WAL.
+    /// 4. Flushes the WAL through the checkpoint record's LSN.
+    /// 5. Writes the checkpoint LSN to the database header on Page 0 and syncs the database file.
+    ///
+    /// Returns the durable checkpoint LSN.
+    pub fn checkpoint(&mut self) -> Result<Lsn> {
+        // 1. Flush all dirty pages to PageManager, enforcing PageLSN <= durable WAL LSN
+        self.flush_all()?;
+
+        let checkpoint_lsn = if let Some(ref mut wal) = self.wal {
+            // 2. Query currently active uncommitted transactions
+            let active_txns = wal.active_txns();
+
+            // 3. Append Checkpoint log record
+            let lsn = wal.append_checkpoint(active_txns)?;
+
+            // 4. Flush WAL through checkpoint LSN
+            wal.flush(lsn)?;
+            lsn
+        } else {
+            NULL_LSN
+        };
+
+        // 5. Update Database Header on Page 0 with last_checkpoint_lsn and sync
+        self.page_manager.set_last_checkpoint_lsn(checkpoint_lsn)?;
+        self.page_manager.sync()?;
+
+        Ok(checkpoint_lsn)
+    }
+
+    /// Executes a synchronous checkpoint and safely truncates obsolete WAL records.
+    ///
+    /// Calculates the safe retention boundary:
+    /// min(last_checkpoint_lsn, min(first_lsn_of_active_txns))
+    /// and truncates WAL prefix prior to this boundary.
+    pub fn checkpoint_and_truncate_wal(&mut self) -> Result<Lsn> {
+        let checkpoint_lsn = self.checkpoint()?;
+        if let Some(ref mut wal) = self.wal {
+            let retention_lsn = wal.calculate_retention_lsn(checkpoint_lsn);
+            wal.truncate_prefix(retention_lsn)?;
+        }
+        Ok(checkpoint_lsn)
     }
 
     /// Allocates a page (reusing from freelist if available, or appending to file) and installs it in the buffer pool with pin_count = 1.

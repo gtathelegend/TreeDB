@@ -12,6 +12,7 @@ use crate::wal::recovery::RecoveryEngine;
 
 /// High-level persistent database engine coordinating the B+ Tree index,
 /// slotted Record Store, Buffer Pool, and Write-Ahead Logging.
+#[derive(Debug)]
 pub struct TreeDb {
     tree: BPlusTree,
     record_store: RecordStore,
@@ -220,6 +221,21 @@ impl TreeDb {
     /// Synchronizes all dirty buffer pool frames and flushes file changes to physical storage.
     pub fn sync(&mut self) -> Result<()> {
         self.buffer_pool.sync()
+    }
+
+    /// Executes a synchronous checkpoint of the database.
+    ///
+    /// 1. Flushes all dirty buffer pool pages to disk.
+    /// 2. Records active uncommitted transactions.
+    /// 3. Appends a Checkpoint record to WAL and flushes WAL.
+    /// 4. Updates Page 0 DbHeader with last_checkpoint_lsn and syncs database file.
+    pub fn checkpoint(&mut self) -> Result<Lsn> {
+        self.buffer_pool.checkpoint()
+    }
+
+    /// Executes a synchronous checkpoint and safely truncates obsolete WAL records.
+    pub fn checkpoint_and_truncate_wal(&mut self) -> Result<Lsn> {
+        self.buffer_pool.checkpoint_and_truncate_wal()
     }
 
     /// Returns a reference to the underlying B+ Tree handle.

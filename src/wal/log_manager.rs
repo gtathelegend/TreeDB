@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::storage::page::PageId;
-use crate::wal::log_record::LogRecord;
+use crate::wal::log_record::{LogRecord, LogRecordBody, LogRecordType};
 use crate::wal::lsn::{Lsn, TxnId, NULL_LSN};
 
 /// Recognizable magic bytes for TreeDB WAL files.
@@ -93,6 +93,7 @@ pub struct LogManager {
     next_lsn: Lsn,
     flushed_lsn: Lsn,
     next_txn_id: TxnId,
+    txn_first_lsn: HashMap<TxnId, Lsn>,
     txn_prev_lsn: HashMap<TxnId, Lsn>,
 }
 
@@ -119,6 +120,7 @@ impl LogManager {
             next_lsn: Lsn::new(1),
             flushed_lsn: NULL_LSN,
             next_txn_id: TxnId::new(1),
+            txn_first_lsn: HashMap::new(),
             txn_prev_lsn: HashMap::new(),
         })
     }
@@ -126,6 +128,17 @@ impl LogManager {
     /// Opens an existing WAL file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+
+        // If crash happened during rename, restore from .bak if .wal is missing
+        let bak_path = PathBuf::from(format!("{}.bak", path.display()));
+        if !path.exists() && bak_path.exists() {
+            std::fs::rename(&bak_path, &path)?;
+        }
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        if tmp_path.exists() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
 
         let mut header_bytes = [0u8; WAL_HEADER_SIZE];
@@ -139,11 +152,15 @@ impl LogManager {
             next_lsn: Lsn::new(1),
             flushed_lsn: header.flushed_lsn,
             next_txn_id: TxnId::new(1),
+            txn_first_lsn: HashMap::new(),
             txn_prev_lsn: HashMap::new(),
         };
 
-        // Scan existing records to locate highest LSN and highest TxnId
+        // Scan existing records to locate highest LSN, highest TxnId, and active transactions
         let records = manager.read_all_records()?;
+        let mut active_first_lsn = HashMap::new();
+        let mut active_prev_lsn = HashMap::new();
+
         for rec in &records {
             if rec.lsn >= manager.next_lsn {
                 manager.next_lsn = rec.lsn.next();
@@ -151,10 +168,31 @@ impl LogManager {
             if rec.txn_id >= manager.next_txn_id {
                 manager.next_txn_id = rec.txn_id.next();
             }
-            if rec.txn_id.is_valid() {
-                manager.txn_prev_lsn.insert(rec.txn_id, rec.lsn);
+            match rec.record_type {
+                LogRecordType::Begin => {
+                    active_first_lsn.insert(rec.txn_id, rec.lsn);
+                    active_prev_lsn.insert(rec.txn_id, rec.lsn);
+                }
+                LogRecordType::Commit | LogRecordType::Abort => {
+                    active_first_lsn.remove(&rec.txn_id);
+                    active_prev_lsn.remove(&rec.txn_id);
+                }
+                LogRecordType::PageDelta | LogRecordType::Clr => {
+                    active_first_lsn.entry(rec.txn_id).or_insert(rec.lsn);
+                    active_prev_lsn.insert(rec.txn_id, rec.lsn);
+                }
+                LogRecordType::Checkpoint => {
+                    if let LogRecordBody::Checkpoint { active_txns } = &rec.body {
+                        for &(tid, last_lsn) in active_txns {
+                            active_first_lsn.entry(tid).or_insert(last_lsn);
+                            active_prev_lsn.insert(tid, last_lsn);
+                        }
+                    }
+                }
             }
         }
+        manager.txn_first_lsn = active_first_lsn;
+        manager.txn_prev_lsn = active_prev_lsn;
 
         // Position file pointer at end of log
         manager.file.seek(SeekFrom::End(0))?;
@@ -171,6 +209,7 @@ impl LogManager {
         let record = LogRecord::new_begin(lsn, txn_id);
         self.append_record(&record)?;
 
+        self.txn_first_lsn.insert(txn_id, lsn);
         self.txn_prev_lsn.insert(txn_id, lsn);
         Ok(txn_id)
     }
@@ -182,6 +221,7 @@ impl LogManager {
         let record = LogRecord::new_commit(lsn, prev_lsn, txn_id);
         self.append_record(&record)?;
 
+        self.txn_first_lsn.remove(&txn_id);
         self.txn_prev_lsn.remove(&txn_id);
         self.flush(lsn)?;
         Ok(lsn)
@@ -194,6 +234,7 @@ impl LogManager {
         let record = LogRecord::new_abort(lsn, prev_lsn, txn_id);
         self.append_record(&record)?;
 
+        self.txn_first_lsn.remove(&txn_id);
         self.txn_prev_lsn.remove(&txn_id);
         self.flush(lsn)?;
         Ok(lsn)
@@ -220,6 +261,7 @@ impl LogManager {
             after_image,
         );
         self.append_record(&record)?;
+        self.txn_first_lsn.entry(txn_id).or_insert(lsn);
         self.txn_prev_lsn.insert(txn_id, lsn);
         Ok(lsn)
     }
@@ -245,6 +287,7 @@ impl LogManager {
             undo_next_lsn,
         );
         self.append_record(&record)?;
+        self.txn_first_lsn.entry(txn_id).or_insert(lsn);
         self.txn_prev_lsn.insert(txn_id, lsn);
         Ok(lsn)
     }
@@ -319,6 +362,105 @@ impl LogManager {
         }
 
         Ok(records)
+    }
+
+    /// Returns a list of all currently active transactions and their last logged LSNs.
+    pub fn active_txns(&self) -> Vec<(TxnId, Lsn)> {
+        let mut list: Vec<(TxnId, Lsn)> = self
+            .txn_prev_lsn
+            .iter()
+            .map(|(&tid, &lsn)| (tid, lsn))
+            .collect();
+        list.sort_by_key(|(tid, _)| *tid);
+        list
+    }
+
+    /// Returns the minimum logged LSN across all active transactions (or `None` if no active transactions).
+    pub fn min_active_txn_lsn(&self) -> Option<Lsn> {
+        self.txn_first_lsn.values().copied().min()
+    }
+
+    /// Calculates the minimum LSN that must be retained in the WAL.
+    pub fn calculate_retention_lsn(&self, last_checkpoint_lsn: Lsn) -> Lsn {
+        if !last_checkpoint_lsn.is_valid() {
+            return Lsn(1);
+        }
+        match self.min_active_txn_lsn() {
+            Some(min_active) => std::cmp::min(min_active, last_checkpoint_lsn),
+            None => last_checkpoint_lsn,
+        }
+    }
+
+    /// Truncates the WAL prefix by safely removing records with `LSN < min_lsn`.
+    ///
+    /// Retained records (`LSN >= min_lsn`) are written to a temporary file, synced,
+    /// and replaced crash-safely.
+    /// Returns the number of obsolete log records removed.
+    pub fn truncate_prefix(&mut self, min_lsn: Lsn) -> Result<usize> {
+        if !min_lsn.is_valid() || min_lsn <= Lsn(1) {
+            return Ok(0);
+        }
+
+        let all_records = self.read_all_records()?;
+        let total_count = all_records.len();
+        let retained: Vec<LogRecord> = all_records
+            .into_iter()
+            .filter(|r| r.lsn >= min_lsn)
+            .collect();
+        let removed_count = total_count - retained.len();
+
+        if removed_count == 0 {
+            return Ok(0);
+        }
+
+        let tmp_path = PathBuf::from(format!("{}.tmp", self.path.display()));
+        let bak_path = PathBuf::from(format!("{}.bak", self.path.display()));
+
+        // 1. Write retained records to temp file
+        {
+            let mut tmp_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+
+            let header_bytes = self.header.serialize();
+            tmp_file.write_all(&header_bytes)?;
+            for rec in &retained {
+                let rec_bytes = rec.serialize();
+                tmp_file.write_all(&rec_bytes)?;
+            }
+            tmp_file.sync_all()?;
+        }
+
+        // 2. Safely replace WAL file releasing file handles to avoid OS sharing violations
+        let scratch_path = PathBuf::from(format!("{}.scratch", self.path.display()));
+        let scratch_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&scratch_path)?;
+        let _old_file = std::mem::replace(&mut self.file, scratch_file);
+        drop(_old_file);
+
+        // Backup existing WAL
+        if self.path.exists() {
+            let _ = std::fs::remove_file(&bak_path);
+            std::fs::rename(&self.path, &bak_path)?;
+        }
+
+        // Rename tmp to path
+        std::fs::rename(&tmp_path, &self.path)?;
+        let _ = std::fs::remove_file(&bak_path);
+
+        // 3. Reopen self.file on the updated self.path
+        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.file.seek(SeekFrom::End(0))?;
+        let _ = std::fs::remove_file(&scratch_path);
+
+        Ok(removed_count)
     }
 
     /// Returns the currently flushed LSN.

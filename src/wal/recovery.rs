@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::storage::page::Page;
+use crate::storage::page::{Page, PageId};
 use crate::storage::page_manager::PageManager;
 use crate::wal::log_manager::LogManager;
 use crate::wal::log_record::{LogRecord, LogRecordBody, LogRecordType};
@@ -33,6 +33,7 @@ pub struct RecoveryStats {
     pub redo_count: usize,
     pub undo_count: usize,
     pub clrs_generated: usize,
+    pub checkpoint_lsn: Lsn,
 }
 
 /// Simulated crash / fault injection point during crash recovery testing.
@@ -94,11 +95,69 @@ impl RecoveryEngine {
         }
 
         // -------------------------------------------------------------------
+        // CHECKPOINT VALIDATION & INITIALIZATION
+        // -------------------------------------------------------------------
+        let last_checkpoint_lsn = page_manager.header().last_checkpoint_lsn;
+        let mut txn_table: HashMap<TxnId, TxnTableEntry> = HashMap::new();
+        let mut dpt: HashMap<PageId, Lsn> = HashMap::new();
+
+        let scan_start_idx = if last_checkpoint_lsn.is_valid() {
+            // Validate that last_checkpoint_lsn does not exceed durable WAL boundary
+            if log_manager.flushed_lsn().is_valid()
+                && last_checkpoint_lsn > log_manager.flushed_lsn()
+            {
+                return Err(Error::WalCorruption(format!(
+                    "checkpoint LSN {} exceeds durable flushed LSN {}",
+                    last_checkpoint_lsn,
+                    log_manager.flushed_lsn()
+                )));
+            }
+
+            let cp_rec = log_map.get(&last_checkpoint_lsn).ok_or_else(|| {
+                Error::WalCorruption(format!(
+                    "checkpoint LSN {} referenced in header not found in WAL",
+                    last_checkpoint_lsn
+                ))
+            })?;
+
+            if cp_rec.record_type != LogRecordType::Checkpoint {
+                return Err(Error::WalCorruption(format!(
+                    "record at checkpoint LSN {} is not a Checkpoint record (type={:?})",
+                    last_checkpoint_lsn, cp_rec.record_type
+                )));
+            }
+
+            stats.checkpoint_lsn = last_checkpoint_lsn;
+
+            if let LogRecordBody::Checkpoint { active_txns } = &cp_rec.body {
+                for &(txn_id, last_lsn) in active_txns {
+                    txn_table.insert(
+                        txn_id,
+                        TxnTableEntry {
+                            status: TxnStatus::Active,
+                            last_lsn,
+                            undo_next_lsn: last_lsn,
+                        },
+                    );
+                }
+            }
+
+            // Find index of checkpoint record or start scan from earliest active LSN
+            let min_active_lsn = txn_table.values().map(|e| e.last_lsn).min();
+            let start_lsn = match min_active_lsn {
+                Some(min_l) => std::cmp::min(min_l, last_checkpoint_lsn),
+                None => last_checkpoint_lsn,
+            };
+
+            records.iter().position(|r| r.lsn >= start_lsn).unwrap_or(0)
+        } else {
+            0
+        };
+
+        // -------------------------------------------------------------------
         // 1. ANALYSIS PASS
         // -------------------------------------------------------------------
-        let mut txn_table: HashMap<TxnId, TxnTableEntry> = HashMap::new();
-
-        for rec in &records {
+        for rec in &records[scan_start_idx..] {
             match rec.record_type {
                 LogRecordType::Begin => {
                     txn_table.insert(
@@ -130,9 +189,18 @@ impl RecoveryEngine {
                     });
                     entry.last_lsn = rec.lsn;
                     entry.undo_next_lsn = rec.lsn;
+
+                    if let LogRecordBody::PageDelta { page_id, .. } = rec.body {
+                        dpt.entry(page_id).or_insert(rec.lsn);
+                    }
                 }
                 LogRecordType::Clr => {
-                    if let LogRecordBody::Clr { undo_next_lsn, .. } = &rec.body {
+                    if let LogRecordBody::Clr {
+                        page_id,
+                        undo_next_lsn,
+                        ..
+                    } = &rec.body
+                    {
                         let entry = txn_table.entry(rec.txn_id).or_insert(TxnTableEntry {
                             status: TxnStatus::Active,
                             last_lsn: rec.lsn,
@@ -140,6 +208,8 @@ impl RecoveryEngine {
                         });
                         entry.last_lsn = rec.lsn;
                         entry.undo_next_lsn = *undo_next_lsn;
+
+                        dpt.entry(*page_id).or_insert(rec.lsn);
                     }
                 }
                 LogRecordType::Checkpoint => {
@@ -175,7 +245,14 @@ impl RecoveryEngine {
         // 2. REDO PASS
         // -------------------------------------------------------------------
         // Replay history forward for all PageDelta and Clr records
-        for rec in &records {
+        let min_rec_lsn = dpt.values().copied().min();
+        let redo_start_idx = if let Some(min_rec) = min_rec_lsn {
+            records.iter().position(|r| r.lsn >= min_rec).unwrap_or(0)
+        } else {
+            records.len()
+        };
+
+        for rec in &records[redo_start_idx..] {
             match &rec.body {
                 LogRecordBody::PageDelta {
                     page_id,
@@ -183,20 +260,25 @@ impl RecoveryEngine {
                     after_image,
                     ..
                 } if *page_id < page_manager.page_count() => {
-                    let mut page = page_manager.read_page(*page_id)?;
-                    if page.lsn() < rec.lsn {
-                        let start = *offset as usize;
-                        let end = start + after_image.len();
-                        if end <= page.as_bytes().len() {
-                            page.as_bytes_mut()[start..end].copy_from_slice(after_image);
-                            page.set_lsn(rec.lsn);
-                            page_manager.write_page(&page)?;
-                            stats.redo_count += 1;
+                    // DPT check: if rec.lsn < DPT[page_id], redo is unnecessary
+                    if let Some(&rec_lsn) = dpt.get(page_id) {
+                        if rec.lsn >= rec_lsn {
+                            let mut page = page_manager.read_page(*page_id)?;
+                            if page.lsn() < rec.lsn {
+                                let start = *offset as usize;
+                                let end = start + after_image.len();
+                                if end <= page.as_bytes().len() {
+                                    page.as_bytes_mut()[start..end].copy_from_slice(after_image);
+                                    page.set_lsn(rec.lsn);
+                                    page_manager.write_page(&page)?;
+                                    stats.redo_count += 1;
 
-                            if fault == Some(RecoveryFault::DuringRedo(stats.redo_count)) {
-                                return Err(Error::RecoveryInterrupted(
-                                    "simulated crash during redo".into(),
-                                ));
+                                    if fault == Some(RecoveryFault::DuringRedo(stats.redo_count)) {
+                                        return Err(Error::RecoveryInterrupted(
+                                            "simulated crash during redo".into(),
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
@@ -207,20 +289,24 @@ impl RecoveryEngine {
                     redo_image,
                     ..
                 } if *page_id < page_manager.page_count() => {
-                    let mut page = page_manager.read_page(*page_id)?;
-                    if page.lsn() < rec.lsn {
-                        let start = *offset as usize;
-                        let end = start + redo_image.len();
-                        if end <= page.as_bytes().len() {
-                            page.as_bytes_mut()[start..end].copy_from_slice(redo_image);
-                            page.set_lsn(rec.lsn);
-                            page_manager.write_page(&page)?;
-                            stats.redo_count += 1;
+                    if let Some(&rec_lsn) = dpt.get(page_id) {
+                        if rec.lsn >= rec_lsn {
+                            let mut page = page_manager.read_page(*page_id)?;
+                            if page.lsn() < rec.lsn {
+                                let start = *offset as usize;
+                                let end = start + redo_image.len();
+                                if end <= page.as_bytes().len() {
+                                    page.as_bytes_mut()[start..end].copy_from_slice(redo_image);
+                                    page.set_lsn(rec.lsn);
+                                    page_manager.write_page(&page)?;
+                                    stats.redo_count += 1;
 
-                            if fault == Some(RecoveryFault::DuringRedo(stats.redo_count)) {
-                                return Err(Error::RecoveryInterrupted(
-                                    "simulated crash during redo".into(),
-                                ));
+                                    if fault == Some(RecoveryFault::DuringRedo(stats.redo_count)) {
+                                        return Err(Error::RecoveryInterrupted(
+                                            "simulated crash during redo".into(),
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }

@@ -187,6 +187,12 @@ impl PageManager {
         self.write_header_to_disk()
     }
 
+    /// Updates the last checkpoint LSN in the header and persists it to disk.
+    pub fn set_last_checkpoint_lsn(&mut self, lsn: crate::wal::lsn::Lsn) -> Result<()> {
+        self.header.last_checkpoint_lsn = lsn;
+        self.write_header_to_disk()
+    }
+
     /// Writes the serialized header directly to Page 0 on disk.
     pub fn write_header_to_disk(&mut self) -> Result<()> {
         let header_bytes = self.header.serialize();

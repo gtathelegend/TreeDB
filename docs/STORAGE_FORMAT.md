@@ -39,7 +39,8 @@ Page 0 contains global configuration, integrity verification tokens, and allocat
 | `0x18` | 4 bytes | `metadata_page_id` | `u32` (LE) | Page ID of catalog/metadata page (`1`) |
 | `0x1C` | 4 bytes | `freelist_head` | `u32` (LE) | Page ID of first free page in linked freelist (`0` if empty) |
 | `0x20` | 4 bytes | `free_page_count` | `u32` (LE) | Total number of free pages currently in freelist |
-| `0x24` | 4060 bytes | `reserved` | `[u8; 4060]`| Zero-padded reserved space for future extensions |
+| `0x24` | 8 bytes | `last_checkpoint_lsn`| `u64` (LE) | LSN of the most recent completed durable checkpoint (`0` if none) |
+| `0x2C` | 4052 bytes | `reserved` | `[u8; 4052]`| Zero-padded reserved space for future extensions |
 
 ---
 

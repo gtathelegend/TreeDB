@@ -229,4 +229,29 @@ This document records key architectural and design choices, their rationale, and
   * **Freelist Integration:** Deleting an overflow record reclaims all pages in its chain directly into the persistent freelist.
   * **Defensive Integrity Validation:** Bounded traversal and cycle detection protect against infinite loops in corrupted databases.
 
+---
+
+## Decision 23: Synchronous Checkpointing Protocol & Durable Metadata
+
+* **Decision:** Synchronous checkpoints execute in a strict multi-step order:
+  1. `BufferPool::flush_all()` flushes all resident dirty pages to disk, enforcing the WAL Write-Ahead invariant (`PageLSN <= durable WAL LSN`) for every page before disk write.
+  2. Query active uncommitted transactions and append a `Checkpoint { active_txns }` record to the WAL.
+  3. Flush WAL to physical storage through the checkpoint LSN.
+  4. Persist `last_checkpoint_lsn` to Page 0 (`DbHeader` offset 36..44) and sync the database file.
+* **Rationale:**
+  * **Strict Durability Invariant:** A checkpoint is never marked durable until both dirty pages and the WAL checkpoint record are on disk, and the header metadata is synced.
+  * **Single-Threaded Simplicity:** Synchronous checkpoints avoid background worker threads and asynchronous runtime dependencies while guaranteeing exact recovery boundaries.
+
+---
+
+## Decision 24: WAL Retention Boundary & Crash-Safe Atomic Truncation
+
+* **Decision:** The safe WAL retention boundary is computed as:
+  $$\text{retention\_lsn} = \min\left( \text{last\_checkpoint\_lsn},\; \min_{T \in \text{ActiveTxns}} (\text{first\_lsn}(T)) \right)$$
+  WAL prefix truncation writes retained records (`LSN >= retention_lsn`) to a temporary file (`.wal.tmp`), syncs to disk, releases file handles, renames the existing file to `.wal.bak`, renames `.wal.tmp` to `.wal`, and cleans up `.wal.bak`.
+* **Rationale:**
+  * **Undo Chain Preservation:** Active loser transactions spanning checkpoints require their complete historical Undo chains (back to `Begin`). Truncating only before `retention_lsn` guarantees loser transactions can always be undone.
+  * **Cross-Platform Crash-Safety:** Releasing file handles and using atomic renames prevents Windows sharing violations and ensures that even if a crash occurs during truncation, either the original or the replacement WAL is completely valid.
+
+
 

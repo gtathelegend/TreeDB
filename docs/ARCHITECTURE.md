@@ -71,11 +71,13 @@ v                                                             v
   * Durable file synchronization (`sync_all`) through target LSNs (`flushed_lsn`).
   * Sequential log scanning distinguishing clean truncated crash tails from mid-log corruption (`Error::WalCorruption`).
 
-### `RecoveryEngine`
-* **Role:** Implements an ARIES-inspired recovery pipeline with physical page-delta logging, PageLSNs, analysis, redo, undo, and compensation log records.
+### `RecoveryEngine` & `Checkpointing`
+* **Role:** Implements an ARIES-inspired recovery pipeline and synchronous checkpoint protocol.
 * **Responsibilities:**
-  * **Analysis Pass:** Reconstructs the active Transaction Table and Dirty Page Table from the log to identify uncommitted loser transactions.
-  * **Redo Pass:** Replays history forward for all `PageDelta` and `Clr` records where `page.lsn() < log_record.lsn()`. Skips pages where `page.lsn() >= log_record.lsn()`.
+  * **Synchronous Checkpoint:** Flushes all dirty buffer pool frames (enforcing Write-Ahead ordering), captures active transactions in a `Checkpoint` WAL record, flushes WAL, and persists `last_checkpoint_lsn` to Page 0 (`DbHeader`).
+  * **Safe WAL Prefix Truncation:** Computes the retention boundary $\min(\text{last\_checkpoint\_lsn}, \min(\text{first\_lsn}(T)))$ and safely removes obsolete WAL prefixes with atomic temporary file swapping.
+  * **Checkpoint-Aware Analysis Pass:** Initializes the active transaction table directly from the durable checkpoint, starting log scan from the earliest active transaction LSN.
+  * **DPT & Redo Pass Optimization:** Reconstructs Dirty Page Table (`rec_lsn` per page) to bypass unnecessary page reads during Redo. Replays forward for all `PageDelta` and `Clr` records where `page.lsn() < log_record.lsn()`.
   * **Undo Pass:** Reverses uncommitted loser transactions backward in reverse LSN order, writing Compensation Log Records (CLRs) with `undo_next_lsn` pointers and `Abort` markers.
   * **CLR Durability Order:** Enforces `append CLR -> flush WAL through CLR LSN -> write recovered page` so recovery modifications never precede their CLR on disk.
   * **Fault Injection & Restartability:** Supports deterministic interruption via `RecoveryFault` (before recovery, during Redo, during Undo, after CLR append, after CLR flush, after page write). Recovery safely restarts, redoing durable CLRs and continuing Undo.
@@ -156,11 +158,11 @@ v                                                             v
 
 ---
 
-## 6. Intentionally Deferred Items (Phase 10+)
+## 6. Intentionally Deferred Items (Phase 11+)
 
-The following capabilities are intentionally deferred to subsequent phases and not implemented in Phase 9:
-* Background fuzzy checkpointing and WAL truncation / log recycling.
-* Group commit and asynchronous WAL flush queues.
+The following capabilities are intentionally deferred to subsequent phases and not implemented in Phase 10:
+* Background fuzzy checkpointing and asynchronous log worker threads.
+* Group commit and lock-free WAL flush rings.
 * Multi-threading, concurrency control, and latching.
 * SQL query parser, execution engine, and MVCC.
 

@@ -143,11 +143,27 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 10: Checkpointing, WAL Truncation & System Maturation (Next Phase)
-* [ ] Periodic background fuzzy checkpointing and WAL truncation / log recycling
+## Phase 10: Checkpointing & WAL Lifecycle Management (Completed)
+* [x] Synchronous checkpoint protocol (`BufferPool::checkpoint()`, `TreeDb::checkpoint()`)
+* [x] Durable checkpoint metadata on Page 0 (`DbHeader::last_checkpoint_lsn` at offset 36..44)
+* [x] Checkpoint-aware Analysis pass starting from durable checkpoint and active transaction table
+* [x] Dirty Page Table (DPT) tracking `rec_lsn` per page for Redo optimization
+* [x] Safe WAL retention boundary formula: $\min(\text{last\_checkpoint\_lsn}, \min(\text{first\_lsn}(T)))$
+* [x] Crash-safe atomic WAL prefix truncation and log recycling (`LogManager::truncate_prefix`)
+* [x] Loser transaction complete Undo history preservation across checkpoints
+* [x] Corrupted checkpoint metadata validation and defense against impossible LSNs
+* [x] Freelist and multi-page overflow interaction across checkpoints
+* [x] Recovery equivalence testing between full WAL scan and checkpoint recovery
+* [x] Demonstrably bounded WAL file growth under periodic checkpointing workloads
+* [x] 11 dedicated checkpoint integration tests and benchmarks
+
+---
+
+## Phase 11: Group Commit, Concurrency & CLI (Future)
 * [ ] Group commit and asynchronous WAL flush queues
 * [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`, `inspect-freelist`)
 * [ ] Microbenchmarks and high-throughput stress testing
 * [ ] Multi-threading, concurrency control, and latching
+
 
 
