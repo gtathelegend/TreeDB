@@ -208,7 +208,7 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// Creates and validates a new `Schema` definition.
+    /// Creates and validates a new `Schema` definition for a persistent table.
     pub fn new(columns: Vec<Column>, primary_key_idx: usize) -> Result<Self> {
         let schema = Self {
             columns,
@@ -216,6 +216,14 @@ impl Schema {
         };
         schema.validate()?;
         Ok(schema)
+    }
+
+    /// Creates a `Schema` representation for a query result or projection.
+    pub fn new_projected(columns: Vec<Column>) -> Self {
+        Self {
+            columns,
+            primary_key_idx: 0,
+        }
     }
 
     /// Validates structural invariants of the schema.
@@ -271,6 +279,11 @@ impl Schema {
     /// Finds the index of a column by name.
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == name)
+    }
+
+    /// Finds a column definition by name.
+    pub fn get_column(&self, name: &str) -> Option<&Column> {
+        self.columns.iter().find(|c| c.name == name)
     }
 
     /// Validates a `Row` against this schema.

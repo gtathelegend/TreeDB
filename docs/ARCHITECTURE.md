@@ -48,23 +48,52 @@ v                                                             v
 ```
 
 ```text
-                         TreeDb
-                           |
-             +-------------+-------------+
-             |                           |
-          Catalog                    User Tables
-             |                           |
-       Table Metadata              Table Storage
-             |                     +-----+-----+
-             |                     |           |
-          TableId                B+ Tree   RecordStore
-             |                     |
-             +----------+----------+
-                        |
-                  Buffer Pool
-                        |
-                  WAL / Recovery
+                          TreeDb
+                            |
+                        Transaction
+                            |
+                       Query Engine
+                            |
+               +------------+------------+
+               |                         |
+           Expressions               Operators
+               |                         |
+         +-----+------+          +-------+-------+
+         |            |          |       |       |
+       Literal      Column     Filter  Project  Sort
+         |            |          |       |       |
+         +-----+------+          +-------+-------+
+               |
+             Value
+               |
+             Row
+               |
+             Table
 ```
+
+---
+
+## 1. Query Execution & Expression Layer (`src/query`)
+
+### `Expr`, `BinaryOp`, `UnaryOp`, & Evaluator (`src/query/expr.rs`)
+* **Role:** AST-based scalar expression system with static type inference, validation, and SQL-compliant three-valued logic (3VL).
+* **Responsibilities:**
+  * **Expression AST:** `Literal(Value)`, `Column(String)`, `Binary { left, op, right }`, `Unary { op, expr }`, `IsNull(expr)`, `IsNotNull(expr)`.
+  * **Static Type Inference:** `Expr::infer_type(&self, schema: &Schema) -> Result<DataType>` verifies type compatibility and detects invalid operands (e.g., non-boolean in logical operators, incomparable types) before row execution.
+  * **Three-Valued Logic (3VL):** Strict implementation of SQL boolean logic (`TRUE`, `FALSE`, `UNKNOWN`/`NULL`) for `AND`, `OR`, and `NOT`.
+  * **Comparison Evaluation:** Strict type-safe comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`) returning `Value::Null` if either operand is `NULL`. IEEE-754 `NaN` comparisons evaluate predictably to `false`.
+
+### `Query`, `QueryResult`, & Logical Operators (`src/query/operator.rs`, `src/query/builder.rs`)
+* **Role:** Composable relational query pipeline and programmatic query builder executing over `Table<'a>` and `Transaction<'db>`.
+* **Responsibilities:**
+  * **Pipeline Architecture:**
+    1. **Scan:** Evaluates primary-key point lookup (`pk == lit`) or range scan (`pk >= low AND pk < high`) optimizations; otherwise executes a full B+ Tree scan.
+    2. **Filter (`FilterOperator`):** Evaluates predicate expressions, retaining rows where `predicate == Value::Boolean(true)` (discarding `false` and `Null`).
+    3. **Sort (`SortOperator`):** Multi-key stable sorting with configurable NULL placement (defaulting to NULLs first in `ASC`, NULLs last in `DESC`) and deterministic `f64::total_cmp` float ordering.
+    4. **Pagination (`OffsetLimitOperator`):** In-memory offset skipping and limit truncation.
+    5. **Projection (`ProjectOperator`):** Evaluates projection expressions, generating projected `Schema` definitions and derived output `Row`s.
+  * **Programmatic API:** Fluent builder via `TreeDb::query(name)` and `Transaction::query(name)` supporting `.filter()`, `.project()`, `.sort_by()`, `.sort()`, `.offset()`, `.limit()`, and `.execute()`.
+
 
 ---
 

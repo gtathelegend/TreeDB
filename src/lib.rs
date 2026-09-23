@@ -3,6 +3,7 @@
 pub mod engine;
 pub mod error;
 pub mod index;
+pub mod query;
 pub mod storage;
 pub mod wal;
 
@@ -17,6 +18,10 @@ pub use index::{
     INTERNAL_MAX_KEYS, INTERNAL_MIN_CHILDREN, INTERNAL_MIN_KEYS, INVALID_PAGE_ID, KEY_SIZE,
     LEAF_ENTRY_SIZE, LEAF_HEADER_SIZE, LEAF_MAX_ENTRIES, LEAF_MIN_ENTRIES, PAGE_ID_SIZE,
     RECORD_ID_SIZE,
+};
+pub use query::{
+    BinaryOp, Expr, FilterOperator, OffsetLimitOperator, ProjectOperator, Query, QueryResult,
+    SortDirection, SortKey, SortOperator, UnaryOp,
 };
 pub use storage::{
     is_reserved_page, BufferPool, BufferPoolStats, DbHeader, FrameId, FreePageLayout,

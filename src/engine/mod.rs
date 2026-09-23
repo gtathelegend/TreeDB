@@ -338,6 +338,12 @@ impl TreeDb {
         ))
     }
 
+    /// Constructs a programmatic query against a named table.
+    pub fn query(&mut self, table_name: &str) -> Result<crate::query::Query<'_>> {
+        let table = self.open_table(table_name)?;
+        Ok(crate::query::Query::new(table))
+    }
+
     /// Drops a table from the catalog and reclaims all of its physical pages into the freelist.
     ///
     /// Automatically begins and commits a transaction if no transaction is active.

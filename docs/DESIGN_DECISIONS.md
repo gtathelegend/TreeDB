@@ -298,6 +298,22 @@ This document records key architectural and design choices, their rationale, and
   * **Order-Preserving Indexing:** Canonical integer transformations allow signed and unsigned integers to share the high-performance B+ Tree index engine without redundant specialized index implementations.
   * **Strict Type Safety:** Schema validation occurs prior to binary encoding, preventing corrupted or malformed tuples from entering physical storage.
 
+---
+
+## Decision 29: Programmatic Query Execution, Expression AST & Three-Valued Logic Engine
+
+* **Decision:** Introduce a composable relational query execution engine and scalar expression evaluator on top of the typed `Table` API:
+  1. **Scalar Expression AST & Evaluation (`src/query/expr.rs`):** `Expr` AST supporting literals, column references, unary operators (`NOT`), binary operators (`=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`), and null predicates (`IS NULL`, `IS NOT NULL`).
+  2. **SQL-Compliant Three-Valued Logic (3VL):** Boolean operators (`AND`, `OR`, `NOT`) adhere to standard SQL 3VL truth tables where `UNKNOWN` is represented by `Value::Null`. Comparisons involving `NULL` evaluate to `Value::Null`, and `FilterOperator` retains rows strictly when the predicate evaluates to `Value::Boolean(true)` (discarding `false` and `Null`).
+  3. **Multi-Key Sorting & Deterministic NULL Ordering:** `SortOperator` supports multi-key ordering with configurable NULL placement (`nulls_first: Option<bool>`), defaulting to NULLs first in `ASC` and NULLs last in `DESC`. Floating-point numbers are ordered using `f64::total_cmp`, ensuring deterministic handling of `NaN` and signed zeros.
+  4. **Primary Key Point & Range Scan Optimizations:** `Query` inspects filter predicates to recognize single-point lookups (`pk == lit`) and range constraints (`pk >= low AND pk < high`), executing direct B+ Tree point lookups or range scans and eliminating unnecessary table scans while maintaining 100% equivalence with full-scan evaluation.
+  5. **Programmatic Builder & Schema Propagation:** `Query` builder provides a fluent builder API (`filter`, `project`, `sort`, `offset`, `limit`) propagating derived `Schema` metadata through each pipeline stage without relying on SQL text parsing.
+* **Rationale:**
+  * **Clean Decoupling:** Separating query execution and expression evaluation from future SQL parsing allows relational semantics and optimizations to be verified independently before introducing a parser.
+  * **Zero External Dependencies:** Built entirely with safe, idiomatic standard Rust abstractions and structured error handling.
+  * **Transaction-Aware Execution:** Queries execute transparently over active `Transaction` handles, observing uncommitted mutations and respecting transaction rollbacks.
+
+
 
 
 

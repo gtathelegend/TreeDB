@@ -168,6 +168,12 @@ impl<'db> Transaction<'db> {
         ))
     }
 
+    /// Constructs a programmatic query against a named table within this transaction.
+    pub fn query(&mut self, table_name: &str) -> Result<crate::query::Query<'_>> {
+        let table = self.open_table(table_name)?;
+        Ok(crate::query::Query::new(table))
+    }
+
     /// Drops a table from the catalog and reclaims its pages within this transaction.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         self.ensure_active()?;

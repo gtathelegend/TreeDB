@@ -178,4 +178,32 @@ pub enum Error {
     /// Column with the specified name was not found in schema.
     #[error("Column '{0}' not found")]
     ColumnNotFound(String),
+
+    /// Expression type checking failed with mismatched types.
+    #[error("Expression type mismatch: expected {expected}, found {found}")]
+    ExpressionTypeMismatch { expected: String, found: String },
+
+    /// Comparison operator is invalid for the operand types.
+    #[error("Invalid comparison between {left} and {right} using operator '{op}'")]
+    InvalidComparison {
+        left: String,
+        right: String,
+        op: String,
+    },
+
+    /// Boolean operator received a non-boolean operand.
+    #[error("Invalid boolean expression: operand type is {found}")]
+    InvalidBooleanExpression { found: String },
+
+    /// Sort key expression is invalid.
+    #[error("Invalid sort expression: {0}")]
+    InvalidSortExpression(String),
+
+    /// Projection expression list is invalid.
+    #[error("Invalid projection: {0}")]
+    InvalidProjection(String),
+
+    /// General query execution error.
+    #[error("Query execution error: {0}")]
+    QueryExecutionError(String),
 }

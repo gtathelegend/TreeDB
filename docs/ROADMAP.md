@@ -221,11 +221,37 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 14: Future Enhancements (Future)
+## Phase 14: Query Execution & Expression Engine (Completed)
+* [x] AST-based scalar expression system (`Expr::Literal`, `Expr::Column`, `Expr::Binary`, `Expr::Unary`, `Expr::IsNull`, `Expr::IsNotNull`)
+* [x] Binary operators (`=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`) and unary negation (`NOT`)
+* [x] Static type inference and operand compatibility validation (`Expr::infer_type(&self, schema) -> Result<DataType>`)
+* [x] SQL-compliant three-valued logic (3VL) for `AND`, `OR`, `NOT` (`TRUE`, `FALSE`, `UNKNOWN`/`NULL`)
+* [x] Three-valued comparison semantics returning `Value::Null` on NULL operands
+* [x] Logical query result representation (`QueryResult { schema: Schema, rows: Vec<Row> }`)
+* [x] Composable logical operators:
+  * [x] Scan operator with B+ Tree primary key order
+  * [x] Filter operator (`FilterOperator`) evaluating predicates and retaining only `Value::Boolean(true)`
+  * [x] Project operator (`ProjectOperator`) evaluating expression lists and deriving output schemas
+  * [x] Sort operator (`SortOperator`) with multi-key sorting, explicit NULL placement (NULLs first in ASC, NULLs last in DESC), and `f64::total_cmp` float ordering
+  * [x] Pagination operator (`OffsetLimitOperator`) for OFFSET and LIMIT
+* [x] Fluent programmatic query builder (`Query<'a>`) on `TreeDb::query()` and `Transaction::query()`
+* [x] Primary key optimizations:
+  * [x] Point lookup optimization (`pk == lit`) using direct B+ Tree point lookup
+  * [x] Range scan optimization (`pk >= low AND pk < high`) using B+ Tree range scan
+  * [x] 100% equivalence verified between optimized lookups and full table scans
+* [x] Multi-table transactional query execution with uncommitted mutation visibility and rollback safety
+* [x] Deterministic randomized expression evaluator oracle testing vs independent 3VL reference
+* [x] Deterministic randomized query pipeline oracle testing vs pure in-memory `Vec<Row>` model
+* [x] 21 dedicated query integration tests (258 total test suite)
+
+---
+
+## Phase 15: SQL Parser & Query Planning (Future)
+* [ ] SQL lexer and AST parser (`SELECT`, `FROM`, `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`)
+* [ ] SQL AST translation into programmatic `Query` pipelines
 * [ ] Secondary B+ Tree indexes and index-only scans
-* [ ] Group commit and asynchronous WAL flush queues
-* [ ] Interactive CLI commands (`create-table`, `list-tables`, `insert`, `select`, `scan`, `stats`)
-* [ ] Multi-threading, concurrency control, and page latching
+* [ ] Aggregation functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) and `GROUP BY`
+* [ ] Interactive CLI commands (`create-table`, `list-tables`, `query`, `stats`)
 
 
 
