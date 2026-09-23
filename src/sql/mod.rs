@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod binder;
 pub mod lexer;
 pub mod parser;
 pub mod span;
@@ -8,6 +9,7 @@ pub use ast::{
     OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral,
     SqlUnaryOp, TableRef,
 };
+pub use binder::{bind_expr, bind_select, BindingContext, BoundSelect};
 pub use lexer::{Lexer, MAX_IDENTIFIER_LEN};
 pub use parser::Parser;
 pub use span::SourceSpan;

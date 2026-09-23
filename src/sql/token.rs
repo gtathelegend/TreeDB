@@ -42,6 +42,8 @@ pub enum TokenKind {
     // Punctuation
     Asterisk,
     Comma,
+    Dot,
+
     LParen,
     RParen,
     Semicolon,
@@ -83,6 +85,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Minus => write!(f, "'-'"),
             TokenKind::Asterisk => write!(f, "'*'"),
             TokenKind::Comma => write!(f, "','"),
+            TokenKind::Dot => write!(f, "'.'"),
             TokenKind::LParen => write!(f, "'('"),
             TokenKind::RParen => write!(f, "')'"),
             TokenKind::Semicolon => write!(f, "';'"),

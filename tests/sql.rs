@@ -275,6 +275,58 @@ fn test_parser_unary_operators() {
     };
 
     assert_eq!(ast.selection, Some(expected_selection));
+
+    // In SQL standard semantics, NOT binds looser than comparison: NOT x = 1 -> NOT (x = 1)
+    let ast_not_eq = parse_sql("SELECT * FROM t WHERE NOT x = 1").unwrap();
+    let expected_not_eq = SqlExpr::Unary {
+        op: SqlUnaryOp::Not,
+        expr: Box::new(SqlExpr::Binary {
+            left: Box::new(SqlExpr::Identifier("x".into())),
+            op: SqlBinaryOp::Eq,
+            right: Box::new(SqlExpr::Literal(SqlLiteral::Integer(1))),
+        }),
+    };
+    assert_eq!(ast_not_eq.selection, Some(expected_not_eq));
+}
+
+#[test]
+fn test_parser_qualified_identifiers_and_wildcards() {
+    let ast =
+        parse_sql("SELECT u.*, u.id, users.name AS user_name FROM users AS u WHERE u.age >= 18")
+            .unwrap();
+
+    assert_eq!(ast.projection.len(), 3);
+    assert_eq!(ast.projection[0], SelectItem::QualifiedWildcard("u".into()));
+    assert_eq!(
+        ast.projection[1],
+        SelectItem::Expression {
+            expr: SqlExpr::QualifiedIdentifier {
+                qualifier: "u".into(),
+                name: "id".into(),
+            },
+            alias: None,
+        }
+    );
+    assert_eq!(
+        ast.projection[2],
+        SelectItem::Expression {
+            expr: SqlExpr::QualifiedIdentifier {
+                qualifier: "users".into(),
+                name: "name".into(),
+            },
+            alias: Some("user_name".into()),
+        }
+    );
+
+    let expected_selection = SqlExpr::Binary {
+        left: Box::new(SqlExpr::QualifiedIdentifier {
+            qualifier: "u".into(),
+            name: "age".into(),
+        }),
+        op: SqlBinaryOp::GtEq,
+        right: Box::new(SqlExpr::Literal(SqlLiteral::Integer(18))),
+    };
+    assert_eq!(ast.selection, Some(expected_selection));
 }
 
 #[test]

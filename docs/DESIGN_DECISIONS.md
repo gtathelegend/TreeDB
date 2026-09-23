@@ -328,6 +328,22 @@ This document records key architectural and design choices, their rationale, and
   * **Deterministic Error Spans:** Hand-crafted Pratt parser ensures exact error location reporting on unexpected tokens, unclosed parentheses, missing clauses, or invalid clause ordering.
   * **Safety & Maintainability:** Hand-written recursive descent avoids heavy parser-generator dependencies, keeping the engine lightweight, 100% safe Rust, and easily auditable.
 
+---
+
+## Decision 31: SQL Semantic Binding, Type Coercion & Decoupled Execution Layer
+
+* **Decision:** Build a semantic binding and translation layer (`src/sql/binder.rs`) that maps the SQL AST (`SelectStatement`) directly to Phase 14 query execution structures (`Query<'a>`) without duplicating query evaluation logic:
+  1. **Decoupled Architecture:** The SQL subsystem serves exclusively as a frontend parsing and binding layer. TreeDB's Phase 14 execution engine remains the single, authoritative query execution implementation.
+  2. **Name Resolution & Contextual Binding (`BindingContext`):** Resolves table names against the catalog and column identifiers (including qualified `table.column` and `alias.column`) against the table's `Schema`.
+  3. **SQL Standard Precedence & Qualified Wildcards:** Implements SQL-standard precedence where `NOT` binds looser than comparisons (`NOT (x = 1)`), and supports qualified table wildcards (`table.*`, `alias.*`).
+  4. **Contextual Numeric Literal Coercion:** Coerces numeric scalar literals (e.g. integer `42`) when compared against typed columns (`UInt64` or `Float64`) while preserving strict type validation across incompatible types.
+  5. **Direct Engine & Transaction APIs:** Exposes `execute_sql(&str) -> Result<QueryResult>` on both `TreeDb` and `Transaction<'db>`, providing seamless transaction visibility, read-your-writes consistency, and CLI access.
+* **Rationale:**
+  * **Zero Duplication:** Reusing Phase 14 operators (`FilterOperator`, `ProjectOperator`, `SortOperator`, `OffsetLimitOperator`) and primary-key index optimizations ensures 100% semantic consistency between SQL queries and programmatic queries.
+  * **Transaction-Aware Execution:** SQL queries executed within transactions naturally observe uncommitted mutations and participate in transaction commit/rollback lifecycles.
+
+
+
 
 
 

@@ -83,16 +83,28 @@ v                                                             v
   * **Clause Grammar:** Enforces strict clause order: `SELECT [wildcard | expressions [AS alias]] FROM table [WHERE expr] [ORDER BY expr [ASC | DESC], ...] [LIMIT n] [OFFSET n];`.
   * **Precedence Hierarchy:**
     1. Parenthesized expressions `(expr)`
-    2. Unary operators (`NOT`, unary `-`)
-    3. Postfix predicates (`IS NULL`, `IS NOT NULL`)
-    4. Relational comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`) with normalization of `<>` and `!=` to `SqlBinaryOp::NotEq`
-    5. Logical `AND`
-    6. Logical `OR`
+    2. Primary literals and identifiers
+    3. Unary minus (`-`)
+    4. Postfix predicates (`IS NULL`, `IS NOT NULL`)
+    5. Relational comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`) with normalization of `<>` and `!=` to `SqlBinaryOp::NotEq`
+    6. Logical `NOT` (SQL standard precedence binding looser than comparisons)
+    7. Logical `AND`
+    8. Logical `OR`
   * **Standalone Boundary:** Operates completely decoupled from runtime storage, schemas, or buffer pools via `treedb::sql::parse(sql)`.
+
+### `BindingContext`, `BoundSelect` & SQL Binder (`src/sql/binder.rs`)
+* **Role:** Semantic analysis and translation layer bridging SQL ASTs with Phase 14 query execution structures.
+* **Responsibilities:**
+  * **Name Resolution:** Resolves table names against the catalog and columns (both unqualified `name` and qualified `table.name`/`alias.name`) against table schemas.
+  * **Wildcard Expansion:** Expands unqualified `*` and qualified `alias.*` to all columns from the target `Schema`.
+  * **Literal Coercion:** Coerces numeric literals when compared to typed columns (e.g. integer literal `42` to `Value::UInt64` or `Value::Float64`).
+  * **Expression Type Inference:** Verifies data types statically on projections, filters, and sort keys before query execution.
+  * **Zero Execution Duplication:** Translates `SelectStatement` directly into `BoundSelect` and Phase 14 `Expr`s, delegating physical execution entirely to `Query<'a>`.
 
 ---
 
 ## 2. Query Execution & Expression Layer (`src/query`)
+
 
 ### `Expr`, `BinaryOp`, `UnaryOp`, & Evaluator (`src/query/expr.rs`)
 * **Role:** AST-based scalar expression system with static type inference, validation, and SQL-compliant three-valued logic (3VL).

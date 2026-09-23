@@ -22,6 +22,8 @@ pub struct SelectStatement {
 pub enum SelectItem {
     /// Unqualified wildcard (`*`) projecting all table columns.
     Wildcard,
+    /// Qualified wildcard (`table.*` or `alias.*`) projecting all table columns.
+    QualifiedWildcard(String),
     /// Projected expression with an optional column alias (`expr [AS alias]`).
     Expression {
         /// Evaluated scalar expression.
@@ -35,6 +37,7 @@ impl fmt::Display for SelectItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SelectItem::Wildcard => write!(f, "*"),
+            SelectItem::QualifiedWildcard(tbl) => write!(f, "{tbl}.*"),
             SelectItem::Expression { expr, alias } => match alias {
                 Some(name) => write!(f, "{expr} AS {name}"),
                 None => write!(f, "{expr}"),
@@ -165,8 +168,15 @@ impl fmt::Display for SqlLiteral {
 pub enum SqlExpr {
     /// Constant literal value.
     Literal(SqlLiteral),
-    /// Column or identifier reference.
+    /// Unqualified column or identifier reference (`column`).
     Identifier(String),
+    /// Qualified column reference (`table.column` or `alias.column`).
+    QualifiedIdentifier {
+        /// Table name or table alias qualifier.
+        qualifier: String,
+        /// Column name.
+        name: String,
+    },
     /// Binary operation on two sub-expressions (`left op right`).
     Binary {
         /// Left-hand operand.
@@ -194,6 +204,7 @@ impl fmt::Display for SqlExpr {
         match self {
             SqlExpr::Literal(lit) => write!(f, "{lit}"),
             SqlExpr::Identifier(name) => write!(f, "{name}"),
+            SqlExpr::QualifiedIdentifier { qualifier, name } => write!(f, "{qualifier}.{name}"),
             SqlExpr::Binary { left, op, right } => write!(f, "({left} {op} {right})"),
             SqlExpr::Unary { op, expr } => write!(f, "({op} {expr})"),
             SqlExpr::IsNull(expr) => write!(f, "({expr} IS NULL)"),

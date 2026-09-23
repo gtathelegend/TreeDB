@@ -25,10 +25,11 @@ pub use query::{
     SortDirection, SortKey, SortOperator, UnaryOp,
 };
 pub use sql::{
-    parse as parse_sql, tokenize as tokenize_sql, Lexer, OrderByExpr, OrderDirection, Parser,
-    SelectItem, SelectStatement, SourceSpan, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp,
-    TableRef, Token, TokenKind, MAX_IDENTIFIER_LEN,
+    bind_select, parse as parse_sql, tokenize as tokenize_sql, BindingContext, BoundSelect, Lexer,
+    OrderByExpr, OrderDirection, Parser, SelectItem, SelectStatement, SourceSpan, SqlBinaryOp,
+    SqlExpr, SqlLiteral, SqlUnaryOp, TableRef, Token, TokenKind, MAX_IDENTIFIER_LEN,
 };
+
 pub use storage::{
     is_reserved_page, BufferPool, BufferPoolStats, DbHeader, FrameId, FreePageLayout,
     FreePageManager, Key, OverflowDescriptor, OverflowPage, Page, PageId, PageManager, PageType,

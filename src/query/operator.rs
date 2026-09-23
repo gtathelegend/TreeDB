@@ -204,6 +204,18 @@ impl ProjectOperator {
         input_schema: &Schema,
         projections: &[Expr],
     ) -> Result<(Schema, Vec<Row>)> {
+        let named_projections: Vec<(Expr, Option<String>)> =
+            projections.iter().cloned().map(|e| (e, None)).collect();
+        Self::apply_named(rows, input_schema, &named_projections)
+    }
+
+    /// Applies a list of projection expressions with optional column aliases to input rows,
+    /// returning the projected `Schema` and `Row`s.
+    pub fn apply_named(
+        rows: Vec<Row>,
+        input_schema: &Schema,
+        projections: &[(Expr, Option<String>)],
+    ) -> Result<(Schema, Vec<Row>)> {
         if projections.is_empty() {
             return Err(Error::InvalidProjection(
                 "projection list cannot be empty".to_string(),
@@ -211,11 +223,14 @@ impl ProjectOperator {
         }
 
         let mut out_columns = Vec::with_capacity(projections.len());
-        for (idx, expr) in projections.iter().enumerate() {
+        for (idx, (expr, alias)) in projections.iter().enumerate() {
             let dt = expr.infer_type(input_schema)?;
-            let name = match expr {
-                Expr::Column(name) => name.clone(),
-                _ => format!("col_{idx}"),
+            let name = match alias {
+                Some(alias_name) => alias_name.clone(),
+                None => match expr {
+                    Expr::Column(col_name) => col_name.clone(),
+                    _ => format!("col_{idx}"),
+                },
             };
             let nullable = match expr {
                 Expr::Column(name) => input_schema
@@ -233,7 +248,7 @@ impl ProjectOperator {
 
         for row in rows {
             let mut values = Vec::with_capacity(projections.len());
-            for expr in projections {
+            for (expr, _) in projections {
                 values.push(expr.evaluate(&row, input_schema)?);
             }
             out_rows.push(Row::new(values));

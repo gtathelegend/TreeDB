@@ -83,6 +83,13 @@ impl<'a> Lexer<'a> {
                     SourceSpan::new(start, start + 1),
                 ))
             }
+            '.' => {
+                self.advance();
+                Ok(Token::new(
+                    TokenKind::Dot,
+                    SourceSpan::new(start, start + 1),
+                ))
+            }
 
             // Operators
             '=' => {

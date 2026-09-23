@@ -12,9 +12,10 @@ enum Precedence {
     Lowest = 0,
     Or = 1,
     And = 2,
-    Comparison = 3,
-    IsNull = 4,
-    Unary = 5,
+    Not = 3,
+    Comparison = 4,
+    IsNull = 5,
+    UnaryNeg = 6,
 }
 
 /// Recursive descent and Pratt precedence parser for SQL `SELECT` queries.
@@ -142,6 +143,36 @@ impl<'a> Parser<'a> {
         }
 
         loop {
+            // Check for qualified wildcard: `tbl.*`
+            if let TokenKind::Ident(tbl) = &self.peek().kind {
+                if self.peek_ahead(1).kind == TokenKind::Dot
+                    && self.peek_ahead(2).kind == TokenKind::Asterisk
+                {
+                    let tbl_name = tbl.clone();
+                    self.advance(); // consume ident
+                    self.advance(); // consume '.'
+                    self.advance(); // consume '*'
+                    items.push(SelectItem::QualifiedWildcard(tbl_name));
+
+                    if self.peek().kind == TokenKind::Comma {
+                        self.advance(); // consume comma
+                        if self.peek().kind == TokenKind::From || self.peek().kind == TokenKind::Eof
+                        {
+                            let err_token = self.peek();
+                            return Err(Error::SqlParseError {
+                                message: "expected expression after comma in SELECT list"
+                                    .to_string(),
+                                start: err_token.span.start,
+                                end: err_token.span.end,
+                            });
+                        }
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
             let expr = self.parse_expr()?;
             let alias = self.parse_optional_alias()?;
 
@@ -353,6 +384,18 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(name) => {
                 let val = name.clone();
+                if self.peek_ahead(1).kind == TokenKind::Dot {
+                    if let TokenKind::Ident(col) = &self.peek_ahead(2).kind {
+                        let col_name = col.clone();
+                        self.advance(); // consume qualifier
+                        self.advance(); // consume '.'
+                        self.advance(); // consume column ident
+                        return Ok(SqlExpr::QualifiedIdentifier {
+                            qualifier: val,
+                            name: col_name,
+                        });
+                    }
+                }
                 self.advance();
                 Ok(SqlExpr::Identifier(val))
             }
@@ -372,7 +415,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Not => {
                 self.advance(); // consume NOT
-                let expr = self.parse_precedence(Precedence::Unary)?;
+                let expr = self.parse_precedence(Precedence::Not)?;
                 Ok(SqlExpr::Unary {
                     op: SqlUnaryOp::Not,
                     expr: Box::new(expr),
@@ -390,13 +433,14 @@ impl<'a> Parser<'a> {
                     self.advance();
                     Ok(SqlExpr::Literal(SqlLiteral::Float(-val)))
                 } else {
-                    let expr = self.parse_precedence(Precedence::Unary)?;
+                    let expr = self.parse_precedence(Precedence::UnaryNeg)?;
                     Ok(SqlExpr::Unary {
                         op: SqlUnaryOp::Neg,
                         expr: Box::new(expr),
                     })
                 }
             }
+
             other => Err(Error::SqlParseError {
                 message: format!("expected expression, found {other}"),
                 start: span.start,
@@ -532,6 +576,16 @@ impl<'a> Parser<'a> {
 
     fn peek(&self) -> &Token {
         self.tokens.get(self.cursor).unwrap_or_else(|| {
+            static EOF_TOKEN: Token = Token {
+                kind: TokenKind::Eof,
+                span: SourceSpan { start: 0, end: 0 },
+            };
+            &EOF_TOKEN
+        })
+    }
+
+    fn peek_ahead(&self, offset: usize) -> &Token {
+        self.tokens.get(self.cursor + offset).unwrap_or_else(|| {
             static EOF_TOKEN: Token = Token {
                 kind: TokenKind::Eof,
                 span: SourceSpan { start: 0, end: 0 },

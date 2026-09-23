@@ -344,6 +344,32 @@ impl TreeDb {
         Ok(crate::query::Query::new(table))
     }
 
+    /// Parses, binds, and executes an SQL `SELECT` statement directly on the database engine.
+    pub fn execute_sql(&mut self, sql: &str) -> Result<crate::query::QueryResult> {
+        let ast = crate::sql::parse(sql)?;
+        let table = self.open_table(&ast.from.name)?;
+        let bound = crate::sql::bind_select(&ast, table.schema())?;
+
+        let mut query = crate::query::Query::new(table);
+        if let Some(filter) = bound.filter {
+            query = query.filter(filter);
+        }
+        if !bound.projections.is_empty() {
+            query = query.project_with_aliases(bound.projections);
+        }
+        if !bound.order_by.is_empty() {
+            query = query.sort(bound.order_by);
+        }
+        if let Some(offset) = bound.offset {
+            query = query.offset(offset);
+        }
+        if let Some(limit) = bound.limit {
+            query = query.limit(limit);
+        }
+
+        query.execute()
+    }
+
     /// Drops a table from the catalog and reclaims all of its physical pages into the freelist.
     ///
     /// Automatically begins and commits a transaction if no transaction is active.

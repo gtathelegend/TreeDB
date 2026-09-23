@@ -222,4 +222,8 @@ pub enum Error {
         start: usize,
         end: usize,
     },
+
+    /// Semantic error encountered during SQL name binding and validation.
+    #[error("SQL binding error: {0}")]
+    SqlBindingError(String),
 }

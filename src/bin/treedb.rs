@@ -10,15 +10,43 @@ fn main() -> Result<()> {
         println!("Usage: treedb <command> [args]");
         println!();
         println!("Commands:");
-        println!("  init <path>    Initialize a new TreeDB database file");
-        println!("  info <path>    Display database file metadata");
-        println!("  version        Show TreeDB version information");
+        println!("  init <path>         Initialize a new TreeDB database file");
+        println!("  info <path>         Display database file metadata");
+        println!("  query <path> <sql>  Execute a SQL SELECT query against a database");
+        println!("  version             Show TreeDB version information");
         return Ok(());
     }
 
     match args[1].as_str() {
         "version" => {
             println!("TreeDB v{}", env!("CARGO_PKG_VERSION"));
+        }
+        "query" => {
+            if args.len() < 4 {
+                eprintln!("Error: database path and SQL query required. Usage: treedb query <path> \"<SQL>\"");
+                process::exit(1);
+            }
+            let path = &args[2];
+            let sql = &args[3];
+            let mut db = treedb::TreeDb::open(path, 64).unwrap_or_else(|e| {
+                eprintln!("Failed to open database at '{path}': {e}");
+                process::exit(1);
+            });
+
+            let result = db.execute_sql(sql).unwrap_or_else(|e| {
+                eprintln!("SQL Execution Error: {e}");
+                process::exit(1);
+            });
+
+            let schema = result.schema();
+            let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            println!("{}", col_names.join(" | "));
+            println!("{}", "-".repeat(col_names.join(" | ").len().max(10)));
+            for row in result.rows() {
+                let row_str: Vec<String> = row.values.iter().map(|v| v.to_string()).collect();
+                println!("{}", row_str.join(" | "));
+            }
+            println!("({} row(s) returned)", result.len());
         }
         "init" => {
             if args.len() < 3 {

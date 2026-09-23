@@ -266,12 +266,30 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 16: SQL Binder & Execution Engine (Future)
-* [ ] Schema binding and name resolution (`BindingContext`) translating `SqlExpr` to `Expr`
-* [ ] Execution engine integration connecting `SelectStatement` AST to relational `Query<'a>` pipelines
-* [ ] Secondary B+ Tree indexes and index-only scans
+## Phase 16: SQL Binder & Execution Engine (Completed)
+* [x] Semantic binding layer (`src/sql/binder.rs`) translating AST `SelectStatement` to `BoundSelect`
+* [x] Table resolution against catalog and structured `TableNotFound` errors
+* [x] Column resolution against schema with `ColumnNotFound` errors and qualified identifier support (`table.column`, `alias.column`)
+* [x] Wildcard expansion (`*` and `table.*`/`alias.*`) to table schema column definitions
+* [x] Contextual literal coercion for `UInt64` and `Float64` columns
+* [x] Output column alias preservation (`AS alias`) throughout projection operators and query schema derivation
+* [x] Static type inference and validation on projections, filters, and sort keys
+* [x] Direct SQL execution APIs: `Transaction::execute_sql` and `TreeDb::execute_sql`
+* [x] Full transaction integration: uncommitted mutation visibility, read-your-writes, and rollback safety
+* [x] Preservation of primary-key point lookup and range scan index optimizations
+* [x] Reusable CLI command: `treedb query <path> "<SQL>"`
+* [x] 14 dedicated SQL execution integration tests (292 total test suite)
+
+---
+
+## Phase 17: Secondary Indexes & Index-Only Scans (Future)
+* [ ] Secondary B+ Tree index metadata tracking in persistent catalog
+* [ ] Transactional secondary index maintenance on `insert`, `update`, and `delete`
+* [ ] Secondary index point lookups and range scans
+* [ ] Index-only scan query optimization
 * [ ] Aggregation functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) and `GROUP BY`
-* [ ] Interactive CLI commands (`create-table`, `list-tables`, `query`, `stats`)
+* [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

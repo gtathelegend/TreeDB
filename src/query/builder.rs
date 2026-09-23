@@ -12,7 +12,7 @@ use crate::query::operator::{
 pub struct Query<'a> {
     table: Table<'a>,
     filter: Option<Expr>,
-    projection: Option<Vec<Expr>>,
+    projection: Option<Vec<(Expr, Option<String>)>>,
     sort_keys: Vec<SortKey>,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -43,8 +43,15 @@ impl<'a> Query<'a> {
     }
 
     /// Specifies the projection expressions for the query output.
-    pub fn project(mut self, expressions: Vec<Expr>) -> Self {
-        self.projection = Some(expressions);
+    pub fn project(self, expressions: Vec<Expr>) -> Self {
+        let named: Vec<(Expr, Option<String>)> =
+            expressions.into_iter().map(|e| (e, None)).collect();
+        self.project_with_aliases(named)
+    }
+
+    /// Specifies the projection expressions with optional output column aliases.
+    pub fn project_with_aliases(mut self, projections: Vec<(Expr, Option<String>)>) -> Self {
+        self.projection = Some(projections);
         self
     }
 
@@ -128,7 +135,7 @@ impl<'a> Query<'a> {
         match &self.projection {
             Some(projections) => {
                 let (projected_schema, projected_rows) =
-                    ProjectOperator::apply(paginated_rows, &schema, projections)?;
+                    ProjectOperator::apply_named(paginated_rows, &schema, projections)?;
                 Ok(QueryResult::new(projected_schema, projected_rows))
             }
             None => Ok(QueryResult::new(schema, paginated_rows)),
