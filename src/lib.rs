@@ -7,8 +7,9 @@ pub mod storage;
 pub mod wal;
 
 pub use engine::{
-    Catalog, CatalogPage, TableId, TableMetadata, Transaction, TreeDb, TxnState, CATALOG_MAGIC,
-    CURRENT_CATALOG_VERSION, MAX_TABLE_NAME_LEN,
+    Catalog, CatalogPage, Column, DataType, Row, Schema, Table, TableId, TableMetadata,
+    Transaction, TreeDb, TxnState, Value, CATALOG_MAGIC, CURRENT_CATALOG_VERSION,
+    MAX_COLUMN_NAME_LEN, MAX_TABLE_NAME_LEN, TUPLE_FORMAT_VERSION,
 };
 pub use error::{Error, Result};
 pub use index::{

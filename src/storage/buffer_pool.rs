@@ -149,6 +149,11 @@ impl BufferPool {
     /// Sets the active transaction ID for automated page delta logging on dirty frames.
     pub fn set_active_txn(&mut self, txn_id: TxnId) {
         self.active_txn = Some(txn_id);
+        for frame in &mut self.frames {
+            if let Some(ref page) = frame.page {
+                frame.before_image = Some(*page.as_bytes());
+            }
+        }
     }
 
     /// Clears the active transaction ID.
@@ -238,6 +243,8 @@ impl BufferPool {
                         }
                     }
                 }
+            } else if let Some(ref page) = frame.page {
+                frame.before_image = Some(*page.as_bytes());
             }
         }
 

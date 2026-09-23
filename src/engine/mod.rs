@@ -1,10 +1,15 @@
 pub mod catalog;
+pub mod table;
 pub mod transaction;
+pub mod types;
+
 pub use catalog::{
     Catalog, CatalogPage, TableId, TableMetadata, CATALOG_MAGIC, CURRENT_CATALOG_VERSION,
     MAX_TABLE_NAME_LEN,
 };
+pub use table::Table;
 pub use transaction::{Transaction, TxnState};
+pub use types::{Column, DataType, Row, Schema, Value, MAX_COLUMN_NAME_LEN, TUPLE_FORMAT_VERSION};
 
 use std::path::{Path, PathBuf};
 
@@ -298,14 +303,14 @@ impl TreeDb {
     /// Creates a new table in the catalog.
     ///
     /// Automatically begins and commits a transaction if no transaction is active.
-    pub fn create_table(&mut self, name: &str) -> Result<TableId> {
+    pub fn create_table(&mut self, name: &str, schema: Schema) -> Result<TableId> {
         let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
             Some(self.begin_txn()?)
         } else {
             None
         };
 
-        let result = Catalog::create_table(&mut self.buffer_pool, name);
+        let result = Catalog::create_table(&mut self.buffer_pool, name, schema);
 
         if let Some(tid) = auto_txn {
             if result.is_ok() {
@@ -316,6 +321,21 @@ impl TreeDb {
         }
 
         result
+    }
+
+    /// Opens an existing table handle for relational operations.
+    pub fn open_table(&mut self, name: &str) -> Result<Table<'_>> {
+        let metadata = self
+            .get_table(name)?
+            .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
+        let tree = BPlusTree::from_root(metadata.root_page_id);
+        let record_store = RecordStore::with_last_page(metadata.record_page_id);
+        Ok(Table::new(
+            metadata,
+            tree,
+            record_store,
+            &mut self.buffer_pool,
+        ))
     }
 
     /// Drops a table from the catalog and reclaims all of its physical pages into the freelist.

@@ -88,7 +88,7 @@ The 4080-byte payload of a Catalog page is structured as:
 | `0x10` | 4 bytes | `next_catalog_page_id`| `u32` (LE) | PageId of next chained catalog page (`0` if end of chain) |
 | `0x14` | 12 bytes | `reserved` | `[u8; 12]` | Zero-filled reserved space |
 
-### Table Metadata Entry Layout (Variable length, 22 bytes + name_len)
+### Table Metadata Entry Layout (Variable length, 26 bytes + name_len + column definitions)
 | Byte Offset | Length | Field Name | Type | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `+0x00` | 4 bytes | `table_id` | `u32` (LE) | Unique, stable logical table identifier |
@@ -96,8 +96,45 @@ The 4080-byte payload of a Catalog page is structured as:
 | `+0x08` | 4 bytes | `root_page_id` | `u32` (LE) | Root PageId of table's B+ Tree index |
 | `+0x0C` | 4 bytes | `record_page_id` | `u32` (LE) | Initial/active PageId of table's slotted RecordStore |
 | `+0x10` | 4 bytes | `flags` | `u32` (LE) | Configuration flags for future schema options |
-| `+0x14` | 2 bytes | `name_len` | `u16` (LE) | Length in bytes of table name (1..64) |
-| `+0x16` | `name_len` bytes | `name` | `[u8; name_len]` | UTF-8 encoded table name string |
+| `+0x14` | 2 bytes | `primary_key_idx` | `u16` (LE) | Index of primary key column in `columns` array |
+| `+0x16` | 2 bytes | `column_count` | `u16` (LE) | Number of columns in the schema (`N`) |
+| `+0x18` | 2 bytes | `name_len` | `u16` (LE) | Length in bytes of table name (1..64) |
+| `+0x1A` | `name_len` bytes | `name` | `[u8; name_len]` | UTF-8 encoded table name string |
+| Following | Variable | `columns` | `[ColumnDef; N]` | Sequence of serialized column definitions |
+
+#### Column Definition Layout (`4 + col_name_len` bytes per column)
+| Byte Offset | Length | Field Name | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `+0x00` | 1 byte | `data_type` | `u8` | Data type tag (`1`=Boolean, `2`=Int64, `3`=UInt64, `4`=Float64, `5`=String, `6`=Bytes) |
+| `+0x01` | 1 byte | `nullable` | `u8` | `0` = Not Null, `1` = Nullable |
+| `+0x02` | 2 bytes | `col_name_len` | `u16` (LE) | Length in bytes of column name (1..64) |
+| `+0x04` | `col_name_len` bytes | `col_name` | `[u8; col_name_len]` | UTF-8 encoded column name string |
+
+---
+
+## Binary Tuple Serialization Format (Version 1)
+
+Tuples stored in the RecordStore and indexed by the B+ Tree are serialized deterministically as:
+
+```text
++---------------------------------------------------------------+
+| Byte 0: format_version (u8 = 1)                               |
++---------------------------------------------------------------+
+| Byte 1..2: column_count (u16, LE)                             |
++---------------------------------------------------------------+
+| Byte 3..3+ceil(N/8): Null Bitmap (1 = NULL, 0 = Present)      |
++---------------------------------------------------------------+
+| Following: Packed Column Values in Schema Order               |
+|  - Boolean: 1 byte (0 or 1)                                   |
+|  - Int64:   8 bytes (i64, Little-Endian)                      |
+|  - UInt64:  8 bytes (u64, Little-Endian)                      |
+|  - Float64: 8 bytes (IEEE 754 f64 bits, Little-Endian)        |
+|  - String:  4 bytes length (u32, LE) + UTF-8 payload          |
+|  - Bytes:   4 bytes length (u32, LE) + raw byte payload       |
++---------------------------------------------------------------+
+```
+
+* **Canonical Primary Key Indexing:** For signed integer primary keys (`DataType::Int64`), the engine applies a sign-flip transformation `canonical_key = (i as u64) ^ (1 << 63)`. This maps `[i64::MIN, i64::MAX]` monotonically onto `[0, u64::MAX]`, enabling negative integers to sort naturally before positive integers in the unsigned B+ Tree.
 
 ---
 

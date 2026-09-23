@@ -143,9 +143,29 @@ impl<'db> Transaction<'db> {
     }
 
     /// Creates a new table in the catalog within this transaction.
-    pub fn create_table(&mut self, name: &str) -> Result<crate::engine::catalog::TableId> {
+    pub fn create_table(
+        &mut self,
+        name: &str,
+        schema: crate::engine::types::Schema,
+    ) -> Result<crate::engine::catalog::TableId> {
         self.ensure_active()?;
-        crate::engine::catalog::Catalog::create_table(&mut self.db.buffer_pool, name)
+        crate::engine::catalog::Catalog::create_table(&mut self.db.buffer_pool, name, schema)
+    }
+
+    /// Opens an existing table handle for relational operations within this transaction.
+    pub fn open_table(&mut self, name: &str) -> Result<crate::engine::table::Table<'_>> {
+        self.ensure_active()?;
+        let metadata = crate::engine::catalog::Catalog::get_table(&mut self.db.buffer_pool, name)?
+            .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
+        let tree = crate::index::bplus_tree::BPlusTree::from_root(metadata.root_page_id);
+        let record_store =
+            crate::storage::record_store::RecordStore::with_last_page(metadata.record_page_id);
+        Ok(crate::engine::table::Table::new(
+            metadata,
+            tree,
+            record_store,
+            &mut self.db.buffer_pool,
+        ))
     }
 
     /// Drops a table from the catalog and reclaims its pages within this transaction.

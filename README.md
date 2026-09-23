@@ -56,6 +56,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **WAL Lifecycle & Checkpoint Hardening** | **Implemented** | Fundamental retention invariant, active txn Undo preservation, monotonic LSN continuity, non-zero start LSN, crash-safe atomic replacement, .wal.bak fallback, 4-path equivalence |
 | **Transaction Manager & Atomic Multi-Op Txns** | **Implemented** | Explicit `Transaction<'db>` RAII API, multi-operation atomic commit/abort, CLR runtime rollback, drop safety, read-your-writes, crash recovery |
 | **Persistent Catalog & Schema Metadata** | **Implemented** | Stable monotonic `TableId`s, `TableMetadata`, `PageType::Catalog`, paged chaining, transactional create/drop, freelist reclamation, catalog validation |
+| **Typed Tables & Tuple Storage** | **Implemented** | Strong typing (`Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`), null bitmaps, canonical index key encoding, `Table<'a>` CRUD API, dynamic root synchronization |
 
 
 ---

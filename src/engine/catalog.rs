@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::engine::types::{Column, DataType, Schema, MAX_COLUMN_NAME_LEN};
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
 use crate::index::leaf::LeafNode;
@@ -29,7 +30,7 @@ pub const MAX_TABLE_NAME_LEN: usize = 64;
 /// - `20..32`: `reserved: [u8; 12]`
 pub const CATALOG_HEADER_SIZE: usize = 32;
 
-/// Fixed-size header for each serialized table entry in the catalog payload (22 bytes).
+/// Fixed-size header for each serialized table entry in the catalog payload (26 bytes).
 ///
 /// Layout:
 /// - `0..4`: `table_id: u32`
@@ -37,8 +38,10 @@ pub const CATALOG_HEADER_SIZE: usize = 32;
 /// - `8..12`: `root_page_id: u32`
 /// - `12..16`: `record_page_id: u32`
 /// - `16..20`: `flags: u32`
-/// - `20..22`: `name_len: u16`
-pub const TABLE_ENTRY_HEADER_SIZE: usize = 22;
+/// - `20..22`: `primary_key_idx: u16`
+/// - `22..24`: `column_count: u16`
+/// - `24..26`: `name_len: u16`
+pub const TABLE_ENTRY_HEADER_SIZE: usize = 26;
 
 /// Available payload capacity for catalog entries on a single page.
 pub const CATALOG_ENTRIES_CAPACITY: usize = PAGE_PAYLOAD_SIZE - CATALOG_HEADER_SIZE;
@@ -73,6 +76,22 @@ pub struct TableMetadata {
     pub record_page_id: PageId,
     /// Table configuration flags (reserved for future schema options).
     pub flags: u32,
+    /// Relational schema defining columns and the primary key.
+    pub schema: Schema,
+}
+
+impl TableMetadata {
+    /// Computes the serialized byte size of this table metadata entry.
+    pub fn byte_size(&self) -> usize {
+        TABLE_ENTRY_HEADER_SIZE
+            + self.name.len()
+            + self
+                .schema
+                .columns
+                .iter()
+                .map(|col| 4 + col.name.len())
+                .sum::<usize>()
+    }
 }
 
 /// Validates table name syntax and constraints.
@@ -126,16 +145,12 @@ impl CatalogPage {
 
     /// Computes the total serialized byte size of all entries on this page.
     pub fn entries_byte_size(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|e| TABLE_ENTRY_HEADER_SIZE + e.name.len())
-            .sum()
+        self.entries.iter().map(|e| e.byte_size()).sum()
     }
 
-    /// Returns `true` if a new table entry with the given name length can fit on this page.
-    pub fn can_fit(&self, name_len: usize) -> bool {
-        let needed = TABLE_ENTRY_HEADER_SIZE + name_len;
-        self.entries_byte_size() + needed <= CATALOG_ENTRIES_CAPACITY
+    /// Returns `true` if a new table entry with the given byte size can fit on this page.
+    pub fn can_fit(&self, entry_size: usize) -> bool {
+        self.entries_byte_size() + entry_size <= CATALOG_ENTRIES_CAPACITY
     }
 
     /// Serializes this `CatalogPage` into the payload region of a standard `Page`.
@@ -153,9 +168,7 @@ impl CatalogPage {
         // 2. Write table entries
         let mut offset = CATALOG_HEADER_SIZE;
         for entry in &self.entries {
-            let name_bytes = entry.name.as_bytes();
-            let name_len = name_bytes.len();
-            let entry_len = TABLE_ENTRY_HEADER_SIZE + name_len;
+            let entry_len = entry.byte_size();
 
             if offset + entry_len > PAGE_PAYLOAD_SIZE {
                 return Err(Error::CatalogCorruption(format!(
@@ -164,13 +177,34 @@ impl CatalogPage {
                 )));
             }
 
+            let name_bytes = entry.name.as_bytes();
+            let name_len = name_bytes.len();
+            let col_count = entry.schema.columns.len();
+
             payload[offset..offset + 4].copy_from_slice(&entry.table_id.0.to_le_bytes());
             payload[offset + 4..offset + 8].copy_from_slice(&entry.schema_version.to_le_bytes());
             payload[offset + 8..offset + 12].copy_from_slice(&entry.root_page_id.to_le_bytes());
             payload[offset + 12..offset + 16].copy_from_slice(&entry.record_page_id.to_le_bytes());
             payload[offset + 16..offset + 20].copy_from_slice(&entry.flags.to_le_bytes());
-            payload[offset + 20..offset + 22].copy_from_slice(&(name_len as u16).to_le_bytes());
-            payload[offset + 22..offset + entry_len].copy_from_slice(name_bytes);
+            payload[offset + 20..offset + 22]
+                .copy_from_slice(&(entry.schema.primary_key_idx as u16).to_le_bytes());
+            payload[offset + 22..offset + 24].copy_from_slice(&(col_count as u16).to_le_bytes());
+            payload[offset + 24..offset + 26].copy_from_slice(&(name_len as u16).to_le_bytes());
+
+            let mut cur = offset + TABLE_ENTRY_HEADER_SIZE;
+            payload[cur..cur + name_len].copy_from_slice(name_bytes);
+            cur += name_len;
+
+            for col in &entry.schema.columns {
+                payload[cur] = col.data_type.to_u8();
+                payload[cur + 1] = if col.nullable { 1 } else { 0 };
+                let col_name_bytes = col.name.as_bytes();
+                let col_name_len = col_name_bytes.len();
+                payload[cur + 2..cur + 4].copy_from_slice(&(col_name_len as u16).to_le_bytes());
+                cur += 4;
+                payload[cur..cur + col_name_len].copy_from_slice(col_name_bytes);
+                cur += col_name_len;
+            }
 
             offset += entry_len;
         }
@@ -259,8 +293,12 @@ impl CatalogPage {
                 payload[offset + 18],
                 payload[offset + 19],
             ]);
-            let name_len =
+            let primary_key_idx =
                 u16::from_le_bytes([payload[offset + 20], payload[offset + 21]]) as usize;
+            let column_count =
+                u16::from_le_bytes([payload[offset + 22], payload[offset + 23]]) as usize;
+            let name_len =
+                u16::from_le_bytes([payload[offset + 24], payload[offset + 25]]) as usize;
 
             if name_len == 0 || name_len > MAX_TABLE_NAME_LEN {
                 return Err(Error::CatalogCorruption(format!(
@@ -270,15 +308,15 @@ impl CatalogPage {
                 )));
             }
 
-            let entry_len = TABLE_ENTRY_HEADER_SIZE + name_len;
-            if offset + entry_len > PAGE_PAYLOAD_SIZE {
+            let mut cur = offset + TABLE_ENTRY_HEADER_SIZE;
+            if cur + name_len > PAGE_PAYLOAD_SIZE {
                 return Err(Error::CatalogCorruption(format!(
                     "unexpected end of payload reading table name on page {}",
                     page.id()
                 )));
             }
 
-            let name_bytes = &payload[offset + 22..offset + entry_len];
+            let name_bytes = &payload[cur..cur + name_len];
             let name = std::str::from_utf8(name_bytes)
                 .map_err(|_| {
                     Error::CatalogCorruption(format!(
@@ -287,6 +325,60 @@ impl CatalogPage {
                     ))
                 })?
                 .to_string();
+            cur += name_len;
+
+            let mut columns = Vec::with_capacity(column_count);
+            for _ in 0..column_count {
+                if cur + 4 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::CatalogCorruption(format!(
+                        "unexpected end of payload reading column header on page {}",
+                        page.id()
+                    )));
+                }
+
+                let data_type = DataType::from_u8(payload[cur])?;
+                let nullable = match payload[cur + 1] {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(Error::CatalogCorruption(format!(
+                            "invalid nullable tag {other} on page {}",
+                            page.id()
+                        )));
+                    }
+                };
+                let col_name_len =
+                    u16::from_le_bytes([payload[cur + 2], payload[cur + 3]]) as usize;
+                cur += 4;
+
+                if col_name_len == 0 || col_name_len > MAX_COLUMN_NAME_LEN {
+                    return Err(Error::CatalogCorruption(format!(
+                        "invalid column name length {col_name_len} on page {}",
+                        page.id()
+                    )));
+                }
+
+                if cur + col_name_len > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::CatalogCorruption(format!(
+                        "unexpected end of payload reading column name on page {}",
+                        page.id()
+                    )));
+                }
+
+                let col_name = std::str::from_utf8(&payload[cur..cur + col_name_len])
+                    .map_err(|_| {
+                        Error::CatalogCorruption(format!(
+                            "invalid UTF-8 in column name on page {}",
+                            page.id()
+                        ))
+                    })?
+                    .to_string();
+                cur += col_name_len;
+
+                columns.push(Column::new(col_name, data_type, nullable));
+            }
+
+            let schema = Schema::new(columns, primary_key_idx)?;
 
             entries.push(TableMetadata {
                 table_id: TableId(table_id),
@@ -295,9 +387,10 @@ impl CatalogPage {
                 root_page_id,
                 record_page_id,
                 flags,
+                schema,
             });
 
-            offset += entry_len;
+            offset = cur;
         }
 
         Ok(Self {
@@ -321,7 +414,7 @@ impl CatalogPage {
 
     /// Adds a new table metadata entry to this page.
     pub fn add_entry(&mut self, entry: TableMetadata) -> Result<()> {
-        if !self.can_fit(entry.name.len()) {
+        if !self.can_fit(entry.byte_size()) {
             return Err(Error::CatalogCorruption(format!(
                 "catalog page {} is full",
                 self.page_id
@@ -348,7 +441,7 @@ impl Catalog {
     /// Creates a new table in the catalog and initializes its physical structures.
     ///
     /// # Process
-    /// 1. Validates table name (non-empty, bounded length, UTF-8).
+    /// 1. Validates table name and schema invariants.
     /// 2. Verifies table name uniqueness across all catalog pages.
     /// 3. Reads root catalog page (Page 1) to allocate a new monotonic `TableId`.
     /// 4. Allocates initial physical structures (`PageType::Leaf` and `PageType::Record`).
@@ -357,8 +450,14 @@ impl Catalog {
     /// # Errors
     /// * `Error::TableAlreadyExists` if a table with the same name already exists.
     /// * `Error::InvalidTableName` if the table name is invalid.
-    pub fn create_table(buffer_pool: &mut BufferPool, name: &str) -> Result<TableId> {
+    /// * `Error::TableSchemaMismatch` if the schema is invalid.
+    pub fn create_table(
+        buffer_pool: &mut BufferPool,
+        name: &str,
+        schema: Schema,
+    ) -> Result<TableId> {
         validate_table_name(name)?;
+        schema.validate()?;
 
         // 1. Check for duplicate table name across all catalog pages
         if Self::get_table(buffer_pool, name)?.is_some() {
@@ -403,11 +502,12 @@ impl Catalog {
             root_page_id,
             record_page_id,
             flags: 0,
+            schema,
         };
 
         // 4. Insert metadata entry into catalog page chain
-        let name_len = name.len();
-        if root_cat.can_fit(name_len) {
+        let entry_size = metadata.byte_size();
+        if root_cat.can_fit(entry_size) {
             root_cat.add_entry(metadata)?;
             let page_mut = buffer_pool.fetch_page_mut(root_cat_page_id)?;
             root_cat.serialize(page_mut)?;
@@ -433,7 +533,7 @@ impl Catalog {
                     c
                 };
 
-                if cat.can_fit(name_len) {
+                if cat.can_fit(entry_size) {
                     cat.add_entry(metadata.clone())?;
                     let page_mut = buffer_pool.fetch_page_mut(curr_pid)?;
                     cat.serialize(page_mut)?;
@@ -638,6 +738,38 @@ impl Catalog {
         Ok(None)
     }
 
+    /// Updates the metadata entry for an existing table in the catalog.
+    pub fn update_table_metadata(
+        buffer_pool: &mut BufferPool,
+        metadata: &TableMetadata,
+    ) -> Result<()> {
+        let mut curr_pid = DEFAULT_METADATA_PAGE_ID;
+        while curr_pid != NO_NEXT_CATALOG_PAGE {
+            let mut cat = {
+                let page = buffer_pool.fetch_page(curr_pid)?;
+                let c = CatalogPage::deserialize(page)?;
+                buffer_pool.unpin_page(curr_pid, false)?;
+                c
+            };
+
+            if let Some(pos) = cat
+                .entries
+                .iter()
+                .position(|e| e.table_id == metadata.table_id)
+            {
+                cat.entries[pos] = metadata.clone();
+                let page_mut = buffer_pool.fetch_page_mut(curr_pid)?;
+                cat.serialize(page_mut)?;
+                buffer_pool.unpin_page(curr_pid, true)?;
+                return Ok(());
+            }
+
+            curr_pid = cat.next_catalog_page_id;
+        }
+
+        Err(Error::TableNotFound(metadata.name.clone()))
+    }
+
     /// Looks up a table in the catalog by `TableId`.
     ///
     /// Returns `Ok(Some(TableMetadata))` if found, or `Ok(None)` if absent.
@@ -783,8 +915,9 @@ impl Catalog {
                     )));
                 }
 
-                // Table name validation
+                // Table name and schema validation
                 validate_table_name(&entry.name)?;
+                entry.schema.validate()?;
                 if !seen_names.insert(entry.name.clone()) {
                     return Err(Error::CatalogCorruption(format!(
                         "duplicate table name '{}' detected in catalog",

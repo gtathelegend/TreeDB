@@ -68,23 +68,32 @@ v                                                             v
 
 ---
 
-## 1. Engine & Catalog Layer (`src/engine`)
+## 1. Engine, Catalog & Relational Layer (`src/engine`)
 
-### `Catalog`, `CatalogPage`, `TableMetadata`, & `TableId`
+### `Table`, `Schema`, `Column`, `DataType`, & `Row` (`src/engine/types.rs`, `src/engine/table.rs`)
+* **Role:** High-level typed relational abstraction layer mapping logical rows to deterministic binary tuples stored across the B+ Tree index and slotted RecordStore.
+* **Responsibilities:**
+  * **Logical Type System:** `DataType` (`Null`, `Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`) with explicit 1-byte discriminants and typed scalar `Value` variants.
+  * **Relational Schema Definition:** `Schema { columns: Vec<Column>, primary_key_idx: usize }` with `Column { name, data_type, nullable }`. Enforces single-column primary keys (`UInt64` or `Int64`), non-nullable PK constraints, unique column names, and length limits.
+  * **Canonical Primary Key Mapping:** Preserves signed integer monotonicity by mapping `Int64(i)` to `(i as u64) ^ (1 << 63)` for direct, order-preserving B+ Tree indexing where negative keys naturally precede positive keys.
+  * **Deterministic Binary Tuple Encoding:** Format version 1 packing column count, a compact null bitmap (`ceil(N / 8)` bytes, 1 = NULL), little-endian fixed-width primitives (`bool`, `i64`, `u64`, `f64`), and 4-byte length-prefixed variable strings and raw bytes.
+  * **Relational Table Handle:** `Table<'a>` provides full CRUD (`insert`, `get`, `update`, `delete`, `scan`) operating transparently within active transactions, supporting multi-page overflow rows via RecordStore, and automatically keeping catalog page root metadata synchronized upon B+ Tree splits/merges.
+
+### `Catalog`, `CatalogPage`, `TableMetadata`, & `TableId` (`src/engine/catalog.rs`)
 * **Role:** Persistent schema and table metadata management layer decoupling logical object definitions from physical B+ Tree and RecordStore structures.
 * **Responsibilities:**
   * **Stable Table Identifiers:** `TableId(pub u32)` allocated monotonically and never reused upon table drop.
-  * **Persistent Table Metadata:** `TableMetadata { table_id, name, schema_version, root_page_id, record_page_id, flags }`.
+  * **Persistent Table Metadata:** `TableMetadata { table_id, name, schema_version, root_page_id, record_page_id, flags, schema }`.
   * **Paged Chaining Structure:** Anchored on Page 1 (`DEFAULT_METADATA_PAGE_ID`) with `PageType::Catalog = 7` (or `PageType::Metadata`), dynamically chaining additional catalog pages via `next_catalog_page_id` to support unbounded table capacity without artificial ceilings.
   * **Transactional Lifecycle:** Table creation (`create_table`) and dropping (`drop_table`) integrate seamlessly into the active transaction context (`TxnId`), writing physical `PageDelta` WAL records, supporting runtime rollback with CLRs, and recovering via ARIES.
   * **Complete Freelist Reclamation:** Dropping a table reclaims all associated B+ Tree pages, record pages, and overflow chains back into the persistent freelist with zero page leaks.
-  * **Structural & Referential Validation:** `validate_catalog()` verifies magic (`CATL`), version, table count, ID monotonicity, name syntax, and referential validity of root and record page pointers.
+  * **Structural & Referential Validation:** `validate_catalog()` verifies magic (`CATL`), version, table count, ID monotonicity, name syntax, schema invariants, and referential validity of root and record page pointers.
 
 ### `TreeDb`
-* **Role:** High-level unified database interface coordinating the catalog, index, record storage, buffer pool, and transactions.
+* **Role:** High-level unified database interface coordinating the catalog, relational tables, index, record storage, buffer pool, and transactions.
 * **Responsibilities:**
   * Key-value operations: `put(key, value)`, `update(key, value)`, `get(key)`, `delete(key)`, `scan(start, end)`.
-  * Catalog operations: `create_table(name)`, `drop_table(name)`, `get_table(name)`, `get_table_by_id(id)`, `list_tables()`, `validate_catalog()`.
+  * Relational table operations: `create_table(name, schema)`, `open_table(name)`, `drop_table(name)`, `get_table(name)`, `get_table_by_id(id)`, `list_tables()`, `validate_catalog()`.
   * Transaction coordination: `begin() -> Result<Transaction<'_>>`, `begin_txn()`, `commit_txn(txn_id)`, `abort_txn(txn_id)`.
   * Automatic ARIES crash recovery upon opening existing database and WAL files.
   * Explicit buffer pool and WAL synchronization via `sync()`.

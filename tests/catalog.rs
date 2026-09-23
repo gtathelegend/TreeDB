@@ -6,7 +6,7 @@ use treedb::engine::catalog::{
 use treedb::error::Error;
 use treedb::storage::metadata::DEFAULT_METADATA_PAGE_ID;
 use treedb::storage::page_manager::PageManager;
-use treedb::TreeDb;
+use treedb::{Column, DataType, Schema, TreeDb};
 
 // ============================================================================
 // Helper Utilities
@@ -16,6 +16,17 @@ fn temp_db_path() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join("catalog_test.treedb");
     (dir, path)
+}
+
+fn default_schema() -> Schema {
+    Schema::new(
+        vec![
+            Column::new("id", DataType::UInt64, false),
+            Column::new("name", DataType::String, true),
+        ],
+        0,
+    )
+    .unwrap()
 }
 
 // ============================================================================
@@ -42,7 +53,9 @@ fn test_catalog_create_and_lookup_table() {
     let (_dir, path) = temp_db_path();
     let mut db = TreeDb::create(&path, 10).expect("create database");
 
-    let table_id = db.create_table("users").expect("create table");
+    let table_id = db
+        .create_table("users", default_schema())
+        .expect("create table");
     assert_eq!(table_id, TableId(1));
 
     let meta = db
@@ -55,6 +68,7 @@ fn test_catalog_create_and_lookup_table() {
     assert!(meta.root_page_id > 1);
     assert!(meta.record_page_id > 1);
     assert_ne!(meta.root_page_id, meta.record_page_id);
+    assert_eq!(meta.schema, default_schema());
 
     let meta_by_id = db
         .get_table_by_id(table_id)
@@ -70,8 +84,9 @@ fn test_catalog_create_duplicate_rejected() {
     let (_dir, path) = temp_db_path();
     let mut db = TreeDb::create(&path, 10).expect("create database");
 
-    db.create_table("orders").expect("create table orders");
-    let err = db.create_table("orders").unwrap_err();
+    db.create_table("orders", default_schema())
+        .expect("create table orders");
+    let err = db.create_table("orders", default_schema()).unwrap_err();
     assert!(
         matches!(err, Error::TableAlreadyExists(ref name) if name == "orders"),
         "expected TableAlreadyExists, got {err:?}"
@@ -86,18 +101,18 @@ fn test_catalog_invalid_names_rejected() {
     let mut db = TreeDb::create(&path, 10).expect("create database");
 
     // Empty name
-    let err_empty = db.create_table("").unwrap_err();
+    let err_empty = db.create_table("", default_schema()).unwrap_err();
     assert!(matches!(err_empty, Error::InvalidTableName(_)));
 
     // Name exceeding MAX_TABLE_NAME_LEN (64 bytes)
     let long_name = "a".repeat(MAX_TABLE_NAME_LEN + 1);
-    let err_long = db.create_table(&long_name).unwrap_err();
+    let err_long = db.create_table(&long_name, default_schema()).unwrap_err();
     assert!(matches!(err_long, Error::InvalidTableName(_)));
 
     // Exactly MAX_TABLE_NAME_LEN is allowed
     let exact_name = "b".repeat(MAX_TABLE_NAME_LEN);
     let tid = db
-        .create_table(&exact_name)
+        .create_table(&exact_name, default_schema())
         .expect("exact length name allowed");
     assert_eq!(tid, TableId(1));
 
@@ -109,9 +124,15 @@ fn test_catalog_list_tables() {
     let (_dir, path) = temp_db_path();
     let mut db = TreeDb::create(&path, 10).expect("create database");
 
-    let t1 = db.create_table("table_alpha").expect("create alpha");
-    let t2 = db.create_table("table_beta").expect("create beta");
-    let t3 = db.create_table("table_gamma").expect("create gamma");
+    let t1 = db
+        .create_table("table_alpha", default_schema())
+        .expect("create alpha");
+    let t2 = db
+        .create_table("table_beta", default_schema())
+        .expect("create beta");
+    let t3 = db
+        .create_table("table_gamma", default_schema())
+        .expect("create gamma");
 
     assert_eq!(t1, TableId(1));
     assert_eq!(t2, TableId(2));
@@ -131,8 +152,12 @@ fn test_catalog_drop_table_and_lookup() {
     let (_dir, path) = temp_db_path();
     let mut db = TreeDb::create(&path, 10).expect("create database");
 
-    let t1 = db.create_table("users").expect("create users");
-    let t2 = db.create_table("posts").expect("create posts");
+    let t1 = db
+        .create_table("users", default_schema())
+        .expect("create users");
+    let t2 = db
+        .create_table("posts", default_schema())
+        .expect("create posts");
 
     db.drop_table("users").expect("drop users");
 
@@ -179,8 +204,12 @@ fn test_catalog_persistence_across_close_reopen() {
 
     let (t1, t2) = {
         let mut db = TreeDb::create(&path, 10).expect("create database");
-        let id1 = db.create_table("customers").expect("create customers");
-        let id2 = db.create_table("orders").expect("create orders");
+        let id1 = db
+            .create_table("customers", default_schema())
+            .expect("create customers");
+        let id2 = db
+            .create_table("orders", default_schema())
+            .expect("create orders");
         db.sync().expect("sync");
         (id1, id2)
     };
@@ -213,8 +242,8 @@ fn test_catalog_stable_table_ids_across_restarts() {
 
     {
         let mut db = TreeDb::create(&path, 10).expect("create database");
-        let t1 = db.create_table("t1").expect("create t1");
-        let t2 = db.create_table("t2").expect("create t2");
+        let t1 = db.create_table("t1", default_schema()).expect("create t1");
+        let t2 = db.create_table("t2", default_schema()).expect("create t2");
         assert_eq!(t1, TableId(1));
         assert_eq!(t2, TableId(2));
 
@@ -225,7 +254,7 @@ fn test_catalog_stable_table_ids_across_restarts() {
     // Reopen database and create t3
     {
         let mut db = TreeDb::open(&path, 10).expect("reopen database");
-        let t3 = db.create_table("t3").expect("create t3");
+        let t3 = db.create_table("t3", default_schema()).expect("create t3");
         // IDs must be monotonic and NOT reused
         assert_eq!(t3, TableId(3));
         db.sync().expect("sync");
@@ -254,7 +283,9 @@ fn test_catalog_transaction_create_commit_and_abort() {
     // 1. Transaction Create -> Abort
     {
         let mut txn = db.begin().expect("begin txn");
-        let tid = txn.create_table("aborted_table").expect("create table");
+        let tid = txn
+            .create_table("aborted_table", default_schema())
+            .expect("create table");
         assert_eq!(tid, TableId(1));
         assert!(txn.get_table("aborted_table").expect("get").is_some());
         txn.abort().expect("abort txn");
@@ -273,7 +304,9 @@ fn test_catalog_transaction_create_commit_and_abort() {
     // 2. Transaction Create -> Commit
     {
         let mut txn = db.begin().expect("begin txn");
-        let tid = txn.create_table("committed_table").expect("create table");
+        let tid = txn
+            .create_table("committed_table", default_schema())
+            .expect("create table");
         assert!(tid.0 >= 1);
         txn.commit().expect("commit txn");
     }
@@ -290,7 +323,8 @@ fn test_catalog_transaction_drop_commit_and_abort() {
     let (_dir, path) = temp_db_path();
     let mut db = TreeDb::create(&path, 10).expect("create database");
 
-    db.create_table("keep_me").expect("create keep_me");
+    db.create_table("keep_me", default_schema())
+        .expect("create keep_me");
 
     // 1. Drop -> Abort
     {
@@ -325,12 +359,13 @@ fn test_catalog_transaction_drop_auto_rollback() {
     let (_dir, path) = temp_db_path();
     let mut db = TreeDb::create(&path, 10).expect("create database");
 
-    db.create_table("persistent_table")
+    db.create_table("persistent_table", default_schema())
         .expect("create persistent");
 
     {
         let mut txn = db.begin().expect("begin txn");
-        txn.create_table("temp_table").expect("create temp");
+        txn.create_table("temp_table", default_schema())
+            .expect("create temp");
         txn.drop_table("persistent_table").expect("drop persistent");
         // Transaction dropped without commit -> auto-abort
     }
@@ -351,15 +386,15 @@ fn test_catalog_transaction_multiple_operations_atomicity() {
     let (_dir, path) = temp_db_path();
     let mut db = TreeDb::create(&path, 10).expect("create database");
 
-    db.create_table("t1").expect("create t1");
-    db.create_table("t2").expect("create t2");
+    db.create_table("t1", default_schema()).expect("create t1");
+    db.create_table("t2", default_schema()).expect("create t2");
 
     // Multi-operation transaction abort
     {
         let mut txn = db.begin().expect("begin txn");
-        txn.create_table("t3").expect("create t3");
+        txn.create_table("t3", default_schema()).expect("create t3");
         txn.drop_table("t1").expect("drop t1");
-        txn.create_table("t4").expect("create t4");
+        txn.create_table("t4", default_schema()).expect("create t4");
         txn.drop_table("t2").expect("drop t2");
         txn.abort().expect("abort txn");
     }
@@ -385,11 +420,11 @@ fn test_catalog_crash_recovery_uncommitted_create() {
 
     {
         let mut db = TreeDb::create(&path, 10).expect("create database");
-        db.create_table("persisted_table")
+        db.create_table("persisted_table", default_schema())
             .expect("create persisted");
 
         let mut txn = db.begin().expect("begin txn");
-        txn.create_table("crashed_uncommitted_table")
+        txn.create_table("crashed_uncommitted_table", default_schema())
             .expect("create table");
         // Simulate sudden crash: do not call commit, forget txn to bypass Drop
         std::mem::forget(txn);
@@ -420,7 +455,7 @@ fn test_catalog_crash_recovery_committed_create() {
     {
         let mut db = TreeDb::create(&path, 10).expect("create database");
         let mut txn = db.begin().expect("begin txn");
-        txn.create_table("committed_crash_table")
+        txn.create_table("committed_crash_table", default_schema())
             .expect("create table");
         txn.commit().expect("commit");
     }
@@ -441,7 +476,7 @@ fn test_catalog_crash_recovery_uncommitted_drop() {
 
     {
         let mut db = TreeDb::create(&path, 10).expect("create database");
-        db.create_table("surviving_table")
+        db.create_table("surviving_table", default_schema())
             .expect("create surviving");
 
         let mut txn = db.begin().expect("begin txn");
@@ -466,7 +501,8 @@ fn test_catalog_crash_recovery_committed_drop() {
 
     {
         let mut db = TreeDb::create(&path, 10).expect("create database");
-        db.create_table("dropped_table").expect("create table");
+        db.create_table("dropped_table", default_schema())
+            .expect("create table");
 
         let mut txn = db.begin().expect("begin txn");
         txn.drop_table("dropped_table").expect("drop table in txn");
@@ -491,10 +527,10 @@ fn test_catalog_checkpoint_and_wal_truncation() {
     let (_dir, path) = temp_db_path();
     let mut db = TreeDb::create(&path, 10).expect("create database");
 
-    db.create_table("t1").expect("create t1");
+    db.create_table("t1", default_schema()).expect("create t1");
     db.checkpoint_and_truncate_wal().expect("checkpoint 1");
 
-    db.create_table("t2").expect("create t2");
+    db.create_table("t2", default_schema()).expect("create t2");
     db.checkpoint_and_truncate_wal().expect("checkpoint 2");
 
     db.drop_table("t1").expect("drop t1");
@@ -523,7 +559,9 @@ fn test_catalog_freelist_page_recycling_on_drop() {
 
     let initial_free = db.buffer_pool().page_manager().header().free_page_count;
 
-    let t1 = db.create_table("table_one").expect("create table_one");
+    let t1 = db
+        .create_table("table_one", default_schema())
+        .expect("create table_one");
     let meta1 = db.get_table_by_id(t1).unwrap().unwrap();
 
     // Dropping table_one must free its root_page_id and record_page_id
@@ -537,7 +575,9 @@ fn test_catalog_freelist_page_recycling_on_drop() {
         .expect("validate freelist");
 
     // Creating a new table should reuse the freed pages from the freelist
-    let t2 = db.create_table("table_two").expect("create table_two");
+    let t2 = db
+        .create_table("table_two", default_schema())
+        .expect("create table_two");
     let meta2 = db.get_table_by_id(t2).unwrap().unwrap();
 
     // One of the allocated pages must be reused from meta1
@@ -567,7 +607,7 @@ fn test_catalog_multi_page_chain_expansion() {
     let num_tables = 60;
     for i in 0..num_tables {
         let name = format!("table_num_{:03}", i);
-        db.create_table(&name)
+        db.create_table(&name, default_schema())
             .unwrap_or_else(|e| panic!("create {name} failed: {e:?}"));
     }
 
@@ -613,7 +653,8 @@ fn test_catalog_corruption_detection_matrix() {
     // 1. Invalid Magic
     {
         let mut db = TreeDb::create(&path, 10).expect("create database");
-        db.create_table("valid_table").expect("create table");
+        db.create_table("valid_table", default_schema())
+            .expect("create table");
         db.sync().expect("sync");
 
         // Corrupt magic on Page 1
@@ -692,7 +733,7 @@ fn test_catalog_randomized_oracle_comparison() {
                 let is_txn = (next_rand() % 2) == 1;
                 if is_txn {
                     let mut txn = db.begin().expect("begin txn");
-                    let res = txn.create_table(&name);
+                    let res = txn.create_table(&name, default_schema());
                     if should_succeed {
                         let tid = res.expect("create table in txn should succeed");
                         let meta = txn.get_table(&name).unwrap().unwrap();
@@ -710,7 +751,7 @@ fn test_catalog_randomized_oracle_comparison() {
                         txn.abort().expect("abort");
                     }
                 } else {
-                    let res = db.create_table(&name);
+                    let res = db.create_table(&name, default_schema());
                     if should_succeed {
                         let tid = res.expect("create table should succeed");
                         let meta = db.get_table(&name).unwrap().unwrap();

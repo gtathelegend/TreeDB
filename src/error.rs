@@ -134,4 +134,48 @@ pub enum Error {
     /// Invalid or out-of-bounds table identifier.
     #[error("Invalid table ID: {0}")]
     InvalidTableId(u32),
+
+    /// Table schema definition is invalid or inconsistent.
+    #[error("Table schema error: {0}")]
+    TableSchemaMismatch(String),
+
+    /// Row column count does not match table schema column count.
+    #[error("Column count mismatch: expected {expected}, found {found}")]
+    ColumnCountMismatch { expected: usize, found: usize },
+
+    /// Row value data type does not match column schema.
+    #[error("Type mismatch for column '{column}': expected {expected}, found {found}")]
+    TypeMismatch {
+        column: String,
+        expected: String,
+        found: String,
+    },
+
+    /// Non-nullable column received a NULL value.
+    #[error("NULL constraint violation for column '{column}'")]
+    NullConstraintViolation { column: String },
+
+    /// Primary key value already exists in the table.
+    #[error("Duplicate primary key: {0}")]
+    DuplicatePrimaryKey(String),
+
+    /// Row with the specified primary key was not found.
+    #[error("Row not found")]
+    RowNotFound,
+
+    /// Invalid primary key value or definition.
+    #[error("Invalid primary key: {0}")]
+    InvalidPrimaryKey(String),
+
+    /// Binary tuple corruption detected during decoding.
+    #[error("Tuple corruption detected: {0}")]
+    TupleCorruption(String),
+
+    /// Serialized tuple format version is unsupported.
+    #[error("Unsupported tuple format version: found {found}, supported {supported}")]
+    TupleVersionUnsupported { found: u8, supported: u8 },
+
+    /// Column with the specified name was not found in schema.
+    #[error("Column '{0}' not found")]
+    ColumnNotFound(String),
 }

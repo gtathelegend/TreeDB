@@ -284,7 +284,20 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * **Layer Decoupling:** Logical table metadata is cleanly isolated from the physical B+ Tree and RecordStore implementations, preparing the storage engine for future table/query layers without modifying lower-level formats.
   * **Unbounded Capacity via Paged Chaining:** Catalog pages link sequentially via `next_catalog_page_id`, supporting arbitrary table counts without imposing small single-page limits.
-  * **Transactional Lifecycle & Zero Leakage:** `create_table` and `drop_table` participate in the active transaction context, generating standard WAL deltas and supporting rollback. Dropping a table reclaims all associated B+ Tree pages, record pages, and overflow chains directly back into the persistent freelist.
+---
+
+## Decision 28: Typed Tables, Relational Tuple Storage & Canonical Primary Key Indexing
+
+* **Decision:** Introduce a typed relational schema layer (`DataType`, `Value`, `Column`, `Schema`, `Row`, `Table<'a>`) backed by deterministic binary tuple serialization and canonical primary key indexing:
+  1. **Logical Type System:** Seven core primitives (`Null`, `Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`) with explicit 1-byte discriminants and typed scalar values.
+  2. **Canonical Primary Key Mapping:** To index signed 64-bit integers (`DataType::Int64`) in the unsigned B+ Tree (`Key = u64`), map `i64` via sign-bit inversion: `(i as u64) ^ (1 << 63)`. This maps `[i64::MIN, i64::MAX]` monotonically onto `[0, u64::MAX]`, ensuring negative integers sort naturally before positive integers during search and range scans.
+  3. **Deterministic Binary Tuple Encoding (Version 1):** Serializes a row as `[format_version: u8 = 1, column_count: u16, null_bitmap: [u8; ceil(N/8)], packed_payloads...]`. Variable-length strings and byte blobs are length-prefixed with 4-byte little-endian integers.
+  4. **Dynamic Metadata Synchronization:** Table handles (`Table<'a>`) automatically synchronize catalog root page pointers whenever root splitting or merging occurs in the underlying B+ Tree, ensuring table reopen always resolves the latest root page.
+* **Rationale:**
+  * **Zero Abstraction Cost:** Relational tuple encoding transparently utilizes the existing slotted `RecordStore` and multi-page overflow mechanisms without altering page header formats or introducing external serialization crates.
+  * **Order-Preserving Indexing:** Canonical integer transformations allow signed and unsigned integers to share the high-performance B+ Tree index engine without redundant specialized index implementations.
+  * **Strict Type Safety:** Schema validation occurs prior to binary encoding, preventing corrupted or malformed tuples from entering physical storage.
+
 
 
 

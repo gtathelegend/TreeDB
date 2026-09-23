@@ -204,11 +204,29 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 13: Group Commit, Concurrency & Table Storage (Future)
-* [ ] Table-level tuple CRUD operations and typed row serialization
+## Phase 13: Typed Tables & Relational Tuple Storage (Completed)
+* [x] Rich logical type system (`DataType::Null`, `Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`) with typed `Value` scalar representation
+* [x] Relational schema representation (`Column { name, data_type, nullable }`, `Schema { columns, primary_key_idx }`)
+* [x] Single-column primary key constraints (`UInt64` or `Int64`, non-nullable)
+* [x] Order-preserving canonical primary key mapping for signed integers: `(i as u64) ^ (1 << 63)`
+* [x] Deterministic binary tuple encoding format version 1 (column count, null bitmap, packed fixed-width primitives, 4-byte length-prefixed strings and raw bytes)
+* [x] Schema validation for columns, primary keys, and incoming row values
+* [x] High-level relational table handle (`Table<'a>`) supporting CRUD (`insert`, `get`, `update`, `delete`, `scan`)
+* [x] Dynamic catalog root metadata synchronization on tree root splits and merges
+* [x] Multi-row and multi-table atomic transaction integration (commit / rollback)
+* [x] Full ARIES crash recovery and checkpoint integration
+* [x] Multi-page overflow support for large text strings and binary blobs (> 4070 bytes)
+* [x] Deterministic randomized table oracle comparison vs in-memory `BTreeMap`
+* [x] 22 dedicated table integration tests (237 total test suite)
+
+---
+
+## Phase 14: Future Enhancements (Future)
+* [ ] Secondary B+ Tree indexes and index-only scans
 * [ ] Group commit and asynchronous WAL flush queues
-* [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`, `inspect-freelist`, `create-table`, `list-tables`)
-* [ ] Multi-threading, concurrency control, and latching
+* [ ] Interactive CLI commands (`create-table`, `list-tables`, `insert`, `select`, `scan`, `stats`)
+* [ ] Multi-threading, concurrency control, and page latching
+
 
 
 

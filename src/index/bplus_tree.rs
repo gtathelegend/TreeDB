@@ -204,9 +204,11 @@ impl BPlusTree {
             buffer_pool.unpin_page(root_page_id, true)?;
 
             self.root_page_id = root_page_id;
-            buffer_pool
-                .page_manager_mut()
-                .set_root_page_id(root_page_id)?;
+            if buffer_pool.page_manager().header().root_page_id == INVALID_PAGE_ID {
+                buffer_pool
+                    .page_manager_mut()
+                    .set_root_page_id(root_page_id)?;
+            }
 
             return Ok(());
         }
@@ -359,10 +361,13 @@ impl BPlusTree {
                 }
                 buffer_pool.unpin_page(new_root_id, true)?;
 
+                let old_root_id = self.root_page_id;
                 self.root_page_id = new_root_id;
-                buffer_pool
-                    .page_manager_mut()
-                    .set_root_page_id(new_root_id)?;
+                if buffer_pool.page_manager().header().root_page_id == old_root_id {
+                    buffer_pool
+                        .page_manager_mut()
+                        .set_root_page_id(new_root_id)?;
+                }
 
                 split_to_propagate = None;
             }
@@ -689,9 +694,11 @@ impl BPlusTree {
                     let old_root_id = self.root_page_id;
                     let new_root_id = root_node.children[0];
                     self.root_page_id = new_root_id;
-                    buffer_pool
-                        .page_manager_mut()
-                        .set_root_page_id(new_root_id)?;
+                    if buffer_pool.page_manager().header().root_page_id == old_root_id {
+                        buffer_pool
+                            .page_manager_mut()
+                            .set_root_page_id(new_root_id)?;
+                    }
                     buffer_pool.free_page(old_root_id)?;
                 }
                 return Ok(());
