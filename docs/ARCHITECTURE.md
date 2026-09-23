@@ -52,28 +52,47 @@ v                                                             v
                             |
                         Transaction
                             |
-                       Query Engine
-                            |
-               +------------+------------+
-               |                         |
-           Expressions               Operators
-               |                         |
-         +-----+------+          +-------+-------+
-         |            |          |       |       |
-       Literal      Column     Filter  Project  Sort
-         |            |          |       |       |
-         +-----+------+          +-------+-------+
-               |
-             Value
-               |
-             Row
-               |
-             Table
+                   +--------+--------+
+                   |                 |
+               SQL Parser       Query Engine
+               (Lexer/AST)           |
+                   |           +-----+-----+
+               SelectStmt      |           |
+                           Expr/Eval   Operators
+                               |           |
+                         +-----+-----+  +--+--+
+                         |           |  |     |
+                       Literal    Column Scan Filter ...
 ```
 
 ---
 
-## 1. Query Execution & Expression Layer (`src/query`)
+## 1. SQL Lexer, Parser & AST Layer (`src/sql`)
+
+### `Lexer`, `Token`, & `SourceSpan` (`src/sql/lexer.rs`, `src/sql/token.rs`, `src/sql/span.rs`)
+* **Role:** Zero-dependency lexical scanner tokenizing SQL query strings with precise source position tracking.
+* **Responsibilities:**
+  * **Token Stream:** Emits typed `Token` items carrying `TokenKind` (keywords, identifiers, literals, operators, delimiters, EOF) and `SourceSpan { start, end }`.
+  * **Keywords & Identifiers:** Case-insensitive recognition for standard SQL keywords (`SELECT`, `FROM`, `WHERE`, `ORDER`, `BY`, `ASC`, `DESC`, `LIMIT`, `OFFSET`, `AND`, `OR`, `NOT`, `IS`, `NULL`, `TRUE`, `FALSE`, `AS`). Case-sensitive identifiers with length limit validation (`MAX_IDENTIFIER_LEN = 128`).
+  * **Literals:** Supports single-quoted string literals with SQL-standard `''` escaping, signed integers, IEEE floats, boolean literals (`TRUE`/`FALSE`), and `NULL`.
+  * **Comments & Whitespace:** Preserves byte offsets while skipping whitespace and single-line SQL comments (`-- ...`).
+
+### `Parser` & Pratt Expression Parser (`src/sql/parser.rs`)
+* **Role:** Recursive descent parser and Pratt precedence climbing expression parser for the scoped SQL `SELECT` dialect.
+* **Responsibilities:**
+  * **Clause Grammar:** Enforces strict clause order: `SELECT [wildcard | expressions [AS alias]] FROM table [WHERE expr] [ORDER BY expr [ASC | DESC], ...] [LIMIT n] [OFFSET n];`.
+  * **Precedence Hierarchy:**
+    1. Parenthesized expressions `(expr)`
+    2. Unary operators (`NOT`, unary `-`)
+    3. Postfix predicates (`IS NULL`, `IS NOT NULL`)
+    4. Relational comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`) with normalization of `<>` and `!=` to `SqlBinaryOp::NotEq`
+    5. Logical `AND`
+    6. Logical `OR`
+  * **Standalone Boundary:** Operates completely decoupled from runtime storage, schemas, or buffer pools via `treedb::sql::parse(sql)`.
+
+---
+
+## 2. Query Execution & Expression Layer (`src/query`)
 
 ### `Expr`, `BinaryOp`, `UnaryOp`, & Evaluator (`src/query/expr.rs`)
 * **Role:** AST-based scalar expression system with static type inference, validation, and SQL-compliant three-valued logic (3VL).

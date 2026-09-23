@@ -206,4 +206,20 @@ pub enum Error {
     /// General query execution error.
     #[error("Query execution error: {0}")]
     QueryExecutionError(String),
+
+    /// Lexical error encountered during SQL tokenization.
+    #[error("SQL lexical error at position {start}..{end}: {message}")]
+    SqlLexError {
+        message: String,
+        start: usize,
+        end: usize,
+    },
+
+    /// Syntax error encountered during SQL parsing.
+    #[error("SQL syntax error at position {start}..{end}: {message}")]
+    SqlParseError {
+        message: String,
+        start: usize,
+        end: usize,
+    },
 }

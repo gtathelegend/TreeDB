@@ -313,6 +313,22 @@ This document records key architectural and design choices, their rationale, and
   * **Zero External Dependencies:** Built entirely with safe, idiomatic standard Rust abstractions and structured error handling.
   * **Transaction-Aware Execution:** Queries execute transparently over active `Transaction` handles, observing uncommitted mutations and respecting transaction rollbacks.
 
+---
+
+## Decision 30: Scoped SQL Lexer, Parser & Independent AST Representation
+
+* **Decision:** Implement a zero-dependency hand-written lexer, precedence-climbing (Pratt) expression parser, and abstract syntax tree (`src/sql/`) strictly targeting the scoped `SELECT` dialect:
+  1. **Target Dialect:** `SELECT [wildcard | expressions [AS alias]] FROM table [WHERE expr] [ORDER BY expr [ASC | DESC], ...] [LIMIT n] [OFFSET n];`.
+  2. **Lexer & Span Tracking (`src/sql/lexer.rs`, `src/sql/span.rs`):** Hand-written scanner emitting `Token { kind, span }`. Tracks exact byte offsets (`SourceSpan { start, end }`) for informative syntax error diagnostics. Implements case-insensitive keyword recognition, case-sensitive identifiers (enforcing `MAX_IDENTIFIER_LEN = 128`), single-quoted string literals with SQL-standard `''` escaping, signed integers/floats, booleans (`TRUE`/`FALSE`), `NULL`, and single-line comments (`-- ...`).
+  3. **Pratt Precedence Expression Parser (`src/sql/parser.rs`):** Implements precedence climbing across 6 distinct levels: `Parentheses` > `Unary (NOT, -)` > `IS [NOT] NULL` > `Comparisons (=, !=, <>, <, <=, >, >=)` > `AND` > `OR`. Normalizes inequality operators (`!=` and `<>`) to `SqlBinaryOp::NotEq`.
+  4. **Decoupled AST (`src/sql/ast.rs`):** Fully decoupled `SelectStatement` AST independent of disk storage, buffer pools, transaction managers, catalogs, or runtime expression evaluation (`Expr`).
+  5. **Standalone API (`src/sql/mod.rs`):** Exposes `treedb::sql::parse(sql)` and `treedb::sql::tokenize(sql)` which can parse arbitrary valid SQL queries in isolation without opening a database file.
+* **Rationale:**
+  * **Architectural Separation of Concerns:** Building a pure AST parsing layer before schema binding/compilation prevents coupling SQL grammar rules with execution physical plan construction or table schemas.
+  * **Deterministic Error Spans:** Hand-crafted Pratt parser ensures exact error location reporting on unexpected tokens, unclosed parentheses, missing clauses, or invalid clause ordering.
+  * **Safety & Maintainability:** Hand-written recursive descent avoids heavy parser-generator dependencies, keeping the engine lightweight, 100% safe Rust, and easily auditable.
+
+
 
 
 

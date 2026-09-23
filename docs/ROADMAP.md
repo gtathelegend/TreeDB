@@ -246,12 +246,33 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 15: SQL Parser & Query Planning (Future)
-* [ ] SQL lexer and AST parser (`SELECT`, `FROM`, `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`)
-* [ ] SQL AST translation into programmatic `Query` pipelines
+## Phase 15: SQL Lexer, Parser & AST (Completed)
+* [x] Scoped SQL lexer (`Lexer`) tokenizing keywords, identifiers, literals, operators, and punctuation
+* [x] Case-insensitive keyword recognition and case-sensitive identifier support (up to 128 bytes)
+* [x] Source span tracking (`SourceSpan { start, end }`) for precise syntax error reporting
+* [x] Literals: single-quoted strings with `''` escaping, integers, floats, booleans (`TRUE`/`FALSE`), and `NULL`
+* [x] Single-line comments (`-- comment`) and whitespace preservation
+* [x] Precedence climbing / Pratt expression parser (`SqlExpr`) supporting:
+  * [x] Parenthesized expressions `(expr)`
+  * [x] Unary operators (`NOT`, `-`)
+  * [x] Postfix `IS NULL` and `IS NOT NULL`
+  * [x] Comparisons (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`) with inequality normalization to `SqlBinaryOp::NotEq`
+  * [x] Logical conjunctions: `AND` > `OR`
+* [x] Complete AST representations: `SelectStatement`, `SelectItem`, `TableRef`, `SqlExpr`, `SqlLiteral`, `SqlBinaryOp`, `SqlUnaryOp`, `OrderDirection`, `OrderByExpr`
+* [x] Scoped `SELECT` grammar: `SELECT [wildcard | expressions [AS alias]] FROM table [WHERE expr] [ORDER BY expr [ASC | DESC], ...] [LIMIT n] [OFFSET n];`
+* [x] Explicit clause order enforcement and trailing token rejection
+* [x] Standalone parsing API: `treedb::sql::parse(sql)` and `treedb::sql::tokenize(sql)` decoupled from engine storage and catalogs
+* [x] 19 dedicated SQL parser tests (277 total test suite)
+
+---
+
+## Phase 16: SQL Binder & Execution Engine (Future)
+* [ ] Schema binding and name resolution (`BindingContext`) translating `SqlExpr` to `Expr`
+* [ ] Execution engine integration connecting `SelectStatement` AST to relational `Query<'a>` pipelines
 * [ ] Secondary B+ Tree indexes and index-only scans
 * [ ] Aggregation functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) and `GROUP BY`
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `query`, `stats`)
+
 
 
 

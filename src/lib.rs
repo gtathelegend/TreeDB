@@ -4,6 +4,7 @@ pub mod engine;
 pub mod error;
 pub mod index;
 pub mod query;
+pub mod sql;
 pub mod storage;
 pub mod wal;
 
@@ -22,6 +23,11 @@ pub use index::{
 pub use query::{
     BinaryOp, Expr, FilterOperator, OffsetLimitOperator, ProjectOperator, Query, QueryResult,
     SortDirection, SortKey, SortOperator, UnaryOp,
+};
+pub use sql::{
+    parse as parse_sql, tokenize as tokenize_sql, Lexer, OrderByExpr, OrderDirection, Parser,
+    SelectItem, SelectStatement, SourceSpan, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp,
+    TableRef, Token, TokenKind, MAX_IDENTIFIER_LEN,
 };
 pub use storage::{
     is_reserved_page, BufferPool, BufferPoolStats, DbHeader, FrameId, FreePageLayout,

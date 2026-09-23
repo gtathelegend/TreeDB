@@ -58,6 +58,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **Persistent Catalog & Schema Metadata** | **Implemented** | Stable monotonic `TableId`s, `TableMetadata`, `PageType::Catalog`, paged chaining, transactional create/drop, freelist reclamation, catalog validation |
 | **Typed Tables & Tuple Storage** | **Implemented** | Strong typing (`Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`), null bitmaps, canonical index key encoding, `Table<'a>` CRUD API, dynamic root synchronization |
 | **Query Execution & Expression Engine** | **Implemented** | Scalar expression AST, SQL 3-valued logic (3VL), composable operators (`Scan`, `Filter`, `Project`, `Sort`, `Limit`, `Offset`), PK point & range scan optimizations, programmatic `Query` builder |
+| **SQL Lexer, Parser & AST** | **Implemented** | Zero-dependency lexical scanner with byte-offset span tracking, Pratt precedence climbing parser, AST representation for scoped `SELECT` dialect |
 
 
 ---
