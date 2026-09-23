@@ -110,4 +110,28 @@ pub enum Error {
     /// Attempted to begin a transaction while another is already active.
     #[error("A transaction ({0}) is already active on the engine")]
     TransactionActive(crate::wal::lsn::TxnId),
+
+    /// Table with the specified name already exists in the catalog.
+    #[error("Table '{0}' already exists")]
+    TableAlreadyExists(String),
+
+    /// Table with the specified name was not found in the catalog.
+    #[error("Table '{0}' not found")]
+    TableNotFound(String),
+
+    /// Table name is invalid (e.g. empty, too long, or invalid characters).
+    #[error("Invalid table name: {0}")]
+    InvalidTableName(String),
+
+    /// Catalog structure or metadata corruption detected.
+    #[error("Catalog corruption detected: {0}")]
+    CatalogCorruption(String),
+
+    /// Catalog version is unsupported by the current engine.
+    #[error("Unsupported catalog version: found {found}, supported {supported}")]
+    CatalogVersionUnsupported { found: u32, supported: u32 },
+
+    /// Invalid or out-of-bounds table identifier.
+    #[error("Invalid table ID: {0}")]
+    InvalidTableId(u32),
 }

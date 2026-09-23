@@ -1,4 +1,9 @@
+pub mod catalog;
 pub mod transaction;
+pub use catalog::{
+    Catalog, CatalogPage, TableId, TableMetadata, CATALOG_MAGIC, CURRENT_CATALOG_VERSION,
+    MAX_TABLE_NAME_LEN,
+};
 pub use transaction::{Transaction, TxnState};
 
 use std::path::{Path, PathBuf};
@@ -288,5 +293,71 @@ impl TreeDb {
     /// Validates the structural invariants of the B+ Tree.
     pub fn validate_tree(&mut self) -> Result<()> {
         self.tree.validate_tree(&mut self.buffer_pool)
+    }
+
+    /// Creates a new table in the catalog.
+    ///
+    /// Automatically begins and commits a transaction if no transaction is active.
+    pub fn create_table(&mut self, name: &str) -> Result<TableId> {
+        let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
+            Some(self.begin_txn()?)
+        } else {
+            None
+        };
+
+        let result = Catalog::create_table(&mut self.buffer_pool, name);
+
+        if let Some(tid) = auto_txn {
+            if result.is_ok() {
+                self.commit_txn(tid)?;
+            } else {
+                let _ = self.abort_txn(tid);
+            }
+        }
+
+        result
+    }
+
+    /// Drops a table from the catalog and reclaims all of its physical pages into the freelist.
+    ///
+    /// Automatically begins and commits a transaction if no transaction is active.
+    pub fn drop_table(&mut self, name: &str) -> Result<()> {
+        let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
+            Some(self.begin_txn()?)
+        } else {
+            None
+        };
+
+        let result = Catalog::drop_table(&mut self.buffer_pool, name);
+
+        if let Some(tid) = auto_txn {
+            if result.is_ok() {
+                self.commit_txn(tid)?;
+            } else {
+                let _ = self.abort_txn(tid);
+            }
+        }
+
+        result
+    }
+
+    /// Looks up a table in the catalog by name.
+    pub fn get_table(&mut self, name: &str) -> Result<Option<TableMetadata>> {
+        Catalog::get_table(&mut self.buffer_pool, name)
+    }
+
+    /// Looks up a table in the catalog by table ID.
+    pub fn get_table_by_id(&mut self, table_id: TableId) -> Result<Option<TableMetadata>> {
+        Catalog::get_table_by_id(&mut self.buffer_pool, table_id)
+    }
+
+    /// Lists all tables registered in the catalog.
+    pub fn list_tables(&mut self) -> Result<Vec<TableMetadata>> {
+        Catalog::list_tables(&mut self.buffer_pool)
+    }
+
+    /// Validates the structural and referential integrity of the catalog.
+    pub fn validate_catalog(&mut self) -> Result<()> {
+        Catalog::validate_catalog(&mut self.buffer_pool)
     }
 }

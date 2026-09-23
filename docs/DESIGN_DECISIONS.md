@@ -276,6 +276,16 @@ This document records key architectural and design choices, their rationale, and
   * **Safe Rust Ownership:** `Transaction<'db>` borrows `&'db mut TreeDb`, statically preventing concurrent access while dynamic tracking (`Error::TransactionActive`) rejects attempts to begin nested transactions.
   * **Read-Your-Writes:** Modifications directly update the buffer pool and index, ensuring immediate read visibility within the same transaction without duplicate buffering layers.
 
+---
+
+## Decision 27: Persistent Catalog Design, Monotonic TableIds & Schema Metadata
+
+* **Decision:** Implement a persistent catalog rooted on Page 1 (`DEFAULT_METADATA_PAGE_ID`) utilizing dedicated catalog pages (`PageType::Catalog = 7` or `PageType::Metadata`) with self-describing 32-byte headers (`CATL` magic, version 1, `next_table_id`, `table_count`, `next_catalog_page_id`). Table entries store stable monotonic `TableId`s (never reused upon drop), `schema_version = 1`, `root_page_id`, and `record_page_id`.
+* **Rationale:**
+  * **Layer Decoupling:** Logical table metadata is cleanly isolated from the physical B+ Tree and RecordStore implementations, preparing the storage engine for future table/query layers without modifying lower-level formats.
+  * **Unbounded Capacity via Paged Chaining:** Catalog pages link sequentially via `next_catalog_page_id`, supporting arbitrary table counts without imposing small single-page limits.
+  * **Transactional Lifecycle & Zero Leakage:** `create_table` and `drop_table` participate in the active transaction context, generating standard WAL deltas and supporting rollback. Dropping a table reclaims all associated B+ Tree pages, record pages, and overflow chains directly back into the persistent freelist.
+
 
 
 

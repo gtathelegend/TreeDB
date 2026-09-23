@@ -188,12 +188,26 @@ This roadmap outlines the planned development phases for TreeDB.
 * [x] Deterministic randomized transaction oracle comparison vs in-memory `BTreeMap`
 * [x] 15 dedicated transaction integration tests (193 total test suite)
 
+## Phase 12: Persistent Catalog & Schema Metadata (Completed)
+* [x] Stable logical table identifiers (`TableId(pub u32)`) allocated monotonically without reuse on drop
+* [x] Persistent table metadata structure (`TableMetadata { table_id, name, schema_version, root_page_id, record_page_id, flags }`)
+* [x] Dedicated catalog page layout (`PageType::Catalog = 7` / `PageType::Metadata`) with 32-byte header (`CATL` magic, version 1, `next_table_id`, `table_count`, `next_catalog_page_id`)
+* [x] Paged catalog chaining via `next_catalog_page_id` supporting unbounded table capacity
+* [x] Table name validation rules (UTF-8, non-empty, max 64 bytes, case-sensitive exact uniqueness)
+* [x] Transactional table creation (`create_table`) and deletion (`drop_table`) in `Transaction` and `TreeDb`
+* [x] Complete freelist reclamation: dropping a table frees its B+ Tree nodes, record pages, and overflow chains with zero page leaks
+* [x] Comprehensive catalog integrity validator (`validate_catalog`) verifying magic, version, IDs, name syntax, and referential page bounds
+* [x] Full ARIES crash-recovery integration (uncommitted create/drop rollback, committed create/drop replay)
+* [x] Checkpoint and WAL prefix truncation integration preserving catalog mutation history
+* [x] Deterministic randomized catalog oracle comparison vs in-memory `BTreeMap`
+* [x] 22 dedicated catalog integration tests (215 total test suite)
+
 ---
 
-## Phase 12: Group Commit, Concurrency & CLI (Future)
+## Phase 13: Group Commit, Concurrency & Table Storage (Future)
+* [ ] Table-level tuple CRUD operations and typed row serialization
 * [ ] Group commit and asynchronous WAL flush queues
-* [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`, `inspect-freelist`)
-* [ ] Microbenchmarks and high-throughput stress testing
+* [ ] Interactive CLI commands (`get`, `put`, `delete`, `scan`, `stats`, `inspect-freelist`, `create-table`, `list-tables`)
 * [ ] Multi-threading, concurrency control, and latching
 
 

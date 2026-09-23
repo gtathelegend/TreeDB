@@ -142,6 +142,48 @@ impl<'db> Transaction<'db> {
         Ok(results)
     }
 
+    /// Creates a new table in the catalog within this transaction.
+    pub fn create_table(&mut self, name: &str) -> Result<crate::engine::catalog::TableId> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::create_table(&mut self.db.buffer_pool, name)
+    }
+
+    /// Drops a table from the catalog and reclaims its pages within this transaction.
+    pub fn drop_table(&mut self, name: &str) -> Result<()> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::drop_table(&mut self.db.buffer_pool, name)
+    }
+
+    /// Retrieves table metadata for `name` within this transaction.
+    pub fn get_table(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<crate::engine::catalog::TableMetadata>> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::get_table(&mut self.db.buffer_pool, name)
+    }
+
+    /// Retrieves table metadata for `table_id` within this transaction.
+    pub fn get_table_by_id(
+        &mut self,
+        table_id: crate::engine::catalog::TableId,
+    ) -> Result<Option<crate::engine::catalog::TableMetadata>> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::get_table_by_id(&mut self.db.buffer_pool, table_id)
+    }
+
+    /// Lists all tables in the catalog within this transaction.
+    pub fn list_tables(&mut self) -> Result<Vec<crate::engine::catalog::TableMetadata>> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::list_tables(&mut self.db.buffer_pool)
+    }
+
+    /// Validates the structural and referential integrity of the catalog within this transaction.
+    pub fn validate_catalog(&mut self) -> Result<()> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::validate_catalog(&mut self.db.buffer_pool)
+    }
+
     /// Executes a synchronous checkpoint during an active transaction.
     pub fn checkpoint(&mut self) -> Result<crate::wal::lsn::Lsn> {
         self.db.checkpoint()

@@ -1121,6 +1121,48 @@ impl BPlusTree {
         Ok(())
     }
 
+    /// Collects all node page IDs belonging to this B+ Tree (internal and leaf nodes).
+    pub fn collect_all_pages(&self, buffer_pool: &mut BufferPool) -> Result<Vec<PageId>> {
+        if self.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pages = Vec::new();
+        let mut queue = vec![self.root_page_id];
+
+        while let Some(pid) = queue.pop() {
+            pages.push(pid);
+            let page = buffer_pool.fetch_page(pid)?;
+            let page_type = page.page_type();
+            match page_type {
+                PageType::Leaf => {
+                    buffer_pool.unpin_page(pid, false)?;
+                }
+                PageType::Internal => {
+                    let internal = match InternalNode::deserialize(page) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(pid, false);
+                            return Err(e);
+                        }
+                    };
+                    for &child in &internal.children {
+                        queue.push(child);
+                    }
+                    buffer_pool.unpin_page(pid, false)?;
+                }
+                other => {
+                    let _ = buffer_pool.unpin_page(pid, false);
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {pid} during page collection"
+                    )));
+                }
+            }
+        }
+
+        Ok(pages)
+    }
+
     /// Finds the leftmost leaf page ID in the tree.
     fn find_leftmost_leaf(&self, buffer_pool: &mut BufferPool) -> Result<PageId> {
         let mut curr = self.root_page_id;

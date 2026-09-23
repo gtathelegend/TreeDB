@@ -6,7 +6,10 @@ pub mod index;
 pub mod storage;
 pub mod wal;
 
-pub use engine::{Transaction, TreeDb, TxnState};
+pub use engine::{
+    Catalog, CatalogPage, TableId, TableMetadata, Transaction, TreeDb, TxnState, CATALOG_MAGIC,
+    CURRENT_CATALOG_VERSION, MAX_TABLE_NAME_LEN,
+};
 pub use error::{Error, Result};
 pub use index::{
     BPlusTree, InternalNode, LeafNode, RecordId, INTERNAL_ENTRY_SIZE, INTERNAL_HEADER_SIZE,

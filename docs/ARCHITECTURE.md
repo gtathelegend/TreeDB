@@ -47,14 +47,44 @@ v                                                             v
 +------------------------------+ +----------------------------+
 ```
 
+```text
+                         TreeDb
+                           |
+             +-------------+-------------+
+             |                           |
+          Catalog                    User Tables
+             |                           |
+       Table Metadata              Table Storage
+             |                     +-----+-----+
+             |                     |           |
+          TableId                B+ Tree   RecordStore
+             |                     |
+             +----------+----------+
+                        |
+                  Buffer Pool
+                        |
+                  WAL / Recovery
+```
+
 ---
 
-## 1. Engine Layer (`src/engine`)
+## 1. Engine & Catalog Layer (`src/engine`)
+
+### `Catalog`, `CatalogPage`, `TableMetadata`, & `TableId`
+* **Role:** Persistent schema and table metadata management layer decoupling logical object definitions from physical B+ Tree and RecordStore structures.
+* **Responsibilities:**
+  * **Stable Table Identifiers:** `TableId(pub u32)` allocated monotonically and never reused upon table drop.
+  * **Persistent Table Metadata:** `TableMetadata { table_id, name, schema_version, root_page_id, record_page_id, flags }`.
+  * **Paged Chaining Structure:** Anchored on Page 1 (`DEFAULT_METADATA_PAGE_ID`) with `PageType::Catalog = 7` (or `PageType::Metadata`), dynamically chaining additional catalog pages via `next_catalog_page_id` to support unbounded table capacity without artificial ceilings.
+  * **Transactional Lifecycle:** Table creation (`create_table`) and dropping (`drop_table`) integrate seamlessly into the active transaction context (`TxnId`), writing physical `PageDelta` WAL records, supporting runtime rollback with CLRs, and recovering via ARIES.
+  * **Complete Freelist Reclamation:** Dropping a table reclaims all associated B+ Tree pages, record pages, and overflow chains back into the persistent freelist with zero page leaks.
+  * **Structural & Referential Validation:** `validate_catalog()` verifies magic (`CATL`), version, table count, ID monotonicity, name syntax, and referential validity of root and record page pointers.
 
 ### `TreeDb`
-* **Role:** High-level unified database interface coordinating the index, record storage, buffer pool, and transactions.
+* **Role:** High-level unified database interface coordinating the catalog, index, record storage, buffer pool, and transactions.
 * **Responsibilities:**
   * Key-value operations: `put(key, value)`, `update(key, value)`, `get(key)`, `delete(key)`, `scan(start, end)`.
+  * Catalog operations: `create_table(name)`, `drop_table(name)`, `get_table(name)`, `get_table_by_id(id)`, `list_tables()`, `validate_catalog()`.
   * Transaction coordination: `begin() -> Result<Transaction<'_>>`, `begin_txn()`, `commit_txn(txn_id)`, `abort_txn(txn_id)`.
   * Automatic ARIES crash recovery upon opening existing database and WAL files.
   * Explicit buffer pool and WAL synchronization via `sync()`.
@@ -65,30 +95,10 @@ v                                                             v
 * **Responsibilities:**
   * **State Machine:** Governed by explicit `TxnState` (`Active`, `Committed`, `Aborted`). Mutations on closed transactions return structured errors (`TransactionAlreadyCommitted`, `TransactionAlreadyAborted`).
   * **Single-Transaction Exclusivity:** Enforces single-threaded mutual exclusion on `TreeDb` via Rust's mutable borrowing and dynamic tracking (`Error::TransactionActive`).
-  * **Read-Your-Writes:** Immediate visibility of uncommitted inserts, updates, and deletes for subsequent in-transaction reads (`get`) and range scans (`scan`).
+  * **Read-Your-Writes:** Immediate visibility of uncommitted inserts, updates, deletes, and catalog modifications for subsequent in-transaction reads.
   * **Commit Durability:** Commits all mutations atomically, ensuring WAL commit record is durably flushed before acknowledging completion.
   * **Runtime Rollback with CLRs:** On explicit `abort()`, walks the transaction's `PageDelta` history backward in reverse chronological order via `prev_lsn`, applies `before_image` byte slices, appends Compensation Log Records (CLRs), and flushes the WAL.
   * **Deterministic Drop Behavior:** Uncommitted transactions dropped out of scope automatically invoke rollback to maintain memory/disk cleanliness.
-
-```text
-                  TreeDb
-                    │
-                 begin()
-                    │
-               Transaction
-                    │
-          ┌─────────┼─────────┐
-          │         │         │
-         get       put      delete
-          │         │         │
-          └─────────┼─────────┘
-                    │
-                WAL TxnId
-                    │
-              Commit / Abort
-                    │
-              WAL + Recovery
-```
 
 ---
 

@@ -64,12 +64,40 @@ All pages other than Page 0 share a common 16-byte header:
 
 | Tag (u8) | Name | Purpose |
 | :--- | :--- | :--- |
-| `0x01` | `Metadata` | Catalog and table descriptor storage |
+| `0x01` | `Metadata` | Root catalog and table descriptor storage |
 | `0x02` | `Internal` | B+ Tree interior routing node |
 | `0x03` | `Leaf` | B+ Tree leaf node storing keys and record pointers |
 | `0x04` | `Record` | Slotted data page holding tuple data |
 | `0x05` | `Free` | Unallocated / recycled page in persistent freelist |
 | `0x06` | `Overflow` | Multi-page overflow chunk for values > 4070 bytes |
+| `0x07` | `Catalog` | Dedicated catalog page for table schema metadata |
+
+---
+
+## Catalog Page Payload Layout (`PageType::Catalog` / `PageType::Metadata`)
+
+The 4080-byte payload of a Catalog page is structured as:
+
+### Catalog Header (32 bytes)
+| Byte Offset | Length | Field Name | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x00` | 4 bytes | `magic` | `[u8; 4]` | ASCII identifier `CATL` |
+| `0x04` | 4 bytes | `format_version` | `u32` (LE) | Catalog layout version (`1`) |
+| `0x08` | 4 bytes | `next_table_id` | `u32` (LE) | Monotonic counter for allocating new `TableId`s |
+| `0x0C` | 4 bytes | `table_count` | `u32` (LE) | Number of active table metadata entries on this page |
+| `0x10` | 4 bytes | `next_catalog_page_id`| `u32` (LE) | PageId of next chained catalog page (`0` if end of chain) |
+| `0x14` | 12 bytes | `reserved` | `[u8; 12]` | Zero-filled reserved space |
+
+### Table Metadata Entry Layout (Variable length, 22 bytes + name_len)
+| Byte Offset | Length | Field Name | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `+0x00` | 4 bytes | `table_id` | `u32` (LE) | Unique, stable logical table identifier |
+| `+0x04` | 4 bytes | `schema_version` | `u32` (LE) | Table schema definition version (`1`) |
+| `+0x08` | 4 bytes | `root_page_id` | `u32` (LE) | Root PageId of table's B+ Tree index |
+| `+0x0C` | 4 bytes | `record_page_id` | `u32` (LE) | Initial/active PageId of table's slotted RecordStore |
+| `+0x10` | 4 bytes | `flags` | `u32` (LE) | Configuration flags for future schema options |
+| `+0x14` | 2 bytes | `name_len` | `u16` (LE) | Length in bytes of table name (1..64) |
+| `+0x16` | `name_len` bytes | `name` | `[u8; name_len]` | UTF-8 encoded table name string |
 
 ---
 
