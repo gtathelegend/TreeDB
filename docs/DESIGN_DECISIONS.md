@@ -412,6 +412,37 @@ This document records key architectural and design choices, their rationale, and
   * **Storage Independence:** JOIN execution operates purely on row streams in the query layer, leaving the underlying B+ Tree, slotted page record store, WAL, and crash recovery layers untouched.
   * **Future Extensibility:** The nested-loop operator interface is designed to permit pluggable hash joins, merge joins, or indexed nested loop joins in future phases without altering SQL binding or AST definitions.
 
+---
+
+## Decision 35: Rule-Based Query Optimizer & Physical Access-Path Planner
+
+* **Decision:** Implement a deterministic, rule-based query optimizer and explicit physical access-path planning layer separating SQL semantic binding from physical execution:
+  1. **Planning Boundary:**
+     $$\text{SQL} \rightarrow \text{Lexer/Parser} \rightarrow \text{Binder} \rightarrow \text{BoundSelect} \rightarrow \text{Optimizer} \rightarrow \text{PhysicalPlan} \rightarrow \text{Execution}$$
+  2. **Explicit Physical Access Paths (`AccessPath`):**
+     * `PrimaryPointLookup { key: Value }`: Single-key B+ Tree lookup via `table.get(key)`.
+     * `PrimaryRangeScan { start: Option<Value>, end: Option<Value> }`: Contiguous primary-key range scan via `table.scan(start, end)`.
+     * `SecondaryIndexScan { index_id: IndexId, scan_type: SecondaryScanType }`: Direct point lookup (`Point(IndexKey)`) or range scan (`Range { start, end }`) over secondary index B+ Tree leaves, fetching matching `RecordId`s followed by row hydration via `table.get_by_record_id`.
+     * `FullTableScan`: Fallback full primary B+ Tree scan over the entire table.
+  3. **Deterministic Access-Path Selection Hierarchy:**
+     $$\text{Primary Point Lookup} > \text{Primary Range Scan} > \text{Secondary Index Scan (ordered by IndexId ascending)} > \text{Full Table Scan}$$
+     If multiple secondary indexes match candidate predicates, tie-breaking is strictly deterministic based on numerical `IndexId` order.
+  4. **Predicate Decomposition & Relation Affiliation:**
+     * Conjunctions (`AND`) are recursively split into constituent conjuncts.
+     * Each conjunct is analyzed for relation affiliation: local single-table predicates are pushed down to the respective `PhysicalTableScan`, while multi-table or outer-referencing predicates remain at the join or outer filter level.
+  5. **Residual Filter Preservation & SQL 3VL Correctness:**
+     * An access path only replaces the exact predicate bounds it satisfies; any remaining or partially matched conjuncts are preserved in `PhysicalTableScan.residual_filter`.
+     * Non-indexable predicates (`OR`, `NOT`, `IS NULL`, `IS NOT NULL`, complex expressions) and `NULL` comparisons (`col = NULL` evaluating to 3VL NULL) are never transformed into index lookups and are safely retained as residual or post-join filters.
+  6. **LEFT JOIN Safety Invariant:**
+     * `WHERE` predicates referencing the right side of a `LEFT JOIN` are preserved as post-join filters to eliminate unmatched NULL-padded rows in accordance with SQL semantics.
+     * `ON` predicates referencing only the right side are safely pushed down to the right table scan before the join.
+  7. **Plan Inspection (`PhysicalPlan::Display`, `EXPLAIN`):**
+     * Textual representation provides inspectable, deterministic plan trees for debugging, tests, and future tooling.
+* **Rationale:**
+  * **Conservatism & Semantic Equivalence:** Optimizations are applied only when provably semantics-preserving.
+  * **Zero Storage Impact:** Storage, buffer pool, WAL, and transaction engines remain completely decoupled from query optimization.
+
+
 
 
 

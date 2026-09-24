@@ -135,6 +135,16 @@ v                                                             v
     8. **Pagination (`OffsetLimitOperator`):** In-memory offset skipping and limit truncation.
   * **Programmatic API:** Fluent builder via `TreeDb::query(name)` and `Transaction::query(name)` supporting `.filter()`, `.group_by()`, `.aggregate()`, `.having()`, `.project()`, `.sort_by()`, `.sort()`, `.offset()`, `.limit()`, and `.execute()`.
 
+### `Optimizer`, `AccessPath`, & `PhysicalPlan` (`src/query/optimizer.rs`)
+* **Role:** Deterministic rule-based query optimizer and physical execution planner producing executable `PhysicalPlan` trees from `BoundSelect`.
+* **Responsibilities:**
+  * **Access Path Selection:** Identifies primary-key point lookups, primary-key range scans, secondary-index point/range scans, or full table scans using catalog and index metadata.
+  * **Deterministic Priority:** Follows strict precedence: `PrimaryPointLookup > PrimaryRangeScan > SecondaryIndexScan (sorted by IndexId asc) > FullTableScan`.
+  * **Predicate Decomposition & Pushdown:** Splits `AND` conjunctions into individual conjuncts. Pushes table-local predicates down into individual `PhysicalTableScan` access paths and residual filters before executing joins.
+  * **LEFT JOIN Outer Safety:** Restricts pushdown across `LEFT JOIN` boundaries; filters on the right side in `WHERE` are retained post-join to ensure unmatched rows are correctly filtered out.
+  * **Residual Filter Preservation:** Always retains unconsumed predicate components in `PhysicalTableScan.residual_filter` to ensure full semantic equivalence.
+  * **SQL 3VL Preservation:** Treats `col = NULL` and `IS NULL` correctly without converting them to invalid matching index lookups.
+  * **Deterministic Plan Inspection:** Provides formatted, indented tree representations via `PhysicalPlan::Display` and `Transaction::explain_sql` / `TreeDb::explain_sql`.
 
 ---
 

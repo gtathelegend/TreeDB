@@ -359,7 +359,23 @@ impl TreeDb {
         Ok(crate::query::Query::new(table))
     }
 
-    /// Parses, binds, and executes an SQL `SELECT` statement directly on the database engine.
+    /// Parses, binds, and produces an optimized physical execution plan (`PhysicalPlan`) for the given SQL query.
+    pub fn plan_sql(&mut self, sql: &str) -> Result<crate::query::optimizer::PhysicalPlan> {
+        let mut txn = self.begin_transaction()?;
+        let plan = txn.plan_sql(sql)?;
+        txn.commit()?;
+        Ok(plan)
+    }
+
+    /// Generates a human-readable text explanation of the optimized physical execution plan for the given SQL query.
+    pub fn explain_sql(&mut self, sql: &str) -> Result<String> {
+        let mut txn = self.begin_transaction()?;
+        let explanation = txn.explain_sql(sql)?;
+        txn.commit()?;
+        Ok(explanation)
+    }
+
+    /// Parses, binds, optimizes, and executes an SQL `SELECT` statement directly on the database engine.
     pub fn execute_sql(&mut self, sql: &str) -> Result<crate::query::QueryResult> {
         let mut txn = self.begin_transaction()?;
         let result = txn.execute_sql(sql)?;

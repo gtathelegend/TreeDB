@@ -330,8 +330,25 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 20: Advanced Query Processing & DDL (Future)
-* [ ] Hash join and merge join execution operators
+## Phase 20: Rule-Based Optimizer & Access-Path Planner (Completed)
+* [x] Decoupled logical/physical planning boundary (`BoundSelect` -> `Optimizer` -> `PhysicalPlan` -> execution)
+* [x] Explicit physical access paths: `PrimaryPointLookup`, `PrimaryRangeScan`, `SecondaryIndexScan` (`PointLookup`, `RangeScan`), `FullTableScan`
+* [x] Rule-based predicate decomposition (`split_conjunction`, `recombine_conjunction`, `unqualify_expr`)
+* [x] Deterministic access-path selection priority (PK point -> PK range -> Secondary index by IndexId asc -> Full scan)
+* [x] Residual filter preservation (never discarding unconsumed predicates)
+* [x] SQL 3VL NULL safety: `WHERE col = NULL` and `IS NULL` are not incorrectly matched as index point lookups
+* [x] JOIN predicate pushdown: table-local filters pushed down to respective table scans before joins
+* [x] LEFT JOIN safety: WHERE predicates on right table of LEFT JOIN remain post-join to eliminate NULL-padded rows; ON predicates on right table safely pushed down
+* [x] Full composition: optimized scans feed seamlessly into `JoinOperator -> FilterOperator -> AggregateOperator -> SortOperator -> ProjectOperator -> OffsetLimitOperator`
+* [x] Deterministic plan inspection API: `PhysicalPlan::Display`, `txn.plan_sql()`, `txn.explain_sql()`, `db.plan_sql()`, `db.explain_sql()`
+* [x] Dynamic index lifecycle: immediate recognition of created/dropped secondary indexes in active transactions
+* [x] Baseline vs optimized execution equivalence tests and randomized reference oracle
+* [x] 20 dedicated optimizer integration tests in `tests/optimizer.rs` (358 total test suite)
+
+---
+
+## Phase 21: Advanced Query Processing & DDL (Future)
+* [ ] Hash join and merge join physical execution operators
 * [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes

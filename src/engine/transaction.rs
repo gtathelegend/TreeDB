@@ -324,81 +324,117 @@ impl<'db> Transaction<'db> {
         Ok(crate::query::Query::new(table))
     }
 
-    /// Parses, binds, and executes an SQL `SELECT` statement within this transaction.
+    /// Parses, binds, and produces an optimized physical execution plan (`PhysicalPlan`) for the given SQL query.
+    pub fn plan_sql(&mut self, sql: &str) -> Result<crate::query::optimizer::PhysicalPlan> {
+        self.ensure_active()?;
+        let ast = crate::sql::parse(sql)?;
+
+        let mut table_infos = Vec::new();
+        let mut bindings = Vec::new();
+
+        {
+            let base_table = self.open_table(&ast.from.name)?;
+            let schema = base_table.schema().clone();
+            let indexes = base_table
+                .indexes()
+                .iter()
+                .map(|(m, _)| m.clone())
+                .collect();
+            table_infos.push(crate::query::optimizer::TableOptInfo::new(
+                &ast.from.name,
+                ast.from.alias.as_deref(),
+                schema,
+                indexes,
+            ));
+        }
+
+        for j in &ast.joins {
+            let t = self.open_table(&j.table.name)?;
+            let schema = t.schema().clone();
+            let indexes = t.indexes().iter().map(|(m, _)| m.clone()).collect();
+            table_infos.push(crate::query::optimizer::TableOptInfo::new(
+                &j.table.name,
+                j.table.alias.as_deref(),
+                schema,
+                indexes,
+            ));
+        }
+
+        for t in &table_infos {
+            bindings.push(crate::sql::TableBinding::new(
+                &t.name,
+                t.alias.as_deref(),
+                &t.schema,
+            ));
+        }
+
+        let bound = crate::sql::bind_select_multi(&ast, &bindings)?;
+        crate::query::optimizer::Optimizer::optimize(&bound, &table_infos)
+    }
+
+    /// Generates a human-readable text explanation of the optimized physical execution plan for the given SQL query.
+    pub fn explain_sql(&mut self, sql: &str) -> Result<String> {
+        let plan = self.plan_sql(sql)?;
+        Ok(plan.to_string())
+    }
+
+    /// Parses, binds, optimizes, and executes an SQL `SELECT` statement within this transaction.
     ///
     /// Observes prior uncommitted mutations made within the same transaction.
     pub fn execute_sql(&mut self, sql: &str) -> Result<crate::query::QueryResult> {
         self.ensure_active()?;
-        let ast = crate::sql::parse(sql)?;
-        let mut table = self.open_table(&ast.from.name)?;
+        let plan = self.plan_sql(sql)?;
+        self.execute_physical_plan(&plan)
+    }
 
-        if ast.joins.is_empty() {
-            let bound = crate::sql::bind_select(&ast, table.schema())?;
+    /// Executes a fully optimized `PhysicalPlan` against this transaction.
+    pub fn execute_physical_plan(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+    ) -> Result<crate::query::QueryResult> {
+        self.ensure_active()?;
 
-            let mut query = crate::query::Query::new(table);
-            if let Some(filter) = bound.filter {
-                query = query.filter(filter);
-            }
-            if !bound.group_by.is_empty() {
-                query = query.group_by(bound.group_by);
-            }
-            if !bound.aggregates.is_empty() {
-                query = query.aggregate(bound.aggregates);
-            }
-            if let Some(having) = bound.having {
-                query = query.having(having);
-            }
-            if !bound.projections.is_empty() {
-                query = query.project_with_aliases(bound.projections);
-            }
-            if !bound.order_by.is_empty() {
-                query = query.sort(bound.order_by);
-            }
-            if let Some(offset) = bound.offset {
-                query = query.offset(offset);
-            }
-            if let Some(limit) = bound.limit {
-                query = query.limit(limit);
-            }
-
-            query.execute()
-        } else {
-            // Multi-table JOIN query execution
-            let (from_schema, mut current_rows) = {
-                let schema = table.schema().clone();
-                let rows = table.scan(None, None)?;
-                (schema, rows)
+        // 1. Execute base table scan
+        let (mut current_schema, mut current_rows) = {
+            let mut table = self.open_table(&plan.base_table.table_name)?;
+            let raw_schema = table.schema().clone();
+            let initial_rows = match &plan.base_table.access_path {
+                crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
+                    match table.get(key)? {
+                        Some(row) => vec![row],
+                        None => Vec::new(),
+                    }
+                }
+                crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
+                    table.scan(start.as_ref(), end.as_ref())?
+                }
+                crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                    index_name,
+                    scan_type,
+                    ..
+                } => match scan_type {
+                    crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                        table.index_lookup(index_name, val)?
+                    }
+                    crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
+                        table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                    }
+                },
+                crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
             };
 
-            let mut joined_info = Vec::new();
-            for j in &ast.joins {
-                let mut t = self.open_table(&j.table.name)?;
-                let schema = t.schema().clone();
-                let rows = t.scan(None, None)?;
-                joined_info.push((j, schema, rows));
-            }
+            let filtered_rows = match &plan.base_table.residual_filter {
+                Some(filter) => {
+                    crate::query::FilterOperator::apply(initial_rows, &raw_schema, filter)?
+                }
+                None => initial_rows,
+            };
 
-            let mut bindings = Vec::new();
-            bindings.push(crate::sql::TableBinding::new(
-                &ast.from.name,
-                ast.from.alias.as_deref(),
-                &from_schema,
-            ));
-            for (j, schema, _) in &joined_info {
-                bindings.push(crate::sql::TableBinding::new(
-                    &j.table.name,
-                    j.table.alias.as_deref(),
-                    schema,
-                ));
-            }
-
-            let bound = crate::sql::bind_select_multi(&ast, &bindings)?;
-
-            // 1. Qualified schema for left-most table
-            let mut current_schema = {
-                let q = bindings[0].qualifier();
-                let cols: Vec<crate::engine::types::Column> = bindings[0]
-                    .schema
+            let schema = if plan.joins.is_empty() {
+                raw_schema
+            } else {
+                let q = plan.base_table.qualifier();
+                let cols: Vec<crate::engine::types::Column> = raw_schema
                     .columns
                     .iter()
                     .map(|c| {
@@ -412,107 +448,128 @@ impl<'db> Transaction<'db> {
                 crate::engine::types::Schema::new_projected(cols)
             };
 
-            // 2. Perform chained joins left-to-right
-            for (join_idx, (j, right_schema_raw, right_rows)) in joined_info.iter().enumerate() {
-                let right_schema = {
-                    let q = bindings[join_idx + 1].qualifier();
-                    let cols: Vec<crate::engine::types::Column> = right_schema_raw
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            crate::engine::types::Column::new(
-                                format!("{q}.{}", c.name),
-                                c.data_type,
-                                c.nullable,
-                            )
-                        })
-                        .collect();
-                    crate::engine::types::Schema::new_projected(cols)
+            (schema, filtered_rows)
+        };
+
+        // 2. Execute Joins sequentially
+        for join in &plan.joins {
+            let (right_schema, right_rows) = {
+                let mut table = self.open_table(&join.right.table_name)?;
+                let raw_schema = table.schema().clone();
+                let initial_rows = match &join.right.access_path {
+                    crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
+                        match table.get(key)? {
+                            Some(row) => vec![row],
+                            None => Vec::new(),
+                        }
+                    }
+                    crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
+                        table.scan(start.as_ref(), end.as_ref())?
+                    }
+                    crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                        index_name,
+                        scan_type,
+                        ..
+                    } => match scan_type {
+                        crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                            table.index_lookup(index_name, val)?
+                        }
+                        crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
+                            table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                        }
+                    },
+                    crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
                 };
 
-                let (next_schema, next_rows) = crate::query::JoinOperator::apply(
-                    current_rows,
-                    &current_schema,
-                    right_rows,
-                    &right_schema,
-                    j.join_type,
-                    &bound.joins[join_idx].on,
-                )?;
-                current_schema = next_schema;
-                current_rows = next_rows;
-            }
+                let filtered_rows = match &join.right.residual_filter {
+                    Some(filter) => {
+                        crate::query::FilterOperator::apply(initial_rows, &raw_schema, filter)?
+                    }
+                    None => initial_rows,
+                };
 
-            // 3. Filter Operator (WHERE)
-            let filtered_rows = match &bound.filter {
-                Some(predicate) => {
-                    crate::query::FilterOperator::apply(current_rows, &current_schema, predicate)?
-                }
-                None => current_rows,
+                let q = join.right.qualifier();
+                let cols: Vec<crate::engine::types::Column> = raw_schema
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        crate::engine::types::Column::new(
+                            format!("{q}.{}", c.name),
+                            c.data_type,
+                            c.nullable,
+                        )
+                    })
+                    .collect();
+                (
+                    crate::engine::types::Schema::new_projected(cols),
+                    filtered_rows,
+                )
             };
 
-            // 4. Aggregation & HAVING or standard Sort & Project
-            let is_aggregate = !bound.group_by.is_empty() || !bound.aggregates.is_empty();
-            if is_aggregate {
-                let (grouped_schema, grouped_rows) = crate::query::AggregateOperator::apply(
-                    filtered_rows,
-                    &current_schema,
-                    &bound.group_by,
-                    &bound.aggregates,
-                )?;
+            let (next_schema, next_rows) = crate::query::JoinOperator::apply(
+                current_rows,
+                &current_schema,
+                &right_rows,
+                &right_schema,
+                join.join_type,
+                &join.on,
+            )?;
+            current_schema = next_schema;
+            current_rows = next_rows;
+        }
 
-                let having_rows = match &bound.having {
-                    Some(predicate) => crate::query::FilterOperator::apply(
-                        grouped_rows,
-                        &grouped_schema,
-                        predicate,
-                    )?,
-                    None => grouped_rows,
-                };
+        // 3. Post-Join Filter
+        if let Some(post_filter) = &plan.post_join_filter {
+            current_rows =
+                crate::query::FilterOperator::apply(current_rows, &current_schema, post_filter)?;
+        }
 
-                let sorted_rows = crate::query::SortOperator::apply(
-                    having_rows,
-                    &grouped_schema,
-                    &bound.order_by,
-                )?;
+        // 4. Aggregation / Group By / Having vs Sort / Project
+        let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
+        if is_aggregate {
+            let (grouped_schema, grouped_rows) = crate::query::AggregateOperator::apply(
+                current_rows,
+                &current_schema,
+                &plan.group_by,
+                &plan.aggregates,
+            )?;
 
-                let (projected_schema, projected_rows) =
-                    crate::query::ProjectOperator::apply_named(
-                        sorted_rows,
-                        &grouped_schema,
-                        &bound.projections,
-                    )?;
-                let paginated_rows = crate::query::OffsetLimitOperator::apply(
-                    projected_rows,
-                    bound.offset,
-                    bound.limit,
-                );
-                Ok(crate::query::QueryResult::new(
-                    projected_schema,
-                    paginated_rows,
-                ))
-            } else {
-                let sorted_rows = crate::query::SortOperator::apply(
-                    filtered_rows,
-                    &current_schema,
-                    &bound.order_by,
-                )?;
+            let having_rows = match &plan.having {
+                Some(predicate) => {
+                    crate::query::FilterOperator::apply(grouped_rows, &grouped_schema, predicate)?
+                }
+                None => grouped_rows,
+            };
 
-                let (projected_schema, projected_rows) =
-                    crate::query::ProjectOperator::apply_named(
-                        sorted_rows,
-                        &current_schema,
-                        &bound.projections,
-                    )?;
-                let paginated_rows = crate::query::OffsetLimitOperator::apply(
-                    projected_rows,
-                    bound.offset,
-                    bound.limit,
-                );
-                Ok(crate::query::QueryResult::new(
-                    projected_schema,
-                    paginated_rows,
-                ))
-            }
+            let sorted_rows =
+                crate::query::SortOperator::apply(having_rows, &grouped_schema, &plan.order_by)?;
+
+            let (projected_schema, projected_rows) = crate::query::ProjectOperator::apply_named(
+                sorted_rows,
+                &grouped_schema,
+                &plan.projections,
+            )?;
+            let paginated_rows =
+                crate::query::OffsetLimitOperator::apply(projected_rows, plan.offset, plan.limit);
+            Ok(crate::query::QueryResult::new(
+                projected_schema,
+                paginated_rows,
+            ))
+        } else {
+            let sorted_rows =
+                crate::query::SortOperator::apply(current_rows, &current_schema, &plan.order_by)?;
+
+            let (projected_schema, projected_rows) = crate::query::ProjectOperator::apply_named(
+                sorted_rows,
+                &current_schema,
+                &plan.projections,
+            )?;
+            let paginated_rows =
+                crate::query::OffsetLimitOperator::apply(projected_rows, plan.offset, plan.limit);
+            Ok(crate::query::QueryResult::new(
+                projected_schema,
+                paginated_rows,
+            ))
         }
     }
 
