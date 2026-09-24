@@ -295,6 +295,8 @@ impl<'a> Lexer<'a> {
             "TRUE" => TokenKind::True,
             "FALSE" => TokenKind::False,
             "AS" => TokenKind::As,
+            "GROUP" => TokenKind::Group,
+            "HAVING" => TokenKind::Having,
             _ => TokenKind::Ident(ident_str.to_string()),
         };
 

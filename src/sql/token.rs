@@ -23,6 +23,8 @@ pub enum TokenKind {
     True,
     False,
     As,
+    Group,
+    Having,
 
     // Identifiers & Literals
     Ident(String),
@@ -72,6 +74,8 @@ impl fmt::Display for TokenKind {
             TokenKind::True => write!(f, "TRUE"),
             TokenKind::False => write!(f, "FALSE"),
             TokenKind::As => write!(f, "AS"),
+            TokenKind::Group => write!(f, "GROUP"),
+            TokenKind::Having => write!(f, "HAVING"),
             TokenKind::Ident(s) => write!(f, "identifier '{s}'"),
             TokenKind::Integer(i) => write!(f, "integer '{i}'"),
             TokenKind::Float(v) => write!(f, "float '{v}'"),

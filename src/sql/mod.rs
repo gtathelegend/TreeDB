@@ -6,8 +6,8 @@ pub mod span;
 pub mod token;
 
 pub use ast::{
-    OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral,
-    SqlUnaryOp, TableRef,
+    AggregateFunction, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp,
+    SqlExpr, SqlLiteral, SqlUnaryOp, TableRef,
 };
 pub use binder::{bind_expr, bind_select, BindingContext, BoundSelect};
 pub use lexer::{Lexer, MAX_IDENTIFIER_LEN};

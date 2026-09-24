@@ -72,7 +72,32 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // 4. Optional ORDER BY clause
+        // 4. Optional GROUP BY clause
+        let group_by = if self.peek().kind == TokenKind::Group {
+            self.advance(); // consume GROUP
+            let by_token = self.peek();
+            if by_token.kind != TokenKind::By {
+                return Err(Error::SqlParseError {
+                    message: format!("expected BY after GROUP, found {}", by_token.kind),
+                    start: by_token.span.start,
+                    end: by_token.span.end,
+                });
+            }
+            self.advance(); // consume BY
+            self.parse_group_by_list()?
+        } else {
+            Vec::new()
+        };
+
+        // 5. Optional HAVING clause
+        let having = if self.peek().kind == TokenKind::Having {
+            self.advance(); // consume HAVING
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // 6. Optional ORDER BY clause
         let order_by = if self.peek().kind == TokenKind::Order {
             self.advance(); // consume ORDER
             let by_token = self.peek();
@@ -89,7 +114,7 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
 
-        // 5. Optional LIMIT clause
+        // 7. Optional LIMIT clause
         let limit = if self.peek().kind == TokenKind::Limit {
             self.advance(); // consume LIMIT
             Some(self.parse_non_negative_integer("LIMIT")?)
@@ -97,7 +122,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // 6. Optional OFFSET clause
+        // 8. Optional OFFSET clause
         let offset = if self.peek().kind == TokenKind::Offset {
             self.advance(); // consume OFFSET
             Some(self.parse_non_negative_integer("OFFSET")?)
@@ -105,12 +130,12 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // 7. Optional trailing semicolon
+        // 9. Optional trailing semicolon
         if self.peek().kind == TokenKind::Semicolon {
             self.advance();
         }
 
-        // 8. Enforce EOF (no unexpected trailing tokens)
+        // 10. Enforce EOF (no unexpected trailing tokens)
         if self.peek().kind != TokenKind::Eof {
             let trailing = self.peek();
             return Err(Error::SqlParseError {
@@ -127,6 +152,8 @@ impl<'a> Parser<'a> {
             projection,
             from,
             selection,
+            group_by,
+            having,
             order_by,
             limit,
             offset,
@@ -309,6 +336,32 @@ impl<'a> Parser<'a> {
         Ok(list)
     }
 
+    fn parse_group_by_list(&mut self) -> Result<Vec<SqlExpr>> {
+        let mut list = Vec::new();
+
+        loop {
+            let expr = self.parse_expr()?;
+            list.push(expr);
+
+            if self.peek().kind == TokenKind::Comma {
+                self.advance(); // consume comma
+            } else {
+                break;
+            }
+        }
+
+        if list.is_empty() {
+            let span = self.peek().span;
+            return Err(Error::SqlParseError {
+                message: "GROUP BY list cannot be empty".to_string(),
+                start: span.start,
+                end: span.end,
+            });
+        }
+
+        Ok(list)
+    }
+
     fn parse_non_negative_integer(&mut self, clause: &str) -> Result<u64> {
         let token = self.peek();
         match token.kind {
@@ -396,6 +449,106 @@ impl<'a> Parser<'a> {
                         });
                     }
                 }
+
+                if self.peek_ahead(1).kind == TokenKind::LParen {
+                    let upper = val.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "COUNT" => {
+                            self.advance(); // consume 'COUNT'
+                            self.advance(); // consume '('
+                            if self.peek().kind == TokenKind::Asterisk {
+                                self.advance(); // consume '*'
+                                let close = self.peek();
+                                if close.kind != TokenKind::RParen {
+                                    return Err(Error::SqlParseError {
+                                        message: format!(
+                                            "expected ')' after COUNT(*), found {}",
+                                            close.kind
+                                        ),
+                                        start: close.span.start,
+                                        end: close.span.end,
+                                    });
+                                }
+                                self.advance(); // consume ')'
+                                return Ok(SqlExpr::CountAll);
+                            } else if self.peek().kind == TokenKind::RParen {
+                                return Err(Error::InvalidAggregateArgument(
+                                    "COUNT() requires an argument or '*'".to_string(),
+                                ));
+                            } else {
+                                let arg = self.parse_expr()?;
+                                if matches!(&arg, SqlExpr::CountAll | SqlExpr::Aggregate { .. }) {
+                                    return Err(Error::NestedAggregate(format!(
+                                        "nested aggregate inside COUNT: {arg}"
+                                    )));
+                                }
+                                let close = self.peek();
+                                if close.kind != TokenKind::RParen {
+                                    return Err(Error::SqlParseError {
+                                        message: format!(
+                                            "expected ')' after function argument, found {}",
+                                            close.kind
+                                        ),
+                                        start: close.span.start,
+                                        end: close.span.end,
+                                    });
+                                }
+                                self.advance(); // consume ')'
+                                return Ok(SqlExpr::Aggregate {
+                                    function: crate::sql::ast::AggregateFunction::Count,
+                                    arg: Box::new(arg),
+                                });
+                            }
+                        }
+                        "SUM" | "AVG" | "MIN" | "MAX" => {
+                            let func = match upper.as_str() {
+                                "SUM" => crate::sql::ast::AggregateFunction::Sum,
+                                "AVG" => crate::sql::ast::AggregateFunction::Avg,
+                                "MIN" => crate::sql::ast::AggregateFunction::Min,
+                                "MAX" => crate::sql::ast::AggregateFunction::Max,
+                                _ => unreachable!(),
+                            };
+                            self.advance(); // consume function name
+                            self.advance(); // consume '('
+                            if self.peek().kind == TokenKind::Asterisk {
+                                return Err(Error::InvalidAggregateArgument(format!(
+                                    "{func}(*) is not valid"
+                                )));
+                            } else if self.peek().kind == TokenKind::RParen {
+                                return Err(Error::InvalidAggregateArgument(format!(
+                                    "{func}() requires an argument"
+                                )));
+                            } else {
+                                let arg = self.parse_expr()?;
+                                if matches!(&arg, SqlExpr::CountAll | SqlExpr::Aggregate { .. }) {
+                                    return Err(Error::NestedAggregate(format!(
+                                        "nested aggregate inside {func}: {arg}"
+                                    )));
+                                }
+                                let close = self.peek();
+                                if close.kind != TokenKind::RParen {
+                                    return Err(Error::SqlParseError {
+                                        message: format!(
+                                            "expected ')' after function argument, found {}",
+                                            close.kind
+                                        ),
+                                        start: close.span.start,
+                                        end: close.span.end,
+                                    });
+                                }
+                                self.advance(); // consume ')'
+                                return Ok(SqlExpr::Aggregate {
+                                    function: func,
+                                    arg: Box::new(arg),
+                                });
+                            }
+                        }
+                        _ => {
+                            return Err(Error::UnknownAggregateFunction(val));
+                        }
+                    }
+                }
+
                 self.advance();
                 Ok(SqlExpr::Identifier(val))
             }

@@ -61,6 +61,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **SQL Lexer, Parser & AST** | **Implemented** | Zero-dependency lexical scanner with byte-offset span tracking, Pratt precedence climbing parser, AST representation for scoped `SELECT` dialect |
 | **SQL Binding & Execution Engine** | **Implemented** | Semantic analysis, table/column name resolution, wildcard expansion, type checking, transaction-aware query execution |
 | **Persistent Secondary Indexes** | **Implemented** | Monotonic `IndexId`s, `IndexMetadata`, canonical order-preserving index key encoding, unique/non-unique composite keys, auto-maintenance on table mutations, query index access paths, catalog validation |
+| **Aggregation, GROUP BY & HAVING** | **Implemented** | `COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX`, single/multi-key `GROUP BY`, `HAVING` filter, deterministic `CanonicalValue` grouping, incremental accumulators, semantic validation |
 
 
 ---

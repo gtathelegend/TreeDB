@@ -337,6 +337,15 @@ impl<'db> Transaction<'db> {
         if let Some(filter) = bound.filter {
             query = query.filter(filter);
         }
+        if !bound.group_by.is_empty() {
+            query = query.group_by(bound.group_by);
+        }
+        if !bound.aggregates.is_empty() {
+            query = query.aggregate(bound.aggregates);
+        }
+        if let Some(having) = bound.having {
+            query = query.having(having);
+        }
         if !bound.projections.is_empty() {
             query = query.project_with_aliases(bound.projections);
         }

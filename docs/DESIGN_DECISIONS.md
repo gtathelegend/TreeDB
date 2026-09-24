@@ -357,6 +357,29 @@ This document records key architectural and design choices, their rationale, and
   * **Zero Duplicate Code:** The `(IndexKey, RecordId)` composite design reuses balanced B+ Tree search, split, merge, and range scan mechanics directly.
   * **Strict Referential Invariants:** Dropping tables automatically cascades to drop all attached secondary indexes and returns all allocated pages to the persistent freelist.
 
+---
+
+## Decision 33: Relational Aggregation, GROUP BY & HAVING Execution Engine
+
+* **Decision:** Implement aggregate functions (`COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX`), `GROUP BY`, and `HAVING` as a pure, query-layer execution operator (`AggregateOperator`) without modifying the storage engine, B+ Tree, or secondary index layers:
+  1. **Single-Pass Incremental Accumulators (`AggregateState`):** State transitions occur per row without buffering raw rows for each group:
+     * `COUNT(*)` counts all input rows; `COUNT(expr)` ignores `NULL`s.
+     * `SUM` returns `Int64`, `UInt64`, or `Float64`, ignoring `NULL` values. Empty or all-NULL inputs evaluate to `Value::Null` (not zero). Checked integer addition raises `Error::AggregateOverflow` on overflow.
+     * `AVG` uses an accumulator tracking `(sum, non_null_count)` and produces `DataType::Float64` (`sum / non_null_count`). Empty or all-NULL inputs evaluate to `Value::Null`.
+     * `MIN` / `MAX` support all comparable types (`Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`), ignoring `NULL`s and returning `Value::Null` on empty inputs. Float comparisons use `f64::total_cmp` for deterministic handling of `-0.0`, `NaN`, and infinities.
+  2. **Deterministic Group Key (`CanonicalValue`, `GroupKey`):** Exact canonical type and value encoding mapping `Float64` using `f64::to_bits()` to avoid NaN/negative-zero collisions. Multiple `NULL` grouping keys are treated as identical, belonging to the same group.
+  3. **Strict Query Execution Pipeline Ordering:**
+     $$\text{Scan / Index Access} \rightarrow \text{Filter (WHERE)} \rightarrow \text{GROUP BY / Aggregation} \rightarrow \text{HAVING} \rightarrow \text{Projection} \rightarrow \text{Sort (ORDER BY)} \rightarrow \text{Pagination (Offset/Limit)}$$
+  4. **Strict SQL Grouping Semantic Validation:**
+     * Aggregates in `WHERE` clauses are rejected at semantic binding time (`Error::AggregateInWhere`).
+     * Nested aggregates (e.g. `SUM(COUNT(*))`) are rejected by the parser (`Error::NestedAggregate`).
+     * Every expression in `SELECT`, `HAVING`, and `ORDER BY` must either appear in `GROUP BY` or be derived entirely from aggregate functions (`Error::UngroupedColumn`, `Error::InvalidHavingExpression`).
+     * Output column aliases are preserved in the projected schema and available for `ORDER BY`.
+  5. **Global Implicit Grouping vs Grouped Execution:** Queries with aggregates but no `GROUP BY` produce exactly one row for all inputs (including empty input sets, returning e.g. `COUNT(*) = 0`, `SUM = NULL`). Grouped queries over empty input sets produce zero rows.
+* **Rationale:**
+  * **Strict Separation of Storage & Query:** Storage remains focused on rows, indexes, persistence, transactions, and recovery. Aggregation is purely execution-time state.
+  * **Zero Duplicate Query Execution:** SQL queries compile down directly to `Query<'a>`, ensuring 100% equivalence between SQL aggregation and programmatic API aggregation.
+
 
 
 

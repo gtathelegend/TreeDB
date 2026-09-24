@@ -9,6 +9,10 @@ pub struct SelectStatement {
     pub from: TableRef,
     /// Optional boolean filtering predicate in the `WHERE` clause.
     pub selection: Option<SqlExpr>,
+    /// Optional list of grouping expressions in the `GROUP BY` clause.
+    pub group_by: Vec<SqlExpr>,
+    /// Optional boolean filtering predicate in the `HAVING` clause.
+    pub having: Option<SqlExpr>,
     /// Ordered list of sort expressions in the `ORDER BY` clause.
     pub order_by: Vec<OrderByExpr>,
     /// Optional non-negative maximum row count in the `LIMIT` clause.
@@ -163,6 +167,33 @@ impl fmt::Display for SqlLiteral {
     }
 }
 
+/// Supported relational aggregate functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AggregateFunction {
+    /// COUNT
+    Count,
+    /// SUM
+    Sum,
+    /// AVG
+    Avg,
+    /// MIN
+    Min,
+    /// MAX
+    Max,
+}
+
+impl fmt::Display for AggregateFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AggregateFunction::Count => write!(f, "COUNT"),
+            AggregateFunction::Sum => write!(f, "SUM"),
+            AggregateFunction::Avg => write!(f, "AVG"),
+            AggregateFunction::Min => write!(f, "MIN"),
+            AggregateFunction::Max => write!(f, "MAX"),
+        }
+    }
+}
+
 /// Abstract Syntax Tree (AST) node for SQL scalar expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlExpr {
@@ -197,6 +228,15 @@ pub enum SqlExpr {
     IsNull(Box<SqlExpr>),
     /// `expr IS NOT NULL` predicate.
     IsNotNull(Box<SqlExpr>),
+    /// Special wildcard count aggregate `COUNT(*)`.
+    CountAll,
+    /// Aggregate function applied to a single scalar expression (`FUNC(expr)`).
+    Aggregate {
+        /// Aggregate function name.
+        function: AggregateFunction,
+        /// Inner argument expression.
+        arg: Box<SqlExpr>,
+    },
 }
 
 impl fmt::Display for SqlExpr {
@@ -209,6 +249,8 @@ impl fmt::Display for SqlExpr {
             SqlExpr::Unary { op, expr } => write!(f, "({op} {expr})"),
             SqlExpr::IsNull(expr) => write!(f, "({expr} IS NULL)"),
             SqlExpr::IsNotNull(expr) => write!(f, "({expr} IS NOT NULL)"),
+            SqlExpr::CountAll => write!(f, "COUNT(*)"),
+            SqlExpr::Aggregate { function, arg } => write!(f, "{function}({arg})"),
         }
     }
 }

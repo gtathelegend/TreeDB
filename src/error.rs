@@ -262,4 +262,45 @@ pub enum Error {
     /// Index name is invalid (e.g. empty, too long).
     #[error("Invalid index name: {0}")]
     InvalidIndexName(String),
+
+    /// Column in SELECT or HAVING is not in GROUP BY and not in an aggregate function.
+    #[error("Column '{0}' must appear in the GROUP BY clause or be used in an aggregate function")]
+    UngroupedColumn(String),
+
+    /// Aggregate functions are not allowed in WHERE clause.
+    #[error("Aggregate functions are not allowed in WHERE clause")]
+    AggregateInWhere,
+
+    /// Invalid expression in HAVING clause.
+    #[error("Invalid HAVING expression: {0}")]
+    InvalidHavingExpression(String),
+
+    /// Invalid argument provided to aggregate function.
+    #[error("Invalid aggregate argument: {0}")]
+    InvalidAggregateArgument(String),
+
+    /// Aggregate nesting is not supported.
+    #[error("Nested aggregate functions are not allowed: {0}")]
+    NestedAggregate(String),
+
+    /// Aggregate function called on unsupported data type.
+    #[error("Aggregate function '{func}' is not supported for data type '{data_type}'")]
+    UnsupportedAggregateType {
+        /// Aggregate function name.
+        func: String,
+        /// Data type encountered.
+        data_type: String,
+    },
+
+    /// Arithmetic overflow during aggregate accumulator evaluation.
+    #[error("Arithmetic overflow during aggregate calculation: {0}")]
+    AggregateOverflow(String),
+
+    /// Unknown or unsupported aggregate function name.
+    #[error("Unknown aggregate function '{0}'")]
+    UnknownAggregateFunction(String),
+
+    /// Invalid GROUP BY expression.
+    #[error("Invalid GROUP BY expression: {0}")]
+    InvalidGroupByExpression(String),
 }

@@ -80,10 +80,11 @@ v                                                             v
 ### `Parser` & Pratt Expression Parser (`src/sql/parser.rs`)
 * **Role:** Recursive descent parser and Pratt precedence climbing expression parser for the scoped SQL `SELECT` dialect.
 * **Responsibilities:**
-  * **Clause Grammar:** Enforces strict clause order: `SELECT [wildcard | expressions [AS alias]] FROM table [WHERE expr] [ORDER BY expr [ASC | DESC], ...] [LIMIT n] [OFFSET n];`.
+  * **Clause Grammar:** Enforces strict clause order: `SELECT [wildcard | expressions [AS alias]] FROM table [WHERE expr] [GROUP BY expr, ...] [HAVING expr] [ORDER BY expr [ASC | DESC], ...] [LIMIT n] [OFFSET n];`.
+  * **Aggregate Expressions:** Case-insensitive parsing for `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)`. Rejects nested aggregates (e.g. `SUM(COUNT(*))`), empty aggregate calls, and wildcard arguments for non-COUNT functions (`SUM(*)`).
   * **Precedence Hierarchy:**
     1. Parenthesized expressions `(expr)`
-    2. Primary literals and identifiers
+    2. Primary literals, identifiers, and aggregate function calls
     3. Unary minus (`-`)
     4. Postfix predicates (`IS NULL`, `IS NOT NULL`)
     5. Relational comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`) with normalization of `<>` and `!=` to `SqlBinaryOp::NotEq`
@@ -93,37 +94,43 @@ v                                                             v
   * **Standalone Boundary:** Operates completely decoupled from runtime storage, schemas, or buffer pools via `treedb::sql::parse(sql)`.
 
 ### `BindingContext`, `BoundSelect` & SQL Binder (`src/sql/binder.rs`)
-* **Role:** Semantic analysis and translation layer bridging SQL ASTs with Phase 14 query execution structures.
+* **Role:** Semantic analysis and translation layer bridging SQL ASTs with Phase 14/18 query execution structures.
 * **Responsibilities:**
   * **Name Resolution:** Resolves table names against the catalog and columns (both unqualified `name` and qualified `table.name`/`alias.name`) against table schemas.
-  * **Wildcard Expansion:** Expands unqualified `*` and qualified `alias.*` to all columns from the target `Schema`.
-  * **Literal Coercion:** Coerces numeric literals when compared to typed columns (e.g. integer literal `42` to `Value::UInt64` or `Value::Float64`).
-  * **Expression Type Inference:** Verifies data types statically on projections, filters, and sort keys before query execution.
-  * **Zero Execution Duplication:** Translates `SelectStatement` directly into `BoundSelect` and Phase 14 `Expr`s, delegating physical execution entirely to `Query<'a>`.
+  * **Wildcard Expansion:** Expands unqualified `*` and qualified `alias.*` to all columns from the target `Schema` (validating grouping invariants if `GROUP BY` is present).
+  * **Semantic Grouping Validation:** Enforces SQL grouping rules: rejects aggregates in `WHERE`, validates that every expression in `SELECT`, `HAVING`, and `ORDER BY` is either present in `GROUP BY` or derived entirely from aggregate functions.
+  * **Literal Coercion:** Coerces numeric literals when compared to typed columns or aggregate outputs (e.g. integer literal `42` in `COUNT(*) >= 1` coerced to `Value::UInt64`).
+  * **Expression Type Inference:** Verifies data types statically on projections, filters, aggregates, HAVING, and sort keys before query execution.
+  * **Zero Execution Duplication:** Translates `SelectStatement` directly into `BoundSelect` and Phase 14/18 `Expr`s/`AggregateExpr`s, delegating physical execution entirely to `Query<'a>`.
 
 ---
 
 ## 2. Query Execution & Expression Layer (`src/query`)
 
 
-### `Expr`, `BinaryOp`, `UnaryOp`, & Evaluator (`src/query/expr.rs`)
-* **Role:** AST-based scalar expression system with static type inference, validation, and SQL-compliant three-valued logic (3VL).
+### `Expr`, `AggregateExpr`, `AggregateState`, & Evaluator (`src/query/expr.rs`)
+* **Role:** AST-based scalar expression and aggregate accumulator system with static type inference, validation, and SQL-compliant three-valued logic (3VL).
 * **Responsibilities:**
   * **Expression AST:** `Literal(Value)`, `Column(String)`, `Binary { left, op, right }`, `Unary { op, expr }`, `IsNull(expr)`, `IsNotNull(expr)`.
+  * **Aggregate Expressions:** `AggregateExpr::CountAll`, `AggregateExpr::Function { func, expr }` with `AggregateFunction` (`Count`, `Sum`, `Avg`, `Min`, `Max`).
+  * **Incremental Accumulators (`AggregateState`):** State machine for single-pass aggregation (`CountAll`, `Count`, `SumInt64`, `SumUInt64`, `SumFloat64`, `Avg`, `Min`, `Max`). Returns `Value::Null` for empty/all-null input on `SUM`, `AVG`, `MIN`, `MAX`, and `0` for `COUNT`. Checked integer addition prevents silent overflow (`Error::AggregateOverflow`).
+  * **Deterministic Group Keys (`CanonicalValue`, `GroupKey`):** Exact canonical type and value encoding mapping `Float64` using `f64::to_bits()` to avoid NaN/negative-zero collisions, treating all `NULL` group keys as a single group.
   * **Static Type Inference:** `Expr::infer_type(&self, schema: &Schema) -> Result<DataType>` verifies type compatibility and detects invalid operands (e.g., non-boolean in logical operators, incomparable types) before row execution.
   * **Three-Valued Logic (3VL):** Strict implementation of SQL boolean logic (`TRUE`, `FALSE`, `UNKNOWN`/`NULL`) for `AND`, `OR`, and `NOT`.
-  * **Comparison Evaluation:** Strict type-safe comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`) returning `Value::Null` if either operand is `NULL`. IEEE-754 `NaN` comparisons evaluate predictably to `false`.
+  * **Comparison Evaluation:** Strict type-safe comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`) returning `Value::Null` if either operand is `NULL`.
 
 ### `Query`, `QueryResult`, & Logical Operators (`src/query/operator.rs`, `src/query/builder.rs`)
 * **Role:** Composable relational query pipeline and programmatic query builder executing over `Table<'a>` and `Transaction<'db>`.
 * **Responsibilities:**
   * **Pipeline Architecture:**
-    1. **Scan:** Evaluates primary-key point lookup (`pk == lit`) or range scan (`pk >= low AND pk < high`) optimizations; otherwise executes a full B+ Tree scan.
-    2. **Filter (`FilterOperator`):** Evaluates predicate expressions, retaining rows where `predicate == Value::Boolean(true)` (discarding `false` and `Null`).
-    3. **Sort (`SortOperator`):** Multi-key stable sorting with configurable NULL placement (defaulting to NULLs first in `ASC`, NULLs last in `DESC`) and deterministic `f64::total_cmp` float ordering.
-    4. **Pagination (`OffsetLimitOperator`):** In-memory offset skipping and limit truncation.
+    1. **Scan / Index Access:** Evaluates primary-key point lookup / range scan or secondary index lookups/scans; otherwise executes a full scan.
+    2. **Filter (`FilterOperator`):** Evaluates `WHERE` predicate expressions, retaining matching rows (`Value::Boolean(true)`).
+    3. **GROUP BY & Aggregation (`AggregateOperator`):** Computes group keys for input rows and updates incremental `AggregateState`s per group. Produces 1 row per group (or exactly 1 row for global non-grouped aggregation).
+    4. **HAVING Filter (`FilterOperator`):** Evaluates `HAVING` predicates over the aggregated/grouped intermediate schema.
     5. **Projection (`ProjectOperator`):** Evaluates projection expressions, generating projected `Schema` definitions and derived output `Row`s.
-  * **Programmatic API:** Fluent builder via `TreeDb::query(name)` and `Transaction::query(name)` supporting `.filter()`, `.project()`, `.sort_by()`, `.sort()`, `.offset()`, `.limit()`, and `.execute()`.
+    6. **Sort (`SortOperator`):** Multi-key stable sorting with configurable NULL placement and deterministic `f64::total_cmp` float ordering.
+    7. **Pagination (`OffsetLimitOperator`):** In-memory offset skipping and limit truncation.
+  * **Programmatic API:** Fluent builder via `TreeDb::query(name)` and `Transaction::query(name)` supporting `.filter()`, `.group_by()`, `.aggregate()`, `.having()`, `.project()`, `.sort_by()`, `.sort()`, `.offset()`, `.limit()`, and `.execute()`.
 
 
 ---

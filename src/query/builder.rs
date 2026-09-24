@@ -1,10 +1,10 @@
 use crate::engine::table::Table;
 use crate::engine::types::{DataType, Row, Value};
 use crate::error::Result;
-use crate::query::expr::{BinaryOp, Expr};
+use crate::query::expr::{AggregateExpr, BinaryOp, Expr};
 use crate::query::operator::{
-    FilterOperator, OffsetLimitOperator, ProjectOperator, QueryResult, SortDirection, SortKey,
-    SortOperator,
+    AggregateOperator, FilterOperator, OffsetLimitOperator, ProjectOperator, QueryResult,
+    SortDirection, SortKey, SortOperator,
 };
 
 /// Programmatic query builder for constructing and executing relational queries against a `Table`.
@@ -12,6 +12,9 @@ use crate::query::operator::{
 pub struct Query<'a> {
     table: Table<'a>,
     filter: Option<Expr>,
+    group_by: Vec<Expr>,
+    aggregates: Vec<AggregateExpr>,
+    having: Option<Expr>,
     projection: Option<Vec<(Expr, Option<String>)>>,
     sort_keys: Vec<SortKey>,
     offset: Option<usize>,
@@ -24,6 +27,9 @@ impl<'a> Query<'a> {
         Self {
             table,
             filter: None,
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
+            having: None,
             projection: None,
             sort_keys: Vec::new(),
             offset: None,
@@ -36,6 +42,27 @@ impl<'a> Query<'a> {
     /// If a filter is already defined, the new predicate is combined using logical `AND`.
     pub fn filter(mut self, predicate: Expr) -> Self {
         self.filter = match self.filter {
+            Some(existing) => Some(Expr::and(existing, predicate)),
+            None => Some(predicate),
+        };
+        self
+    }
+
+    /// Adds grouping expressions to the query (`GROUP BY`).
+    pub fn group_by(mut self, exprs: Vec<Expr>) -> Self {
+        self.group_by.extend(exprs);
+        self
+    }
+
+    /// Appends aggregate expressions to evaluate.
+    pub fn aggregate(mut self, aggregates: Vec<AggregateExpr>) -> Self {
+        self.aggregates.extend(aggregates);
+        self
+    }
+
+    /// Adds a post-aggregation filtering predicate expression (`HAVING`).
+    pub fn having(mut self, predicate: Expr) -> Self {
+        self.having = match self.having {
             Some(existing) => Some(Expr::and(existing, predicate)),
             None => Some(predicate),
         };
@@ -91,17 +118,14 @@ impl<'a> Query<'a> {
 
     /// Executes the query pipeline and returns the resulting `QueryResult`.
     ///
-    /// # Access Path Selection Policy
-    /// 1. **Primary Key Optimization**: If predicate can be satisfied via primary-key point lookup or range scan.
-    /// 2. **Secondary Index Optimization**: If predicate can be satisfied via a matching secondary index point lookup or range scan.
-    /// 3. **Full Table Scan**: Scans all rows via primary B+ Tree.
-    ///
     /// # Pipeline Stages
     /// 1. **Scan**: Evaluates access paths and fetches initial candidate rows.
-    /// 2. **Filter**: Evaluates full WHERE predicate, discarding false and NULL results.
-    /// 3. **Sort**: Applies multi-key sorting if sort keys are present.
-    /// 4. **Offset & Limit**: Applies row pagination.
-    /// 5. **Project**: Evaluates projection expressions, generating the final `Schema` and `Row`s.
+    /// 2. **Filter**: Evaluates WHERE predicate, discarding false and NULL results.
+    /// 3. **GROUP BY & Aggregation**: Groups rows and evaluates accumulators.
+    /// 4. **HAVING**: Evaluates post-aggregation filter predicates.
+    /// 5. **Sort**: Orders rows across sort keys.
+    /// 6. **Project**: Evaluates output projection expressions.
+    /// 7. **Offset & Limit**: Applies row pagination.
     pub fn execute(mut self) -> Result<QueryResult> {
         let schema = self.table.schema().clone();
         let pk_col_name = schema.primary_key_column().name.clone();
@@ -152,20 +176,51 @@ impl<'a> Query<'a> {
             None => initial_rows,
         };
 
-        // Stage 3: Sort Operator
-        let sorted_rows = SortOperator::apply(filtered_rows, &schema, &self.sort_keys)?;
+        // Stage 3 & 4: Aggregation and HAVING
+        let is_aggregate_query = !self.group_by.is_empty() || !self.aggregates.is_empty();
 
-        // Stage 4: Offset and Limit
-        let paginated_rows = OffsetLimitOperator::apply(sorted_rows, self.offset, self.limit);
+        if is_aggregate_query {
+            let (grouped_schema, grouped_rows) =
+                AggregateOperator::apply(filtered_rows, &schema, &self.group_by, &self.aggregates)?;
 
-        // Stage 5: Project Operator
-        match &self.projection {
-            Some(projections) => {
-                let (projected_schema, projected_rows) =
-                    ProjectOperator::apply_named(paginated_rows, &schema, projections)?;
-                Ok(QueryResult::new(projected_schema, projected_rows))
+            let having_rows = match &self.having {
+                Some(predicate) => FilterOperator::apply(grouped_rows, &grouped_schema, predicate)?,
+                None => grouped_rows,
+            };
+
+            let sorted_rows = SortOperator::apply(having_rows, &grouped_schema, &self.sort_keys)?;
+
+            match &self.projection {
+                Some(projections) => {
+                    let (projected_schema, projected_rows) =
+                        ProjectOperator::apply_named(sorted_rows, &grouped_schema, projections)?;
+                    let paginated_rows =
+                        OffsetLimitOperator::apply(projected_rows, self.offset, self.limit);
+                    Ok(QueryResult::new(projected_schema, paginated_rows))
+                }
+                None => {
+                    let paginated_rows =
+                        OffsetLimitOperator::apply(sorted_rows, self.offset, self.limit);
+                    Ok(QueryResult::new(grouped_schema, paginated_rows))
+                }
             }
-            None => Ok(QueryResult::new(schema, paginated_rows)),
+        } else {
+            let sorted_rows = SortOperator::apply(filtered_rows, &schema, &self.sort_keys)?;
+
+            match &self.projection {
+                Some(projections) => {
+                    let (projected_schema, projected_rows) =
+                        ProjectOperator::apply_named(sorted_rows, &schema, projections)?;
+                    let paginated_rows =
+                        OffsetLimitOperator::apply(projected_rows, self.offset, self.limit);
+                    Ok(QueryResult::new(projected_schema, paginated_rows))
+                }
+                None => {
+                    let paginated_rows =
+                        OffsetLimitOperator::apply(sorted_rows, self.offset, self.limit);
+                    Ok(QueryResult::new(schema, paginated_rows))
+                }
+            }
         }
     }
 }

@@ -55,6 +55,163 @@ impl fmt::Display for UnaryOp {
     }
 }
 
+/// Aggregate functions supported in query expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AggregateFunction {
+    /// Count rows or non-null values
+    Count,
+    /// Sum of numeric values
+    Sum,
+    /// Average of numeric values
+    Avg,
+    /// Minimum value
+    Min,
+    /// Maximum value
+    Max,
+}
+
+impl fmt::Display for AggregateFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AggregateFunction::Count => write!(f, "COUNT"),
+            AggregateFunction::Sum => write!(f, "SUM"),
+            AggregateFunction::Avg => write!(f, "AVG"),
+            AggregateFunction::Min => write!(f, "MIN"),
+            AggregateFunction::Max => write!(f, "MAX"),
+        }
+    }
+}
+
+/// Aggregate expression representing an aggregation operation over a group of rows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateExpr {
+    /// `COUNT(*)` counting all input rows including NULLs.
+    CountAll,
+    /// Standard aggregate function over an expression: `FUNC(expr)`.
+    Function {
+        /// Aggregate function kind.
+        func: AggregateFunction,
+        /// Inner argument expression.
+        expr: Expr,
+    },
+}
+
+impl AggregateExpr {
+    /// Creates a `COUNT(*)` aggregate expression.
+    pub fn count_all() -> Self {
+        AggregateExpr::CountAll
+    }
+
+    /// Creates a `COUNT(expr)` aggregate expression.
+    pub fn count(expr: Expr) -> Self {
+        AggregateExpr::Function {
+            func: AggregateFunction::Count,
+            expr,
+        }
+    }
+
+    /// Creates a `SUM(expr)` aggregate expression.
+    pub fn sum(expr: Expr) -> Self {
+        AggregateExpr::Function {
+            func: AggregateFunction::Sum,
+            expr,
+        }
+    }
+
+    /// Creates an `AVG(expr)` aggregate expression.
+    pub fn avg(expr: Expr) -> Self {
+        AggregateExpr::Function {
+            func: AggregateFunction::Avg,
+            expr,
+        }
+    }
+
+    /// Creates a `MIN(expr)` aggregate expression.
+    pub fn min(expr: Expr) -> Self {
+        AggregateExpr::Function {
+            func: AggregateFunction::Min,
+            expr,
+        }
+    }
+
+    /// Creates a `MAX(expr)` aggregate expression.
+    pub fn max(expr: Expr) -> Self {
+        AggregateExpr::Function {
+            func: AggregateFunction::Max,
+            expr,
+        }
+    }
+
+    /// Infers the output `DataType` of this aggregate expression.
+    pub fn infer_type(&self, schema: &Schema) -> Result<DataType> {
+        match self {
+            AggregateExpr::CountAll => Ok(DataType::UInt64),
+            AggregateExpr::Function { func, expr } => {
+                let dt = expr.infer_type(schema)?;
+                match func {
+                    AggregateFunction::Count => Ok(DataType::UInt64),
+                    AggregateFunction::Sum => match dt {
+                        DataType::Int64 => Ok(DataType::Int64),
+                        DataType::UInt64 => Ok(DataType::UInt64),
+                        DataType::Float64 => Ok(DataType::Float64),
+                        other => Err(Error::UnsupportedAggregateType {
+                            func: "SUM".to_string(),
+                            data_type: other.to_string(),
+                        }),
+                    },
+                    AggregateFunction::Avg => match dt {
+                        DataType::Int64 | DataType::UInt64 | DataType::Float64 => {
+                            Ok(DataType::Float64)
+                        }
+                        other => Err(Error::UnsupportedAggregateType {
+                            func: "AVG".to_string(),
+                            data_type: other.to_string(),
+                        }),
+                    },
+                    AggregateFunction::Min => match dt {
+                        DataType::Boolean
+                        | DataType::Int64
+                        | DataType::UInt64
+                        | DataType::Float64
+                        | DataType::String
+                        | DataType::Bytes => Ok(dt),
+                        other => Err(Error::UnsupportedAggregateType {
+                            func: "MIN".to_string(),
+                            data_type: other.to_string(),
+                        }),
+                    },
+                    AggregateFunction::Max => match dt {
+                        DataType::Boolean
+                        | DataType::Int64
+                        | DataType::UInt64
+                        | DataType::Float64
+                        | DataType::String
+                        | DataType::Bytes => Ok(dt),
+                        other => Err(Error::UnsupportedAggregateType {
+                            func: "MAX".to_string(),
+                            data_type: other.to_string(),
+                        }),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Returns a canonical display name for the aggregate expression.
+    pub fn display_name(&self) -> String {
+        match self {
+            AggregateExpr::CountAll => "COUNT(*)".to_string(),
+            AggregateExpr::Function { func, expr } => format!("{func}({expr})"),
+        }
+    }
+}
+
+impl fmt::Display for AggregateExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
 /// Abstract Syntax Tree (AST) node for scalar expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {

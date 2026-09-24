@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use crate::engine::types::{Column, DataType, Row, Schema, Value};
 use crate::error::{Error, Result};
-use crate::query::expr::Expr;
+use crate::query::expr::{AggregateExpr, AggregateFunction, Expr};
 
 /// Result set returned by the execution of a query pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -301,5 +302,421 @@ impl OffsetLimitOperator {
         let take = limit.unwrap_or(usize::MAX);
 
         rows.into_iter().skip(skip).take(take).collect()
+    }
+}
+
+/// Canonical typed representation of a scalar value suitable for robust in-memory grouping keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CanonicalValue {
+    Null,
+    Boolean(bool),
+    Int64(i64),
+    UInt64(u64),
+    Float64(u64),
+    String(String),
+    Bytes(Vec<u8>),
+}
+
+impl CanonicalValue {
+    /// Maps a `Value` to its canonical representation.
+    pub fn from_value(val: &Value) -> Self {
+        match val {
+            Value::Null => CanonicalValue::Null,
+            Value::Boolean(b) => CanonicalValue::Boolean(*b),
+            Value::Int64(i) => CanonicalValue::Int64(*i),
+            Value::UInt64(u) => CanonicalValue::UInt64(*u),
+            Value::Float64(f) => {
+                if f.is_nan() {
+                    CanonicalValue::Float64(f64::NAN.to_bits())
+                } else if *f == 0.0 {
+                    CanonicalValue::Float64((0.0f64).to_bits())
+                } else {
+                    CanonicalValue::Float64(f.to_bits())
+                }
+            }
+            Value::String(s) => CanonicalValue::String(s.clone()),
+            Value::Bytes(b) => CanonicalValue::Bytes(b.clone()),
+        }
+    }
+}
+
+/// Composite grouping key constructed from evaluated `GROUP BY` expressions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GroupKey(pub Vec<CanonicalValue>);
+
+/// Internal accumulator state tracking incremental aggregate calculation for a single group.
+#[derive(Debug, Clone)]
+pub enum AggregateState {
+    /// `COUNT(*)` accumulator.
+    CountAll { count: u64 },
+    /// `COUNT(expr)` accumulator (skips NULLs).
+    Count { count: u64, expr: Expr },
+    /// `SUM(Int64)` accumulator.
+    SumInt64 { sum: i64, seen: bool, expr: Expr },
+    /// `SUM(UInt64)` accumulator.
+    SumUInt64 { sum: u64, seen: bool, expr: Expr },
+    /// `SUM(Float64)` accumulator.
+    SumFloat64 { sum: f64, seen: bool, expr: Expr },
+    /// `AVG(numeric)` accumulator.
+    Avg { sum: f64, count: u64, expr: Expr },
+    /// `MIN(expr)` accumulator.
+    Min { value: Option<Value>, expr: Expr },
+    /// `MAX(expr)` accumulator.
+    Max { value: Option<Value>, expr: Expr },
+}
+
+impl AggregateState {
+    /// Initializes a new accumulator for the specified `AggregateExpr`.
+    pub fn new(agg_expr: &AggregateExpr, schema: &Schema) -> Result<Self> {
+        match agg_expr {
+            AggregateExpr::CountAll => Ok(AggregateState::CountAll { count: 0 }),
+            AggregateExpr::Function { func, expr } => {
+                let dt = expr.infer_type(schema)?;
+                match func {
+                    AggregateFunction::Count => Ok(AggregateState::Count {
+                        count: 0,
+                        expr: expr.clone(),
+                    }),
+                    AggregateFunction::Sum => match dt {
+                        DataType::Int64 => Ok(AggregateState::SumInt64 {
+                            sum: 0,
+                            seen: false,
+                            expr: expr.clone(),
+                        }),
+                        DataType::UInt64 => Ok(AggregateState::SumUInt64 {
+                            sum: 0,
+                            seen: false,
+                            expr: expr.clone(),
+                        }),
+                        DataType::Float64 => Ok(AggregateState::SumFloat64 {
+                            sum: 0.0,
+                            seen: false,
+                            expr: expr.clone(),
+                        }),
+                        other => Err(Error::UnsupportedAggregateType {
+                            func: "SUM".to_string(),
+                            data_type: other.to_string(),
+                        }),
+                    },
+                    AggregateFunction::Avg => match dt {
+                        DataType::Int64 | DataType::UInt64 | DataType::Float64 => {
+                            Ok(AggregateState::Avg {
+                                sum: 0.0,
+                                count: 0,
+                                expr: expr.clone(),
+                            })
+                        }
+                        other => Err(Error::UnsupportedAggregateType {
+                            func: "AVG".to_string(),
+                            data_type: other.to_string(),
+                        }),
+                    },
+                    AggregateFunction::Min => match dt {
+                        DataType::Boolean
+                        | DataType::Int64
+                        | DataType::UInt64
+                        | DataType::Float64
+                        | DataType::String
+                        | DataType::Bytes => Ok(AggregateState::Min {
+                            value: None,
+                            expr: expr.clone(),
+                        }),
+                        other => Err(Error::UnsupportedAggregateType {
+                            func: "MIN".to_string(),
+                            data_type: other.to_string(),
+                        }),
+                    },
+                    AggregateFunction::Max => match dt {
+                        DataType::Boolean
+                        | DataType::Int64
+                        | DataType::UInt64
+                        | DataType::Float64
+                        | DataType::String
+                        | DataType::Bytes => Ok(AggregateState::Max {
+                            value: None,
+                            expr: expr.clone(),
+                        }),
+                        other => Err(Error::UnsupportedAggregateType {
+                            func: "MAX".to_string(),
+                            data_type: other.to_string(),
+                        }),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Accumulates one row of input into this state.
+    pub fn accumulate(&mut self, row: &Row, schema: &Schema) -> Result<()> {
+        match self {
+            AggregateState::CountAll { count } => {
+                *count += 1;
+                Ok(())
+            }
+            AggregateState::Count { count, expr } => {
+                let val = expr.evaluate(row, schema)?;
+                if !val.is_null() {
+                    *count += 1;
+                }
+                Ok(())
+            }
+            AggregateState::SumInt64 { sum, seen, expr } => {
+                let val = expr.evaluate(row, schema)?;
+                match val {
+                    Value::Int64(n) => {
+                        *seen = true;
+                        *sum = sum.checked_add(n).ok_or_else(|| {
+                            Error::AggregateOverflow(format!(
+                                "integer overflow adding {n} to current sum {sum}"
+                            ))
+                        })?;
+                    }
+                    Value::Null => {}
+                    other => {
+                        return Err(Error::UnsupportedAggregateType {
+                            func: "SUM".to_string(),
+                            data_type: other.data_type().to_string(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            AggregateState::SumUInt64 { sum, seen, expr } => {
+                let val = expr.evaluate(row, schema)?;
+                match val {
+                    Value::UInt64(n) => {
+                        *seen = true;
+                        *sum = sum.checked_add(n).ok_or_else(|| {
+                            Error::AggregateOverflow(format!(
+                                "unsigned integer overflow adding {n} to current sum {sum}"
+                            ))
+                        })?;
+                    }
+                    Value::Null => {}
+                    other => {
+                        return Err(Error::UnsupportedAggregateType {
+                            func: "SUM".to_string(),
+                            data_type: other.data_type().to_string(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            AggregateState::SumFloat64 { sum, seen, expr } => {
+                let val = expr.evaluate(row, schema)?;
+                match val {
+                    Value::Float64(f) => {
+                        *seen = true;
+                        *sum += f;
+                    }
+                    Value::Null => {}
+                    other => {
+                        return Err(Error::UnsupportedAggregateType {
+                            func: "SUM".to_string(),
+                            data_type: other.data_type().to_string(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            AggregateState::Avg { sum, count, expr } => {
+                let val = expr.evaluate(row, schema)?;
+                match val {
+                    Value::Int64(n) => {
+                        *count += 1;
+                        *sum += n as f64;
+                    }
+                    Value::UInt64(n) => {
+                        *count += 1;
+                        *sum += n as f64;
+                    }
+                    Value::Float64(f) => {
+                        *count += 1;
+                        *sum += f;
+                    }
+                    Value::Null => {}
+                    other => {
+                        return Err(Error::UnsupportedAggregateType {
+                            func: "AVG".to_string(),
+                            data_type: other.data_type().to_string(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            AggregateState::Min { value, expr } => {
+                let val = expr.evaluate(row, schema)?;
+                if !val.is_null() {
+                    match value {
+                        None => *value = Some(val),
+                        Some(cur) => {
+                            let ord =
+                                compare_values_for_sort(&val, cur, SortDirection::Ascending, None)?;
+                            if ord == Ordering::Less {
+                                *value = Some(val);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            AggregateState::Max { value, expr } => {
+                let val = expr.evaluate(row, schema)?;
+                if !val.is_null() {
+                    match value {
+                        None => *value = Some(val),
+                        Some(cur) => {
+                            let ord =
+                                compare_values_for_sort(&val, cur, SortDirection::Ascending, None)?;
+                            if ord == Ordering::Greater {
+                                *value = Some(val);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Finalizes accumulator state into a scalar `Value`.
+    pub fn finish(self) -> Value {
+        match self {
+            AggregateState::CountAll { count } => Value::UInt64(count),
+            AggregateState::Count { count, .. } => Value::UInt64(count),
+            AggregateState::SumInt64 { sum, seen, .. } => {
+                if seen {
+                    Value::Int64(sum)
+                } else {
+                    Value::Null
+                }
+            }
+            AggregateState::SumUInt64 { sum, seen, .. } => {
+                if seen {
+                    Value::UInt64(sum)
+                } else {
+                    Value::Null
+                }
+            }
+            AggregateState::SumFloat64 { sum, seen, .. } => {
+                if seen {
+                    Value::Float64(sum)
+                } else {
+                    Value::Null
+                }
+            }
+            AggregateState::Avg { sum, count, .. } => {
+                if count > 0 {
+                    Value::Float64(sum / count as f64)
+                } else {
+                    Value::Null
+                }
+            }
+            AggregateState::Min { value, .. } => value.unwrap_or(Value::Null),
+            AggregateState::Max { value, .. } => value.unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// Logical aggregation and grouping operator.
+pub struct AggregateOperator;
+
+impl AggregateOperator {
+    /// Executes grouping and aggregation over input rows.
+    ///
+    /// Produces an intermediate Schema and Row set containing:
+    /// - Grouping columns first: columns corresponding to each `group_by` expression.
+    /// - Aggregate columns next: columns corresponding to each `aggregates` expression.
+    pub fn apply(
+        rows: Vec<Row>,
+        input_schema: &Schema,
+        group_by: &[Expr],
+        aggregates: &[AggregateExpr],
+    ) -> Result<(Schema, Vec<Row>)> {
+        // Build intermediate output schema
+        let mut out_cols = Vec::new();
+        for (idx, grp_expr) in group_by.iter().enumerate() {
+            let dt = grp_expr.infer_type(input_schema)?;
+            let name = match grp_expr {
+                Expr::Column(col_name) => col_name.clone(),
+                _ => format!("_group_{idx}"),
+            };
+            out_cols.push(Column::new(name, dt, true));
+        }
+
+        for agg_expr in aggregates {
+            let dt = agg_expr.infer_type(input_schema)?;
+            let name = agg_expr.display_name();
+            out_cols.push(Column::new(name, dt, true));
+        }
+
+        let out_schema = Schema::new_projected(out_cols);
+
+        // Case 1: Global aggregation (no GROUP BY)
+        if group_by.is_empty() {
+            let mut accumulators = Vec::with_capacity(aggregates.len());
+            for agg in aggregates {
+                accumulators.push(AggregateState::new(agg, input_schema)?);
+            }
+
+            for row in &rows {
+                for acc in &mut accumulators {
+                    acc.accumulate(row, input_schema)?;
+                }
+            }
+
+            let agg_values: Vec<Value> = accumulators.into_iter().map(|acc| acc.finish()).collect();
+            return Ok((out_schema, vec![Row::new(agg_values)]));
+        }
+
+        // Case 2: Grouped aggregation (group_by is non-empty)
+        if rows.is_empty() {
+            return Ok((out_schema, Vec::new()));
+        }
+
+        let mut groups: HashMap<GroupKey, (Vec<Value>, Vec<AggregateState>)> = HashMap::new();
+        let mut group_order: Vec<GroupKey> = Vec::new();
+
+        for row in rows {
+            let mut key_values = Vec::with_capacity(group_by.len());
+            let mut canonical_keys = Vec::with_capacity(group_by.len());
+
+            for grp_expr in group_by {
+                let val = grp_expr.evaluate(&row, input_schema)?;
+                canonical_keys.push(CanonicalValue::from_value(&val));
+                key_values.push(val);
+            }
+
+            let key = GroupKey(canonical_keys);
+
+            if let Some(entry) = groups.get_mut(&key) {
+                for acc in &mut entry.1 {
+                    acc.accumulate(&row, input_schema)?;
+                }
+            } else {
+                group_order.push(key.clone());
+                let mut initial_states = Vec::with_capacity(aggregates.len());
+                for agg in aggregates {
+                    initial_states.push(AggregateState::new(agg, input_schema)?);
+                }
+                for acc in &mut initial_states {
+                    acc.accumulate(&row, input_schema)?;
+                }
+                groups.insert(key, (key_values, initial_states));
+            }
+        }
+
+        let mut out_rows = Vec::with_capacity(group_order.len());
+        for key in group_order {
+            if let Some((grp_vals, accs)) = groups.remove(&key) {
+                let mut row_values = grp_vals;
+                for acc in accs {
+                    row_values.push(acc.finish());
+                }
+                out_rows.push(Row::new(row_values));
+            }
+        }
+
+        Ok((out_schema, out_rows))
     }
 }

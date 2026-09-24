@@ -298,13 +298,30 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 18: Aggregations, GROUP BY & Advanced SQL (Future)
-* [ ] Aggregation functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`)
-* [ ] `GROUP BY` and `HAVING` clause execution
+## Phase 18: Aggregations, GROUP BY & HAVING (Completed)
+* [x] Aggregation functions (`COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX`)
+* [x] Incremental accumulator state machine (`AggregateState`) with integer overflow protection (`Error::AggregateOverflow`)
+* [x] Deterministic in-memory canonical group keys (`GroupKey`, `CanonicalValue`) with float bitwise comparison and unified NULL group semantics
+* [x] Composable `AggregateOperator` supporting both grouped aggregation and 1-group global aggregation
+* [x] SQL Lexer & Parser support for `GROUP BY` and `HAVING` clauses and case-insensitive aggregate function calls
+* [x] Parser rejection of nested aggregates (`SUM(COUNT(*))`), empty calls (`COUNT()`), and wildcards in non-COUNT functions (`SUM(*)`)
+* [x] Semantic validation in SQL binder: aggregate rejection in `WHERE`, ungrouped column validation in `SELECT`/`HAVING`/`ORDER BY`
+* [x] Contextual numeric literal type coercion for HAVING comparisons (e.g. `COUNT(*) >= 1`)
+* [x] Query execution pipeline integration: `Scan/Index -> Filter -> GROUP BY/Aggregate -> HAVING -> Project -> Sort -> Limit/Offset`
+* [x] Programmatic `Query` builder API extensions: `.group_by(...)`, `.aggregate(...)`, `.having(...)`
+* [x] Transaction visibility, crash recovery, and database reopen durability integration
+* [x] 13 dedicated aggregation tests including SQL vs programmatic equivalence and randomized reference oracle (325 total test suite)
+
+---
+
+## Phase 19: Joins & Advanced Query Processing (Future)
+* [ ] Inner join execution (`NestedLoopJoin`, `HashJoin`)
+* [ ] Multi-table `FROM` clause parsing and binding
 * [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

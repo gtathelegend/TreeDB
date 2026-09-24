@@ -540,3 +540,132 @@ fn test_sql_parsing_standalone_boundary() {
     assert_eq!(ast.order_by.len(), 1);
     assert_eq!(ast.limit, Some(10));
 }
+
+// ============================================================================
+// 8. Aggregation, GROUP BY & HAVING Parsing Tests (Phase 18)
+// ============================================================================
+
+#[test]
+fn test_parser_aggregates_and_case_insensitivity() {
+    let sql = "SELECT COUNT(*), count(age), Sum(salary), AVG(rating), min(score), MAX(height) FROM users;";
+    let ast = parse_sql(sql).expect("parsing aggregates should succeed");
+
+    assert_eq!(ast.projection.len(), 6);
+    assert_eq!(
+        ast.projection[0],
+        SelectItem::Expression {
+            expr: SqlExpr::CountAll,
+            alias: None,
+        }
+    );
+    assert_eq!(
+        ast.projection[1],
+        SelectItem::Expression {
+            expr: SqlExpr::Aggregate {
+                function: treedb::sql::AggregateFunction::Count,
+                arg: Box::new(SqlExpr::Identifier("age".into())),
+            },
+            alias: None,
+        }
+    );
+    assert_eq!(
+        ast.projection[2],
+        SelectItem::Expression {
+            expr: SqlExpr::Aggregate {
+                function: treedb::sql::AggregateFunction::Sum,
+                arg: Box::new(SqlExpr::Identifier("salary".into())),
+            },
+            alias: None,
+        }
+    );
+    assert_eq!(
+        ast.projection[3],
+        SelectItem::Expression {
+            expr: SqlExpr::Aggregate {
+                function: treedb::sql::AggregateFunction::Avg,
+                arg: Box::new(SqlExpr::Identifier("rating".into())),
+            },
+            alias: None,
+        }
+    );
+    assert_eq!(
+        ast.projection[4],
+        SelectItem::Expression {
+            expr: SqlExpr::Aggregate {
+                function: treedb::sql::AggregateFunction::Min,
+                arg: Box::new(SqlExpr::Identifier("score".into())),
+            },
+            alias: None,
+        }
+    );
+    assert_eq!(
+        ast.projection[5],
+        SelectItem::Expression {
+            expr: SqlExpr::Aggregate {
+                function: treedb::sql::AggregateFunction::Max,
+                arg: Box::new(SqlExpr::Identifier("height".into())),
+            },
+            alias: None,
+        }
+    );
+}
+
+#[test]
+fn test_parser_group_by_and_having() {
+    let sql = "SELECT department, role, COUNT(*) AS emp_cnt FROM employees WHERE active = TRUE GROUP BY department, role HAVING COUNT(*) >= 5 ORDER BY emp_cnt DESC LIMIT 10 OFFSET 5;";
+    let ast = parse_sql(sql).expect("parsing grouped query should succeed");
+
+    assert_eq!(ast.projection.len(), 3);
+    assert_eq!(ast.from.name, "employees");
+    assert!(ast.selection.is_some());
+    assert_eq!(
+        ast.group_by,
+        vec![
+            SqlExpr::Identifier("department".into()),
+            SqlExpr::Identifier("role".into())
+        ]
+    );
+    assert_eq!(
+        ast.having,
+        Some(SqlExpr::Binary {
+            left: Box::new(SqlExpr::CountAll),
+            op: SqlBinaryOp::GtEq,
+            right: Box::new(SqlExpr::Literal(SqlLiteral::Integer(5))),
+        })
+    );
+    assert_eq!(ast.order_by.len(), 1);
+    assert_eq!(ast.limit, Some(10));
+    assert_eq!(ast.offset, Some(5));
+}
+
+#[test]
+fn test_parser_invalid_aggregate_and_group_by_syntax() {
+    let invalid = [
+        "SELECT COUNT() FROM users;",           // COUNT without args
+        "SELECT SUM(*) FROM users;",            // SUM(*) invalid
+        "SELECT AVG(*) FROM users;",            // AVG(*) invalid
+        "SELECT MIN(*) FROM users;",            // MIN(*) invalid
+        "SELECT MAX(*) FROM users;",            // MAX(*) invalid
+        "SELECT SUM() FROM users;",             // SUM() empty
+        "SELECT AVG() FROM users;",             // AVG() empty
+        "SELECT MIN() FROM users;",             // MIN() empty
+        "SELECT MAX() FROM users;",             // MAX() empty
+        "SELECT SUM(COUNT(*)) FROM users;",     // Nested aggregate
+        "SELECT AVG(SUM(salary)) FROM users;",  // Nested aggregate
+        "SELECT UNKNOWN_FUNC(age) FROM users;", // Unknown function
+        "SELECT * FROM users GROUP;",           // GROUP without BY
+        "SELECT * FROM users GROUP BY;",        // GROUP BY without expr
+        "SELECT * FROM users HAVING;",          // HAVING without expr
+        "SELECT * FROM users GROUP BY department WHERE active = TRUE;", // Out of order: GROUP BY before WHERE
+        "SELECT * FROM users ORDER BY age GROUP BY department;", // Out of order: ORDER BY before GROUP BY
+        "SELECT * FROM users LIMIT 10 GROUP BY department;", // Out of order: LIMIT before GROUP BY
+    ];
+
+    for &sql in &invalid {
+        let result = parse_sql(sql);
+        assert!(
+            result.is_err(),
+            "Expected parse error for query: '{sql}', but succeeded: {result:?}"
+        );
+    }
+}
