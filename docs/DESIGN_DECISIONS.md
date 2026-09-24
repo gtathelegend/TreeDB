@@ -342,6 +342,21 @@ This document records key architectural and design choices, their rationale, and
   * **Zero Duplication:** Reusing Phase 14 operators (`FilterOperator`, `ProjectOperator`, `SortOperator`, `OffsetLimitOperator`) and primary-key index optimizations ensures 100% semantic consistency between SQL queries and programmatic queries.
   * **Transaction-Aware Execution:** SQL queries executed within transactions naturally observe uncommitted mutations and participate in transaction commit/rollback lifecycles.
 
+---
+
+## Decision 32: Persistent Secondary B+ Tree Indexes & Composite Key Representation
+
+* **Decision:** Implement persistent secondary B+ Tree indexes as first-class catalog-managed database objects:
+  1. **Index Identity & Metadata:** Introduce monotonic, never-reused `IndexId(pub u32)` counters persisted in the catalog root page. Catalog page headers extend backward-compatibly using reserved bytes to store `next_index_id` and `index_count`.
+  2. **Canonical Key Encoding (`IndexKey`):** Deterministic, order-preserving byte encoding across all supported scalar types (`Null`, `Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`). Integer and floating point representations use big-endian sign-bit and sortable IEEE transformations ensuring lexicographical byte comparison strictly preserves mathematical ordering.
+  3. **Composite Entry Ordering `(IndexKey, RecordId)`:** Secondary B+ Tree leaf nodes store sorted pairs of `(IndexKey, RecordId)`. By including `RecordId` in the composite key ordering, non-unique indexes naturally form contiguous clusters for identical index keys without requiring separate posting list structures or specialized tree layouts.
+  4. **Automatic Transactional Maintenance:** `Table::insert`, `Table::update`, and `Table::delete` maintain all secondary indexes attached to the table in the same transaction context, protected by WAL physical page deltas and participating in ARIES crash recovery and CLR runtime rollbacks.
+  5. **Query Access Path Selection:** Query execution prioritizes primary-key optimizations, then secondary index point lookups and range scans when eligible predicates exist on indexed columns, retrieving matching `RecordId`s and evaluating full `WHERE` predicates on the fetched tuples.
+* **Rationale:**
+  * **Unified Storage Architecture:** Secondary indexes leverage the existing buffer pool, WAL manager, page manager, and freelist without inventing parallel logging or caching subsystems.
+  * **Zero Duplicate Code:** The `(IndexKey, RecordId)` composite design reuses balanced B+ Tree search, split, merge, and range scan mechanics directly.
+  * **Strict Referential Invariants:** Dropping tables automatically cascades to drop all attached secondary indexes and returns all allocated pages to the persistent freelist.
+
 
 
 

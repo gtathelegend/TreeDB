@@ -4,8 +4,8 @@ pub mod transaction;
 pub mod types;
 
 pub use catalog::{
-    Catalog, CatalogPage, TableId, TableMetadata, CATALOG_MAGIC, CURRENT_CATALOG_VERSION,
-    MAX_TABLE_NAME_LEN,
+    Catalog, CatalogPage, IndexId, IndexMetadata, TableId, TableMetadata, CATALOG_MAGIC,
+    CURRENT_CATALOG_VERSION, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
 };
 pub use table::Table;
 pub use transaction::{Transaction, TxnState};
@@ -116,6 +116,11 @@ impl TreeDb {
             header.free_page_count,
             header.page_count,
         ))
+    }
+
+    /// Convenience alias for `begin()`.
+    pub fn begin_transaction(&mut self) -> Result<Transaction<'_>> {
+        self.begin()
     }
 
     /// Begins a new transaction in the WAL stream.
@@ -330,10 +335,20 @@ impl TreeDb {
             .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
         let tree = BPlusTree::from_root(metadata.root_page_id);
         let record_store = RecordStore::with_last_page(metadata.record_page_id);
+        let index_metas =
+            Catalog::list_indexes_for_table(&mut self.buffer_pool, metadata.table_id)?;
+        let mut indexes = Vec::with_capacity(index_metas.len());
+        for idx_meta in index_metas {
+            let sec_tree =
+                crate::index::secondary::SecondaryIndex::from_root(idx_meta.root_page_id);
+            indexes.push((idx_meta, sec_tree));
+        }
+
         Ok(Table::new(
             metadata,
             tree,
             record_store,
+            indexes,
             &mut self.buffer_pool,
         ))
     }
@@ -368,6 +383,70 @@ impl TreeDb {
         }
 
         query.execute()
+    }
+
+    /// Creates a persistent secondary index.
+    pub fn create_index(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        column_name: &str,
+        unique: bool,
+    ) -> Result<IndexId> {
+        let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
+            Some(self.begin_txn()?)
+        } else {
+            None
+        };
+
+        let result = Catalog::create_index(
+            &mut self.buffer_pool,
+            table_name,
+            index_name,
+            column_name,
+            unique,
+        );
+
+        if let Some(tid) = auto_txn {
+            if result.is_ok() {
+                self.commit_txn(tid)?;
+            } else {
+                let _ = self.abort_txn(tid);
+            }
+        }
+
+        result
+    }
+
+    /// Drops a secondary index from the catalog and reclaims its pages.
+    pub fn drop_index(&mut self, name: &str) -> Result<()> {
+        let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
+            Some(self.begin_txn()?)
+        } else {
+            None
+        };
+
+        let result = Catalog::drop_index(&mut self.buffer_pool, name);
+
+        if let Some(tid) = auto_txn {
+            if result.is_ok() {
+                self.commit_txn(tid)?;
+            } else {
+                let _ = self.abort_txn(tid);
+            }
+        }
+
+        result
+    }
+
+    /// Looks up a secondary index by name.
+    pub fn get_index(&mut self, name: &str) -> Result<Option<IndexMetadata>> {
+        Catalog::get_index(&mut self.buffer_pool, name)
+    }
+
+    /// Lists all secondary indexes in the database.
+    pub fn list_indexes(&mut self) -> Result<Vec<IndexMetadata>> {
+        Catalog::list_indexes(&mut self.buffer_pool)
     }
 
     /// Drops a table from the catalog and reclaims all of its physical pages into the freelist.

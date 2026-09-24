@@ -4,11 +4,13 @@ use crate::engine::types::{Column, DataType, Schema, MAX_COLUMN_NAME_LEN};
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
 use crate::index::leaf::LeafNode;
+use crate::index::secondary::{IndexKey, SecondaryIndex, SecondaryLeafNode};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::metadata::{DEFAULT_METADATA_PAGE_ID, HEADER_PAGE_ID};
 use crate::storage::overflow_page::{OverflowPage, NO_OVERFLOW_PAGE};
 use crate::storage::page::{Page, PageId, PageType, PAGE_PAYLOAD_SIZE};
 use crate::storage::record_page::{OverflowDescriptor, RecordPage};
+use crate::storage::record_store::RecordStore;
 
 /// Recognizable magic bytes for Catalog pages.
 pub const CATALOG_MAGIC: &[u8; 4] = b"CATL";
@@ -19,15 +21,20 @@ pub const CURRENT_CATALOG_VERSION: u32 = 1;
 /// Maximum allowable length for a table name in bytes.
 pub const MAX_TABLE_NAME_LEN: usize = 64;
 
+/// Maximum allowable length for an index name in bytes.
+pub const MAX_INDEX_NAME_LEN: usize = 64;
+
 /// Size in bytes of the catalog page header within the payload (32 bytes).
 ///
 /// Layout:
 /// - `0..4`: `magic: [u8; 4]` (`CATL`)
 /// - `4..8`: `format_version: u32` (1)
-/// - `8..12`: `next_table_id: u32` (Monotonically increasing ID counter, stored on root catalog page)
+/// - `8..12`: `next_table_id: u32` (Monotonically increasing table ID counter, stored on root catalog page)
 /// - `12..16`: `table_count: u32` (Number of active table entries on this page)
 /// - `16..20`: `next_catalog_page_id: PageId` (0 if no next page)
-/// - `20..32`: `reserved: [u8; 12]`
+/// - `20..24`: `next_index_id: u32` (Monotonically increasing index ID counter, stored on root catalog page)
+/// - `24..28`: `index_count: u32` (Number of active index entries on this page)
+/// - `28..32`: `reserved: [u8; 4]`
 pub const CATALOG_HEADER_SIZE: usize = 32;
 
 /// Fixed-size header for each serialized table entry in the catalog payload (26 bytes).
@@ -42,6 +49,18 @@ pub const CATALOG_HEADER_SIZE: usize = 32;
 /// - `22..24`: `column_count: u16`
 /// - `24..26`: `name_len: u16`
 pub const TABLE_ENTRY_HEADER_SIZE: usize = 26;
+
+/// Fixed-size header for each serialized index entry in the catalog payload (18 bytes).
+///
+/// Layout:
+/// - `0..4`: `index_id: u32`
+/// - `4..8`: `table_id: u32`
+/// - `8..12`: `root_page_id: u32`
+/// - `12..14`: `column_idx: u16`
+/// - `14`: `unique: u8` (0 = non-unique, 1 = unique)
+/// - `15`: `reserved: u8` (0)
+/// - `16..18`: `name_len: u16`
+pub const INDEX_ENTRY_HEADER_SIZE: usize = 18;
 
 /// Available payload capacity for catalog entries on a single page.
 pub const CATALOG_ENTRIES_CAPACITY: usize = PAGE_PAYLOAD_SIZE - CATALOG_HEADER_SIZE;
@@ -58,6 +77,18 @@ pub struct TableId(pub u32);
 impl std::fmt::Display for TableId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "TableId({})", self.0)
+    }
+}
+
+/// Unique, stable, logical identifier for a secondary index.
+///
+/// Index IDs are allocated monotonically and are never reused upon index drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IndexId(pub u32);
+
+impl std::fmt::Display for IndexId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IndexId({})", self.0)
     }
 }
 
@@ -94,12 +125,31 @@ impl TableMetadata {
     }
 }
 
+/// Persistent metadata describing a secondary index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexMetadata {
+    /// Unique, stable logical index identifier.
+    pub index_id: IndexId,
+    /// Logical table identifier of the indexed table.
+    pub table_id: TableId,
+    /// Root page ID of the secondary B+ Tree index.
+    pub root_page_id: PageId,
+    /// UTF-8 index name.
+    pub name: String,
+    /// Zero-based column index in the table schema.
+    pub column_idx: usize,
+    /// True if the index enforces a unique constraint.
+    pub unique: bool,
+}
+
+impl IndexMetadata {
+    /// Computes the serialized byte size of this index metadata entry.
+    pub fn byte_size(&self) -> usize {
+        INDEX_ENTRY_HEADER_SIZE + self.name.len()
+    }
+}
+
 /// Validates table name syntax and constraints.
-///
-/// Rules:
-/// - Non-empty
-/// - Maximum 64 bytes
-/// - Valid UTF-8
 pub fn validate_table_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidTableName(
@@ -116,6 +166,23 @@ pub fn validate_table_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates index name syntax and constraints.
+pub fn validate_index_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidIndexName(
+            "index name cannot be empty".to_string(),
+        ));
+    }
+    if name.len() > MAX_INDEX_NAME_LEN {
+        return Err(Error::InvalidIndexName(format!(
+            "index name length {} exceeds limit of {} bytes",
+            name.len(),
+            MAX_INDEX_NAME_LEN
+        )));
+    }
+    Ok(())
+}
+
 /// In-memory representation of an individual 4096-byte Catalog Page (`PageType::Catalog` or `PageType::Metadata`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogPage {
@@ -127,8 +194,12 @@ pub struct CatalogPage {
     pub next_table_id: u32,
     /// Next chained catalog page ID (0 if last page in chain).
     pub next_catalog_page_id: PageId,
+    /// Monotonically increasing next index ID counter (active on root catalog page).
+    pub next_index_id: u32,
     /// Active table metadata entries stored on this page.
     pub entries: Vec<TableMetadata>,
+    /// Active index metadata entries stored on this page.
+    pub indexes: Vec<IndexMetadata>,
 }
 
 impl CatalogPage {
@@ -139,16 +210,20 @@ impl CatalogPage {
             format_version: CURRENT_CATALOG_VERSION,
             next_table_id: 1,
             next_catalog_page_id: NO_NEXT_CATALOG_PAGE,
+            next_index_id: 1,
             entries: Vec::new(),
+            indexes: Vec::new(),
         }
     }
 
-    /// Computes the total serialized byte size of all entries on this page.
+    /// Computes the total serialized byte size of all table and index entries on this page.
     pub fn entries_byte_size(&self) -> usize {
-        self.entries.iter().map(|e| e.byte_size()).sum()
+        let table_bytes: usize = self.entries.iter().map(|e| e.byte_size()).sum();
+        let index_bytes: usize = self.indexes.iter().map(|i| i.byte_size()).sum();
+        table_bytes + index_bytes
     }
 
-    /// Returns `true` if a new table entry with the given byte size can fit on this page.
+    /// Returns `true` if a new entry with the given byte size can fit on this page.
     pub fn can_fit(&self, entry_size: usize) -> bool {
         self.entries_byte_size() + entry_size <= CATALOG_ENTRIES_CAPACITY
     }
@@ -163,7 +238,9 @@ impl CatalogPage {
         payload[8..12].copy_from_slice(&self.next_table_id.to_le_bytes());
         payload[12..16].copy_from_slice(&(self.entries.len() as u32).to_le_bytes());
         payload[16..20].copy_from_slice(&self.next_catalog_page_id.to_le_bytes());
-        payload[20..32].fill(0); // reserved
+        payload[20..24].copy_from_slice(&self.next_index_id.to_le_bytes());
+        payload[24..28].copy_from_slice(&(self.indexes.len() as u32).to_le_bytes());
+        payload[28..32].fill(0); // reserved
 
         // 2. Write table entries
         let mut offset = CATALOG_HEADER_SIZE;
@@ -172,7 +249,7 @@ impl CatalogPage {
 
             if offset + entry_len > PAGE_PAYLOAD_SIZE {
                 return Err(Error::CatalogCorruption(format!(
-                    "catalog page {} overflowed payload capacity",
+                    "catalog page {} overflowed payload capacity writing table",
                     self.page_id
                 )));
             }
@@ -207,6 +284,35 @@ impl CatalogPage {
             }
 
             offset += entry_len;
+        }
+
+        // 3. Write index entries
+        for idx in &self.indexes {
+            let idx_len = idx.byte_size();
+
+            if offset + idx_len > PAGE_PAYLOAD_SIZE {
+                return Err(Error::CatalogCorruption(format!(
+                    "catalog page {} overflowed payload capacity writing index",
+                    self.page_id
+                )));
+            }
+
+            let name_bytes = idx.name.as_bytes();
+            let name_len = name_bytes.len();
+
+            payload[offset..offset + 4].copy_from_slice(&idx.index_id.0.to_le_bytes());
+            payload[offset + 4..offset + 8].copy_from_slice(&idx.table_id.0.to_le_bytes());
+            payload[offset + 8..offset + 12].copy_from_slice(&idx.root_page_id.to_le_bytes());
+            payload[offset + 12..offset + 14]
+                .copy_from_slice(&(idx.column_idx as u16).to_le_bytes());
+            payload[offset + 14] = if idx.unique { 1 } else { 0 };
+            payload[offset + 15] = 0; // reserved
+            payload[offset + 16..offset + 18].copy_from_slice(&(name_len as u16).to_le_bytes());
+
+            let cur = offset + INDEX_ENTRY_HEADER_SIZE;
+            payload[cur..cur + name_len].copy_from_slice(name_bytes);
+
+            offset += idx_len;
         }
 
         // Zero remaining payload to prevent stale byte leakage
@@ -251,6 +357,13 @@ impl CatalogPage {
             u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]) as usize;
         let next_catalog_page_id =
             u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
+        let mut next_index_id =
+            u32::from_le_bytes([payload[20], payload[21], payload[22], payload[23]]);
+        if next_index_id == 0 {
+            next_index_id = 1;
+        }
+        let index_count =
+            u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]) as usize;
 
         let mut entries = Vec::with_capacity(table_count);
         let mut offset = CATALOG_HEADER_SIZE;
@@ -393,12 +506,93 @@ impl CatalogPage {
             offset = cur;
         }
 
+        let mut indexes = Vec::with_capacity(index_count);
+        for _ in 0..index_count {
+            if offset + INDEX_ENTRY_HEADER_SIZE > PAGE_PAYLOAD_SIZE {
+                return Err(Error::CatalogCorruption(format!(
+                    "unexpected end of payload reading index entry header on page {}",
+                    page.id()
+                )));
+            }
+
+            let index_id = u32::from_le_bytes([
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
+            ]);
+            let table_id = u32::from_le_bytes([
+                payload[offset + 4],
+                payload[offset + 5],
+                payload[offset + 6],
+                payload[offset + 7],
+            ]);
+            let root_page_id = u32::from_le_bytes([
+                payload[offset + 8],
+                payload[offset + 9],
+                payload[offset + 10],
+                payload[offset + 11],
+            ]);
+            let column_idx =
+                u16::from_le_bytes([payload[offset + 12], payload[offset + 13]]) as usize;
+            let unique = match payload[offset + 14] {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(Error::CatalogCorruption(format!(
+                        "invalid unique flag {other} on index in page {}",
+                        page.id()
+                    )));
+                }
+            };
+            let name_len =
+                u16::from_le_bytes([payload[offset + 16], payload[offset + 17]]) as usize;
+
+            if name_len == 0 || name_len > MAX_INDEX_NAME_LEN {
+                return Err(Error::CatalogCorruption(format!(
+                    "invalid index name length {name_len} on page {}",
+                    page.id()
+                )));
+            }
+
+            let cur = offset + INDEX_ENTRY_HEADER_SIZE;
+            if cur + name_len > PAGE_PAYLOAD_SIZE {
+                return Err(Error::CatalogCorruption(format!(
+                    "unexpected end of payload reading index name on page {}",
+                    page.id()
+                )));
+            }
+
+            let name_bytes = &payload[cur..cur + name_len];
+            let name = std::str::from_utf8(name_bytes)
+                .map_err(|_| {
+                    Error::CatalogCorruption(format!(
+                        "invalid UTF-8 in index name on page {}",
+                        page.id()
+                    ))
+                })?
+                .to_string();
+
+            indexes.push(IndexMetadata {
+                index_id: IndexId(index_id),
+                table_id: TableId(table_id),
+                root_page_id,
+                name,
+                column_idx,
+                unique,
+            });
+
+            offset = cur + name_len;
+        }
+
         Ok(Self {
             page_id: page.id(),
             format_version,
             next_table_id,
             next_catalog_page_id,
+            next_index_id,
             entries,
+            indexes,
         })
     }
 
@@ -410,6 +604,25 @@ impl CatalogPage {
     /// Searches this page for a table metadata entry matching `table_id`.
     pub fn find_by_id(&self, table_id: TableId) -> Option<&TableMetadata> {
         self.entries.iter().find(|e| e.table_id == table_id)
+    }
+
+    /// Searches this page for an index metadata entry matching `name`.
+    pub fn find_index_by_name(&self, name: &str) -> Option<&IndexMetadata> {
+        self.indexes.iter().find(|i| i.name == name)
+    }
+
+    /// Searches this page for an index metadata entry matching `index_id`.
+    pub fn find_index_by_id(&self, index_id: IndexId) -> Option<&IndexMetadata> {
+        self.indexes.iter().find(|i| i.index_id == index_id)
+    }
+
+    /// Finds all index metadata entries on this page associated with `table_id`.
+    pub fn find_indexes_by_table_id(&self, table_id: TableId) -> Vec<IndexMetadata> {
+        self.indexes
+            .iter()
+            .filter(|i| i.table_id == table_id)
+            .cloned()
+            .collect()
     }
 
     /// Adds a new table metadata entry to this page.
@@ -424,6 +637,18 @@ impl CatalogPage {
         Ok(())
     }
 
+    /// Adds a new index metadata entry to this page.
+    pub fn add_index_entry(&mut self, index: IndexMetadata) -> Result<()> {
+        if !self.can_fit(index.byte_size()) {
+            return Err(Error::CatalogCorruption(format!(
+                "catalog page {} is full",
+                self.page_id
+            )));
+        }
+        self.indexes.push(index);
+        Ok(())
+    }
+
     /// Removes a table metadata entry matching `name` from this page.
     pub fn remove_entry(&mut self, name: &str) -> Option<TableMetadata> {
         if let Some(pos) = self.entries.iter().position(|e| e.name == name) {
@@ -432,25 +657,22 @@ impl CatalogPage {
             None
         }
     }
+
+    /// Removes an index metadata entry matching `name` from this page.
+    pub fn remove_index_entry(&mut self, name: &str) -> Option<IndexMetadata> {
+        if let Some(pos) = self.indexes.iter().position(|i| i.name == name) {
+            Some(self.indexes.remove(pos))
+        } else {
+            None
+        }
+    }
 }
 
-/// Catalog manager coordinating table schema metadata across persistent catalog pages.
+/// Catalog manager coordinating table and index metadata across persistent catalog pages.
 pub struct Catalog;
 
 impl Catalog {
     /// Creates a new table in the catalog and initializes its physical structures.
-    ///
-    /// # Process
-    /// 1. Validates table name and schema invariants.
-    /// 2. Verifies table name uniqueness across all catalog pages.
-    /// 3. Reads root catalog page (Page 1) to allocate a new monotonic `TableId`.
-    /// 4. Allocates initial physical structures (`PageType::Leaf` and `PageType::Record`).
-    /// 5. Appends `TableMetadata` to an existing catalog page or a newly allocated chained catalog page.
-    ///
-    /// # Errors
-    /// * `Error::TableAlreadyExists` if a table with the same name already exists.
-    /// * `Error::InvalidTableName` if the table name is invalid.
-    /// * `Error::TableSchemaMismatch` if the schema is invalid.
     pub fn create_table(
         buffer_pool: &mut BufferPool,
         name: &str,
@@ -477,7 +699,6 @@ impl Catalog {
         root_cat.next_table_id += 1;
 
         // 3. Allocate physical structures for the new table
-        // A: B+ Tree Root (initialized as an empty Leaf node)
         let root_page_id = buffer_pool.allocate_page(PageType::Leaf)?;
         let leaf = LeafNode::new();
         {
@@ -486,7 +707,6 @@ impl Catalog {
         }
         buffer_pool.unpin_page(root_page_id, true)?;
 
-        // B: Slotted Record Store Page (initialized as an empty RecordPage)
         let record_page_id = buffer_pool.allocate_page(PageType::Record)?;
         let rec_page = RecordPage::new();
         {
@@ -513,14 +733,12 @@ impl Catalog {
             root_cat.serialize(page_mut)?;
             buffer_pool.unpin_page(root_cat_page_id, true)?;
         } else {
-            // Save updated next_table_id on root catalog page
             {
                 let page_mut = buffer_pool.fetch_page_mut(root_cat_page_id)?;
                 root_cat.serialize(page_mut)?;
             }
             buffer_pool.unpin_page(root_cat_page_id, true)?;
 
-            // Traverse chain to find a page with room or append a new page
             let mut curr_pid = root_cat.next_catalog_page_id;
             let mut prev_pid = root_cat_page_id;
             let mut inserted = false;
@@ -547,7 +765,6 @@ impl Catalog {
             }
 
             if !inserted {
-                // Allocate a new catalog page and link it
                 let new_cat_pid = buffer_pool.allocate_page(PageType::Catalog)?;
                 let mut new_cat = CatalogPage::new(new_cat_pid);
                 new_cat.add_entry(metadata)?;
@@ -558,7 +775,6 @@ impl Catalog {
                 }
                 buffer_pool.unpin_page(new_cat_pid, true)?;
 
-                // Link previous catalog page to new_cat_pid
                 let mut prev_cat = {
                     let page = buffer_pool.fetch_page(prev_pid)?;
                     let c = CatalogPage::deserialize(page)?;
@@ -577,14 +793,216 @@ impl Catalog {
         Ok(new_table_id)
     }
 
-    /// Drops a table from the catalog and reclaims all of its physical pages into the freelist.
-    ///
-    /// # Process
-    /// 1. Finds table metadata by name (returns `Error::TableNotFound` if absent).
-    /// 2. Traverses and collects all B+ Tree node pages belonging to the table.
-    /// 3. Traverses and collects the table's record page and any referenced overflow chains.
-    /// 4. Reclaims every collected physical page into the persistent freelist via `BufferPool::free_page`.
-    /// 5. Removes the metadata entry from the catalog page.
+    /// Creates a new persistent secondary index in the catalog and populates it from existing table data.
+    pub fn create_index(
+        buffer_pool: &mut BufferPool,
+        table_name: &str,
+        index_name: &str,
+        column_name: &str,
+        unique: bool,
+    ) -> Result<IndexId> {
+        validate_index_name(index_name)?;
+
+        // 1. Check for duplicate index name across all catalog pages
+        if Self::get_index(buffer_pool, index_name)?.is_some() {
+            return Err(Error::DuplicateIndexName(index_name.to_string()));
+        }
+
+        // 2. Resolve table metadata
+        let table_meta = Self::get_table(buffer_pool, table_name)?
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+
+        // 3. Resolve column index
+        let column_idx = table_meta
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.name == column_name)
+            .ok_or_else(|| Error::IndexColumnNotFound(column_name.to_string()))?;
+
+        // 4. Read root catalog page to get and increment next_index_id
+        let root_cat_page_id = DEFAULT_METADATA_PAGE_ID;
+        let mut root_cat = {
+            let page = buffer_pool.fetch_page(root_cat_page_id)?;
+            let cat = CatalogPage::deserialize(page)?;
+            buffer_pool.unpin_page(root_cat_page_id, false)?;
+            cat
+        };
+
+        let new_index_id = IndexId(root_cat.next_index_id);
+        root_cat.next_index_id += 1;
+
+        // 5. Scan table rows to validate uniqueness and populate index entries
+        let tree = BPlusTree::from_root(table_meta.root_page_id);
+        let record_store = RecordStore::with_last_page(table_meta.record_page_id);
+        let rids = tree.scan(buffer_pool, None, None)?;
+
+        let mut entries_to_insert = Vec::new();
+        let mut seen_keys = HashSet::new();
+
+        for (_pk, rid) in rids {
+            if let Some(bytes) = record_store.get(buffer_pool, rid)? {
+                let row = table_meta.schema.decode_tuple(&bytes)?;
+                let val = &row.values[column_idx];
+                let idx_key = IndexKey::from_value(val);
+
+                if unique && !seen_keys.insert(idx_key.clone()) {
+                    return Err(Error::DuplicateIndexKey(format!("{val}")));
+                }
+                entries_to_insert.push((idx_key, rid));
+            }
+        }
+
+        // 6. Allocate and populate secondary index B+ Tree
+        let mut sec_index = SecondaryIndex::new_empty();
+        for (idx_key, rid) in entries_to_insert {
+            sec_index.insert(buffer_pool, &idx_key, rid)?;
+        }
+        let root_page_id = if sec_index.is_empty() {
+            let pid = buffer_pool.allocate_page(PageType::Leaf)?;
+            let leaf = SecondaryLeafNode::new();
+            {
+                let page_mut = buffer_pool.get_page_mut(pid)?;
+                leaf.serialize(page_mut)?;
+            }
+            buffer_pool.unpin_page(pid, true)?;
+            pid
+        } else {
+            sec_index.root_page_id()
+        };
+
+        let index_meta = IndexMetadata {
+            index_id: new_index_id,
+            table_id: table_meta.table_id,
+            root_page_id,
+            name: index_name.to_string(),
+            column_idx,
+            unique,
+        };
+
+        // 7. Store index metadata entry in catalog
+        let entry_size = index_meta.byte_size();
+        if root_cat.can_fit(entry_size) {
+            root_cat.add_index_entry(index_meta)?;
+            let page_mut = buffer_pool.fetch_page_mut(root_cat_page_id)?;
+            root_cat.serialize(page_mut)?;
+            buffer_pool.unpin_page(root_cat_page_id, true)?;
+        } else {
+            {
+                let page_mut = buffer_pool.fetch_page_mut(root_cat_page_id)?;
+                root_cat.serialize(page_mut)?;
+            }
+            buffer_pool.unpin_page(root_cat_page_id, true)?;
+
+            let mut curr_pid = root_cat.next_catalog_page_id;
+            let mut prev_pid = root_cat_page_id;
+            let mut inserted = false;
+
+            while curr_pid != NO_NEXT_CATALOG_PAGE {
+                let mut cat = {
+                    let page = buffer_pool.fetch_page(curr_pid)?;
+                    let c = CatalogPage::deserialize(page)?;
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    c
+                };
+
+                if cat.can_fit(entry_size) {
+                    cat.add_index_entry(index_meta.clone())?;
+                    let page_mut = buffer_pool.fetch_page_mut(curr_pid)?;
+                    cat.serialize(page_mut)?;
+                    buffer_pool.unpin_page(curr_pid, true)?;
+                    inserted = true;
+                    break;
+                }
+
+                prev_pid = curr_pid;
+                curr_pid = cat.next_catalog_page_id;
+            }
+
+            if !inserted {
+                let new_cat_pid = buffer_pool.allocate_page(PageType::Catalog)?;
+                let mut new_cat = CatalogPage::new(new_cat_pid);
+                new_cat.add_index_entry(index_meta)?;
+
+                {
+                    let new_page_mut = buffer_pool.get_page_mut(new_cat_pid)?;
+                    new_cat.serialize(new_page_mut)?;
+                }
+                buffer_pool.unpin_page(new_cat_pid, true)?;
+
+                let mut prev_cat = {
+                    let page = buffer_pool.fetch_page(prev_pid)?;
+                    let c = CatalogPage::deserialize(page)?;
+                    buffer_pool.unpin_page(prev_pid, false)?;
+                    c
+                };
+                prev_cat.next_catalog_page_id = new_cat_pid;
+                {
+                    let prev_page_mut = buffer_pool.fetch_page_mut(prev_pid)?;
+                    prev_cat.serialize(prev_page_mut)?;
+                }
+                buffer_pool.unpin_page(prev_pid, true)?;
+            }
+        }
+
+        Ok(new_index_id)
+    }
+
+    /// Drops a secondary index from the catalog and reclaims all of its physical pages into the freelist.
+    pub fn drop_index(buffer_pool: &mut BufferPool, name: &str) -> Result<()> {
+        validate_index_name(name)?;
+
+        let mut curr_pid = DEFAULT_METADATA_PAGE_ID;
+        let mut target_metadata: Option<IndexMetadata> = None;
+        let mut target_cat_pid = 0;
+
+        while curr_pid != NO_NEXT_CATALOG_PAGE {
+            let cat = {
+                let page = buffer_pool.fetch_page(curr_pid)?;
+                let c = CatalogPage::deserialize(page)?;
+                buffer_pool.unpin_page(curr_pid, false)?;
+                c
+            };
+
+            if let Some(entry) = cat.find_index_by_name(name) {
+                target_metadata = Some(entry.clone());
+                target_cat_pid = curr_pid;
+                break;
+            }
+
+            curr_pid = cat.next_catalog_page_id;
+        }
+
+        let metadata = match target_metadata {
+            Some(m) => m,
+            None => return Err(Error::IndexNotFound(name.to_string())),
+        };
+
+        // Reclaim physical secondary index pages
+        let sec_index = SecondaryIndex::from_root(metadata.root_page_id);
+        let pages = sec_index.collect_all_pages(buffer_pool)?;
+        for pid in pages {
+            buffer_pool.free_page(pid)?;
+        }
+
+        // Remove index entry from catalog page
+        let mut target_cat = {
+            let page = buffer_pool.fetch_page(target_cat_pid)?;
+            let c = CatalogPage::deserialize(page)?;
+            buffer_pool.unpin_page(target_cat_pid, false)?;
+            c
+        };
+        target_cat.remove_index_entry(name);
+        {
+            let page_mut = buffer_pool.fetch_page_mut(target_cat_pid)?;
+            target_cat.serialize(page_mut)?;
+        }
+        buffer_pool.unpin_page(target_cat_pid, true)?;
+
+        Ok(())
+    }
+
+    /// Drops a table from the catalog, along with all associated secondary indexes, and reclaims all pages.
     pub fn drop_table(buffer_pool: &mut BufferPool, name: &str) -> Result<()> {
         validate_table_name(name)?;
 
@@ -615,17 +1033,22 @@ impl Catalog {
             None => return Err(Error::TableNotFound(name.to_string())),
         };
 
-        // 2. Reclaim physical B+ Tree pages
+        // 2. Drop and reclaim all secondary indexes associated with this table
+        let indexes = Self::list_indexes_for_table(buffer_pool, metadata.table_id)?;
+        for idx in indexes {
+            Self::drop_index(buffer_pool, &idx.name)?;
+        }
+
+        // 3. Reclaim physical B+ Tree pages
         let tree = BPlusTree::from_root(metadata.root_page_id);
         let tree_pages = tree.collect_all_pages(buffer_pool)?;
         for pid in tree_pages {
             buffer_pool.free_page(pid)?;
         }
 
-        // 3. Reclaim physical RecordStore pages and overflow chains
+        // 4. Reclaim physical RecordStore pages and overflow chains
         if metadata.record_page_id != 0 {
             let rec_pid = metadata.record_page_id;
-            // Scan record page for any overflow descriptors
             let mut overflow_heads = Vec::new();
             {
                 let page = buffer_pool.fetch_page(rec_pid)?;
@@ -659,7 +1082,6 @@ impl Catalog {
                 buffer_pool.unpin_page(rec_pid, false)?;
             }
 
-            // Free overflow chains
             for head_pid in overflow_heads {
                 let mut curr_ovf = head_pid;
                 let mut visited = HashSet::new();
@@ -681,11 +1103,10 @@ impl Catalog {
                 }
             }
 
-            // Free record page itself
             buffer_pool.free_page(rec_pid)?;
         }
 
-        // 4. Remove entry from catalog page
+        // 5. Remove table entry from catalog page
         let mut target_cat = {
             let page = buffer_pool.fetch_page(target_cat_pid)?;
             let c = CatalogPage::deserialize(page)?;
@@ -703,8 +1124,6 @@ impl Catalog {
     }
 
     /// Looks up a table in the catalog by name.
-    ///
-    /// Returns `Ok(Some(TableMetadata))` if found, or `Ok(None)` if absent.
     pub fn get_table(buffer_pool: &mut BufferPool, name: &str) -> Result<Option<TableMetadata>> {
         validate_table_name(name)?;
 
@@ -729,6 +1148,79 @@ impl Catalog {
             buffer_pool.unpin_page(curr_pid, false)?;
 
             if let Some(entry) = cat.find_by_name(name) {
+                return Ok(Some(entry.clone()));
+            }
+
+            curr_pid = cat.next_catalog_page_id;
+        }
+
+        Ok(None)
+    }
+
+    /// Looks up a secondary index in the catalog by name.
+    pub fn get_index(buffer_pool: &mut BufferPool, name: &str) -> Result<Option<IndexMetadata>> {
+        validate_index_name(name)?;
+
+        let mut curr_pid = DEFAULT_METADATA_PAGE_ID;
+        let mut visited = HashSet::new();
+
+        while curr_pid != NO_NEXT_CATALOG_PAGE {
+            if !visited.insert(curr_pid) {
+                return Err(Error::CatalogCorruption(format!(
+                    "cycle detected in catalog page chain at page {curr_pid}"
+                )));
+            }
+
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            let cat = match CatalogPage::deserialize(page) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(curr_pid, false);
+                    return Err(e);
+                }
+            };
+            buffer_pool.unpin_page(curr_pid, false)?;
+
+            if let Some(entry) = cat.find_index_by_name(name) {
+                return Ok(Some(entry.clone()));
+            }
+
+            curr_pid = cat.next_catalog_page_id;
+        }
+
+        Ok(None)
+    }
+
+    /// Looks up a secondary index in the catalog by `IndexId`.
+    pub fn get_index_by_id(
+        buffer_pool: &mut BufferPool,
+        index_id: IndexId,
+    ) -> Result<Option<IndexMetadata>> {
+        if index_id.0 == 0 {
+            return Err(Error::InvalidIndexId(0));
+        }
+
+        let mut curr_pid = DEFAULT_METADATA_PAGE_ID;
+        let mut visited = HashSet::new();
+
+        while curr_pid != NO_NEXT_CATALOG_PAGE {
+            if !visited.insert(curr_pid) {
+                return Err(Error::CatalogCorruption(format!(
+                    "cycle detected in catalog page chain at page {curr_pid}"
+                )));
+            }
+
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            let cat = match CatalogPage::deserialize(page) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(curr_pid, false);
+                    return Err(e);
+                }
+            };
+            buffer_pool.unpin_page(curr_pid, false)?;
+
+            if let Some(entry) = cat.find_index_by_id(index_id) {
                 return Ok(Some(entry.clone()));
             }
 
@@ -770,9 +1262,39 @@ impl Catalog {
         Err(Error::TableNotFound(metadata.name.clone()))
     }
 
+    /// Updates the metadata entry for an existing secondary index in the catalog.
+    pub fn update_index_metadata(
+        buffer_pool: &mut BufferPool,
+        metadata: &IndexMetadata,
+    ) -> Result<()> {
+        let mut curr_pid = DEFAULT_METADATA_PAGE_ID;
+        while curr_pid != NO_NEXT_CATALOG_PAGE {
+            let mut cat = {
+                let page = buffer_pool.fetch_page(curr_pid)?;
+                let c = CatalogPage::deserialize(page)?;
+                buffer_pool.unpin_page(curr_pid, false)?;
+                c
+            };
+
+            if let Some(pos) = cat
+                .indexes
+                .iter()
+                .position(|i| i.index_id == metadata.index_id)
+            {
+                cat.indexes[pos] = metadata.clone();
+                let page_mut = buffer_pool.fetch_page_mut(curr_pid)?;
+                cat.serialize(page_mut)?;
+                buffer_pool.unpin_page(curr_pid, true)?;
+                return Ok(());
+            }
+
+            curr_pid = cat.next_catalog_page_id;
+        }
+
+        Err(Error::IndexNotFound(metadata.name.clone()))
+    }
+
     /// Looks up a table in the catalog by `TableId`.
-    ///
-    /// Returns `Ok(Some(TableMetadata))` if found, or `Ok(None)` if absent.
     pub fn get_table_by_id(
         buffer_pool: &mut BufferPool,
         table_id: TableId,
@@ -841,26 +1363,63 @@ impl Catalog {
         Ok(tables)
     }
 
+    /// Returns a list of all secondary indexes currently registered in the catalog.
+    pub fn list_indexes(buffer_pool: &mut BufferPool) -> Result<Vec<IndexMetadata>> {
+        let mut indexes = Vec::new();
+        let mut curr_pid = DEFAULT_METADATA_PAGE_ID;
+        let mut visited = HashSet::new();
+
+        while curr_pid != NO_NEXT_CATALOG_PAGE {
+            if !visited.insert(curr_pid) {
+                return Err(Error::CatalogCorruption(format!(
+                    "cycle detected in catalog page chain at page {curr_pid}"
+                )));
+            }
+
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            let cat = match CatalogPage::deserialize(page) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(curr_pid, false);
+                    return Err(e);
+                }
+            };
+            buffer_pool.unpin_page(curr_pid, false)?;
+
+            indexes.extend(cat.indexes);
+            curr_pid = cat.next_catalog_page_id;
+        }
+
+        Ok(indexes)
+    }
+
+    /// Returns a list of all secondary indexes associated with a specific table.
+    pub fn list_indexes_for_table(
+        buffer_pool: &mut BufferPool,
+        table_id: TableId,
+    ) -> Result<Vec<IndexMetadata>> {
+        let all_indexes = Self::list_indexes(buffer_pool)?;
+        Ok(all_indexes
+            .into_iter()
+            .filter(|i| i.table_id == table_id)
+            .collect())
+    }
+
     /// Validates the structural integrity and referential correctness of the catalog.
-    ///
-    /// # Checks
-    /// 1. Catalog page chain contains no cycles.
-    /// 2. Every catalog page has a valid `PageType::Catalog` or `PageType::Metadata`.
-    /// 3. Magic bytes and format versions match supported constants.
-    /// 4. All `TableId`s are strictly positive and less than `next_table_id`.
-    /// 5. No duplicate `TableId`s or table names exist.
-    /// 6. All referenced `root_page_id` and `record_page_id` pointers:
-    ///    - Are within the database page count bounds.
-    ///    - Are not reserved pages (Page 0 or Page 1).
-    ///    - Have valid expected page types (`PageType::Leaf`/`PageType::Internal` and `PageType::Record`).
     pub fn validate_catalog(buffer_pool: &mut BufferPool) -> Result<()> {
         let page_count = buffer_pool.page_manager().page_count();
         let mut curr_pid = DEFAULT_METADATA_PAGE_ID;
         let mut visited_pages = HashSet::new();
-        let mut seen_ids = HashSet::new();
-        let mut seen_names = HashSet::new();
+        let mut seen_table_ids = HashSet::new();
+        let mut seen_table_names = HashSet::new();
+        let mut seen_index_ids = HashSet::new();
+        let mut seen_index_names = HashSet::new();
 
         let mut max_table_id_counter: Option<u32> = None;
+        let mut max_index_id_counter: Option<u32> = None;
+
+        let mut all_tables = Vec::new();
+        let mut all_indexes = Vec::new();
 
         while curr_pid != NO_NEXT_CATALOG_PAGE {
             if !visited_pages.insert(curr_pid) {
@@ -896,81 +1455,148 @@ impl Catalog {
             if max_table_id_counter.is_none() {
                 max_table_id_counter = Some(cat.next_table_id);
             }
-
-            let max_counter = max_table_id_counter.unwrap();
-
-            for entry in &cat.entries {
-                // Table ID validation
-                if entry.table_id.0 == 0 || entry.table_id.0 >= max_counter {
-                    return Err(Error::CatalogCorruption(format!(
-                        "invalid table ID {} (next_table_id counter is {})",
-                        entry.table_id.0, max_counter
-                    )));
-                }
-
-                if !seen_ids.insert(entry.table_id.0) {
-                    return Err(Error::CatalogCorruption(format!(
-                        "duplicate table ID {} detected in catalog",
-                        entry.table_id.0
-                    )));
-                }
-
-                // Table name and schema validation
-                validate_table_name(&entry.name)?;
-                entry.schema.validate()?;
-                if !seen_names.insert(entry.name.clone()) {
-                    return Err(Error::CatalogCorruption(format!(
-                        "duplicate table name '{}' detected in catalog",
-                        entry.name
-                    )));
-                }
-
-                // Referential validation for root_page_id
-                if entry.root_page_id >= page_count
-                    || entry.root_page_id == HEADER_PAGE_ID
-                    || entry.root_page_id == DEFAULT_METADATA_PAGE_ID
-                {
-                    return Err(Error::CatalogCorruption(format!(
-                        "table '{}' has invalid root_page_id {}",
-                        entry.name, entry.root_page_id
-                    )));
-                }
-
-                let root_page = buffer_pool.fetch_page(entry.root_page_id)?;
-                let root_type = root_page.page_type();
-                buffer_pool.unpin_page(entry.root_page_id, false)?;
-                if root_type != PageType::Leaf && root_type != PageType::Internal {
-                    return Err(Error::CatalogCorruption(format!(
-                        "table '{}' root page {} has unexpected page type {:?}",
-                        entry.name, entry.root_page_id, root_type
-                    )));
-                }
-
-                // Referential validation for record_page_id
-                if entry.record_page_id != 0 {
-                    if entry.record_page_id >= page_count
-                        || entry.record_page_id == HEADER_PAGE_ID
-                        || entry.record_page_id == DEFAULT_METADATA_PAGE_ID
-                    {
-                        return Err(Error::CatalogCorruption(format!(
-                            "table '{}' has invalid record_page_id {}",
-                            entry.name, entry.record_page_id
-                        )));
-                    }
-
-                    let rec_page = buffer_pool.fetch_page(entry.record_page_id)?;
-                    let rec_type = rec_page.page_type();
-                    buffer_pool.unpin_page(entry.record_page_id, false)?;
-                    if rec_type != PageType::Record {
-                        return Err(Error::CatalogCorruption(format!(
-                            "table '{}' record page {} has unexpected page type {:?}",
-                            entry.name, entry.record_page_id, rec_type
-                        )));
-                    }
-                }
+            if max_index_id_counter.is_none() {
+                max_index_id_counter = Some(cat.next_index_id);
             }
 
+            all_tables.extend(cat.entries);
+            all_indexes.extend(cat.indexes);
+
             curr_pid = cat.next_catalog_page_id;
+        }
+
+        let max_t_counter = max_table_id_counter.unwrap_or(1);
+        let max_i_counter = max_index_id_counter.unwrap_or(1);
+
+        for entry in &all_tables {
+            if entry.table_id.0 == 0 || entry.table_id.0 >= max_t_counter {
+                return Err(Error::CatalogCorruption(format!(
+                    "invalid table ID {} (next_table_id counter is {})",
+                    entry.table_id.0, max_t_counter
+                )));
+            }
+
+            if !seen_table_ids.insert(entry.table_id.0) {
+                return Err(Error::CatalogCorruption(format!(
+                    "duplicate table ID {} detected in catalog",
+                    entry.table_id.0
+                )));
+            }
+
+            validate_table_name(&entry.name)?;
+            entry.schema.validate()?;
+            if !seen_table_names.insert(entry.name.clone()) {
+                return Err(Error::CatalogCorruption(format!(
+                    "duplicate table name '{}' detected in catalog",
+                    entry.name
+                )));
+            }
+
+            if entry.root_page_id >= page_count
+                || entry.root_page_id == HEADER_PAGE_ID
+                || entry.root_page_id == DEFAULT_METADATA_PAGE_ID
+            {
+                return Err(Error::CatalogCorruption(format!(
+                    "table '{}' has invalid root_page_id {}",
+                    entry.name, entry.root_page_id
+                )));
+            }
+
+            let root_page = buffer_pool.fetch_page(entry.root_page_id)?;
+            let root_type = root_page.page_type();
+            buffer_pool.unpin_page(entry.root_page_id, false)?;
+            if root_type != PageType::Leaf && root_type != PageType::Internal {
+                return Err(Error::CatalogCorruption(format!(
+                    "table '{}' root page {} has unexpected page type {:?}",
+                    entry.name, entry.root_page_id, root_type
+                )));
+            }
+
+            if entry.record_page_id != 0 {
+                if entry.record_page_id >= page_count
+                    || entry.record_page_id == HEADER_PAGE_ID
+                    || entry.record_page_id == DEFAULT_METADATA_PAGE_ID
+                {
+                    return Err(Error::CatalogCorruption(format!(
+                        "table '{}' has invalid record_page_id {}",
+                        entry.name, entry.record_page_id
+                    )));
+                }
+
+                let rec_page = buffer_pool.fetch_page(entry.record_page_id)?;
+                let rec_type = rec_page.page_type();
+                buffer_pool.unpin_page(entry.record_page_id, false)?;
+                if rec_type != PageType::Record {
+                    return Err(Error::CatalogCorruption(format!(
+                        "table '{}' record page {} has unexpected page type {:?}",
+                        entry.name, entry.record_page_id, rec_type
+                    )));
+                }
+            }
+        }
+
+        for idx in &all_indexes {
+            if idx.index_id.0 == 0 || idx.index_id.0 >= max_i_counter {
+                return Err(Error::CatalogCorruption(format!(
+                    "invalid index ID {} (next_index_id counter is {})",
+                    idx.index_id.0, max_i_counter
+                )));
+            }
+
+            if !seen_index_ids.insert(idx.index_id.0) {
+                return Err(Error::CatalogCorruption(format!(
+                    "duplicate index ID {} detected in catalog",
+                    idx.index_id.0
+                )));
+            }
+
+            validate_index_name(&idx.name)?;
+            if !seen_index_names.insert(idx.name.clone()) {
+                return Err(Error::CatalogCorruption(format!(
+                    "duplicate index name '{}' detected in catalog",
+                    idx.name
+                )));
+            }
+
+            // Referential validation: Table must exist
+            let table = all_tables
+                .iter()
+                .find(|t| t.table_id == idx.table_id)
+                .ok_or_else(|| {
+                    Error::CatalogCorruption(format!(
+                        "index '{}' references non-existent table ID {}",
+                        idx.name, idx.table_id.0
+                    ))
+                })?;
+
+            if idx.column_idx >= table.schema.columns.len() {
+                return Err(Error::CatalogCorruption(format!(
+                    "index '{}' column index {} exceeds table column count {}",
+                    idx.name,
+                    idx.column_idx,
+                    table.schema.columns.len()
+                )));
+            }
+
+            if idx.root_page_id >= page_count
+                || idx.root_page_id == HEADER_PAGE_ID
+                || idx.root_page_id == DEFAULT_METADATA_PAGE_ID
+            {
+                return Err(Error::CatalogCorruption(format!(
+                    "index '{}' has invalid root_page_id {}",
+                    idx.name, idx.root_page_id
+                )));
+            }
+
+            let root_page = buffer_pool.fetch_page(idx.root_page_id)?;
+            let root_type = root_page.page_type();
+            buffer_pool.unpin_page(idx.root_page_id, false)?;
+            if root_type != PageType::Leaf && root_type != PageType::Internal {
+                return Err(Error::CatalogCorruption(format!(
+                    "index '{}' root page {} has unexpected page type {:?}",
+                    idx.name, idx.root_page_id, root_type
+                )));
+            }
         }
 
         Ok(())

@@ -226,4 +226,40 @@ pub enum Error {
     /// Semantic error encountered during SQL name binding and validation.
     #[error("SQL binding error: {0}")]
     SqlBindingError(String),
+
+    /// Index with the specified name was not found in the catalog.
+    #[error("Index '{0}' not found")]
+    IndexNotFound(String),
+
+    /// Index with the specified name already exists in the catalog.
+    #[error("Index '{0}' already exists")]
+    DuplicateIndexName(String),
+
+    /// Duplicate key value rejected by unique secondary index constraint.
+    #[error("Duplicate index key: {0}")]
+    DuplicateIndexKey(String),
+
+    /// Column specified for index creation was not found on table.
+    #[error("Index column '{0}' not found in table schema")]
+    IndexColumnNotFound(String),
+
+    /// Secondary index definition is invalid.
+    #[error("Invalid index definition: {0}")]
+    InvalidIndexDefinition(String),
+
+    /// Structural corruption detected in secondary index.
+    #[error("Index corruption detected: {0}")]
+    IndexCorruption(String),
+
+    /// Index does not belong to the expected table.
+    #[error("Index '{index}' does not belong to table '{table}'")]
+    IndexTableMismatch { index: String, table: String },
+
+    /// Index identifier is invalid or out of bounds.
+    #[error("Invalid index ID: {0}")]
+    InvalidIndexId(u32),
+
+    /// Index name is invalid (e.g. empty, too long).
+    #[error("Invalid index name: {0}")]
+    InvalidIndexName(String),
 }

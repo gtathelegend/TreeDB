@@ -91,10 +91,14 @@ impl<'a> Query<'a> {
 
     /// Executes the query pipeline and returns the resulting `QueryResult`.
     ///
+    /// # Access Path Selection Policy
+    /// 1. **Primary Key Optimization**: If predicate can be satisfied via primary-key point lookup or range scan.
+    /// 2. **Secondary Index Optimization**: If predicate can be satisfied via a matching secondary index point lookup or range scan.
+    /// 3. **Full Table Scan**: Scans all rows via primary B+ Tree.
+    ///
     /// # Pipeline Stages
-    /// 1. **Scan**: Evaluates whether primary-key point lookup or range scan optimization can be applied;
-    ///    otherwise performs a full ordered table scan via B+ Tree index.
-    /// 2. **Filter**: Applies predicate evaluation discarding false and NULL results.
+    /// 1. **Scan**: Evaluates access paths and fetches initial candidate rows.
+    /// 2. **Filter**: Evaluates full WHERE predicate, discarding false and NULL results.
     /// 3. **Sort**: Applies multi-key sorting if sort keys are present.
     /// 4. **Offset & Limit**: Applies row pagination.
     /// 5. **Project**: Evaluates projection expressions, generating the final `Schema` and `Row`s.
@@ -103,23 +107,46 @@ impl<'a> Query<'a> {
         let pk_col_name = schema.primary_key_column().name.clone();
         let pk_type = schema.primary_key_column().data_type;
 
-        // Determine scan plan based on filter predicate
-        let scan_plan = match &self.filter {
-            Some(predicate) => analyze_pk_predicate(predicate, &pk_col_name, pk_type),
-            None => PkScanPlan::FullScan,
+        // 1. Check Primary Key Scan Plan
+        let pk_plan = match &self.filter {
+            Some(predicate) => analyze_col_predicate(predicate, &pk_col_name, pk_type),
+            None => ColScanPlan::FullScan,
         };
 
-        // Execute initial row retrieval
-        let initial_rows: Vec<Row> = match scan_plan {
-            PkScanPlan::PointLookup(val) => match self.table.get(val)? {
+        // 2. Select Access Path
+        let initial_rows: Vec<Row> = match pk_plan {
+            ColScanPlan::PointLookup(val) => match self.table.get(val)? {
                 Some(row) => vec![row],
                 None => Vec::new(),
             },
-            PkScanPlan::RangeScan { start, end } => self.table.scan(start, end)?,
-            PkScanPlan::FullScan => self.table.scan(None, None)?,
+            ColScanPlan::RangeScan { start, end } => self.table.scan(start, end)?,
+            ColScanPlan::FullScan => {
+                // Check if any secondary index can be used
+                let mut sec_plan: Option<(String, ColScanPlan)> = None;
+                if let Some(predicate) = &self.filter {
+                    for (meta, _) in self.table.indexes() {
+                        let col = &schema.columns[meta.column_idx];
+                        let plan = analyze_col_predicate(predicate, &col.name, col.data_type);
+                        if !matches!(plan, ColScanPlan::FullScan) {
+                            sec_plan = Some((meta.name.clone(), plan));
+                            break;
+                        }
+                    }
+                }
+
+                match sec_plan {
+                    Some((idx_name, ColScanPlan::PointLookup(val))) => {
+                        self.table.index_lookup(&idx_name, val)?
+                    }
+                    Some((idx_name, ColScanPlan::RangeScan { start, end })) => {
+                        self.table.index_scan(&idx_name, start, end)?
+                    }
+                    _ => self.table.scan(None, None)?,
+                }
+            }
         };
 
-        // Stage 2: Filter Operator
+        // Stage 2: Filter Operator (Complete WHERE predicate evaluation)
         let filtered_rows = match &self.filter {
             Some(predicate) => FilterOperator::apply(initial_rows, &schema, predicate)?,
             None => initial_rows,
@@ -143,116 +170,116 @@ impl<'a> Query<'a> {
     }
 }
 
-/// Internal execution plan for primary key scanning optimization.
+/// Internal execution plan for column-based scanning optimization.
 #[derive(Debug, PartialEq)]
-enum PkScanPlan<'a> {
-    /// B+ Tree point lookup on a specific primary key value.
+enum ColScanPlan<'a> {
+    /// Point lookup on a specific column value.
     PointLookup(&'a Value),
-    /// B+ Tree range scan between `[start, end)`.
+    /// Range scan between `[start, end)`.
     RangeScan {
         start: Option<&'a Value>,
         end: Option<&'a Value>,
     },
-    /// Full table scan over all primary keys.
+    /// Full scan over all rows.
     FullScan,
 }
 
-fn analyze_pk_predicate<'a>(
+fn analyze_col_predicate<'a>(
     predicate: &'a Expr,
-    pk_col_name: &str,
-    pk_type: DataType,
-) -> PkScanPlan<'a> {
+    col_name: &str,
+    col_type: DataType,
+) -> ColScanPlan<'a> {
     match predicate {
         Expr::Binary {
             left,
             op: BinaryOp::Eq,
             right,
         } => {
-            if let Some(val) = extract_pk_col_literal(left, right, pk_col_name, pk_type) {
-                return PkScanPlan::PointLookup(val);
+            if let Some(val) = extract_col_literal(left, right, col_name, col_type) {
+                return ColScanPlan::PointLookup(val);
             }
-            PkScanPlan::FullScan
+            ColScanPlan::FullScan
         }
         Expr::Binary {
             left,
             op: BinaryOp::And,
             right,
         } => {
-            if let PkScanPlan::PointLookup(val) = analyze_pk_predicate(left, pk_col_name, pk_type) {
-                return PkScanPlan::PointLookup(val);
+            if let ColScanPlan::PointLookup(val) = analyze_col_predicate(left, col_name, col_type) {
+                return ColScanPlan::PointLookup(val);
             }
-            if let PkScanPlan::PointLookup(val) = analyze_pk_predicate(right, pk_col_name, pk_type)
+            if let ColScanPlan::PointLookup(val) = analyze_col_predicate(right, col_name, col_type)
             {
-                return PkScanPlan::PointLookup(val);
+                return ColScanPlan::PointLookup(val);
             }
 
-            let left_range = extract_single_bound(left, pk_col_name, pk_type);
-            let right_range = extract_single_bound(right, pk_col_name, pk_type);
+            let left_range = extract_single_bound(left, col_name, col_type);
+            let right_range = extract_single_bound(right, col_name, col_type);
 
             match (left_range, right_range) {
-                (Some((true, left_val)), Some((false, right_val))) => PkScanPlan::RangeScan {
+                (Some((true, left_val)), Some((false, right_val))) => ColScanPlan::RangeScan {
                     start: Some(left_val),
                     end: Some(right_val),
                 },
-                (Some((false, left_val)), Some((true, right_val))) => PkScanPlan::RangeScan {
+                (Some((false, left_val)), Some((true, right_val))) => ColScanPlan::RangeScan {
                     start: Some(right_val),
                     end: Some(left_val),
                 },
-                (Some((true, left_val)), None) => PkScanPlan::RangeScan {
+                (Some((true, left_val)), None) => ColScanPlan::RangeScan {
                     start: Some(left_val),
                     end: None,
                 },
-                (Some((false, left_val)), None) => PkScanPlan::RangeScan {
+                (Some((false, left_val)), None) => ColScanPlan::RangeScan {
                     start: None,
                     end: Some(left_val),
                 },
-                (None, Some((true, right_val))) => PkScanPlan::RangeScan {
+                (None, Some((true, right_val))) => ColScanPlan::RangeScan {
                     start: Some(right_val),
                     end: None,
                 },
-                (None, Some((false, right_val))) => PkScanPlan::RangeScan {
+                (None, Some((false, right_val))) => ColScanPlan::RangeScan {
                     start: None,
                     end: Some(right_val),
                 },
-                _ => PkScanPlan::FullScan,
+                _ => ColScanPlan::FullScan,
             }
         }
         single_expr => {
-            if let Some((is_start, val)) = extract_single_bound(single_expr, pk_col_name, pk_type) {
+            if let Some((is_start, val)) = extract_single_bound(single_expr, col_name, col_type) {
                 if is_start {
-                    PkScanPlan::RangeScan {
+                    ColScanPlan::RangeScan {
                         start: Some(val),
                         end: None,
                     }
                 } else {
-                    PkScanPlan::RangeScan {
+                    ColScanPlan::RangeScan {
                         start: None,
                         end: Some(val),
                     }
                 }
             } else {
-                PkScanPlan::FullScan
+                ColScanPlan::FullScan
             }
         }
     }
 }
 
-fn extract_pk_col_literal<'a>(
+fn extract_col_literal<'a>(
     left: &'a Expr,
     right: &'a Expr,
-    pk_col_name: &str,
-    pk_type: DataType,
+    col_name: &str,
+    col_type: DataType,
 ) -> Option<&'a Value> {
     match (left, right) {
-        (Expr::Column(name), Expr::Literal(val)) if name == pk_col_name => {
-            if val.data_type() == pk_type && !val.is_null() {
+        (Expr::Column(name), Expr::Literal(val)) if name == col_name => {
+            if val.data_type() == col_type || val.is_null() {
                 Some(val)
             } else {
                 None
             }
         }
-        (Expr::Literal(val), Expr::Column(name)) if name == pk_col_name => {
-            if val.data_type() == pk_type && !val.is_null() {
+        (Expr::Literal(val), Expr::Column(name)) if name == col_name => {
+            if val.data_type() == col_type || val.is_null() {
                 Some(val)
             } else {
                 None
@@ -264,8 +291,8 @@ fn extract_pk_col_literal<'a>(
 
 fn extract_single_bound<'a>(
     expr: &'a Expr,
-    pk_col_name: &str,
-    pk_type: DataType,
+    col_name: &str,
+    col_type: DataType,
 ) -> Option<(bool, &'a Value)> {
     match expr {
         Expr::Binary {
@@ -274,7 +301,7 @@ fn extract_single_bound<'a>(
             right,
         } => match (left.as_ref(), right.as_ref()) {
             (Expr::Column(name), Expr::Literal(val))
-                if name == pk_col_name && val.data_type() == pk_type && !val.is_null() =>
+                if name == col_name && (val.data_type() == col_type || val.is_null()) =>
             {
                 Some((true, val))
             }
@@ -286,12 +313,12 @@ fn extract_single_bound<'a>(
             right,
         } => match (left.as_ref(), right.as_ref()) {
             (Expr::Literal(val), Expr::Column(name))
-                if name == pk_col_name && val.data_type() == pk_type && !val.is_null() =>
+                if name == col_name && (val.data_type() == col_type || val.is_null()) =>
             {
                 Some((true, val))
             }
             (Expr::Column(name), Expr::Literal(val))
-                if name == pk_col_name && val.data_type() == pk_type && !val.is_null() =>
+                if name == col_name && (val.data_type() == col_type || val.is_null()) =>
             {
                 Some((false, val))
             }

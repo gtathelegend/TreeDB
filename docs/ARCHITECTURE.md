@@ -252,7 +252,29 @@ v                                                             v
 
 ---
 
-## 5. Critical Invariants
+## 5. Secondary Index Engine (`src/index/secondary.rs`)
+
+```text
+Table
+ ├── Primary B+ Tree  (PK -> RecordId)
+ ├── Secondary Index A (IndexKey -> RecordId)
+ ├── Secondary Index B (IndexKey -> RecordId)
+ └── RecordStore       (RecordId -> Tuple Bytes)
+```
+
+### `SecondaryIndex`, `SecondaryLeafNode` & `SecondaryInternalNode`
+* **Role:** Persistent disk-backed B+ Tree implementation managing secondary access paths over `(IndexKey, RecordId)` tuples.
+* **Responsibilities:**
+  * **Canonical Key Encoding (`IndexKey`):** Deterministic, order-preserving binary encoding for all supported types (`Null`, `Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`). Integer and floating point representations use big-endian sign-bit / IEEE transformations ensuring byte-level comparison strictly matches numerical ordering.
+  * **Composite Key Ordering:** Entries in leaf nodes are sorted by `(IndexKey, RecordId)`. This provides deterministic contiguous clustering for non-unique index keys while guaranteeing that every entry is unique in the tree.
+  * **Lifecycle & Auto-Maintenance:** Mutations via `Table::insert`, `Table::update`, and `Table::delete` automatically propagate changes to all attached secondary indexes within the active transaction.
+  * **Unique Constraint Validation:** Unique secondary indexes reject duplicate insertions before allocating heap storage (`Error::DuplicateIndexKey`).
+  * **Access Path Selection:** `Query::execute` detects indexed predicates in `WHERE` clauses and uses secondary index point lookups or range scans to fetch candidate `RecordId`s, evaluating full predicates on retrieved records.
+  * **Cascading Reclamation:** Dropping a table or index reclaims all associated B+ Tree pages directly into the persistent freelist.
+
+---
+
+## 6. Critical Invariants
 
 * **Write-Ahead Invariant:** `append WAL record -> WAL durable -> page modification -> page flush`. A dirty page with `page_lsn > wal.flushed_lsn` cannot reach disk without its WAL records first being flushed.
 * **PageLSN Semantics:** Every page modification stamps the page with its corresponding LSN. During Redo:
@@ -261,6 +283,7 @@ v                                                             v
   PageLSN never regresses.
 * **CLR Durability Invariant:** `append CLR -> flush WAL through CLR LSN -> write recovered page`. Recovery-generated modifications are never durable before their CLR is durable on disk.
 * **Engine Atomicity Boundary:** `TreeDb::put` and `TreeDb::delete` operations wrap both RecordStore heap modifications (inline and overflow) and B+ Tree index mutations in a single transaction (`TxnId`). If an uncommitted operation crashes, both index and record mutations are undone atomically.
+* **Secondary Index Invariant:** Every committed table row must have exactly the corresponding secondary-index entries required by its indexed columns, and every secondary-index entry must resolve to a valid current `RecordId`.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -268,11 +291,12 @@ v                                                             v
 
 ---
 
-## 6. Intentionally Deferred Items (Phase 11+)
+## 7. Intentionally Deferred Items
 
-The following capabilities are intentionally deferred to subsequent phases and not implemented in Phase 10:
-* Background fuzzy checkpointing and asynchronous log worker threads.
-* Group commit and lock-free WAL flush rings.
-* Multi-threading, concurrency control, and latching.
-* SQL query parser, execution engine, and MVCC.
+The following capabilities are intentionally deferred to subsequent phases:
+* Multi-column composite secondary indexes.
+* Index-only covering scans.
+* Full cost-based optimizer and cardinality statistics.
+* DDL statements (`CREATE INDEX`, `DROP INDEX`) in SQL grammar.
+* Multi-threading, concurrency control, and MVCC.
 

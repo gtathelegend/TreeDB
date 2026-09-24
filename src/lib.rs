@@ -9,16 +9,17 @@ pub mod storage;
 pub mod wal;
 
 pub use engine::{
-    Catalog, CatalogPage, Column, DataType, Row, Schema, Table, TableId, TableMetadata,
-    Transaction, TreeDb, TxnState, Value, CATALOG_MAGIC, CURRENT_CATALOG_VERSION,
-    MAX_COLUMN_NAME_LEN, MAX_TABLE_NAME_LEN, TUPLE_FORMAT_VERSION,
+    Catalog, CatalogPage, Column, DataType, IndexId, IndexMetadata, Row, Schema, Table, TableId,
+    TableMetadata, Transaction, TreeDb, TxnState, Value, CATALOG_MAGIC, CURRENT_CATALOG_VERSION,
+    MAX_COLUMN_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN, TUPLE_FORMAT_VERSION,
 };
 pub use error::{Error, Result};
 pub use index::{
-    BPlusTree, InternalNode, LeafNode, RecordId, INTERNAL_ENTRY_SIZE, INTERNAL_HEADER_SIZE,
-    INTERNAL_MAX_KEYS, INTERNAL_MIN_CHILDREN, INTERNAL_MIN_KEYS, INVALID_PAGE_ID, KEY_SIZE,
-    LEAF_ENTRY_SIZE, LEAF_HEADER_SIZE, LEAF_MAX_ENTRIES, LEAF_MIN_ENTRIES, PAGE_ID_SIZE,
-    RECORD_ID_SIZE,
+    BPlusTree, IndexKey, InternalNode, LeafNode, RecordId, SecondaryIndex, SecondaryInternalNode,
+    SecondaryLeafNode, INTERNAL_ENTRY_SIZE, INTERNAL_HEADER_SIZE, INTERNAL_MAX_KEYS,
+    INTERNAL_MIN_CHILDREN, INTERNAL_MIN_KEYS, INVALID_PAGE_ID, KEY_SIZE, LEAF_ENTRY_SIZE,
+    LEAF_HEADER_SIZE, LEAF_MAX_ENTRIES, LEAF_MIN_ENTRIES, PAGE_ID_SIZE, RECORD_ID_SIZE,
+    SEC_INTERNAL_HEADER_SIZE, SEC_LEAF_HEADER_SIZE,
 };
 pub use query::{
     BinaryOp, Expr, FilterOperator, OffsetLimitOperator, ProjectOperator, Query, QueryResult,

@@ -160,12 +160,162 @@ impl<'db> Transaction<'db> {
         let tree = crate::index::bplus_tree::BPlusTree::from_root(metadata.root_page_id);
         let record_store =
             crate::storage::record_store::RecordStore::with_last_page(metadata.record_page_id);
+        let index_metas = crate::engine::catalog::Catalog::list_indexes_for_table(
+            &mut self.db.buffer_pool,
+            metadata.table_id,
+        )?;
+        let mut indexes = Vec::with_capacity(index_metas.len());
+        for idx_meta in index_metas {
+            let sec_tree =
+                crate::index::secondary::SecondaryIndex::from_root(idx_meta.root_page_id);
+            indexes.push((idx_meta, sec_tree));
+        }
+
         Ok(crate::engine::table::Table::new(
             metadata,
             tree,
             record_store,
+            indexes,
             &mut self.db.buffer_pool,
         ))
+    }
+
+    /// Creates a new persistent secondary index within this transaction.
+    pub fn create_index(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        column_name: &str,
+        unique: bool,
+    ) -> Result<crate::engine::catalog::IndexId> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::create_index(
+            &mut self.db.buffer_pool,
+            table_name,
+            index_name,
+            column_name,
+            unique,
+        )
+    }
+
+    /// Drops a persistent secondary index and reclaims its pages within this transaction.
+    pub fn drop_index(&mut self, index_name: &str) -> Result<()> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::drop_index(&mut self.db.buffer_pool, index_name)
+    }
+
+    /// Retrieves metadata for a secondary index by name.
+    pub fn get_index(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<crate::engine::catalog::IndexMetadata>> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::get_index(&mut self.db.buffer_pool, name)
+    }
+
+    /// Retrieves metadata for a secondary index by `IndexId`.
+    pub fn get_index_by_id(
+        &mut self,
+        id: crate::engine::catalog::IndexId,
+    ) -> Result<Option<crate::engine::catalog::IndexMetadata>> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::get_index_by_id(&mut self.db.buffer_pool, id)
+    }
+
+    /// Lists all secondary indexes registered in the catalog.
+    pub fn list_indexes(&mut self) -> Result<Vec<crate::engine::catalog::IndexMetadata>> {
+        self.ensure_active()?;
+        crate::engine::catalog::Catalog::list_indexes(&mut self.db.buffer_pool)
+    }
+
+    /// Lists all secondary indexes registered for a specific table.
+    pub fn list_indexes_for_table(
+        &mut self,
+        table_name: &str,
+    ) -> Result<Vec<crate::engine::catalog::IndexMetadata>> {
+        self.ensure_active()?;
+        let table = self
+            .get_table(table_name)?
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        crate::engine::catalog::Catalog::list_indexes_for_table(
+            &mut self.db.buffer_pool,
+            table.table_id,
+        )
+    }
+
+    /// Performs a secondary index lookup returning matching `RecordId`s.
+    pub fn index_lookup(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        value: &crate::engine::types::Value,
+    ) -> Result<Vec<crate::index::node::RecordId>> {
+        self.ensure_active()?;
+        let idx_meta =
+            crate::engine::catalog::Catalog::get_index(&mut self.db.buffer_pool, index_name)?
+                .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+        let table =
+            crate::engine::catalog::Catalog::get_table(&mut self.db.buffer_pool, table_name)?
+                .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        if idx_meta.table_id != table.table_id {
+            return Err(Error::IndexTableMismatch {
+                index: index_name.to_string(),
+                table: table_name.to_string(),
+            });
+        }
+        let sec_tree = crate::index::secondary::SecondaryIndex::from_root(idx_meta.root_page_id);
+        let idx_key = crate::index::secondary::IndexKey::from_value(value);
+        sec_tree.lookup(&mut self.db.buffer_pool, &idx_key)
+    }
+
+    /// Performs a secondary index range scan returning matching `(Value, RecordId)` pairs.
+    pub fn index_scan(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        start: Option<&crate::engine::types::Value>,
+        end: Option<&crate::engine::types::Value>,
+    ) -> Result<Vec<(crate::engine::types::Value, crate::index::node::RecordId)>> {
+        self.ensure_active()?;
+        let idx_meta =
+            crate::engine::catalog::Catalog::get_index(&mut self.db.buffer_pool, index_name)?
+                .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+        let table =
+            crate::engine::catalog::Catalog::get_table(&mut self.db.buffer_pool, table_name)?
+                .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        if idx_meta.table_id != table.table_id {
+            return Err(Error::IndexTableMismatch {
+                index: index_name.to_string(),
+                table: table_name.to_string(),
+            });
+        }
+        let col_type = table.schema.columns[idx_meta.column_idx].data_type;
+        let sec_tree = crate::index::secondary::SecondaryIndex::from_root(idx_meta.root_page_id);
+
+        let start_key = start.map(crate::index::secondary::IndexKey::from_value);
+        let end_key = end.map(crate::index::secondary::IndexKey::from_value);
+
+        let entries = sec_tree.scan(
+            &mut self.db.buffer_pool,
+            start_key.as_ref(),
+            end_key.as_ref(),
+        )?;
+        let mut results = Vec::with_capacity(entries.len());
+        for (k, rid) in entries {
+            let val = k.to_value(col_type)?;
+            results.push((val, rid));
+        }
+        Ok(results)
+    }
+
+    /// Validates the structural invariants of a named secondary index.
+    pub fn validate_index(&mut self, index_name: &str) -> Result<()> {
+        self.ensure_active()?;
+        let idx_meta =
+            crate::engine::catalog::Catalog::get_index(&mut self.db.buffer_pool, index_name)?
+                .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+        let sec_tree = crate::index::secondary::SecondaryIndex::from_root(idx_meta.root_page_id);
+        sec_tree.validate_tree(&mut self.db.buffer_pool, idx_meta.unique)
     }
 
     /// Constructs a programmatic query against a named table within this transaction.

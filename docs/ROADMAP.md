@@ -282,12 +282,28 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 17: Secondary Indexes & Index-Only Scans (Future)
-* [ ] Secondary B+ Tree index metadata tracking in persistent catalog
-* [ ] Transactional secondary index maintenance on `insert`, `update`, and `delete`
-* [ ] Secondary index point lookups and range scans
-* [ ] Index-only scan query optimization
-* [ ] Aggregation functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) and `GROUP BY`
+## Phase 17: Persistent Secondary Indexes (Completed)
+* [x] Monotonic, stable, persistent `IndexId`s independent from `TableId`
+* [x] Persistent catalog extension with `IndexMetadata` and backward-compatible page header serialization
+* [x] Canonical order-preserving index key encoding (`IndexKey`) supporting `Null`, `Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`
+* [x] Composite entry representation `(IndexKey, RecordId)` for non-unique secondary indexes with deterministic traversal
+* [x] Unique secondary index constraints (`DuplicateIndexKey`) and transactional rollback on duplicate rejection
+* [x] Programmatic APIs: `txn.create_index(...)`, `txn.drop_index(...)`, `txn.index_lookup(...)`, `txn.index_scan(...)`
+* [x] Automatic secondary index maintenance on `Table::insert`, `Table::update`, `Table::delete`
+* [x] Cascading table drop reclaiming all secondary index pages into the freelist
+* [x] Structural catalog and index tree validators (`validate_catalog`, `validate_index`, `validate_indexes`)
+* [x] Query engine integration: automatic secondary index selection on equality and range predicates
+* [x] Transaction, WAL/ARIES crash recovery, and checkpoint/WAL truncation integration
+* [x] 16 dedicated secondary index tests including randomized reference model oracle (308 total test suite)
+
+---
+
+## Phase 18: Aggregations, GROUP BY & Advanced SQL (Future)
+* [ ] Aggregation functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`)
+* [ ] `GROUP BY` and `HAVING` clause execution
+* [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
+* [ ] Index-only covering scans
+* [ ] Multi-column composite secondary indexes
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
 
 
