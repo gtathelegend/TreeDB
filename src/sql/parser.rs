@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral,
-    SqlUnaryOp, TableRef,
+    JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp,
+    SqlExpr, SqlLiteral, SqlUnaryOp, TableRef,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};
@@ -64,7 +64,72 @@ impl<'a> Parser<'a> {
 
         let from = self.parse_table_ref()?;
 
-        // 3. Optional WHERE clause
+        // 3. Optional JOIN clauses
+        let mut joins = Vec::new();
+        loop {
+            let next_token = self.peek();
+            let join_type = match next_token.kind {
+                TokenKind::Inner => {
+                    self.advance(); // consume INNER
+                    let join_token = self.peek();
+                    if join_token.kind != TokenKind::Join {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected JOIN after INNER, found {}",
+                                join_token.kind
+                            ),
+                            start: join_token.span.start,
+                            end: join_token.span.end,
+                        });
+                    }
+                    self.advance(); // consume JOIN
+                    JoinType::Inner
+                }
+                TokenKind::Join => {
+                    self.advance(); // consume JOIN
+                    JoinType::Inner
+                }
+                TokenKind::Left => {
+                    self.advance(); // consume LEFT
+                    if self.peek().kind == TokenKind::Outer {
+                        self.advance(); // consume OUTER
+                    }
+                    let join_token = self.peek();
+                    if join_token.kind != TokenKind::Join {
+                        return Err(Error::SqlParseError {
+                            message: format!("expected JOIN after LEFT, found {}", join_token.kind),
+                            start: join_token.span.start,
+                            end: join_token.span.end,
+                        });
+                    }
+                    self.advance(); // consume JOIN
+                    JoinType::Left
+                }
+                _ => break,
+            };
+
+            let table = self.parse_table_ref()?;
+            let on_token = self.peek();
+            if on_token.kind != TokenKind::On {
+                return Err(Error::SqlParseError {
+                    message: format!(
+                        "expected ON after table in JOIN clause, found {}",
+                        on_token.kind
+                    ),
+                    start: on_token.span.start,
+                    end: on_token.span.end,
+                });
+            }
+            self.advance(); // consume ON
+            let on = self.parse_expr()?;
+            joins.push(JoinClause {
+                join_type,
+                table,
+                on,
+            });
+        }
+
+        // 4. Optional WHERE clause
         let selection = if self.peek().kind == TokenKind::Where {
             self.advance(); // consume WHERE
             Some(self.parse_expr()?)
@@ -72,7 +137,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // 4. Optional GROUP BY clause
+        // 5. Optional GROUP BY clause
         let group_by = if self.peek().kind == TokenKind::Group {
             self.advance(); // consume GROUP
             let by_token = self.peek();
@@ -89,7 +154,7 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
 
-        // 5. Optional HAVING clause
+        // 6. Optional HAVING clause
         let having = if self.peek().kind == TokenKind::Having {
             self.advance(); // consume HAVING
             Some(self.parse_expr()?)
@@ -97,7 +162,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // 6. Optional ORDER BY clause
+        // 7. Optional ORDER BY clause
         let order_by = if self.peek().kind == TokenKind::Order {
             self.advance(); // consume ORDER
             let by_token = self.peek();
@@ -114,7 +179,7 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
 
-        // 7. Optional LIMIT clause
+        // 8. Optional LIMIT clause
         let limit = if self.peek().kind == TokenKind::Limit {
             self.advance(); // consume LIMIT
             Some(self.parse_non_negative_integer("LIMIT")?)
@@ -122,7 +187,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // 8. Optional OFFSET clause
+        // 9. Optional OFFSET clause
         let offset = if self.peek().kind == TokenKind::Offset {
             self.advance(); // consume OFFSET
             Some(self.parse_non_negative_integer("OFFSET")?)
@@ -130,12 +195,12 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // 9. Optional trailing semicolon
+        // 10. Optional trailing semicolon
         if self.peek().kind == TokenKind::Semicolon {
             self.advance();
         }
 
-        // 10. Enforce EOF (no unexpected trailing tokens)
+        // 11. Enforce EOF (no unexpected trailing tokens)
         if self.peek().kind != TokenKind::Eof {
             let trailing = self.peek();
             return Err(Error::SqlParseError {
@@ -151,6 +216,7 @@ impl<'a> Parser<'a> {
         Ok(SelectStatement {
             projection,
             from,
+            joins,
             selection,
             group_by,
             having,

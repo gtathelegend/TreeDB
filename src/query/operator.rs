@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use crate::engine::types::{Column, DataType, Row, Schema, Value};
 use crate::error::{Error, Result};
 use crate::query::expr::{AggregateExpr, AggregateFunction, Expr};
+use crate::sql::ast::JoinType;
 
 /// Result set returned by the execution of a query pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -192,6 +193,71 @@ impl FilterOperator {
             }
         }
         Ok(matched)
+    }
+}
+
+/// Relational join operator executing nested-loop joins over row streams.
+pub struct JoinOperator;
+
+impl JoinOperator {
+    /// Executes a nested-loop join between `left_rows` and `right_rows` using `join_type` and `on_predicate`.
+    ///
+    /// Returns the combined intermediate `Schema` and the resulting joined `Vec<Row>`.
+    pub fn apply(
+        left_rows: Vec<Row>,
+        left_schema: &Schema,
+        right_rows: &[Row],
+        right_schema: &Schema,
+        join_type: JoinType,
+        on_predicate: &Expr,
+    ) -> Result<(Schema, Vec<Row>)> {
+        let mut combined_columns =
+            Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
+
+        for col in &left_schema.columns {
+            combined_columns.push(col.clone());
+        }
+
+        for col in &right_schema.columns {
+            let mut col_copy = col.clone();
+            if join_type == JoinType::Left {
+                col_copy.nullable = true;
+            }
+            combined_columns.push(col_copy);
+        }
+
+        let joined_schema = Schema::new_projected(combined_columns);
+        let mut out_rows = Vec::new();
+
+        for left_row in left_rows {
+            let mut matched = false;
+
+            for right_row in right_rows {
+                let mut combined_values =
+                    Vec::with_capacity(left_row.values.len() + right_row.values.len());
+                combined_values.extend_from_slice(&left_row.values);
+                combined_values.extend_from_slice(&right_row.values);
+                let joined_row = Row::new(combined_values);
+
+                let on_val = on_predicate.evaluate(&joined_row, &joined_schema)?;
+                if on_val == Value::Boolean(true) {
+                    matched = true;
+                    out_rows.push(joined_row);
+                }
+            }
+
+            if join_type == JoinType::Left && !matched {
+                let mut combined_values =
+                    Vec::with_capacity(left_row.values.len() + right_schema.columns.len());
+                combined_values.extend_from_slice(&left_row.values);
+                for _ in 0..right_schema.columns.len() {
+                    combined_values.push(Value::Null);
+                }
+                out_rows.push(Row::new(combined_values));
+            }
+        }
+
+        Ok((joined_schema, out_rows))
     }
 }
 

@@ -6,10 +6,12 @@ pub mod span;
 pub mod token;
 
 pub use ast::{
-    AggregateFunction, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp,
-    SqlExpr, SqlLiteral, SqlUnaryOp, TableRef,
+    AggregateFunction, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem,
+    SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, TableRef,
 };
-pub use binder::{bind_expr, bind_select, BindingContext, BoundSelect};
+pub use binder::{
+    bind_expr, bind_select, bind_select_multi, BindingContext, BoundJoin, BoundSelect, TableBinding,
+};
 pub use lexer::{Lexer, MAX_IDENTIFIER_LEN};
 pub use parser::Parser;
 pub use span::SourceSpan;

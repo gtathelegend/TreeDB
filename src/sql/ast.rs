@@ -7,6 +7,8 @@ pub struct SelectStatement {
     pub projection: Vec<SelectItem>,
     /// Target table reference in the `FROM` clause.
     pub from: TableRef,
+    /// Joined table clauses in order of declaration.
+    pub joins: Vec<JoinClause>,
     /// Optional boolean filtering predicate in the `WHERE` clause.
     pub selection: Option<SqlExpr>,
     /// Optional list of grouping expressions in the `GROUP BY` clause.
@@ -83,6 +85,41 @@ impl fmt::Display for TableRef {
             Some(alias) => write!(f, "{} AS {}", self.name, alias),
             None => write!(f, "{}", self.name),
         }
+    }
+}
+
+/// Type of relational JOIN operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JoinType {
+    /// INNER JOIN: Only pairs of rows satisfying the join predicate are emitted.
+    Inner,
+    /// LEFT OUTER JOIN: All left-side rows are emitted, with NULL-padded right side when no match.
+    Left,
+}
+
+impl fmt::Display for JoinType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JoinType::Inner => write!(f, "INNER JOIN"),
+            JoinType::Left => write!(f, "LEFT JOIN"),
+        }
+    }
+}
+
+/// A single `JOIN` clause in a `SELECT` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    /// Relational join strategy (Inner or Left).
+    pub join_type: JoinType,
+    /// Right-hand table reference being joined.
+    pub table: TableRef,
+    /// Join condition boolean predicate (`ON <expr>`).
+    pub on: SqlExpr,
+}
+
+impl fmt::Display for JoinClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} ON {}", self.join_type, self.table, self.on)
     }
 }
 

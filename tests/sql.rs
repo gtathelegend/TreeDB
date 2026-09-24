@@ -669,3 +669,63 @@ fn test_parser_invalid_aggregate_and_group_by_syntax() {
         );
     }
 }
+
+#[test]
+fn test_parser_joins_and_case_insensitivity() {
+    let sql = "SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id LEFT OUTER JOIN products AS p ON o.prod_id = p.id WHERE u.active = true;";
+    let ast = parse_sql(sql).unwrap();
+
+    assert_eq!(ast.from.name, "users");
+    assert_eq!(ast.from.alias, Some("u".to_string()));
+    assert_eq!(ast.joins.len(), 2);
+
+    assert_eq!(ast.joins[0].join_type, treedb::sql::JoinType::Inner);
+    assert_eq!(ast.joins[0].table.name, "orders");
+    assert_eq!(ast.joins[0].table.alias, Some("o".to_string()));
+    assert_eq!(
+        ast.joins[0].on,
+        SqlExpr::Binary {
+            left: Box::new(SqlExpr::QualifiedIdentifier {
+                qualifier: "u".to_string(),
+                name: "id".to_string(),
+            }),
+            op: SqlBinaryOp::Eq,
+            right: Box::new(SqlExpr::QualifiedIdentifier {
+                qualifier: "o".to_string(),
+                name: "user_id".to_string(),
+            }),
+        }
+    );
+
+    assert_eq!(ast.joins[1].join_type, treedb::sql::JoinType::Left);
+    assert_eq!(ast.joins[1].table.name, "products");
+    assert_eq!(ast.joins[1].table.alias, Some("p".to_string()));
+
+    // Case insensitivity: 'join', 'left join', 'inner join'
+    let sql2 = "SELECT * FROM a join b on a.id = b.a_id left join c on b.id = c.b_id;";
+    let ast2 = parse_sql(sql2).unwrap();
+    assert_eq!(ast2.joins.len(), 2);
+    assert_eq!(ast2.joins[0].join_type, treedb::sql::JoinType::Inner);
+    assert_eq!(ast2.joins[1].join_type, treedb::sql::JoinType::Left);
+}
+
+#[test]
+fn test_parser_invalid_join_syntax() {
+    let invalid = [
+        "SELECT * FROM users JOIN;",                             // Missing table
+        "SELECT * FROM users JOIN orders;",                      // Missing ON
+        "SELECT * FROM users JOIN orders ON;",                   // Missing ON expr
+        "SELECT * FROM users INNER orders ON u.id = o.id;",      // Missing JOIN after INNER
+        "SELECT * FROM users LEFT orders ON u.id = o.id;",       // Missing JOIN after LEFT
+        "SELECT * FROM users LEFT OUTER orders ON u.id = o.id;", // Missing JOIN after LEFT OUTER
+        "SELECT * FROM users WHERE active = true JOIN orders ON u.id = o.id;", // JOIN after WHERE
+    ];
+
+    for &sql in &invalid {
+        let result = parse_sql(sql);
+        assert!(
+            result.is_err(),
+            "Expected parse error for query: '{sql}', but succeeded: {result:?}"
+        );
+    }
+}

@@ -1,50 +1,178 @@
-use crate::engine::types::{DataType, Schema, Value};
+use crate::engine::types::{Column, DataType, Schema, Value};
 use crate::error::{Error, Result};
 use crate::query::expr::{AggregateExpr, AggregateFunction, BinaryOp, Expr, UnaryOp};
 use crate::query::operator::{SortDirection, SortKey};
 use crate::sql::ast::{
-    OrderDirection, SelectItem, SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp,
+    JoinType, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral,
+    SqlUnaryOp,
 };
 
-/// Semantic binding context holding the target table schema and name/alias mappings.
+/// Represents an individual table in scope for SQL semantic binding.
 #[derive(Debug, Clone)]
-pub struct BindingContext<'a> {
-    /// Canonical table name from the `FROM` clause.
-    pub table_name: &'a str,
-    /// Optional table alias from the `FROM` clause (`FROM table AS alias`).
-    pub table_alias: Option<&'a str>,
-    /// Logical schema of the referenced table.
+pub struct TableBinding<'a> {
+    /// Canonical table name.
+    pub name: &'a str,
+    /// Optional alias specified in FROM/JOIN (`AS alias` or `alias`).
+    pub alias: Option<&'a str>,
+    /// Table schema.
     pub schema: &'a Schema,
 }
 
-impl<'a> BindingContext<'a> {
-    /// Creates a new `BindingContext`.
-    pub fn new(table_name: &'a str, table_alias: Option<&'a str>, schema: &'a Schema) -> Self {
+impl<'a> TableBinding<'a> {
+    /// Creates a new `TableBinding`.
+    pub fn new(name: &'a str, alias: Option<&'a str>, schema: &'a Schema) -> Self {
         Self {
-            table_name,
-            table_alias,
+            name,
+            alias,
             schema,
         }
     }
 
-    /// Verifies if a given table or alias qualifier is valid in this binding context.
-    pub fn validate_qualifier(&self, qualifier: &str) -> Result<()> {
-        if self.table_name == qualifier || self.table_alias == Some(qualifier) {
-            Ok(())
+    /// Returns the primary qualifier for this table (alias if present, otherwise table name).
+    pub fn qualifier(&self) -> &'a str {
+        self.alias.unwrap_or(self.name)
+    }
+}
+
+/// Semantic binding context holding the target tables in scope and combined schema information.
+#[derive(Debug, Clone)]
+pub struct BindingContext<'a> {
+    /// All tables in FROM and JOIN clauses in order of declaration.
+    pub tables: Vec<TableBinding<'a>>,
+    /// Combined/intermediate schema representing all visible columns.
+    pub combined_schema: Schema,
+}
+
+impl<'a> BindingContext<'a> {
+    /// Creates a new `BindingContext` for a list of table bindings.
+    pub fn new(tables: Vec<TableBinding<'a>>) -> Self {
+        let combined_schema = if tables.len() == 1 {
+            tables[0].schema.clone()
         } else {
-            Err(Error::SqlBindingError(format!(
-                "table or alias '{qualifier}' not found in FROM clause (expected '{}')",
-                self.table_alias.unwrap_or(self.table_name)
-            )))
+            let mut cols = Vec::new();
+            for tbl in &tables {
+                let q = tbl.qualifier();
+                for col in &tbl.schema.columns {
+                    cols.push(Column::new(
+                        format!("{q}.{}", col.name),
+                        col.data_type,
+                        col.nullable,
+                    ));
+                }
+            }
+            Schema::new_projected(cols)
+        };
+        Self {
+            tables,
+            combined_schema,
         }
     }
+
+    /// Creates a single-table `BindingContext`.
+    pub fn new_single(
+        table_name: &'a str,
+        table_alias: Option<&'a str>,
+        schema: &'a Schema,
+    ) -> Self {
+        Self::new(vec![TableBinding::new(table_name, table_alias, schema)])
+    }
+
+    /// Primary table name (first table in FROM).
+    pub fn table_name(&self) -> &str {
+        self.tables.first().map(|t| t.name).unwrap_or("")
+    }
+
+    /// Primary table alias.
+    pub fn table_alias(&self) -> Option<&str> {
+        self.tables.first().and_then(|t| t.alias)
+    }
+
+    /// Combined schema.
+    pub fn schema(&self) -> &Schema {
+        &self.combined_schema
+    }
+
+    /// Resolves an unqualified column identifier across visible tables.
+    pub fn resolve_column(&self, col_name: &str) -> Result<Expr> {
+        let mut matches = Vec::new();
+        for tbl in &self.tables {
+            if tbl.schema.get_column(col_name).is_some() {
+                matches.push(tbl);
+            }
+        }
+        if matches.is_empty() {
+            return Err(Error::ColumnNotFound(col_name.to_string()));
+        }
+        if matches.len() > 1 {
+            return Err(Error::AmbiguousColumn(col_name.to_string()));
+        }
+        if self.tables.len() == 1 {
+            Ok(Expr::Column(col_name.to_string()))
+        } else {
+            let q = matches[0].qualifier();
+            Ok(Expr::Column(format!("{q}.{col_name}")))
+        }
+    }
+
+    /// Resolves a qualified column identifier (`qualifier.col_name`).
+    pub fn resolve_qualified_column(&self, qualifier: &str, col_name: &str) -> Result<Expr> {
+        let mut matching_tables = Vec::new();
+        for tbl in &self.tables {
+            if tbl.alias == Some(qualifier) || (tbl.alias.is_none() && tbl.name == qualifier) {
+                matching_tables.push(tbl);
+            }
+        }
+        if matching_tables.is_empty() {
+            return Err(Error::UnknownTableAlias(qualifier.to_string()));
+        }
+        if matching_tables.len() > 1 {
+            return Err(Error::AmbiguousColumn(format!("{qualifier}.{col_name}")));
+        }
+        let tbl = matching_tables[0];
+        if tbl.schema.get_column(col_name).is_none() {
+            return Err(Error::ColumnNotFound(format!("{qualifier}.{col_name}")));
+        }
+        if self.tables.len() == 1 {
+            Ok(Expr::Column(col_name.to_string()))
+        } else {
+            let q = tbl.qualifier();
+            Ok(Expr::Column(format!("{q}.{col_name}")))
+        }
+    }
+
+    /// Verifies if a given table or alias qualifier is valid in this binding context.
+    pub fn validate_qualifier(&self, qualifier: &str) -> Result<&TableBinding<'a>> {
+        for tbl in &self.tables {
+            if tbl.alias == Some(qualifier) || (tbl.alias.is_none() && tbl.name == qualifier) {
+                return Ok(tbl);
+            }
+        }
+        Err(Error::UnknownTableAlias(qualifier.to_string()))
+    }
+}
+
+/// A fully validated, bound JOIN clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundJoin {
+    /// Relational join strategy.
+    pub join_type: JoinType,
+    /// Right-hand table name being joined.
+    pub table_name: String,
+    /// Optional right-hand table alias.
+    pub table_alias: Option<String>,
+    /// Bound join condition boolean predicate.
+    pub on: Expr,
 }
 
 /// A fully validated, bound SQL query ready for execution against TreeDB's query engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundSelect {
-    /// Target table name to query.
+    /// Target base table name to query (FROM).
     pub table_name: String,
+    /// Optional base table alias.
+    pub table_alias: Option<String>,
+    /// Bound JOIN clauses in order of evaluation.
+    pub joins: Vec<BoundJoin>,
     /// Output projection expressions with optional output column aliases.
     pub projections: Vec<(Expr, Option<String>)>,
     /// Optional boolean filtering predicate expression (WHERE).
@@ -109,7 +237,7 @@ fn collect_aggregates(
                 func,
                 expr: bound_arg,
             };
-            let _ = agg.infer_type(ctx.schema)?;
+            let _ = agg.infer_type(&ctx.combined_schema)?;
             if !aggs.contains(&agg) {
                 aggs.push(agg);
             }
@@ -129,19 +257,46 @@ fn collect_aggregates(
     }
 }
 
-/// Binds a parsed `SelectStatement` AST against a table's `Schema`.
-///
-/// Performs name resolution for columns, expands wildcards (`*`, `table.*`),
-/// validates qualifiers and aliases, validates grouping and aggregate semantics,
-/// performs static type inference, and translates AST expressions into executable `Expr`s.
+/// Binds a parsed `SelectStatement` AST against a single table's `Schema`.
 pub fn bind_select(statement: &SelectStatement, schema: &Schema) -> Result<BoundSelect> {
-    let ctx = BindingContext::new(
+    let binding = TableBinding::new(
         &statement.from.name,
         statement.from.alias.as_deref(),
         schema,
     );
+    bind_select_multi(statement, &[binding])
+}
 
-    // 1. Bind WHERE filtering predicate
+/// Binds a parsed `SelectStatement` AST against multiple tables' schemas (supporting `FROM` and `JOIN`s).
+pub fn bind_select_multi<'a>(
+    statement: &SelectStatement,
+    tables: &[TableBinding<'a>],
+) -> Result<BoundSelect> {
+    let ctx = BindingContext::new(tables.to_vec());
+    let schema = &ctx.combined_schema;
+
+    // 1. Bind JOIN clauses
+    let mut bound_joins = Vec::with_capacity(statement.joins.len());
+    for join_clause in &statement.joins {
+        if contains_aggregate(&join_clause.on) {
+            return Err(Error::AggregateInWhere);
+        }
+        let bound_on = bind_expr(&join_clause.on, &ctx)?;
+        let dt = bound_on.infer_type(schema)?;
+        if dt != DataType::Boolean && dt != DataType::Null {
+            return Err(Error::InvalidBooleanExpression {
+                found: dt.to_string(),
+            });
+        }
+        bound_joins.push(BoundJoin {
+            join_type: join_clause.join_type,
+            table_name: join_clause.table.name.clone(),
+            table_alias: join_clause.table.alias.clone(),
+            on: bound_on,
+        });
+    }
+
+    // 2. Bind WHERE filtering predicate
     let filter = if let Some(selection) = &statement.selection {
         if contains_aggregate(selection) {
             return Err(Error::AggregateInWhere);
@@ -158,7 +313,7 @@ pub fn bind_select(statement: &SelectStatement, schema: &Schema) -> Result<Bound
         None
     };
 
-    // 2. Determine whether query is an aggregate / grouped query
+    // 3. Determine whether query is an aggregate / grouped query
     let has_group_by = !statement.group_by.is_empty();
     let has_having = statement.having.is_some();
     let has_proj_agg = statement.projection.iter().any(|item| match item {
@@ -180,20 +335,50 @@ pub fn bind_select(statement: &SelectStatement, schema: &Schema) -> Result<Bound
         for item in &statement.projection {
             match item {
                 SelectItem::Wildcard => {
-                    for col in &schema.columns {
-                        projections.push((Expr::Column(col.name.clone()), None));
+                    if tables.len() == 1 {
+                        for col in &tables[0].schema.columns {
+                            projections
+                                .push((Expr::Column(col.name.clone()), Some(col.name.clone())));
+                        }
+                    } else {
+                        for tbl in tables {
+                            let q = tbl.qualifier();
+                            for col in &tbl.schema.columns {
+                                projections.push((
+                                    Expr::Column(format!("{q}.{}", col.name)),
+                                    Some(col.name.clone()),
+                                ));
+                            }
+                        }
                     }
                 }
                 SelectItem::QualifiedWildcard(qualifier) => {
-                    ctx.validate_qualifier(qualifier)?;
-                    for col in &schema.columns {
-                        projections.push((Expr::Column(col.name.clone()), None));
+                    let tbl = ctx.validate_qualifier(qualifier)?;
+                    let q = tbl.qualifier();
+                    if tables.len() == 1 {
+                        for col in &tbl.schema.columns {
+                            projections
+                                .push((Expr::Column(col.name.clone()), Some(col.name.clone())));
+                        }
+                    } else {
+                        for col in &tbl.schema.columns {
+                            projections.push((
+                                Expr::Column(format!("{q}.{}", col.name)),
+                                Some(col.name.clone()),
+                            ));
+                        }
                     }
                 }
                 SelectItem::Expression { expr, alias } => {
                     let bound = bind_expr(expr, &ctx)?;
                     let _ = bound.infer_type(schema)?;
-                    projections.push((bound, alias.clone()));
+                    let default_alias = match expr {
+                        SqlExpr::Identifier(ident) => Some(ident.clone()),
+                        SqlExpr::QualifiedIdentifier { name, .. } => Some(name.clone()),
+                        _ => None,
+                    };
+                    let final_alias = alias.clone().or(default_alias);
+                    projections.push((bound, final_alias));
                 }
             }
         }
@@ -230,6 +415,8 @@ pub fn bind_select(statement: &SelectStatement, schema: &Schema) -> Result<Bound
 
         return Ok(BoundSelect {
             table_name: statement.from.name.clone(),
+            table_alias: statement.from.alias.clone(),
+            joins: bound_joins,
             projections,
             filter,
             group_by: Vec::new(),
@@ -241,72 +428,90 @@ pub fn bind_select(statement: &SelectStatement, schema: &Schema) -> Result<Bound
         });
     }
 
-    // 3. Aggregate / Grouped query path
+    // Grouped / Aggregate query path
     let mut bound_group_by = Vec::with_capacity(statement.group_by.len());
-    for grp_expr in &statement.group_by {
-        if contains_aggregate(grp_expr) {
-            return Err(Error::InvalidGroupByExpression(format!(
-                "aggregate functions are not allowed in GROUP BY: {grp_expr}"
-            )));
+    for gb_expr in &statement.group_by {
+        if contains_aggregate(gb_expr) {
+            return Err(Error::InvalidGroupByExpression(
+                "GROUP BY cannot contain aggregate functions".to_string(),
+            ));
         }
-        let bound = bind_expr(grp_expr, &ctx)?;
-        bound.infer_type(schema)?;
+        let bound = bind_expr(gb_expr, &ctx)?;
+        let _ = bound.infer_type(schema)?;
         bound_group_by.push(bound);
     }
 
-    // Collect all aggregate expressions from SELECT, HAVING, and ORDER BY
     let mut aggregates = Vec::new();
     for item in &statement.projection {
         if let SelectItem::Expression { expr, .. } = item {
             collect_aggregates(expr, &ctx, &mut aggregates)?;
         }
     }
-    if let Some(having) = &statement.having {
-        collect_aggregates(having, &ctx, &mut aggregates)?;
+    if let Some(having_expr) = &statement.having {
+        collect_aggregates(having_expr, &ctx, &mut aggregates)?;
     }
     for order_item in &statement.order_by {
         collect_aggregates(&order_item.expr, &ctx, &mut aggregates)?;
     }
 
-    // Construct intermediate grouped schema for validation
-    let mut grouped_cols = Vec::new();
-    for (idx, grp) in bound_group_by.iter().enumerate() {
-        let dt = grp.infer_type(schema)?;
-        let name = match grp {
-            Expr::Column(c) => c.clone(),
-            _ => format!("_group_{idx}"),
+    // Build intermediate schema for grouped results
+    let mut grouped_columns = Vec::new();
+    for expr in &bound_group_by {
+        let dt = expr.infer_type(schema)?;
+        let col_name = match expr {
+            Expr::Column(name) => name.clone(),
+            _ => format!("{expr}"),
         };
-        grouped_cols.push(crate::engine::types::Column::new(name, dt, true));
+        grouped_columns.push(Column::new(col_name, dt, true));
     }
     for agg in &aggregates {
         let dt = agg.infer_type(schema)?;
-        grouped_cols.push(crate::engine::types::Column::new(
-            agg.display_name(),
-            dt,
-            true,
-        ));
+        grouped_columns.push(Column::new(agg.display_name(), dt, true));
     }
-    let grouped_schema = Schema::new_projected(grouped_cols);
+    let grouped_schema = Schema::new_projected(grouped_columns);
 
-    // Bind and validate SELECT projections
     let mut projections = Vec::new();
     for item in &statement.projection {
         match item {
             SelectItem::Wildcard => {
-                for col in &schema.columns {
-                    if !bound_group_by.contains(&Expr::Column(col.name.clone())) {
-                        return Err(Error::UngroupedColumn(col.name.clone()));
+                if tables.len() == 1 {
+                    for col in &tables[0].schema.columns {
+                        if !bound_group_by.contains(&Expr::Column(col.name.clone())) {
+                            return Err(Error::UngroupedColumn(col.name.clone()));
+                        }
+                        projections.push((Expr::Column(col.name.clone()), Some(col.name.clone())));
                     }
-                    projections.push((Expr::Column(col.name.clone()), None));
+                } else {
+                    for tbl in tables {
+                        let q = tbl.qualifier();
+                        for col in &tbl.schema.columns {
+                            let qual_col = format!("{q}.{}", col.name);
+                            if !bound_group_by.contains(&Expr::Column(qual_col.clone())) {
+                                return Err(Error::UngroupedColumn(qual_col));
+                            }
+                            projections.push((Expr::Column(qual_col), Some(col.name.clone())));
+                        }
+                    }
                 }
             }
             SelectItem::QualifiedWildcard(qualifier) => {
-                ctx.validate_qualifier(qualifier)?;
-                for col in &schema.columns {
-                    if !bound_group_by.contains(&Expr::Column(col.name.clone())) {
-                        return Err(Error::UngroupedColumn(col.name.clone()));
+                let tbl = ctx.validate_qualifier(qualifier)?;
+                let q = tbl.qualifier();
+                if tables.len() == 1 {
+                    for col in &tbl.schema.columns {
+                        if !bound_group_by.contains(&Expr::Column(col.name.clone())) {
+                            return Err(Error::UngroupedColumn(col.name.clone()));
+                        }
+                        projections.push((Expr::Column(col.name.clone()), Some(col.name.clone())));
                     }
-                    projections.push((Expr::Column(col.name.clone()), None));
+                } else {
+                    for col in &tbl.schema.columns {
+                        let qual_col = format!("{q}.{}", col.name);
+                        if !bound_group_by.contains(&Expr::Column(qual_col.clone())) {
+                            return Err(Error::UngroupedColumn(qual_col));
+                        }
+                        projections.push((Expr::Column(qual_col), Some(col.name.clone())));
+                    }
                 }
             }
             SelectItem::Expression { expr, alias } => {
@@ -315,6 +520,8 @@ pub fn bind_select(statement: &SelectStatement, schema: &Schema) -> Result<Bound
                 let default_alias = match expr {
                     SqlExpr::CountAll => Some("COUNT(*)".to_string()),
                     SqlExpr::Aggregate { function, arg } => Some(format!("{function}({arg})")),
+                    SqlExpr::Identifier(ident) => Some(ident.clone()),
+                    SqlExpr::QualifiedIdentifier { name, .. } => Some(name.clone()),
                     _ => None,
                 };
                 let final_alias = alias.clone().or(default_alias);
@@ -375,6 +582,8 @@ pub fn bind_select(statement: &SelectStatement, schema: &Schema) -> Result<Bound
 
     Ok(BoundSelect {
         table_name: statement.from.name.clone(),
+        table_alias: statement.from.alias.clone(),
+        joins: bound_joins,
         projections,
         filter,
         group_by: bound_group_by,
@@ -422,20 +631,21 @@ pub fn bind_grouped_expr(
         SqlExpr::Identifier(col_name) => {
             if group_by.contains(&Expr::Column(col_name.clone())) {
                 Ok(Expr::Column(col_name.clone()))
-            } else if ctx.schema.get_column(col_name).is_some() {
-                Err(Error::UngroupedColumn(col_name.clone()))
             } else {
-                Err(Error::ColumnNotFound(col_name.clone()))
+                let resolved = ctx.resolve_column(col_name)?;
+                if group_by.contains(&resolved) {
+                    Ok(resolved)
+                } else {
+                    Err(Error::UngroupedColumn(col_name.clone()))
+                }
             }
         }
         SqlExpr::QualifiedIdentifier { qualifier, name } => {
-            ctx.validate_qualifier(qualifier)?;
-            if group_by.contains(&Expr::Column(name.clone())) {
-                Ok(Expr::Column(name.clone()))
-            } else if ctx.schema.get_column(name).is_some() {
-                Err(Error::UngroupedColumn(name.clone()))
+            let resolved = ctx.resolve_qualified_column(qualifier, name)?;
+            if group_by.contains(&resolved) || group_by.contains(&Expr::Column(name.clone())) {
+                Ok(resolved)
             } else {
-                Err(Error::ColumnNotFound(name.clone()))
+                Err(Error::UngroupedColumn(format!("{qualifier}.{name}")))
             }
         }
         SqlExpr::Unary { op, expr } => match op {
@@ -521,20 +731,9 @@ pub fn bind_expr(expr: &SqlExpr, ctx: &BindingContext<'_>) -> Result<Expr> {
             SqlLiteral::Float(f) => Ok(Expr::Literal(Value::Float64(*f))),
             SqlLiteral::String(s) => Ok(Expr::Literal(Value::String(s.clone()))),
         },
-        SqlExpr::Identifier(col_name) => {
-            if ctx.schema.get_column(col_name).is_some() {
-                Ok(Expr::Column(col_name.clone()))
-            } else {
-                Err(Error::ColumnNotFound(col_name.clone()))
-            }
-        }
+        SqlExpr::Identifier(col_name) => ctx.resolve_column(col_name),
         SqlExpr::QualifiedIdentifier { qualifier, name } => {
-            ctx.validate_qualifier(qualifier)?;
-            if ctx.schema.get_column(name).is_some() {
-                Ok(Expr::Column(name.clone()))
-            } else {
-                Err(Error::ColumnNotFound(name.clone()))
-            }
+            ctx.resolve_qualified_column(qualifier, name)
         }
         SqlExpr::Unary { op, expr } => match op {
             SqlUnaryOp::Not => {
@@ -553,8 +752,8 @@ pub fn bind_expr(expr: &SqlExpr, ctx: &BindingContext<'_>) -> Result<Expr> {
             let mut right_bound = bind_expr(right, ctx)?;
 
             // Contextual literal type coercion (e.g. integer literal 42 compared to UInt64 or Float64 column)
-            if let Ok(left_type) = left_bound.infer_type(ctx.schema) {
-                if let Ok(right_type) = right_bound.infer_type(ctx.schema) {
+            if let Ok(left_type) = left_bound.infer_type(&ctx.combined_schema) {
+                if let Ok(right_type) = right_bound.infer_type(&ctx.combined_schema) {
                     if left_type == DataType::UInt64 && right_type == DataType::Int64 {
                         if let Expr::Literal(Value::Int64(i)) = right_bound {
                             if i >= 0 {

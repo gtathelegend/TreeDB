@@ -303,4 +303,12 @@ pub enum Error {
     /// Invalid GROUP BY expression.
     #[error("Invalid GROUP BY expression: {0}")]
     InvalidGroupByExpression(String),
+
+    /// Unqualified column reference is ambiguous across multiple joined tables.
+    #[error("Column '{0}' is ambiguous")]
+    AmbiguousColumn(String),
+
+    /// Referenced table name or alias was not found in FROM or JOIN clauses.
+    #[error("Table or alias '{0}' not found")]
+    UnknownTableAlias(String),
 }

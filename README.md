@@ -62,6 +62,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **SQL Binding & Execution Engine** | **Implemented** | Semantic analysis, table/column name resolution, wildcard expansion, type checking, transaction-aware query execution |
 | **Persistent Secondary Indexes** | **Implemented** | Monotonic `IndexId`s, `IndexMetadata`, canonical order-preserving index key encoding, unique/non-unique composite keys, auto-maintenance on table mutations, query index access paths, catalog validation |
 | **Aggregation, GROUP BY & HAVING** | **Implemented** | `COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX`, single/multi-key `GROUP BY`, `HAVING` filter, deterministic `CanonicalValue` grouping, incremental accumulators, semantic validation |
+| **Relational JOINs** | **Implemented** | `INNER JOIN`, `LEFT JOIN` / `LEFT OUTER JOIN`, multi-table chained joins, table aliases, qualified/unqualified column ambiguity resolution, 3VL `ON` predicates, NULL padding, full query composition with WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET |
 
 
 ---

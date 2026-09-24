@@ -378,7 +378,39 @@ This document records key architectural and design choices, their rationale, and
   5. **Global Implicit Grouping vs Grouped Execution:** Queries with aggregates but no `GROUP BY` produce exactly one row for all inputs (including empty input sets, returning e.g. `COUNT(*) = 0`, `SUM = NULL`). Grouped queries over empty input sets produce zero rows.
 * **Rationale:**
   * **Strict Separation of Storage & Query:** Storage remains focused on rows, indexes, persistence, transactions, and recovery. Aggregation is purely execution-time state.
-  * **Zero Duplicate Query Execution:** SQL queries compile down directly to `Query<'a>`, ensuring 100% equivalence between SQL aggregation and programmatic API aggregation.
+---
+
+## Decision 34: Relational JOINs & Execution Engine
+
+* **Decision:** Implement `INNER JOIN`, `LEFT JOIN` / `LEFT OUTER JOIN`, table aliases, and multi-table chained joins as a clean query-layer pipeline extension:
+  1. **Explicit AST Representation (`JoinClause`, `JoinType`):** Joins are modeled explicitly in the AST without lowering to WHERE filters:
+     ```rust
+     pub enum JoinType { Inner, Left }
+     pub struct JoinClause {
+         pub join_type: JoinType,
+         pub table: TableRef,
+         pub on: SqlExpr,
+     }
+     ```
+  2. **Multi-Table Semantic Binding & Qualification (`BindingContext`, `TableBinding`):**
+     * Columns can be referenced unqualified (`id`) or qualified by table name or alias (`users.id`, `u.id`).
+     * Unqualified lookups search across all participating tables. Exactly one match resolves successfully; multiple matches raise structured `Error::AmbiguousColumn(name)`; zero matches raise `Error::ColumnNotFound(name)`.
+     * References to unknown table aliases raise `Error::UnknownTableAlias(alias)`.
+     * Intermediate column names in joined schemas are normalized to `"{qualifier}.{column_name}"`, ensuring unique provenance throughout subsequent `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, and `SELECT` projections.
+  3. **SQL 3-Valued Logic in `ON` Predicates:**
+     * `ON` expressions evaluate under SQL 3VL where only `Value::Boolean(true)` is treated as a match. `Value::Boolean(false)` and `Value::Null` are non-matches.
+     * `NULL = NULL` evaluates to `NULL` (falsy in join conditions), ensuring NULL foreign keys never join erroneously.
+  4. **LEFT JOIN NULL-Padding & COUNT Semantics:**
+     * Unmatched left-side rows are padded with `Value::Null` for all columns of the right-side schema.
+     * Aggregation over left-joined tables strictly respects SQL semantics: `COUNT(*)` counts the row (evaluating to 1 for an unmatched left row), while `COUNT(right.col)` ignores NULL and evaluates to 0.
+  5. **Nested-Loop Execution & Composable Operators:**
+     * Execution uses `JoinOperator::apply` evaluating joins left-to-right deterministically.
+     * Intermediate table results are materialized sequentially in `Transaction::execute_sql` before joining, respecting the buffer pool single-mutable-borrow rule without leaking pins.
+  6. **Complete Pipeline Ordering:**
+     $$\text{FROM} \rightarrow \text{JOIN(s)} \rightarrow \text{WHERE} \rightarrow \text{GROUP BY} \rightarrow \text{Aggregation} \rightarrow \text{HAVING} \rightarrow \text{Projection} \rightarrow \text{ORDER BY} \rightarrow \text{OFFSET/LIMIT}$$
+* **Rationale:**
+  * **Storage Independence:** JOIN execution operates purely on row streams in the query layer, leaving the underlying B+ Tree, slotted page record store, WAL, and crash recovery layers untouched.
+  * **Future Extensibility:** The nested-loop operator interface is designed to permit pluggable hash joins, merge joins, or indexed nested loop joins in future phases without altering SQL binding or AST definitions.
 
 
 

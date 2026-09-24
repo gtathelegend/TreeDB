@@ -330,36 +330,190 @@ impl<'db> Transaction<'db> {
     pub fn execute_sql(&mut self, sql: &str) -> Result<crate::query::QueryResult> {
         self.ensure_active()?;
         let ast = crate::sql::parse(sql)?;
-        let table = self.open_table(&ast.from.name)?;
-        let bound = crate::sql::bind_select(&ast, table.schema())?;
+        let mut table = self.open_table(&ast.from.name)?;
 
-        let mut query = crate::query::Query::new(table);
-        if let Some(filter) = bound.filter {
-            query = query.filter(filter);
-        }
-        if !bound.group_by.is_empty() {
-            query = query.group_by(bound.group_by);
-        }
-        if !bound.aggregates.is_empty() {
-            query = query.aggregate(bound.aggregates);
-        }
-        if let Some(having) = bound.having {
-            query = query.having(having);
-        }
-        if !bound.projections.is_empty() {
-            query = query.project_with_aliases(bound.projections);
-        }
-        if !bound.order_by.is_empty() {
-            query = query.sort(bound.order_by);
-        }
-        if let Some(offset) = bound.offset {
-            query = query.offset(offset);
-        }
-        if let Some(limit) = bound.limit {
-            query = query.limit(limit);
-        }
+        if ast.joins.is_empty() {
+            let bound = crate::sql::bind_select(&ast, table.schema())?;
 
-        query.execute()
+            let mut query = crate::query::Query::new(table);
+            if let Some(filter) = bound.filter {
+                query = query.filter(filter);
+            }
+            if !bound.group_by.is_empty() {
+                query = query.group_by(bound.group_by);
+            }
+            if !bound.aggregates.is_empty() {
+                query = query.aggregate(bound.aggregates);
+            }
+            if let Some(having) = bound.having {
+                query = query.having(having);
+            }
+            if !bound.projections.is_empty() {
+                query = query.project_with_aliases(bound.projections);
+            }
+            if !bound.order_by.is_empty() {
+                query = query.sort(bound.order_by);
+            }
+            if let Some(offset) = bound.offset {
+                query = query.offset(offset);
+            }
+            if let Some(limit) = bound.limit {
+                query = query.limit(limit);
+            }
+
+            query.execute()
+        } else {
+            // Multi-table JOIN query execution
+            let (from_schema, mut current_rows) = {
+                let schema = table.schema().clone();
+                let rows = table.scan(None, None)?;
+                (schema, rows)
+            };
+
+            let mut joined_info = Vec::new();
+            for j in &ast.joins {
+                let mut t = self.open_table(&j.table.name)?;
+                let schema = t.schema().clone();
+                let rows = t.scan(None, None)?;
+                joined_info.push((j, schema, rows));
+            }
+
+            let mut bindings = Vec::new();
+            bindings.push(crate::sql::TableBinding::new(
+                &ast.from.name,
+                ast.from.alias.as_deref(),
+                &from_schema,
+            ));
+            for (j, schema, _) in &joined_info {
+                bindings.push(crate::sql::TableBinding::new(
+                    &j.table.name,
+                    j.table.alias.as_deref(),
+                    schema,
+                ));
+            }
+
+            let bound = crate::sql::bind_select_multi(&ast, &bindings)?;
+
+            // 1. Qualified schema for left-most table
+            let mut current_schema = {
+                let q = bindings[0].qualifier();
+                let cols: Vec<crate::engine::types::Column> = bindings[0]
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        crate::engine::types::Column::new(
+                            format!("{q}.{}", c.name),
+                            c.data_type,
+                            c.nullable,
+                        )
+                    })
+                    .collect();
+                crate::engine::types::Schema::new_projected(cols)
+            };
+
+            // 2. Perform chained joins left-to-right
+            for (join_idx, (j, right_schema_raw, right_rows)) in joined_info.iter().enumerate() {
+                let right_schema = {
+                    let q = bindings[join_idx + 1].qualifier();
+                    let cols: Vec<crate::engine::types::Column> = right_schema_raw
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            crate::engine::types::Column::new(
+                                format!("{q}.{}", c.name),
+                                c.data_type,
+                                c.nullable,
+                            )
+                        })
+                        .collect();
+                    crate::engine::types::Schema::new_projected(cols)
+                };
+
+                let (next_schema, next_rows) = crate::query::JoinOperator::apply(
+                    current_rows,
+                    &current_schema,
+                    right_rows,
+                    &right_schema,
+                    j.join_type,
+                    &bound.joins[join_idx].on,
+                )?;
+                current_schema = next_schema;
+                current_rows = next_rows;
+            }
+
+            // 3. Filter Operator (WHERE)
+            let filtered_rows = match &bound.filter {
+                Some(predicate) => {
+                    crate::query::FilterOperator::apply(current_rows, &current_schema, predicate)?
+                }
+                None => current_rows,
+            };
+
+            // 4. Aggregation & HAVING or standard Sort & Project
+            let is_aggregate = !bound.group_by.is_empty() || !bound.aggregates.is_empty();
+            if is_aggregate {
+                let (grouped_schema, grouped_rows) = crate::query::AggregateOperator::apply(
+                    filtered_rows,
+                    &current_schema,
+                    &bound.group_by,
+                    &bound.aggregates,
+                )?;
+
+                let having_rows = match &bound.having {
+                    Some(predicate) => crate::query::FilterOperator::apply(
+                        grouped_rows,
+                        &grouped_schema,
+                        predicate,
+                    )?,
+                    None => grouped_rows,
+                };
+
+                let sorted_rows = crate::query::SortOperator::apply(
+                    having_rows,
+                    &grouped_schema,
+                    &bound.order_by,
+                )?;
+
+                let (projected_schema, projected_rows) =
+                    crate::query::ProjectOperator::apply_named(
+                        sorted_rows,
+                        &grouped_schema,
+                        &bound.projections,
+                    )?;
+                let paginated_rows = crate::query::OffsetLimitOperator::apply(
+                    projected_rows,
+                    bound.offset,
+                    bound.limit,
+                );
+                Ok(crate::query::QueryResult::new(
+                    projected_schema,
+                    paginated_rows,
+                ))
+            } else {
+                let sorted_rows = crate::query::SortOperator::apply(
+                    filtered_rows,
+                    &current_schema,
+                    &bound.order_by,
+                )?;
+
+                let (projected_schema, projected_rows) =
+                    crate::query::ProjectOperator::apply_named(
+                        sorted_rows,
+                        &current_schema,
+                        &bound.projections,
+                    )?;
+                let paginated_rows = crate::query::OffsetLimitOperator::apply(
+                    projected_rows,
+                    bound.offset,
+                    bound.limit,
+                );
+                Ok(crate::query::QueryResult::new(
+                    projected_schema,
+                    paginated_rows,
+                ))
+            }
+        }
     }
 
     /// Drops a table from the catalog and reclaims its pages within this transaction.

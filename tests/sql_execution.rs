@@ -171,11 +171,15 @@ fn test_sql_qualified_identifiers_and_wildcards() {
         .unwrap();
     assert_eq!(res3.len(), 2);
 
-    // Mismatched qualifier produces SqlBindingError
+    // Mismatched qualifier produces UnknownTableAlias
     let err = db.execute_sql("SELECT x.name FROM users u").unwrap_err();
     match err {
+        Error::UnknownTableAlias(alias) => assert_eq!(alias, "x"),
         Error::SqlBindingError(msg) => assert!(msg.contains("'x' not found")),
-        other => panic!("expected SqlBindingError, found {:?}", other),
+        other => panic!(
+            "expected UnknownTableAlias or SqlBindingError, found {:?}",
+            other
+        ),
     }
 }
 

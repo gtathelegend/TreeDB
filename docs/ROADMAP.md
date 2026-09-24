@@ -314,12 +314,29 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 19: Joins & Advanced Query Processing (Future)
-* [ ] Inner join execution (`NestedLoopJoin`, `HashJoin`)
-* [ ] Multi-table `FROM` clause parsing and binding
+## Phase 19: Relational JOINs (Completed)
+* [x] SQL Lexer and Parser support for `INNER JOIN`, `JOIN`, `LEFT JOIN`, `LEFT OUTER JOIN`
+* [x] Explicit AST representation: `JoinType` (`Inner`, `Left`), `JoinClause`, table aliases (`FROM table AS alias`, `FROM table alias`), and chained join clauses
+* [x] Multi-table semantic binding (`BindingContext`, `TableBinding`) with qualified (`table.col`, `alias.col`) and unqualified column resolution
+* [x] Structured ambiguity detection (`Error::AmbiguousColumn`) and unknown alias error reporting (`Error::UnknownTableAlias`)
+* [x] Wildcard expansion for full joins (`*`) in deterministic left-to-right table order and qualified wildcards (`alias.*`)
+* [x] Composable query execution operator: `JoinOperator::apply` implementing nested-loop join strategy with SQL 3-valued logic (3VL) `ON` predicate evaluation
+* [x] LEFT JOIN NULL-padding across all right-side relation columns on unmatched left rows
+* [x] SQL 3VL `NULL` key semantics: `NULL = NULL` does not match in standard equality joins
+* [x] Strict pipeline composition: `FROM -> JOIN(s) -> WHERE -> GROUP BY -> Aggregation -> HAVING -> Projection -> ORDER BY -> OFFSET/LIMIT`
+* [x] Aggregation integration: proper handling of `COUNT(*)` (counting NULL-padded rows) vs `COUNT(right.col)` (evaluating to 0 on NULLs)
+* [x] Transaction visibility, read-your-writes, rollback on abort, and durability across crash recovery
+* [x] 11 dedicated integration tests in `tests/join.rs` and 2 dedicated parser tests in `tests/sql.rs` including randomized reference oracle (338 total test suite)
+
+---
+
+## Phase 20: Advanced Query Processing & DDL (Future)
+* [ ] Hash join and merge join execution operators
 * [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
+* [ ] Subqueries and Common Table Expressions (CTEs)
+* [ ] Cost-based join optimization and cardinality estimation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
 
 

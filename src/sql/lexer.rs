@@ -297,6 +297,11 @@ impl<'a> Lexer<'a> {
             "AS" => TokenKind::As,
             "GROUP" => TokenKind::Group,
             "HAVING" => TokenKind::Having,
+            "JOIN" => TokenKind::Join,
+            "INNER" => TokenKind::Inner,
+            "LEFT" => TokenKind::Left,
+            "OUTER" => TokenKind::Outer,
+            "ON" => TokenKind::On,
             _ => TokenKind::Ident(ident_str.to_string()),
         };
 

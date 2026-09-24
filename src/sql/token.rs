@@ -25,6 +25,11 @@ pub enum TokenKind {
     As,
     Group,
     Having,
+    Join,
+    Inner,
+    Left,
+    Outer,
+    On,
 
     // Identifiers & Literals
     Ident(String),
@@ -76,6 +81,11 @@ impl fmt::Display for TokenKind {
             TokenKind::As => write!(f, "AS"),
             TokenKind::Group => write!(f, "GROUP"),
             TokenKind::Having => write!(f, "HAVING"),
+            TokenKind::Join => write!(f, "JOIN"),
+            TokenKind::Inner => write!(f, "INNER"),
+            TokenKind::Left => write!(f, "LEFT"),
+            TokenKind::Outer => write!(f, "OUTER"),
+            TokenKind::On => write!(f, "ON"),
             TokenKind::Ident(s) => write!(f, "identifier '{s}'"),
             TokenKind::Integer(i) => write!(f, "integer '{i}'"),
             TokenKind::Float(v) => write!(f, "float '{v}'"),

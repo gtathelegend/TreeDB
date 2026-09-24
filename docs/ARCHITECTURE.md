@@ -80,7 +80,8 @@ v                                                             v
 ### `Parser` & Pratt Expression Parser (`src/sql/parser.rs`)
 * **Role:** Recursive descent parser and Pratt precedence climbing expression parser for the scoped SQL `SELECT` dialect.
 * **Responsibilities:**
-  * **Clause Grammar:** Enforces strict clause order: `SELECT [wildcard | expressions [AS alias]] FROM table [WHERE expr] [GROUP BY expr, ...] [HAVING expr] [ORDER BY expr [ASC | DESC], ...] [LIMIT n] [OFFSET n];`.
+  * **Clause Grammar:** Enforces strict clause order: `SELECT [wildcard | expressions [AS alias]] FROM table [AS alias] [JOIN table [AS alias] ON expr]* [WHERE expr] [GROUP BY expr, ...] [HAVING expr] [ORDER BY expr [ASC | DESC], ...] [LIMIT n] [OFFSET n];`.
+  * **Join Syntax:** Supports `INNER JOIN`, shorthand `JOIN`, `LEFT JOIN`, and `LEFT OUTER JOIN` with table aliases and boolean `ON` expressions. Preserves source join order.
   * **Aggregate Expressions:** Case-insensitive parsing for `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)`. Rejects nested aggregates (e.g. `SUM(COUNT(*))`), empty aggregate calls, and wildcard arguments for non-COUNT functions (`SUM(*)`).
   * **Precedence Hierarchy:**
     1. Parenthesized expressions `(expr)`
@@ -93,15 +94,16 @@ v                                                             v
     8. Logical `OR`
   * **Standalone Boundary:** Operates completely decoupled from runtime storage, schemas, or buffer pools via `treedb::sql::parse(sql)`.
 
-### `BindingContext`, `BoundSelect` & SQL Binder (`src/sql/binder.rs`)
-* **Role:** Semantic analysis and translation layer bridging SQL ASTs with Phase 14/18 query execution structures.
+### `BindingContext`, `BoundSelect`, `TableBinding` & SQL Binder (`src/sql/binder.rs`)
+* **Role:** Semantic analysis and translation layer bridging SQL ASTs with Phase 14/18/19 query execution structures.
 * **Responsibilities:**
-  * **Name Resolution:** Resolves table names against the catalog and columns (both unqualified `name` and qualified `table.name`/`alias.name`) against table schemas.
-  * **Wildcard Expansion:** Expands unqualified `*` and qualified `alias.*` to all columns from the target `Schema` (validating grouping invariants if `GROUP BY` is present).
+  * **Multi-Table Name Resolution:** Resolves table names against the catalog and columns (both unqualified `col` and qualified `table.col`/`alias.col`) across all joined relations via `BindingContext`.
+  * **Ambiguity & Alias Checking:** Rejects ambiguous unqualified column references appearing in multiple tables (`Error::AmbiguousColumn`) and unknown table qualifiers (`Error::UnknownTableAlias`).
+  * **Intermediate Join Schemas:** Normalizes column identifiers in intermediate joined schemas to `"{qualifier}.{col_name}"` to preserve provenance throughout filtering, grouping, aggregation, projection, and sorting.
+  * **Wildcard Expansion:** Expands full `*` across all joined tables in left-to-right relation order, or qualified `alias.*` to all columns from that specific table schema.
   * **Semantic Grouping Validation:** Enforces SQL grouping rules: rejects aggregates in `WHERE`, validates that every expression in `SELECT`, `HAVING`, and `ORDER BY` is either present in `GROUP BY` or derived entirely from aggregate functions.
   * **Literal Coercion:** Coerces numeric literals when compared to typed columns or aggregate outputs (e.g. integer literal `42` in `COUNT(*) >= 1` coerced to `Value::UInt64`).
-  * **Expression Type Inference:** Verifies data types statically on projections, filters, aggregates, HAVING, and sort keys before query execution.
-  * **Zero Execution Duplication:** Translates `SelectStatement` directly into `BoundSelect` and Phase 14/18 `Expr`s/`AggregateExpr`s, delegating physical execution entirely to `Query<'a>`.
+  * **Expression Type Inference:** Verifies data types statically on ON predicates, projections, filters, aggregates, HAVING, and sort keys before query execution.
 
 ---
 
@@ -123,13 +125,14 @@ v                                                             v
 * **Role:** Composable relational query pipeline and programmatic query builder executing over `Table<'a>` and `Transaction<'db>`.
 * **Responsibilities:**
   * **Pipeline Architecture:**
-    1. **Scan / Index Access:** Evaluates primary-key point lookup / range scan or secondary index lookups/scans; otherwise executes a full scan.
-    2. **Filter (`FilterOperator`):** Evaluates `WHERE` predicate expressions, retaining matching rows (`Value::Boolean(true)`).
-    3. **GROUP BY & Aggregation (`AggregateOperator`):** Computes group keys for input rows and updates incremental `AggregateState`s per group. Produces 1 row per group (or exactly 1 row for global non-grouped aggregation).
-    4. **HAVING Filter (`FilterOperator`):** Evaluates `HAVING` predicates over the aggregated/grouped intermediate schema.
-    5. **Projection (`ProjectOperator`):** Evaluates projection expressions, generating projected `Schema` definitions and derived output `Row`s.
-    6. **Sort (`SortOperator`):** Multi-key stable sorting with configurable NULL placement and deterministic `f64::total_cmp` float ordering.
-    7. **Pagination (`OffsetLimitOperator`):** In-memory offset skipping and limit truncation.
+    1. **Scan / Index Access:** Evaluates primary-key point lookup / range scan or secondary index lookups/scans; otherwise executes full table scans for each participating relation.
+    2. **Join (`JoinOperator`):** Evaluates nested-loop joins for `INNER JOIN` and `LEFT JOIN` / `LEFT OUTER JOIN` left-to-right. Left join pads unmatched left rows with `Value::Null` for all right-relation columns. `ON` predicates evaluate under SQL 3VL where only `Value::Boolean(true)` is a match.
+    3. **Filter (`FilterOperator`):** Evaluates `WHERE` predicate expressions over joined rows, retaining matching rows (`Value::Boolean(true)`).
+    4. **GROUP BY & Aggregation (`AggregateOperator`):** Computes group keys for input rows and updates incremental `AggregateState`s per group. Produces 1 row per group (or exactly 1 row for global non-grouped aggregation). Respects `COUNT(*)` (counting rows) vs `COUNT(right.col)` (ignoring NULLs).
+    5. **HAVING Filter (`FilterOperator`):** Evaluates `HAVING` predicates over the aggregated/grouped intermediate schema.
+    6. **Projection (`ProjectOperator`):** Evaluates projection expressions, generating projected `Schema` definitions and derived output `Row`s.
+    7. **Sort (`SortOperator`):** Multi-key stable sorting with configurable NULL placement and deterministic `f64::total_cmp` float ordering.
+    8. **Pagination (`OffsetLimitOperator`):** In-memory offset skipping and limit truncation.
   * **Programmatic API:** Fluent builder via `TreeDb::query(name)` and `Transaction::query(name)` supporting `.filter()`, `.group_by()`, `.aggregate()`, `.having()`, `.project()`, `.sort_by()`, `.sort()`, `.offset()`, `.limit()`, and `.execute()`.
 
 
