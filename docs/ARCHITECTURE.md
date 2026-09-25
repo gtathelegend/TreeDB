@@ -333,6 +333,13 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Uncorrelated Subqueries:** Pre-evaluated once per statement execution and materialized (`MaterializedSubqueryResult`) prior to scanning outer rows.
   * **Correlated Subqueries:** Executed per outer row with an execution context stack (`outer_contexts: &[(&Row, &Schema)]`) preserving complete outer row state across arbitrary nesting depths.
   * **3-Valued Logic (3VL):** Comprehensive 3VL support for `IN`, `NOT IN`, scalar comparisons, and `EXISTS` predicates.
+* **Common Table Expressions (CTEs):**
+  * **AST & Grammar:** `WithClause` containing sequentially defined `Cte` nodes with optional explicit column lists (`WITH cte(col1, col2) AS (SELECT ...)`).
+  * **Scope & Visibility:** Strict left-to-right sequential visibility; later CTEs can reference earlier CTEs. Forward references and self-references are rejected.
+  * **Table Shadowing:** CTEs take precedence over physical tables of the same name in the main query scope without shadowing within the CTE body itself.
+  * **Dependency DAG & Acyclicity:** Tracks dependencies across base tables, joins, and nested subqueries; 3-color DFS detector enforces acyclicity (`Error::CyclicCteDependency`).
+  * **Materialization & Non-Persistence:** Statement-local in-memory relation storage (`cte_store`) evaluated on query invocation; zero page allocations, zero catalog modifications, zero freelist changes, and zero WAL records for read queries.
+  * **Engine Integration:** Full composition with `INNER JOIN`, `LEFT JOIN`, `GROUP BY`, `HAVING`, scalar/IN/EXISTS subqueries, correlated subqueries, and deterministic `explain_sql` formatting.
 
 ---
 
@@ -347,6 +354,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **Engine Atomicity Boundary:** `TreeDb::put` and `TreeDb::delete` operations wrap both RecordStore heap modifications (inline and overflow) and B+ Tree index mutations in a single transaction (`TxnId`). If an uncommitted operation crashes, both index and record mutations are undone atomically.
 * **Secondary Index Invariant:** Every committed table row must have exactly the corresponding secondary-index entries required by its indexed columns, and every secondary-index entry must resolve to a valid current `RecordId`.
 * **Subquery Cardinality Invariant:** Scalar subqueries must return $\le 1$ row (0 rows -> `NULL`, 1 row -> value, $>1$ rows -> `Error::ScalarSubqueryMultipleRows`) and exactly 1 column.
+* **CTE Non-Persistence Invariant:** Executing CTE queries never modifies persistent database pages, freelist state, catalog metadata, or WAL logs.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -361,8 +369,9 @@ The following capabilities are intentionally deferred to subsequent phases:
 * Index-only covering scans.
 * Full cost-based optimizer and cardinality statistics.
 * DDL statements (`CREATE INDEX`, `DROP INDEX`) in SQL grammar.
-* Common Table Expressions (CTEs) and derived tables (`FROM (SELECT ...)`).
+* Recursive CTEs (`WITH RECURSIVE`) and derived tables (`FROM (SELECT ...)`).
 * Subquery flattening and cost-based decorrelation.
 * Multi-threading, concurrency control, and MVCC.
+
 
 

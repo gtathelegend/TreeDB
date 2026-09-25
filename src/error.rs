@@ -324,4 +324,28 @@ pub enum Error {
     /// Referenced table name or alias was not found in FROM or JOIN clauses.
     #[error("Table or alias '{0}' not found")]
     UnknownTableAlias(String),
+
+    /// Duplicate CTE name declared in a single WITH clause.
+    #[error("Duplicate CTE name '{0}'")]
+    DuplicateCteName(String),
+
+    /// CTE explicit column count does not match query output column count.
+    #[error("CTE '{cte}' column count mismatch: expected {expected}, found {found}")]
+    CteColumnCountMismatch {
+        cte: String,
+        expected: usize,
+        found: usize,
+    },
+
+    /// Duplicate column name in explicit CTE column list.
+    #[error("Duplicate column name '{column}' in CTE '{cte}' explicit column list")]
+    DuplicateCteColumnName { cte: String, column: String },
+
+    /// Cyclic CTE dependency detected.
+    #[error("Cyclic CTE dependency detected: {0}")]
+    CyclicCteDependency(String),
+
+    /// Unsupported SQL statement or clause.
+    #[error("Unsupported statement: {0}")]
+    UnsupportedStatement(String),
 }

@@ -495,6 +495,39 @@ This document records key architectural and design choices, their rationale, and
   * **Unified Execution:** Reusing `PhysicalPlan` and `Optimizer` for subqueries avoids redundant execution engines while preserving full access-path optimization inside inner queries.
   * **Decoupled Future Decorrelation:** Preserving explicit `SubqueryExpr` and `OuterColumn` representation allows future cost-based decorrelation or subquery flattening phases without modifying the binder or AST.
 
+---
+
+## Decision 38: Common Table Expressions (CTEs), Scope Rules, Dependency Analysis, and Statement-Local Materialization
+
+* **Decision:** Implement non-recursive SQL Common Table Expressions (`WITH cte_name AS (...) SELECT ...`) as first-class, statement-local logical relations fully integrated into TreeDB's existing Lexer, Parser, AST, Binder, Optimizer, and Transaction execution pipelines:
+  1. **AST Representation (`WithClause` & `Cte`):**
+     * `WithClause`: Encloses a sequential vector of `Cte` definitions (`ctes: Vec<Cte>`).
+     * `Cte`: Contains `name: String`, optional explicit column list `columns: Option<Vec<String>>`, and the parsed query AST `query: Box<SelectStatement>`.
+     * `SelectStatement`: Extended with `pub with: Option<WithClause>`.
+  2. **Binding Architecture & Visibility Rules:**
+     * **Sequential Left-to-Right Visibility:** A CTE is visible to subsequent sibling CTEs defined later in the same `WITH` clause and to the main query body. Forward references and self-references are rejected during binding.
+     * **Physical Table Shadowing:** When a CTE name matches a persistent physical table name in the catalog, the CTE shadows the physical table for the main query and subsequent CTEs. However, the CTE body itself evaluates against the catalog and any preceding CTEs, permitting CTEs to query a physical table with the same name without accidental self-recursion.
+     * **Subquery Scope Inheritance:** Subqueries within CTEs or within the main query inherit visible CTE relations via `TxnBufferPoolCatalog` and `BindingContext`.
+  3. **Schema Derivation & Explicit Column Lists:**
+     * If explicit column names are provided (`WITH u(uid, uname) AS (...)`), TreeDB validates that the number of explicit column names matches the projected column count (`Error::CteColumnCountMismatch`) and that no duplicate column names exist in the explicit column list (`Error::DuplicateCteColumnName`).
+     * If no explicit column list is provided, column names and aliases from the CTE `SELECT` query projection are preserved.
+  4. **Dependency Tracking & Cycle Detection:**
+     * During semantic planning, `collect_cte_dependencies` inspects table references in base tables, joins, and nested subquery filters/projections.
+     * `validate_cte_acyclicity` constructs an explicit dependency DAG across all bound CTEs (`BoundCte.dependencies`) and executes a 3-color DFS cycle detector, returning `Error::CyclicCteDependency` on any direct or indirect cycle.
+  5. **Independent Optimization & Access-Path Selection:**
+     * Each CTE query body is individually optimized using the Phase 20 rule-based optimizer (`Optimizer::optimize`), selecting optimal access paths (`PrimaryPointLookup`, `PrimaryRangeScan`, `SecondaryIndexScan`, `FullTableScan`).
+     * `explain_sql` formats CTE plans deterministically (`CTE <name>`, dependencies if any, indented sub-plan) alongside the `Main Query` plan.
+  6. **Statement-Local In-Memory Materialization Model:**
+     * CTEs are transient in-memory relations evaluated upon statement execution into a statement-scoped store (`HashMap<String, (Schema, Vec<Row>)>`).
+     * CTE evaluation does NOT allocate disk pages, modify the persistent catalog, alter the freelist, or write WAL records.
+     * CTEs execute within the active `Transaction` context, observing uncommitted in-flight mutations and respecting transaction rollback.
+  7. **Deferral of Recursive CTEs (`WITH RECURSIVE`):**
+     * Recursive CTE execution (`WITH RECURSIVE`) is deferred to a future dedicated phase. Recursive syntax without fixed-point iteration operators is rejected with structured errors rather than silently executing as non-recursive CTEs.
+* **Rationale:**
+  * **Zero Duplication:** Materializing statement-local relations in memory and reading from `cte_store` in `execute_physical_plan_internal` allows complete reuse of all downstream physical operators (`Filter`, `Project`, `Join`, `Aggregate`, `Sort`, `OffsetLimit`) without creating temporary persistent tables or a second query execution engine.
+  * **Guaranteed Engine Safety:** Strict cycle detection and non-persistence ensure that complex CTE queries never cause stack overflow, catalog pollution, or disk storage leaks.
+
+
 
 
 

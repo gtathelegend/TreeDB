@@ -43,6 +43,7 @@ pub enum TokenKind {
     Key,
     In,
     Exists,
+    With,
 
     // Data Type Keywords
     BooleanType,
@@ -120,6 +121,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Key => write!(f, "KEY"),
             TokenKind::In => write!(f, "IN"),
             TokenKind::Exists => write!(f, "EXISTS"),
+            TokenKind::With => write!(f, "WITH"),
             TokenKind::BooleanType => write!(f, "BOOLEAN"),
             TokenKind::BigIntType => write!(f, "BIGINT"),
             TokenKind::UBigIntType => write!(f, "UBIGINT"),

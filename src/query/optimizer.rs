@@ -121,6 +121,8 @@ pub struct PhysicalJoin {
 /// Complete physical execution plan produced by the rule-based optimizer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalPlan {
+    /// Statement-local CTE definitions.
+    pub ctes: Vec<crate::sql::binder::BoundCte>,
     /// Base relation scan node (FROM table).
     pub base_table: PhysicalTableScan,
     /// Physical joins in left-to-right evaluation order.
@@ -152,6 +154,25 @@ impl fmt::Display for PhysicalPlan {
             }
             Ok(())
         };
+
+        if !self.ctes.is_empty() {
+            for cte in &self.ctes {
+                write_indent(f, indent)?;
+                writeln!(f, "CTE {}", cte.name)?;
+                if !cte.dependencies.is_empty() {
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "depends on: [{}]", cte.dependencies.join(", "))?;
+                }
+                let plan_str = format!("{}", cte.plan);
+                for line in plan_str.lines() {
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "{line}")?;
+                }
+            }
+            write_indent(f, indent)?;
+            writeln!(f, "Main Query")?;
+            indent += 1;
+        }
 
         if self.limit.is_some() || self.offset.is_some() {
             write_indent(f, indent)?;
@@ -527,6 +548,7 @@ impl Optimizer {
         let post_join_filter = recombine_conjunction(post_join_conjuncts);
 
         Ok(PhysicalPlan {
+            ctes: bound.ctes.clone(),
             base_table: base_table_scan,
             joins: physical_joins,
             post_join_filter,

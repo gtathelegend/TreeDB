@@ -6,14 +6,15 @@ pub mod span;
 pub mod token;
 
 pub use ast::{
-    AggregateFunction, ColumnDef, CreateTableStatement, DeleteStatement, DropTableStatement,
+    AggregateFunction, ColumnDef, CreateTableStatement, Cte, DeleteStatement, DropTableStatement,
     InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem,
     SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
-    UpdateAssignment, UpdateStatement,
+    UpdateAssignment, UpdateStatement, WithClause,
 };
 pub use binder::{
     bind_expr, bind_grouped_expr, bind_select, bind_select_multi, bind_select_multi_with_catalog,
-    bind_select_with_context, BindingContext, BoundJoin, BoundSelect, TableBinding, TableCatalog,
+    bind_select_with_context, BindingContext, BoundCte, BoundJoin, BoundSelect, TableBinding,
+    TableCatalog,
 };
 pub use lexer::{Lexer, MAX_IDENTIFIER_LEN};
 pub use parser::Parser;

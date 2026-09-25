@@ -1149,3 +1149,62 @@ fn test_parser_invalid_subqueries() {
         );
     }
 }
+
+#[test]
+fn test_parser_with_ctes() {
+    // 1. Single CTE
+    let sql = "WITH active_users AS (SELECT * FROM users WHERE active = true) SELECT * FROM active_users;";
+    let stmt = parse_sql(sql).unwrap();
+    let with = stmt.with.expect("expected WITH clause");
+    assert_eq!(with.ctes.len(), 1);
+    assert_eq!(with.ctes[0].name, "active_users");
+    assert!(with.ctes[0].columns.is_none());
+    assert_eq!(with.ctes[0].query.from.name, "users");
+
+    // 2. Case-insensitivity for WITH / with / WiTh
+    let sql = "WiTh a AS (SELECT id FROM users) SeLeCt * FrOm a;";
+    let stmt = parse_sql(sql).unwrap();
+    assert_eq!(stmt.with.unwrap().ctes[0].name, "a");
+
+    // 3. Multiple CTEs
+    let sql = "WITH a AS (SELECT id FROM users), b AS (SELECT name FROM users) SELECT * FROM a JOIN b ON a.id = b.id;";
+    let stmt = parse_sql(sql).unwrap();
+    let with = stmt.with.expect("expected WITH clause");
+    assert_eq!(with.ctes.len(), 2);
+    assert_eq!(with.ctes[0].name, "a");
+    assert_eq!(with.ctes[1].name, "b");
+
+    // 4. Explicit column list
+    let sql = "WITH users_view(uid, uname) AS (SELECT id, name FROM users) SELECT uid, uname FROM users_view;";
+    let stmt = parse_sql(sql).unwrap();
+    let with = stmt.with.expect("expected WITH clause");
+    assert_eq!(
+        with.ctes[0].columns.as_ref().unwrap(),
+        &vec!["uid".to_string(), "uname".to_string()]
+    );
+}
+
+#[test]
+fn test_parser_invalid_with_ctes() {
+    let invalid = [
+        "WITH",
+        "WITH SELECT * FROM users;",
+        "WITH a AS (SELECT * FROM users)",
+        "WITH a AS () SELECT * FROM a;",
+        "WITH a AS (INSERT INTO users VALUES (1)) SELECT * FROM a;",
+        "WITH a AS (SELECT * FROM users), SELECT * FROM a;",
+        "WITH a AS (SELECT * FROM users), ;",
+        "WITH a (SELECT * FROM users) SELECT * FROM a;",
+        "WITH a AS SELECT * FROM users SELECT * FROM a;",
+        "WITH a(id,) AS (SELECT 1) SELECT * FROM a;",
+        "WITH a() AS (SELECT 1) SELECT * FROM a;",
+    ];
+
+    for &sql in &invalid {
+        let res = parse_sql(sql);
+        assert!(
+            res.is_err(),
+            "Expected parse error for '{sql}', but got {res:?}"
+        );
+    }
+}

@@ -6,10 +6,18 @@ use crate::wal::lsn::TxnId;
 
 struct TxnBufferPoolCatalog<'a, 'b> {
     bp: &'a std::cell::RefCell<&'b mut crate::storage::buffer_pool::BufferPool>,
+    ctes: Option<&'a [crate::sql::BoundCte]>,
 }
 
 impl<'a, 'b> crate::sql::TableCatalog for TxnBufferPoolCatalog<'a, 'b> {
     fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
+        if let Some(ctes) = self.ctes {
+            for cte in ctes {
+                if cte.name == table_name {
+                    return Ok(cte.output_schema.clone());
+                }
+            }
+        }
         let mut bp = self.bp.borrow_mut();
         let meta = crate::engine::catalog::Catalog::get_table(&mut bp, table_name)?
             .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
@@ -20,6 +28,13 @@ impl<'a, 'b> crate::sql::TableCatalog for TxnBufferPoolCatalog<'a, 'b> {
         &self,
         table_name: &str,
     ) -> Result<Vec<crate::engine::catalog::IndexMetadata>> {
+        if let Some(ctes) = self.ctes {
+            for cte in ctes {
+                if cte.name == table_name {
+                    return Ok(Vec::new());
+                }
+            }
+        }
         let mut bp = self.bp.borrow_mut();
         let meta = crate::engine::catalog::Catalog::get_table(&mut bp, table_name)?
             .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
@@ -410,17 +425,91 @@ impl<'db> Transaction<'db> {
         ast: &crate::sql::SelectStatement,
     ) -> Result<crate::query::optimizer::PhysicalPlan> {
         self.ensure_active()?;
+        self.plan_select_with_outer_ctes(ast, &[])
+    }
+
+    /// Plans a parsed `SelectStatement` AST with in-scope outer CTE definitions.
+    pub fn plan_select_with_outer_ctes(
+        &mut self,
+        ast: &crate::sql::SelectStatement,
+        outer_ctes: &[crate::sql::BoundCte],
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
+        self.ensure_active()?;
+        let mut visible_ctes: Vec<crate::sql::BoundCte> = outer_ctes.to_vec();
+
+        if let Some(with_clause) = &ast.with {
+            let mut declared_names = std::collections::HashSet::new();
+            for cte in &with_clause.ctes {
+                if !declared_names.insert(&cte.name) {
+                    return Err(Error::DuplicateCteName(cte.name.clone()));
+                }
+
+                // Bind and plan the CTE query using currently visible CTEs
+                let cte_plan = self.plan_select_with_outer_ctes(&cte.query, &visible_ctes)?;
+
+                // Derive the CTE output schema from cte_plan projections
+                let projected_schema = self.derive_cte_output_schema(&cte_plan, &visible_ctes)?;
+
+                // If explicit column list was provided, validate and rename columns
+                let final_schema = if let Some(cols) = &cte.columns {
+                    if cols.len() != projected_schema.columns.len() {
+                        return Err(Error::CteColumnCountMismatch {
+                            cte: cte.name.clone(),
+                            expected: cols.len(),
+                            found: projected_schema.columns.len(),
+                        });
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    let mut renamed_cols = Vec::with_capacity(cols.len());
+                    for (col_name, orig_col) in cols.iter().zip(projected_schema.columns.iter()) {
+                        if !seen.insert(col_name) {
+                            return Err(Error::DuplicateCteColumnName {
+                                cte: cte.name.clone(),
+                                column: col_name.clone(),
+                            });
+                        }
+                        renamed_cols.push(crate::engine::types::Column::new(
+                            col_name,
+                            orig_col.data_type,
+                            orig_col.nullable,
+                        ));
+                    }
+                    crate::engine::types::Schema::new_projected(renamed_cols)
+                } else {
+                    projected_schema
+                };
+
+                // Track dependencies
+                let mut dependencies = Vec::new();
+                collect_cte_dependencies(&cte_plan, &visible_ctes, &mut dependencies);
+
+                // Check for cyclic dependencies in visible_ctes + this CTE
+                let mut temp_ctes = visible_ctes.clone();
+                temp_ctes.push(crate::sql::BoundCte {
+                    name: cte.name.clone(),
+                    output_schema: final_schema.clone(),
+                    plan: cte_plan.clone(),
+                    dependencies: dependencies.clone(),
+                });
+                validate_cte_acyclicity(&temp_ctes)?;
+
+                visible_ctes.push(crate::sql::BoundCte {
+                    name: cte.name.clone(),
+                    output_schema: final_schema,
+                    plan: cte_plan,
+                    dependencies,
+                });
+            }
+        }
+
+        // Now plan the main query body with visible_ctes
         let mut table_infos = Vec::new();
         let mut bindings = Vec::new();
 
+        // 1. Resolve FROM table
         {
-            let base_table = self.open_table(&ast.from.name)?;
-            let schema = base_table.schema().clone();
-            let indexes = base_table
-                .indexes()
-                .iter()
-                .map(|(m, _)| m.clone())
-                .collect();
+            let (schema, indexes) =
+                self.resolve_table_for_planning(&ast.from.name, &visible_ctes)?;
             table_infos.push(crate::query::optimizer::TableOptInfo::new(
                 &ast.from.name,
                 ast.from.alias.as_deref(),
@@ -429,10 +518,10 @@ impl<'db> Transaction<'db> {
             ));
         }
 
+        // 2. Resolve JOIN tables
         for j in &ast.joins {
-            let t = self.open_table(&j.table.name)?;
-            let schema = t.schema().clone();
-            let indexes = t.indexes().iter().map(|(m, _)| m.clone()).collect();
+            let (schema, indexes) =
+                self.resolve_table_for_planning(&j.table.name, &visible_ctes)?;
             table_infos.push(crate::query::optimizer::TableOptInfo::new(
                 &j.table.name,
                 j.table.alias.as_deref(),
@@ -450,11 +539,260 @@ impl<'db> Transaction<'db> {
         }
 
         let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
-        let catalog = TxnBufferPoolCatalog { bp: &bp_cell };
-        let bound = crate::sql::bind_select_multi_with_catalog(ast, &bindings, Some(&catalog))?;
+        let catalog = TxnBufferPoolCatalog {
+            bp: &bp_cell,
+            ctes: Some(&visible_ctes),
+        };
+        let mut bound = crate::sql::bind_select_multi_with_catalog(ast, &bindings, Some(&catalog))?;
+        bound.ctes = visible_ctes;
         crate::query::optimizer::Optimizer::optimize(&bound, &table_infos)
     }
 
+    fn resolve_table_for_planning(
+        &mut self,
+        table_name: &str,
+        visible_ctes: &[crate::sql::BoundCte],
+    ) -> Result<(
+        crate::engine::types::Schema,
+        Vec<crate::engine::catalog::IndexMetadata>,
+    )> {
+        // CTEs shadow physical tables
+        for cte in visible_ctes {
+            if cte.name == table_name {
+                return Ok((cte.output_schema.clone(), Vec::new()));
+            }
+        }
+        let table = self.open_table(table_name)?;
+        let schema = table.schema().clone();
+        let indexes = table.indexes().iter().map(|(m, _)| m.clone()).collect();
+        Ok((schema, indexes))
+    }
+
+    fn derive_cte_output_schema(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+        visible_ctes: &[crate::sql::BoundCte],
+    ) -> Result<crate::engine::types::Schema> {
+        let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
+
+        let (base_schema, _) =
+            self.resolve_table_for_planning(&plan.base_table.table_name, visible_ctes)?;
+
+        let current_schema = if plan.joins.is_empty() {
+            base_schema
+        } else {
+            let mut cols = Vec::new();
+            let q = plan.base_table.qualifier();
+            for col in &base_schema.columns {
+                cols.push(crate::engine::types::Column::new(
+                    format!("{q}.{}", col.name),
+                    col.data_type,
+                    col.nullable,
+                ));
+            }
+            for join in &plan.joins {
+                let (right_schema, _) =
+                    self.resolve_table_for_planning(&join.right.table_name, visible_ctes)?;
+                let rq = join.right.qualifier();
+                for col in &right_schema.columns {
+                    let mut right_col = col.clone();
+                    if join.join_type == crate::sql::ast::JoinType::Left {
+                        right_col.nullable = true;
+                    }
+                    cols.push(crate::engine::types::Column::new(
+                        format!("{rq}.{}", right_col.name),
+                        right_col.data_type,
+                        right_col.nullable,
+                    ));
+                }
+            }
+            crate::engine::types::Schema::new_projected(cols)
+        };
+
+        let intermediate_schema = if is_aggregate {
+            let mut grouped_cols = Vec::new();
+            for gb in &plan.group_by {
+                let dt = gb.infer_type(&current_schema)?;
+                let name = match gb {
+                    crate::query::expr::Expr::Column(n) => n.clone(),
+                    _ => format!("{gb}"),
+                };
+                grouped_cols.push(crate::engine::types::Column::new(name, dt, true));
+            }
+            for agg in &plan.aggregates {
+                let dt = agg.infer_type(&current_schema)?;
+                grouped_cols.push(crate::engine::types::Column::new(
+                    agg.display_name(),
+                    dt,
+                    true,
+                ));
+            }
+            crate::engine::types::Schema::new_projected(grouped_cols)
+        } else {
+            current_schema
+        };
+
+        let mut out_cols = Vec::with_capacity(plan.projections.len());
+        for (idx, (expr, alias)) in plan.projections.iter().enumerate() {
+            let dt = expr.infer_type(&intermediate_schema)?;
+            let name = match alias {
+                Some(alias_name) => alias_name.clone(),
+                None => match expr {
+                    crate::query::expr::Expr::Column(col_name) => {
+                        if let Some(dot_idx) = col_name.find('.') {
+                            col_name[dot_idx + 1..].to_string()
+                        } else {
+                            col_name.clone()
+                        }
+                    }
+                    _ => format!("col_{idx}"),
+                },
+            };
+            let nullable = match expr {
+                crate::query::expr::Expr::Column(col_name) => intermediate_schema
+                    .get_column(col_name)
+                    .map(|c| c.nullable)
+                    .unwrap_or(true),
+                crate::query::expr::Expr::Literal(Value::Null) => true,
+                _ => true,
+            };
+            out_cols.push(crate::engine::types::Column::new(name, dt, nullable));
+        }
+
+        Ok(crate::engine::types::Schema::new_projected(out_cols))
+    }
+}
+
+fn collect_cte_dependencies(
+    plan: &crate::query::optimizer::PhysicalPlan,
+    visible_ctes: &[crate::sql::BoundCte],
+    deps: &mut Vec<String>,
+) {
+    let mut check_table = |t_name: &str| {
+        for v in visible_ctes {
+            if v.name == t_name && !deps.contains(&v.name) {
+                deps.push(v.name.clone());
+            }
+        }
+    };
+
+    check_table(&plan.base_table.table_name);
+    for j in &plan.joins {
+        check_table(&j.right.table_name);
+    }
+    if let Some(rf) = &plan.base_table.residual_filter {
+        collect_cte_deps_from_expr(rf, visible_ctes, deps);
+    }
+    for j in &plan.joins {
+        collect_cte_deps_from_expr(&j.on, visible_ctes, deps);
+        if let Some(rf) = &j.right.residual_filter {
+            collect_cte_deps_from_expr(rf, visible_ctes, deps);
+        }
+    }
+    if let Some(post) = &plan.post_join_filter {
+        collect_cte_deps_from_expr(post, visible_ctes, deps);
+    }
+    if let Some(h) = &plan.having {
+        collect_cte_deps_from_expr(h, visible_ctes, deps);
+    }
+    for (p, _) in &plan.projections {
+        collect_cte_deps_from_expr(p, visible_ctes, deps);
+    }
+    for o in &plan.order_by {
+        collect_cte_deps_from_expr(&o.expression, visible_ctes, deps);
+    }
+}
+
+fn collect_cte_deps_from_expr(
+    expr: &crate::query::expr::Expr,
+    visible_ctes: &[crate::sql::BoundCte],
+    deps: &mut Vec<String>,
+) {
+    match expr {
+        crate::query::expr::Expr::Subquery(sub) => {
+            collect_cte_dependencies(&sub.plan, visible_ctes, deps);
+        }
+        crate::query::expr::Expr::Binary { left, right, .. } => {
+            collect_cte_deps_from_expr(left, visible_ctes, deps);
+            collect_cte_deps_from_expr(right, visible_ctes, deps);
+        }
+        crate::query::expr::Expr::Unary { expr, .. }
+        | crate::query::expr::Expr::IsNull(expr)
+        | crate::query::expr::Expr::IsNotNull(expr) => {
+            collect_cte_deps_from_expr(expr, visible_ctes, deps);
+        }
+        crate::query::expr::Expr::InList { expr, list, .. } => {
+            collect_cte_deps_from_expr(expr, visible_ctes, deps);
+            for item in list {
+                collect_cte_deps_from_expr(item, visible_ctes, deps);
+            }
+        }
+        crate::query::expr::Expr::Literal(_)
+        | crate::query::expr::Expr::Column(_)
+        | crate::query::expr::Expr::OuterColumn { .. } => {}
+    }
+}
+
+fn validate_cte_acyclicity(ctes: &[crate::sql::BoundCte]) -> Result<()> {
+    let mut adj = std::collections::HashMap::new();
+    for cte in ctes {
+        adj.insert(cte.name.as_str(), &cte.dependencies);
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum VisitState {
+        Unvisited,
+        Visiting,
+        Visited,
+    }
+
+    let mut state = std::collections::HashMap::new();
+    for cte in ctes {
+        state.insert(cte.name.as_str(), VisitState::Unvisited);
+    }
+
+    fn dfs<'a>(
+        node: &'a str,
+        adj: &std::collections::HashMap<&'a str, &'a Vec<String>>,
+        state: &mut std::collections::HashMap<&'a str, VisitState>,
+        path: &mut Vec<&'a str>,
+    ) -> Result<()> {
+        state.insert(node, VisitState::Visiting);
+        path.push(node);
+
+        if let Some(neighbors) = adj.get(node) {
+            for neighbor in *neighbors {
+                let n_str = neighbor.as_str();
+                match state.get(n_str).copied().unwrap_or(VisitState::Unvisited) {
+                    VisitState::Visiting => {
+                        path.push(n_str);
+                        let cycle_repr = path.join(" -> ");
+                        return Err(Error::CyclicCteDependency(cycle_repr));
+                    }
+                    VisitState::Unvisited => {
+                        dfs(n_str, adj, state, path)?;
+                    }
+                    VisitState::Visited => {}
+                }
+            }
+        }
+
+        path.pop();
+        state.insert(node, VisitState::Visited);
+        Ok(())
+    }
+
+    let mut path = Vec::new();
+    for cte in ctes {
+        if state.get(cte.name.as_str()).copied() == Some(VisitState::Unvisited) {
+            dfs(cte.name.as_str(), &adj, &mut state, &mut path)?;
+        }
+    }
+
+    Ok(())
+}
+
+impl<'db> Transaction<'db> {
     /// Parses, binds, and produces an optimized physical execution plan (`PhysicalPlan`) for the given SQL query or DML filter.
     pub fn plan_sql(&mut self, sql: &str) -> Result<crate::query::optimizer::PhysicalPlan> {
         self.ensure_active()?;
@@ -463,6 +801,7 @@ impl<'db> Transaction<'db> {
             crate::sql::Statement::Select(select_stmt) => self.plan_select(&select_stmt),
             crate::sql::Statement::Update(update_stmt) => {
                 let select_ast = crate::sql::SelectStatement {
+                    with: None,
                     projection: vec![crate::sql::SelectItem::Wildcard],
                     from: crate::sql::TableRef::new(&update_stmt.table_name),
                     joins: Vec::new(),
@@ -477,6 +816,7 @@ impl<'db> Transaction<'db> {
             }
             crate::sql::Statement::Delete(delete_stmt) => {
                 let select_ast = crate::sql::SelectStatement {
+                    with: None,
                     projection: vec![crate::sql::SelectItem::Wildcard],
                     from: crate::sql::TableRef::new(&delete_stmt.table_name),
                     joins: Vec::new(),
@@ -748,6 +1088,7 @@ impl<'db> Transaction<'db> {
 
         // 2. Use optimizer to select access path and candidate rows
         let select_ast = crate::sql::SelectStatement {
+            with: None,
             projection: vec![crate::sql::SelectItem::Wildcard],
             from: crate::sql::TableRef::new(&stmt.table_name),
             joins: Vec::new(),
@@ -855,6 +1196,7 @@ impl<'db> Transaction<'db> {
 
         // 1. Use optimizer to select access path and candidate rows
         let select_ast = crate::sql::SelectStatement {
+            with: None,
             projection: vec![crate::sql::SelectItem::Wildcard],
             from: crate::sql::TableRef::new(&stmt.table_name),
             joins: Vec::new(),
@@ -932,74 +1274,69 @@ impl<'db> Transaction<'db> {
         plan: &crate::query::optimizer::PhysicalPlan,
         outer_contexts: &[(&Row, &Schema)],
     ) -> Result<crate::query::QueryResult> {
+        let mut cte_store = std::collections::HashMap::new();
+        self.execute_physical_plan_internal(plan, outer_contexts, &mut cte_store)
+    }
+
+    fn execute_physical_plan_internal(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
+    ) -> Result<crate::query::QueryResult> {
         self.ensure_active()?;
 
+        // 0. Materialize any CTEs defined on this plan (in declaration order)
+        for cte in &plan.ctes {
+            if !cte_store.contains_key(&cte.name) {
+                let res =
+                    self.execute_physical_plan_internal(&cte.plan, outer_contexts, cte_store)?;
+                cte_store.insert(cte.name.clone(), (cte.output_schema.clone(), res.rows));
+            }
+        }
+
         let mut plan = plan.clone();
-        self.pre_evaluate_uncorrelated_subqueries(&mut plan, outer_contexts)?;
+        self.pre_evaluate_uncorrelated_subqueries_internal(&mut plan, outer_contexts, cte_store)?;
 
         // 1. Execute base table scan
         let (mut current_schema, mut current_rows) = {
-            let mut table = self.open_table(&plan.base_table.table_name)?;
-            let raw_schema = table.schema().clone();
-            let initial_rows = match &plan.base_table.access_path {
-                crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
-                    match table.get(key)? {
-                        Some(row) => vec![row],
-                        None => Vec::new(),
-                    }
-                }
-                crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
-                    table.scan(start.as_ref(), end.as_ref())?
-                }
-                crate::query::optimizer::AccessPath::SecondaryIndexScan {
-                    index_name,
-                    scan_type,
-                    ..
-                } => match scan_type {
-                    crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
-                        table.index_lookup(index_name, val)?
-                    }
-                    crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
-                        table.index_scan(index_name, start.as_ref(), end.as_ref())?
-                    }
-                },
-                crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
-            };
+            if let Some((cte_schema, cte_rows)) = cte_store.get(&plan.base_table.table_name) {
+                let raw_schema = cte_schema.clone();
+                let initial_rows = cte_rows.clone();
+                let filtered_rows = match &plan.base_table.residual_filter {
+                    Some(filter) => self.filter_rows_with_outer_internal(
+                        initial_rows,
+                        &raw_schema,
+                        filter,
+                        outer_contexts,
+                        cte_store,
+                    )?,
+                    None => initial_rows,
+                };
 
-            let filtered_rows = match &plan.base_table.residual_filter {
-                Some(filter) => {
-                    self.filter_rows_with_outer(initial_rows, &raw_schema, filter, outer_contexts)?
-                }
-                None => initial_rows,
-            };
+                let schema = if plan.joins.is_empty() {
+                    raw_schema
+                } else {
+                    let q = plan.base_table.qualifier();
+                    let cols: Vec<crate::engine::types::Column> = raw_schema
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            crate::engine::types::Column::new(
+                                format!("{q}.{}", c.name),
+                                c.data_type,
+                                c.nullable,
+                            )
+                        })
+                        .collect();
+                    crate::engine::types::Schema::new_projected(cols)
+                };
 
-            let schema = if plan.joins.is_empty() {
-                raw_schema
+                (schema, filtered_rows)
             } else {
-                let q = plan.base_table.qualifier();
-                let cols: Vec<crate::engine::types::Column> = raw_schema
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        crate::engine::types::Column::new(
-                            format!("{q}.{}", c.name),
-                            c.data_type,
-                            c.nullable,
-                        )
-                    })
-                    .collect();
-                crate::engine::types::Schema::new_projected(cols)
-            };
-
-            (schema, filtered_rows)
-        };
-
-        // 2. Execute Joins sequentially
-        for join in &plan.joins {
-            let (right_schema, right_rows) = {
-                let mut table = self.open_table(&join.right.table_name)?;
+                let mut table = self.open_table(&plan.base_table.table_name)?;
                 let raw_schema = table.schema().clone();
-                let initial_rows = match &join.right.access_path {
+                let initial_rows = match &plan.base_table.access_path {
                     crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
                         match table.get(key)? {
                             Some(row) => vec![row],
@@ -1024,35 +1361,134 @@ impl<'db> Transaction<'db> {
                     crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
                 };
 
-                let filtered_rows = match &join.right.residual_filter {
-                    Some(filter) => self.filter_rows_with_outer(
+                let filtered_rows = match &plan.base_table.residual_filter {
+                    Some(filter) => self.filter_rows_with_outer_internal(
                         initial_rows,
                         &raw_schema,
                         filter,
                         outer_contexts,
+                        cte_store,
                     )?,
                     None => initial_rows,
                 };
 
-                let q = join.right.qualifier();
-                let cols: Vec<crate::engine::types::Column> = raw_schema
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        crate::engine::types::Column::new(
-                            format!("{q}.{}", c.name),
-                            c.data_type,
-                            c.nullable,
-                        )
-                    })
-                    .collect();
-                (
-                    crate::engine::types::Schema::new_projected(cols),
-                    filtered_rows,
-                )
+                let schema = if plan.joins.is_empty() {
+                    raw_schema
+                } else {
+                    let q = plan.base_table.qualifier();
+                    let cols: Vec<crate::engine::types::Column> = raw_schema
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            crate::engine::types::Column::new(
+                                format!("{q}.{}", c.name),
+                                c.data_type,
+                                c.nullable,
+                            )
+                        })
+                        .collect();
+                    crate::engine::types::Schema::new_projected(cols)
+                };
+
+                (schema, filtered_rows)
+            }
+        };
+
+        // 2. Execute Joins sequentially
+        for join in &plan.joins {
+            let (right_schema, right_rows) = {
+                if let Some((cte_schema, cte_rows)) = cte_store.get(&join.right.table_name) {
+                    let raw_schema = cte_schema.clone();
+                    let initial_rows = cte_rows.clone();
+                    let filtered_rows = match &join.right.residual_filter {
+                        Some(filter) => self.filter_rows_with_outer_internal(
+                            initial_rows,
+                            &raw_schema,
+                            filter,
+                            outer_contexts,
+                            cte_store,
+                        )?,
+                        None => initial_rows,
+                    };
+
+                    let q = join.right.qualifier();
+                    let cols: Vec<crate::engine::types::Column> = raw_schema
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            crate::engine::types::Column::new(
+                                format!("{q}.{}", c.name),
+                                c.data_type,
+                                c.nullable,
+                            )
+                        })
+                        .collect();
+                    (
+                        crate::engine::types::Schema::new_projected(cols),
+                        filtered_rows,
+                    )
+                } else {
+                    let mut table = self.open_table(&join.right.table_name)?;
+                    let raw_schema = table.schema().clone();
+                    let initial_rows = match &join.right.access_path {
+                        crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
+                            match table.get(key)? {
+                                Some(row) => vec![row],
+                                None => Vec::new(),
+                            }
+                        }
+                        crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
+                            table.scan(start.as_ref(), end.as_ref())?
+                        }
+                        crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                            index_name,
+                            scan_type,
+                            ..
+                        } => match scan_type {
+                            crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                                table.index_lookup(index_name, val)?
+                            }
+                            crate::query::optimizer::SecondaryScanType::RangeScan {
+                                start,
+                                end,
+                            } => table.index_scan(index_name, start.as_ref(), end.as_ref())?,
+                        },
+                        crate::query::optimizer::AccessPath::FullTableScan => {
+                            table.scan(None, None)?
+                        }
+                    };
+
+                    let filtered_rows = match &join.right.residual_filter {
+                        Some(filter) => self.filter_rows_with_outer_internal(
+                            initial_rows,
+                            &raw_schema,
+                            filter,
+                            outer_contexts,
+                            cte_store,
+                        )?,
+                        None => initial_rows,
+                    };
+
+                    let q = join.right.qualifier();
+                    let cols: Vec<crate::engine::types::Column> = raw_schema
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            crate::engine::types::Column::new(
+                                format!("{q}.{}", c.name),
+                                c.data_type,
+                                c.nullable,
+                            )
+                        })
+                        .collect();
+                    (
+                        crate::engine::types::Schema::new_projected(cols),
+                        filtered_rows,
+                    )
+                }
             };
 
-            let (next_schema, next_rows) = self.join_rows_with_outer(
+            let (next_schema, next_rows) = self.join_rows_with_outer_internal(
                 current_rows,
                 &current_schema,
                 &right_rows,
@@ -1060,6 +1496,7 @@ impl<'db> Transaction<'db> {
                 join.join_type,
                 &join.on,
                 outer_contexts,
+                cte_store,
             )?;
             current_schema = next_schema;
             current_rows = next_rows;
@@ -1067,11 +1504,12 @@ impl<'db> Transaction<'db> {
 
         // 3. Post-Join Filter
         if let Some(post_filter) = &plan.post_join_filter {
-            current_rows = self.filter_rows_with_outer(
+            current_rows = self.filter_rows_with_outer_internal(
                 current_rows,
                 &current_schema,
                 post_filter,
                 outer_contexts,
+                cte_store,
             )?;
         }
 
@@ -1086,11 +1524,12 @@ impl<'db> Transaction<'db> {
             )?;
 
             let having_rows = match &plan.having {
-                Some(predicate) => self.filter_rows_with_outer(
+                Some(predicate) => self.filter_rows_with_outer_internal(
                     grouped_rows,
                     &grouped_schema,
                     predicate,
                     outer_contexts,
+                    cte_store,
                 )?,
                 None => grouped_rows,
             };
@@ -1133,28 +1572,47 @@ impl<'db> Transaction<'db> {
         plan: &mut crate::query::optimizer::PhysicalPlan,
         outer_contexts: &[(&Row, &Schema)],
     ) -> Result<()> {
+        let mut cte_store = std::collections::HashMap::new();
+        self.pre_evaluate_uncorrelated_subqueries_internal(plan, outer_contexts, &mut cte_store)
+    }
+
+    fn pre_evaluate_uncorrelated_subqueries_internal(
+        &mut self,
+        plan: &mut crate::query::optimizer::PhysicalPlan,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
+    ) -> Result<()> {
         if let Some(rf) = &mut plan.base_table.residual_filter {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(rf, outer_contexts)?;
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(rf, outer_contexts, cte_store)?;
         }
         for join in &mut plan.joins {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(&mut join.on, outer_contexts)?;
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(
+                &mut join.on,
+                outer_contexts,
+                cte_store,
+            )?;
             if let Some(rf) = &mut join.right.residual_filter {
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(rf, outer_contexts)?;
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(rf, outer_contexts, cte_store)?;
             }
         }
         if let Some(post_filter) = &mut plan.post_join_filter {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(post_filter, outer_contexts)?;
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(
+                post_filter,
+                outer_contexts,
+                cte_store,
+            )?;
         }
         if let Some(having) = &mut plan.having {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(having, outer_contexts)?;
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(having, outer_contexts, cte_store)?;
         }
         for (proj, _) in &mut plan.projections {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(proj, outer_contexts)?;
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(proj, outer_contexts, cte_store)?;
         }
         for sort_key in &mut plan.order_by {
             self.pre_evaluate_uncorrelated_subqueries_in_expr(
                 &mut sort_key.expression,
                 outer_contexts,
+                cte_store,
             )?;
         }
         Ok(())
@@ -1164,27 +1622,40 @@ impl<'db> Transaction<'db> {
         &mut self,
         expr: &mut crate::query::expr::Expr,
         outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
     ) -> Result<()> {
         match expr {
             crate::query::expr::Expr::Subquery(sub) => {
                 if !sub.is_correlated && sub.materialized.is_none() {
-                    let mat = self.evaluate_subquery_materialized(sub, outer_contexts)?;
+                    let mat = self.evaluate_subquery_materialized_internal(
+                        sub,
+                        outer_contexts,
+                        cte_store,
+                    )?;
                     sub.materialized = Some(mat);
                 }
             }
             crate::query::expr::Expr::Binary { left, right, .. } => {
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(left, outer_contexts)?;
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(right, outer_contexts)?;
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(left, outer_contexts, cte_store)?;
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(
+                    right,
+                    outer_contexts,
+                    cte_store,
+                )?;
             }
             crate::query::expr::Expr::Unary { expr, .. }
             | crate::query::expr::Expr::IsNull(expr)
             | crate::query::expr::Expr::IsNotNull(expr) => {
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(expr, outer_contexts)?;
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(expr, outer_contexts, cte_store)?;
             }
             crate::query::expr::Expr::InList { expr, list, .. } => {
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(expr, outer_contexts)?;
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(expr, outer_contexts, cte_store)?;
                 for item in list {
-                    self.pre_evaluate_uncorrelated_subqueries_in_expr(item, outer_contexts)?;
+                    self.pre_evaluate_uncorrelated_subqueries_in_expr(
+                        item,
+                        outer_contexts,
+                        cte_store,
+                    )?;
                 }
             }
             crate::query::expr::Expr::Literal(_)
@@ -1194,14 +1665,26 @@ impl<'db> Transaction<'db> {
         Ok(())
     }
 
-    fn evaluate_subquery_materialized(
+    /// Evaluates a subquery into a materialized in-memory representation.
+    pub fn evaluate_subquery_materialized(
         &mut self,
         subquery: &crate::query::expr::SubqueryExpr,
         outer_contexts: &[(&Row, &Schema)],
     ) -> Result<crate::query::expr::MaterializedSubqueryResult> {
+        let mut cte_store = std::collections::HashMap::new();
+        self.evaluate_subquery_materialized_internal(subquery, outer_contexts, &mut cte_store)
+    }
+
+    fn evaluate_subquery_materialized_internal(
+        &mut self,
+        subquery: &crate::query::expr::SubqueryExpr,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
+    ) -> Result<crate::query::expr::MaterializedSubqueryResult> {
         match &subquery.kind {
             crate::query::expr::SubqueryKind::Scalar { .. } => {
-                let res = self.execute_physical_plan_with_outer(&subquery.plan, outer_contexts)?;
+                let res =
+                    self.execute_physical_plan_internal(&subquery.plan, outer_contexts, cte_store)?;
                 if res.rows.is_empty() {
                     Ok(crate::query::expr::MaterializedSubqueryResult::Scalar(
                         Value::Null,
@@ -1215,13 +1698,15 @@ impl<'db> Transaction<'db> {
                 }
             }
             crate::query::expr::SubqueryKind::In { .. } => {
-                let res = self.execute_physical_plan_with_outer(&subquery.plan, outer_contexts)?;
+                let res =
+                    self.execute_physical_plan_internal(&subquery.plan, outer_contexts, cte_store)?;
                 let in_vals: Vec<Value> =
                     res.rows.into_iter().map(|r| r.values[0].clone()).collect();
                 Ok(crate::query::expr::MaterializedSubqueryResult::In(in_vals))
             }
             crate::query::expr::SubqueryKind::Exists { .. } => {
-                let res = self.execute_physical_plan_with_outer(&subquery.plan, outer_contexts)?;
+                let res =
+                    self.execute_physical_plan_internal(&subquery.plan, outer_contexts, cte_store)?;
                 let exists = !res.rows.is_empty();
                 Ok(crate::query::expr::MaterializedSubqueryResult::Exists(
                     exists,
@@ -1238,6 +1723,18 @@ impl<'db> Transaction<'db> {
         schema: &Schema,
         outer_contexts: &[(&Row, &Schema)],
     ) -> Result<Value> {
+        let mut cte_store = std::collections::HashMap::new();
+        self.evaluate_expr_with_outer_internal(expr, row, schema, outer_contexts, &mut cte_store)
+    }
+
+    fn evaluate_expr_with_outer_internal(
+        &mut self,
+        expr: &crate::query::expr::Expr,
+        row: &Row,
+        schema: &Schema,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
+    ) -> Result<Value> {
         match expr {
             crate::query::expr::Expr::Subquery(sub) => {
                 if let Some(mat) = &sub.materialized {
@@ -1249,11 +1746,12 @@ impl<'db> Transaction<'db> {
                             if let crate::query::expr::SubqueryKind::In { expr, negated } =
                                 &sub.kind
                             {
-                                let left = self.evaluate_expr_with_outer(
+                                let left = self.evaluate_expr_with_outer_internal(
                                     expr,
                                     row,
                                     schema,
                                     outer_contexts,
+                                    cte_store,
                                 )?;
                                 Ok(crate::query::expr::eval_in_3vl(&left, in_vals, *negated))
                             } else {
@@ -1275,7 +1773,8 @@ impl<'db> Transaction<'db> {
                     nested.push((row, schema));
                     match &sub.kind {
                         crate::query::expr::SubqueryKind::Scalar { .. } => {
-                            let res = self.execute_physical_plan_with_outer(&sub.plan, &nested)?;
+                            let res =
+                                self.execute_physical_plan_internal(&sub.plan, &nested, cte_store)?;
                             if res.rows.is_empty() {
                                 Ok(Value::Null)
                             } else if res.rows.len() == 1 {
@@ -1285,15 +1784,22 @@ impl<'db> Transaction<'db> {
                             }
                         }
                         crate::query::expr::SubqueryKind::In { expr, negated } => {
-                            let left =
-                                self.evaluate_expr_with_outer(expr, row, schema, outer_contexts)?;
-                            let res = self.execute_physical_plan_with_outer(&sub.plan, &nested)?;
+                            let left = self.evaluate_expr_with_outer_internal(
+                                expr,
+                                row,
+                                schema,
+                                outer_contexts,
+                                cte_store,
+                            )?;
+                            let res =
+                                self.execute_physical_plan_internal(&sub.plan, &nested, cte_store)?;
                             let in_vals: Vec<Value> =
                                 res.rows.into_iter().map(|r| r.values[0].clone()).collect();
                             Ok(crate::query::expr::eval_in_3vl(&left, &in_vals, *negated))
                         }
                         crate::query::expr::SubqueryKind::Exists { negated } => {
-                            let res = self.execute_physical_plan_with_outer(&sub.plan, &nested)?;
+                            let res =
+                                self.execute_physical_plan_internal(&sub.plan, &nested, cte_store)?;
                             let has_rows = !res.rows.is_empty();
                             let b = if *negated { !has_rows } else { has_rows };
                             Ok(Value::Boolean(b))
@@ -1306,21 +1812,44 @@ impl<'db> Transaction<'db> {
                 list,
                 negated,
             } => {
-                let target = self.evaluate_expr_with_outer(expr, row, schema, outer_contexts)?;
+                let target = self.evaluate_expr_with_outer_internal(
+                    expr,
+                    row,
+                    schema,
+                    outer_contexts,
+                    cte_store,
+                )?;
                 let mut vals = Vec::with_capacity(list.len());
                 for item in list {
-                    vals.push(self.evaluate_expr_with_outer(item, row, schema, outer_contexts)?);
+                    vals.push(self.evaluate_expr_with_outer_internal(
+                        item,
+                        row,
+                        schema,
+                        outer_contexts,
+                        cte_store,
+                    )?);
                 }
                 Ok(crate::query::expr::eval_in_3vl(&target, &vals, *negated))
             }
             crate::query::expr::Expr::Binary { left, op, right } => match op {
                 crate::query::expr::BinaryOp::And => {
-                    let l = self.evaluate_expr_with_outer(left, row, schema, outer_contexts)?;
+                    let l = self.evaluate_expr_with_outer_internal(
+                        left,
+                        row,
+                        schema,
+                        outer_contexts,
+                        cte_store,
+                    )?;
                     match l {
                         Value::Boolean(false) => Ok(Value::Boolean(false)),
                         Value::Boolean(true) => {
-                            let r =
-                                self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                            let r = self.evaluate_expr_with_outer_internal(
+                                right,
+                                row,
+                                schema,
+                                outer_contexts,
+                                cte_store,
+                            )?;
                             match r {
                                 Value::Boolean(rb) => Ok(Value::Boolean(rb)),
                                 Value::Null => Ok(Value::Null),
@@ -1330,8 +1859,13 @@ impl<'db> Transaction<'db> {
                             }
                         }
                         Value::Null => {
-                            let r =
-                                self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                            let r = self.evaluate_expr_with_outer_internal(
+                                right,
+                                row,
+                                schema,
+                                outer_contexts,
+                                cte_store,
+                            )?;
                             match r {
                                 Value::Boolean(false) => Ok(Value::Boolean(false)),
                                 Value::Boolean(true) | Value::Null => Ok(Value::Null),
@@ -1346,12 +1880,23 @@ impl<'db> Transaction<'db> {
                     }
                 }
                 crate::query::expr::BinaryOp::Or => {
-                    let l = self.evaluate_expr_with_outer(left, row, schema, outer_contexts)?;
+                    let l = self.evaluate_expr_with_outer_internal(
+                        left,
+                        row,
+                        schema,
+                        outer_contexts,
+                        cte_store,
+                    )?;
                     match l {
                         Value::Boolean(true) => Ok(Value::Boolean(true)),
                         Value::Boolean(false) => {
-                            let r =
-                                self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                            let r = self.evaluate_expr_with_outer_internal(
+                                right,
+                                row,
+                                schema,
+                                outer_contexts,
+                                cte_store,
+                            )?;
                             match r {
                                 Value::Boolean(rb) => Ok(Value::Boolean(rb)),
                                 Value::Null => Ok(Value::Null),
@@ -1361,8 +1906,13 @@ impl<'db> Transaction<'db> {
                             }
                         }
                         Value::Null => {
-                            let r =
-                                self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                            let r = self.evaluate_expr_with_outer_internal(
+                                right,
+                                row,
+                                schema,
+                                outer_contexts,
+                                cte_store,
+                            )?;
                             match r {
                                 Value::Boolean(true) => Ok(Value::Boolean(true)),
                                 Value::Boolean(false) | Value::Null => Ok(Value::Null),
@@ -1377,8 +1927,20 @@ impl<'db> Transaction<'db> {
                     }
                 }
                 _ => {
-                    let l = self.evaluate_expr_with_outer(left, row, schema, outer_contexts)?;
-                    let r = self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                    let l = self.evaluate_expr_with_outer_internal(
+                        left,
+                        row,
+                        schema,
+                        outer_contexts,
+                        cte_store,
+                    )?;
+                    let r = self.evaluate_expr_with_outer_internal(
+                        right,
+                        row,
+                        schema,
+                        outer_contexts,
+                        cte_store,
+                    )?;
                     let tmp_schema = Schema::new_projected(Vec::new());
                     let tmp_row = Row::new(Vec::new());
                     let bin_expr = crate::query::expr::Expr::Binary {
@@ -1390,7 +1952,13 @@ impl<'db> Transaction<'db> {
                 }
             },
             crate::query::expr::Expr::Unary { op, expr } => {
-                let val = self.evaluate_expr_with_outer(expr, row, schema, outer_contexts)?;
+                let val = self.evaluate_expr_with_outer_internal(
+                    expr,
+                    row,
+                    schema,
+                    outer_contexts,
+                    cte_store,
+                )?;
                 let tmp_schema = Schema::new_projected(Vec::new());
                 let tmp_row = Row::new(Vec::new());
                 let un_expr = crate::query::expr::Expr::Unary {
@@ -1400,11 +1968,23 @@ impl<'db> Transaction<'db> {
                 un_expr.evaluate(&tmp_row, &tmp_schema)
             }
             crate::query::expr::Expr::IsNull(inner) => {
-                let val = self.evaluate_expr_with_outer(inner, row, schema, outer_contexts)?;
+                let val = self.evaluate_expr_with_outer_internal(
+                    inner,
+                    row,
+                    schema,
+                    outer_contexts,
+                    cte_store,
+                )?;
                 Ok(Value::Boolean(val.is_null()))
             }
             crate::query::expr::Expr::IsNotNull(inner) => {
-                let val = self.evaluate_expr_with_outer(inner, row, schema, outer_contexts)?;
+                let val = self.evaluate_expr_with_outer_internal(
+                    inner,
+                    row,
+                    schema,
+                    outer_contexts,
+                    cte_store,
+                )?;
                 Ok(Value::Boolean(!val.is_null()))
             }
             crate::query::expr::Expr::Literal(_)
@@ -1423,6 +2003,24 @@ impl<'db> Transaction<'db> {
         predicate: &crate::query::expr::Expr,
         outer_contexts: &[(&Row, &Schema)],
     ) -> Result<Vec<Row>> {
+        let mut cte_store = std::collections::HashMap::new();
+        self.filter_rows_with_outer_internal(
+            rows,
+            schema,
+            predicate,
+            outer_contexts,
+            &mut cte_store,
+        )
+    }
+
+    fn filter_rows_with_outer_internal(
+        &mut self,
+        rows: Vec<Row>,
+        schema: &Schema,
+        predicate: &crate::query::expr::Expr,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
+    ) -> Result<Vec<Row>> {
         let pred_type = predicate.infer_type(schema)?;
         if pred_type != DataType::Boolean && pred_type != DataType::Null {
             return Err(Error::InvalidBooleanExpression {
@@ -1432,7 +2030,13 @@ impl<'db> Transaction<'db> {
 
         let mut matched = Vec::new();
         for row in rows {
-            let val = self.evaluate_expr_with_outer(predicate, &row, schema, outer_contexts)?;
+            let val = self.evaluate_expr_with_outer_internal(
+                predicate,
+                &row,
+                schema,
+                outer_contexts,
+                cte_store,
+            )?;
             if val == Value::Boolean(true) {
                 matched.push(row);
             }
@@ -1451,6 +2055,31 @@ impl<'db> Transaction<'db> {
         join_type: crate::sql::ast::JoinType,
         on: &crate::query::expr::Expr,
         outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<(Schema, Vec<Row>)> {
+        let mut cte_store = std::collections::HashMap::new();
+        self.join_rows_with_outer_internal(
+            left_rows,
+            left_schema,
+            right_rows,
+            right_schema,
+            join_type,
+            on,
+            outer_contexts,
+            &mut cte_store,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn join_rows_with_outer_internal(
+        &mut self,
+        left_rows: Vec<Row>,
+        left_schema: &Schema,
+        right_rows: &[Row],
+        right_schema: &Schema,
+        join_type: crate::sql::ast::JoinType,
+        on: &crate::query::expr::Expr,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
     ) -> Result<(Schema, Vec<Row>)> {
         let mut combined_columns = left_schema.columns.clone();
         for col in &right_schema.columns {
@@ -1473,11 +2102,12 @@ impl<'db> Transaction<'db> {
                 combined_vals.extend_from_slice(&r_row.values);
                 let candidate_row = Row::new(combined_vals);
 
-                let on_val = self.evaluate_expr_with_outer(
+                let on_val = self.evaluate_expr_with_outer_internal(
                     on,
                     &candidate_row,
                     &combined_schema,
                     outer_contexts,
+                    cte_store,
                 )?;
                 if on_val == Value::Boolean(true) {
                     matched = true;

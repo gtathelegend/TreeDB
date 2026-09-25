@@ -1,9 +1,10 @@
 use crate::engine::types::DataType;
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    ColumnDef, CreateTableStatement, DeleteStatement, DropTableStatement, InsertStatement,
+    ColumnDef, CreateTableStatement, Cte, DeleteStatement, DropTableStatement, InsertStatement,
     JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp,
     SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement,
+    WithClause,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};
@@ -36,7 +37,7 @@ impl<'a> Parser<'a> {
     pub fn parse_statement(&mut self) -> Result<Statement> {
         let token = self.peek();
         match token.kind {
-            TokenKind::Select => Ok(Statement::Select(self.parse_select()?)),
+            TokenKind::Select | TokenKind::With => Ok(Statement::Select(self.parse_select()?)),
             TokenKind::Create => Ok(Statement::CreateTable(self.parse_create_table()?)),
             TokenKind::Drop => Ok(Statement::DropTable(self.parse_drop_table()?)),
             TokenKind::Insert => Ok(Statement::Insert(self.parse_insert()?)),
@@ -791,8 +792,23 @@ impl<'a> Parser<'a> {
 
     /// Parses the core clauses of a SQL `SELECT` statement without consuming trailing statement delimiters.
     pub fn parse_select_clauses(&mut self) -> Result<SelectStatement> {
-        let select_token = self.peek();
+        let with_clause = if self.peek().kind == TokenKind::With {
+            Some(self.parse_with_clause()?)
+        } else {
+            None
+        };
+
+        let select_token = self.peek().clone();
         if select_token.kind != TokenKind::Select {
+            if matches!(
+                select_token.kind,
+                TokenKind::Insert | TokenKind::Update | TokenKind::Delete | TokenKind::Create
+            ) {
+                return Err(Error::UnsupportedStatement(format!(
+                    "CTE is not supported with {}",
+                    select_token.kind
+                )));
+            }
             return Err(Error::SqlParseError {
                 message: format!("expected SELECT statement, found {}", select_token.kind),
                 start: select_token.span.start,
@@ -952,6 +968,7 @@ impl<'a> Parser<'a> {
         };
 
         Ok(SelectStatement {
+            with: with_clause,
             projection,
             from,
             joins,
@@ -962,6 +979,184 @@ impl<'a> Parser<'a> {
             limit,
             offset,
         })
+    }
+
+    /// Parses a SQL `WITH` clause containing one or more CTE definitions.
+    pub fn parse_with_clause(&mut self) -> Result<WithClause> {
+        let with_tok = self.peek().clone();
+        if with_tok.kind != TokenKind::With {
+            return Err(Error::SqlParseError {
+                message: format!("expected WITH, found {}", with_tok.kind),
+                start: with_tok.span.start,
+                end: with_tok.span.end,
+            });
+        }
+        self.advance(); // consume WITH
+
+        // Check for WITH RECURSIVE
+        if let TokenKind::Ident(s) = &self.peek().kind {
+            if s.eq_ignore_ascii_case("RECURSIVE") {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: "WITH RECURSIVE is not supported".to_string(),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        }
+
+        let mut ctes = Vec::new();
+        loop {
+            let name_tok = self.peek().clone();
+            let cte_name = match &name_tok.kind {
+                TokenKind::Ident(s) => s.clone(),
+                _ => {
+                    return Err(Error::SqlParseError {
+                        message: format!("expected CTE name after WITH, found {}", name_tok.kind),
+                        start: name_tok.span.start,
+                        end: name_tok.span.end,
+                    });
+                }
+            };
+            self.advance(); // consume CTE name
+
+            // Check for duplicate CTE name in the same WITH clause
+            if ctes.iter().any(|c: &Cte| c.name == cte_name) {
+                return Err(Error::DuplicateCteName(cte_name));
+            }
+
+            // Optional column list: `cte_name(col1, col2, ...)`
+            let columns = if self.peek().kind == TokenKind::LParen {
+                self.advance(); // consume '('
+                let mut cols = Vec::new();
+                loop {
+                    let col_tok = self.peek().clone();
+                    let col_name = match &col_tok.kind {
+                        TokenKind::Ident(s) => s.clone(),
+                        _ => {
+                            return Err(Error::SqlParseError {
+                                message: format!(
+                                    "expected column identifier in CTE column list, found {}",
+                                    col_tok.kind
+                                ),
+                                start: col_tok.span.start,
+                                end: col_tok.span.end,
+                            });
+                        }
+                    };
+                    self.advance();
+
+                    if cols.contains(&col_name) {
+                        return Err(Error::DuplicateCteColumnName {
+                            cte: cte_name.clone(),
+                            column: col_name,
+                        });
+                    }
+                    cols.push(col_name);
+
+                    if self.peek().kind == TokenKind::Comma {
+                        self.advance();
+                    } else if self.peek().kind == TokenKind::RParen {
+                        break;
+                    } else {
+                        let err_tok = self.peek().clone();
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected ',' or ')' in CTE column list, found {}",
+                                err_tok.kind
+                            ),
+                            start: err_tok.span.start,
+                            end: err_tok.span.end,
+                        });
+                    }
+                }
+                self.advance(); // consume ')'
+                Some(cols)
+            } else {
+                None
+            };
+
+            // Expect `AS`
+            let as_tok = self.peek().clone();
+            if as_tok.kind != TokenKind::As {
+                return Err(Error::SqlParseError {
+                    message: format!("expected AS after CTE name, found {}", as_tok.kind),
+                    start: as_tok.span.start,
+                    end: as_tok.span.end,
+                });
+            }
+            self.advance(); // consume AS
+
+            // Expect `(`
+            let lparen_tok = self.peek().clone();
+            if lparen_tok.kind != TokenKind::LParen {
+                return Err(Error::SqlParseError {
+                    message: format!(
+                        "expected '(' after AS in CTE definition, found {}",
+                        lparen_tok.kind
+                    ),
+                    start: lparen_tok.span.start,
+                    end: lparen_tok.span.end,
+                });
+            }
+            self.advance(); // consume '('
+
+            // Reject empty body `()`
+            if self.peek().kind == TokenKind::RParen {
+                let rparen_tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: "empty CTE body () is not allowed".to_string(),
+                    start: lparen_tok.span.start,
+                    end: rparen_tok.span.end,
+                });
+            }
+
+            // Check if starts with SELECT (or WITH)
+            let body_tok = self.peek().clone();
+            if body_tok.kind != TokenKind::Select && body_tok.kind != TokenKind::With {
+                return Err(Error::SqlParseError {
+                    message: format!("expected SELECT in CTE body, found {}", body_tok.kind),
+                    start: body_tok.span.start,
+                    end: body_tok.span.end,
+                });
+            }
+
+            // Parse query inside CTE
+            let query = self.parse_select_clauses()?;
+
+            // Expect `)`
+            let rparen_tok = self.peek().clone();
+            if rparen_tok.kind != TokenKind::RParen {
+                return Err(Error::SqlParseError {
+                    message: format!("expected ')' after CTE query, found {}", rparen_tok.kind),
+                    start: rparen_tok.span.start,
+                    end: rparen_tok.span.end,
+                });
+            }
+            self.advance(); // consume ')'
+
+            ctes.push(Cte {
+                name: cte_name,
+                columns,
+                query: Box::new(query),
+            });
+
+            if self.peek().kind == TokenKind::Comma {
+                self.advance(); // consume ','
+            } else {
+                break;
+            }
+        }
+
+        if ctes.is_empty() {
+            return Err(Error::SqlParseError {
+                message: "WITH clause must define at least one CTE".to_string(),
+                start: with_tok.span.start,
+                end: with_tok.span.end,
+            });
+        }
+
+        Ok(WithClause { ctes })
     }
 
     fn parse_projection_list(&mut self) -> Result<Vec<SelectItem>> {

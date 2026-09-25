@@ -327,9 +327,24 @@ pub struct BoundJoin {
     pub on: Expr,
 }
 
+/// A bound Common Table Expression (CTE) definition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundCte {
+    /// Name of the CTE relation.
+    pub name: String,
+    /// Output schema produced by the CTE query projection.
+    pub output_schema: Schema,
+    /// Fully optimized physical execution plan for evaluating the CTE.
+    pub plan: crate::query::optimizer::PhysicalPlan,
+    /// Names of any earlier CTE relations that this CTE depends on.
+    pub dependencies: Vec<String>,
+}
+
 /// A fully validated, bound SQL query ready for execution against TreeDB's query engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundSelect {
+    /// Statement-local CTE definitions bound in left-to-right dependency order.
+    pub ctes: Vec<BoundCte>,
     /// Target base table name to query (FROM).
     pub table_name: String,
     /// Optional base table alias.
@@ -609,6 +624,7 @@ pub fn bind_select_with_context(
         }
 
         return Ok(BoundSelect {
+            ctes: Vec::new(),
             table_name: statement.from.name.clone(),
             table_alias: statement.from.alias.clone(),
             joins: bound_joins,
@@ -776,6 +792,7 @@ pub fn bind_select_with_context(
     }
 
     Ok(BoundSelect {
+        ctes: Vec::new(),
         table_name: statement.from.name.clone(),
         table_alias: statement.from.alias.clone(),
         joins: bound_joins,

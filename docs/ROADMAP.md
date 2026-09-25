@@ -383,15 +383,32 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 23: Advanced Query Processing & Secondary Index DDL (Future)
+## Phase 23: Common Table Expressions (CTEs) (Completed)
+* [x] Lexer & Parser support for `WITH` keyword, case-insensitivity, single CTE, multiple comma-separated CTEs, and explicit column lists `cte(col1, col2)`
+* [x] Structured AST representation: `WithClause` and `Cte` integrated into `SelectStatement` (`pub with: Option<WithClause>`)
+* [x] Scoped CTE binding architecture: left-to-right sequential visibility, sibling reference, forward-reference and self-reference rejection
+* [x] Schema derivation: preserving projection aliases and validating explicit column lists (`CteColumnCountMismatch`, `DuplicateCteColumnName`)
+* [x] Physical table shadowing: CTEs shadow catalog tables with identical names in main queries while allowing CTE body to query base physical table
+* [x] Dependency DAG analysis & cycle detection: `collect_cte_dependencies` and 3-color DFS `validate_cte_acyclicity` emitting `Error::CyclicCteDependency`
+* [x] Optimizer integration: CTE bodies independently bound and optimized through Phase 20 rule-based optimizer (`PhysicalPlan.ctes`)
+* [x] Explain output: deterministic hierarchical `explain_sql` formatting showing CTE plans and dependencies alongside main query plan
+* [x] Statement-local in-memory materialization: executed into transient `cte_store` without persistent pages, freelist allocation, catalog mutation, or WAL writes
+* [x] Full query engine composition: CTEs in `INNER JOIN`, `LEFT JOIN`, `GROUP BY`, `HAVING`, scalar/IN/EXISTS subqueries, and correlated subqueries
+* [x] Transaction visibility: CTEs observe uncommitted mutations in active transactions and respect transaction rollback
+* [x] 21 dedicated integration tests in `tests/cte.rs` and 2 new parser tests in `tests/sql.rs` including randomized differential reference oracle (428 total test suite)
+
+---
+
+## Phase 24: Advanced Query Processing & Secondary Index DDL (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
-* [ ] Common Table Expressions (CTEs) and recursive CTEs
+* [ ] Recursive CTEs (`WITH RECURSIVE`) and fixed-point iteration
 * [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Cost-based join optimization and cardinality estimation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

@@ -315,6 +315,7 @@ impl<'a> Lexer<'a> {
             "KEY" => TokenKind::Key,
             "IN" => TokenKind::In,
             "EXISTS" => TokenKind::Exists,
+            "WITH" => TokenKind::With,
             "BOOLEAN" | "BOOL" => TokenKind::BooleanType,
             "BIGINT" | "INT64" | "INTEGER" | "INT" => TokenKind::BigIntType,
             "UBIGINT" | "UINT64" | "UINT" => TokenKind::UBigIntType,

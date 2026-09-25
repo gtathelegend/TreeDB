@@ -206,9 +206,52 @@ impl fmt::Display for DeleteStatement {
     }
 }
 
+/// A Common Table Expression (`WITH cte_name [(col1, ...)] AS (SELECT ...)`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    /// Name of the CTE relation.
+    pub name: String,
+    /// Optional explicit column name list.
+    pub columns: Option<Vec<String>>,
+    /// Inner SELECT query defining the CTE relation.
+    pub query: Box<SelectStatement>,
+}
+
+impl fmt::Display for Cte {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)?;
+        if let Some(cols) = &self.columns {
+            write!(f, "({})", cols.join(", "))?;
+        }
+        write!(f, " AS ({})", self.query)
+    }
+}
+
+/// A `WITH` clause containing one or more CTE definitions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    /// CTE definitions in declaration order.
+    pub ctes: Vec<Cte>,
+}
+
+impl fmt::Display for WithClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WITH ")?;
+        for (i, cte) in self.ctes.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{cte}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Top-level AST node representing a SQL `SELECT` query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
+    /// Optional Common Table Expression (CTE) `WITH` clause.
+    pub with: Option<WithClause>,
     /// List of projection items in the `SELECT` clause (wildcard or expressions).
     pub projection: Vec<SelectItem>,
     /// Target table reference in the `FROM` clause.
@@ -231,6 +274,9 @@ pub struct SelectStatement {
 
 impl fmt::Display for SelectStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(with) = &self.with {
+            write!(f, "{with} ")?;
+        }
         write!(f, "SELECT ")?;
         for (i, item) in self.projection.iter().enumerate() {
             if i > 0 {
