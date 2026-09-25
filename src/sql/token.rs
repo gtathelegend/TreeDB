@@ -41,6 +41,8 @@ pub enum TokenKind {
     Delete,
     Primary,
     Key,
+    In,
+    Exists,
 
     // Data Type Keywords
     BooleanType,
@@ -116,6 +118,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Delete => write!(f, "DELETE"),
             TokenKind::Primary => write!(f, "PRIMARY"),
             TokenKind::Key => write!(f, "KEY"),
+            TokenKind::In => write!(f, "IN"),
+            TokenKind::Exists => write!(f, "EXISTS"),
             TokenKind::BooleanType => write!(f, "BOOLEAN"),
             TokenKind::BigIntType => write!(f, "BIGINT"),
             TokenKind::UBigIntType => write!(f, "UBIGINT"),

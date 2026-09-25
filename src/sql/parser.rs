@@ -766,6 +766,31 @@ impl<'a> Parser<'a> {
     /// # Grammatical Structure
     /// `SELECT <projection> FROM <table_ref> [WHERE <expr>] [ORDER BY <order_by>] [LIMIT <n>] [OFFSET <n>] [;]`
     pub fn parse_select(&mut self) -> Result<SelectStatement> {
+        let stmt = self.parse_select_clauses()?;
+
+        // Optional trailing semicolon
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        // Enforce EOF (no unexpected trailing tokens)
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        Ok(stmt)
+    }
+
+    /// Parses the core clauses of a SQL `SELECT` statement without consuming trailing statement delimiters.
+    pub fn parse_select_clauses(&mut self) -> Result<SelectStatement> {
         let select_token = self.peek();
         if select_token.kind != TokenKind::Select {
             return Err(Error::SqlParseError {
@@ -925,24 +950,6 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-
-        // 10. Optional trailing semicolon
-        if self.peek().kind == TokenKind::Semicolon {
-            self.advance();
-        }
-
-        // 11. Enforce EOF (no unexpected trailing tokens)
-        if self.peek().kind != TokenKind::Eof {
-            let trailing = self.peek();
-            return Err(Error::SqlParseError {
-                message: format!(
-                    "unexpected trailing token after statement: {}",
-                    trailing.kind
-                ),
-                start: trailing.span.start,
-                end: trailing.span.end,
-            });
-        }
 
         Ok(SelectStatement {
             projection,
@@ -1351,25 +1358,104 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.advance(); // consume '('
-                let inner = self.parse_expr()?;
+                if self.peek().kind == TokenKind::Select {
+                    let subquery = self.parse_select_clauses()?;
+                    let close = self.peek();
+                    if close.kind != TokenKind::RParen {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected ')' to close subquery, found {}",
+                                close.kind
+                            ),
+                            start: close.span.start,
+                            end: close.span.end,
+                        });
+                    }
+                    self.advance(); // consume ')'
+                    Ok(SqlExpr::Subquery(Box::new(subquery)))
+                } else {
+                    let inner = self.parse_expr()?;
+                    let close = self.peek();
+                    if close.kind != TokenKind::RParen {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected ')' to close parenthesis, found {}",
+                                close.kind
+                            ),
+                            start: close.span.start,
+                            end: close.span.end,
+                        });
+                    }
+                    self.advance(); // consume ')'
+                    Ok(inner)
+                }
+            }
+            TokenKind::Exists => {
+                self.advance(); // consume EXISTS
+                if self.peek().kind != TokenKind::LParen {
+                    let tok = self.peek();
+                    return Err(Error::SqlParseError {
+                        message: format!("expected '(' after EXISTS, found {}", tok.kind),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+                self.advance(); // consume '('
+                let subquery = self.parse_select_clauses()?;
                 let close = self.peek();
                 if close.kind != TokenKind::RParen {
                     return Err(Error::SqlParseError {
-                        message: format!("expected ')' to close parenthesis, found {}", close.kind),
+                        message: format!(
+                            "expected ')' to close EXISTS subquery, found {}",
+                            close.kind
+                        ),
                         start: close.span.start,
                         end: close.span.end,
                     });
                 }
                 self.advance(); // consume ')'
-                Ok(inner)
+                Ok(SqlExpr::Exists {
+                    subquery: Box::new(subquery),
+                    negated: false,
+                })
             }
             TokenKind::Not => {
                 self.advance(); // consume NOT
-                let expr = self.parse_precedence(Precedence::Not)?;
-                Ok(SqlExpr::Unary {
-                    op: SqlUnaryOp::Not,
-                    expr: Box::new(expr),
-                })
+                if self.peek().kind == TokenKind::Exists {
+                    self.advance(); // consume EXISTS
+                    if self.peek().kind != TokenKind::LParen {
+                        let tok = self.peek();
+                        return Err(Error::SqlParseError {
+                            message: format!("expected '(' after NOT EXISTS, found {}", tok.kind),
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        });
+                    }
+                    self.advance(); // consume '('
+                    let subquery = self.parse_select_clauses()?;
+                    let close = self.peek();
+                    if close.kind != TokenKind::RParen {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected ')' to close NOT EXISTS subquery, found {}",
+                                close.kind
+                            ),
+                            start: close.span.start,
+                            end: close.span.end,
+                        });
+                    }
+                    self.advance(); // consume ')'
+                    Ok(SqlExpr::Exists {
+                        subquery: Box::new(subquery),
+                        negated: true,
+                    })
+                } else {
+                    let expr = self.parse_precedence(Precedence::Not)?;
+                    Ok(SqlExpr::Unary {
+                        op: SqlUnaryOp::Not,
+                        expr: Box::new(expr),
+                    })
+                }
             }
             TokenKind::Minus => {
                 self.advance(); // consume '-'
@@ -1420,6 +1506,138 @@ impl<'a> Parser<'a> {
                     op: SqlBinaryOp::And,
                     right: Box::new(right),
                 })
+            }
+            TokenKind::In => {
+                self.advance(); // consume IN
+                if self.peek().kind != TokenKind::LParen {
+                    let tok = self.peek();
+                    return Err(Error::SqlParseError {
+                        message: format!("expected '(' after IN, found {}", tok.kind),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+                self.advance(); // consume '('
+                if self.peek().kind == TokenKind::Select {
+                    let subquery = self.parse_select_clauses()?;
+                    let close = self.peek();
+                    if close.kind != TokenKind::RParen {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected ')' after IN (SELECT ...), found {}",
+                                close.kind
+                            ),
+                            start: close.span.start,
+                            end: close.span.end,
+                        });
+                    }
+                    self.advance(); // consume ')'
+                    Ok(SqlExpr::InSubquery {
+                        expr: Box::new(left),
+                        subquery: Box::new(subquery),
+                        negated: false,
+                    })
+                } else if self.peek().kind == TokenKind::RParen {
+                    let tok = self.peek();
+                    Err(Error::SqlParseError {
+                        message: "IN list cannot be empty".to_string(),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    })
+                } else {
+                    let mut list = Vec::new();
+                    loop {
+                        let item = self.parse_expr()?;
+                        list.push(item);
+                        if self.peek().kind == TokenKind::Comma {
+                            self.advance(); // consume comma
+                        } else {
+                            break;
+                        }
+                    }
+                    let close = self.peek();
+                    if close.kind != TokenKind::RParen {
+                        return Err(Error::SqlParseError {
+                            message: format!("expected ')' after IN list, found {}", close.kind),
+                            start: close.span.start,
+                            end: close.span.end,
+                        });
+                    }
+                    self.advance(); // consume ')'
+                    Ok(SqlExpr::InList {
+                        expr: Box::new(left),
+                        list,
+                        negated: false,
+                    })
+                }
+            }
+            TokenKind::Not if self.peek_ahead(1).kind == TokenKind::In => {
+                self.advance(); // consume NOT
+                self.advance(); // consume IN
+                if self.peek().kind != TokenKind::LParen {
+                    let tok = self.peek();
+                    return Err(Error::SqlParseError {
+                        message: format!("expected '(' after NOT IN, found {}", tok.kind),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+                self.advance(); // consume '('
+                if self.peek().kind == TokenKind::Select {
+                    let subquery = self.parse_select_clauses()?;
+                    let close = self.peek();
+                    if close.kind != TokenKind::RParen {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected ')' after NOT IN (SELECT ...), found {}",
+                                close.kind
+                            ),
+                            start: close.span.start,
+                            end: close.span.end,
+                        });
+                    }
+                    self.advance(); // consume ')'
+                    Ok(SqlExpr::InSubquery {
+                        expr: Box::new(left),
+                        subquery: Box::new(subquery),
+                        negated: true,
+                    })
+                } else if self.peek().kind == TokenKind::RParen {
+                    let tok = self.peek();
+                    Err(Error::SqlParseError {
+                        message: "NOT IN list cannot be empty".to_string(),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    })
+                } else {
+                    let mut list = Vec::new();
+                    loop {
+                        let item = self.parse_expr()?;
+                        list.push(item);
+                        if self.peek().kind == TokenKind::Comma {
+                            self.advance(); // consume comma
+                        } else {
+                            break;
+                        }
+                    }
+                    let close = self.peek();
+                    if close.kind != TokenKind::RParen {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected ')' after NOT IN list, found {}",
+                                close.kind
+                            ),
+                            start: close.span.start,
+                            end: close.span.end,
+                        });
+                    }
+                    self.advance(); // consume ')'
+                    Ok(SqlExpr::InList {
+                        expr: Box::new(left),
+                        list,
+                        negated: true,
+                    })
+                }
             }
             TokenKind::Eq => {
                 self.advance();
@@ -1513,6 +1731,8 @@ impl<'a> Parser<'a> {
         match self.peek().kind {
             TokenKind::Or => Precedence::Or,
             TokenKind::And => Precedence::And,
+            TokenKind::In => Precedence::Comparison,
+            TokenKind::Not if self.peek_ahead(1).kind == TokenKind::In => Precedence::Comparison,
             TokenKind::Eq
             | TokenKind::NotEq
             | TokenKind::Lt

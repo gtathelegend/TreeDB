@@ -12,7 +12,8 @@ pub use ast::{
     UpdateAssignment, UpdateStatement,
 };
 pub use binder::{
-    bind_expr, bind_select, bind_select_multi, BindingContext, BoundJoin, BoundSelect, TableBinding,
+    bind_expr, bind_grouped_expr, bind_select, bind_select_multi, bind_select_multi_with_catalog,
+    bind_select_with_context, BindingContext, BoundJoin, BoundSelect, TableBinding, TableCatalog,
 };
 pub use lexer::{Lexer, MAX_IDENTIFIER_LEN};
 pub use parser::Parser;

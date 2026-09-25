@@ -227,6 +227,19 @@ pub enum Error {
     #[error("SQL binding error: {0}")]
     SqlBindingError(String),
 
+    /// Scalar subquery returned more than one row.
+    #[error("Scalar subquery returned multiple rows")]
+    ScalarSubqueryMultipleRows,
+
+    /// Subquery returned unexpected number of projected columns.
+    #[error("Subquery column count mismatch: expected {expected}, found {found}")]
+    SubqueryColumnCountMismatch {
+        /// Expected column count (typically 1).
+        expected: usize,
+        /// Actual column count returned by the subquery.
+        found: usize,
+    },
+
     /// Index with the specified name was not found in the catalog.
     #[error("Index '{0}' not found")]
     IndexNotFound(String),

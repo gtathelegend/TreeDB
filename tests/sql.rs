@@ -1009,3 +1009,143 @@ fn test_parser_invalid_ddl_dml_syntax() {
         );
     }
 }
+
+#[test]
+fn test_lexer_subquery_keywords() {
+    let sql = "IN in In EXISTS exists ExIsTs NOT EXISTS not in";
+    let tokens = tokenize_sql(sql).unwrap();
+
+    let expected = vec![
+        TokenKind::In,
+        TokenKind::In,
+        TokenKind::In,
+        TokenKind::Exists,
+        TokenKind::Exists,
+        TokenKind::Exists,
+        TokenKind::Not,
+        TokenKind::Exists,
+        TokenKind::Not,
+        TokenKind::In,
+        TokenKind::Eof,
+    ];
+
+    let actual: Vec<TokenKind> = tokens.into_iter().map(|t| t.kind).collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_parser_subqueries() {
+    // 1. Scalar subquery
+    let sql = "SELECT * FROM users WHERE id = (SELECT user_id FROM orders WHERE id = 10);";
+    let stmt = parse_sql(sql).unwrap();
+    assert!(stmt.selection.is_some());
+    match stmt.selection.unwrap() {
+        SqlExpr::Binary {
+            left,
+            op: SqlBinaryOp::Eq,
+            right,
+        } => {
+            assert_eq!(*left, SqlExpr::Identifier("id".into()));
+            match *right {
+                SqlExpr::Subquery(sub) => {
+                    assert_eq!(sub.from.name, "orders");
+                }
+                other => panic!("expected Subquery, found {other:?}"),
+            }
+        }
+        other => panic!("expected Binary Eq, found {other:?}"),
+    }
+
+    // 2. IN subquery
+    let sql = "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders);";
+    let stmt = parse_sql(sql).unwrap();
+    match stmt.selection.unwrap() {
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            assert_eq!(*expr, SqlExpr::Identifier("id".into()));
+            assert_eq!(subquery.from.name, "orders");
+            assert!(!negated);
+        }
+        other => panic!("expected InSubquery, found {other:?}"),
+    }
+
+    // 3. NOT IN subquery
+    let sql = "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM orders);";
+    let stmt = parse_sql(sql).unwrap();
+    match stmt.selection.unwrap() {
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            assert_eq!(*expr, SqlExpr::Identifier("id".into()));
+            assert_eq!(subquery.from.name, "orders");
+            assert!(negated);
+        }
+        other => panic!("expected InSubquery negated, found {other:?}"),
+    }
+
+    // 4. EXISTS subquery
+    let sql = "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);";
+    let stmt = parse_sql(sql).unwrap();
+    match stmt.selection.unwrap() {
+        SqlExpr::Exists { subquery, negated } => {
+            assert_eq!(subquery.from.name, "orders");
+            assert_eq!(subquery.from.alias.as_deref(), Some("o"));
+            assert!(!negated);
+        }
+        other => panic!("expected Exists, found {other:?}"),
+    }
+
+    // 5. NOT EXISTS subquery
+    let sql =
+        "SELECT * FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);";
+    let stmt = parse_sql(sql).unwrap();
+    match stmt.selection.unwrap() {
+        SqlExpr::Exists { subquery, negated } => {
+            assert_eq!(subquery.from.name, "orders");
+            assert!(negated);
+        }
+        other => panic!("expected Exists negated, found {other:?}"),
+    }
+
+    // 6. IN expression list
+    let sql = "SELECT * FROM users WHERE id IN (1, 2, 3);";
+    let stmt = parse_sql(sql).unwrap();
+    match stmt.selection.unwrap() {
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            assert_eq!(*expr, SqlExpr::Identifier("id".into()));
+            assert_eq!(list.len(), 3);
+            assert!(!negated);
+        }
+        other => panic!("expected InList, found {other:?}"),
+    }
+}
+
+#[test]
+fn test_parser_invalid_subqueries() {
+    let invalid = [
+        "SELECT * FROM users WHERE id IN ();",
+        "SELECT * FROM users WHERE id NOT IN ();",
+        "SELECT * FROM users WHERE id IN (SELECT);",
+        "SELECT * FROM users WHERE id IN (SELECT * FROM);",
+        "SELECT * FROM users WHERE EXISTS ();",
+        "SELECT * FROM users WHERE NOT EXISTS ();",
+        "SELECT * FROM users WHERE EXISTS (SELECT);",
+    ];
+
+    for &sql in &invalid {
+        let res = parse_sql(sql);
+        assert!(
+            res.is_err(),
+            "Expected parse error for '{sql}', but got {res:?}"
+        );
+    }
+}

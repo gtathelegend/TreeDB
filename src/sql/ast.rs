@@ -527,6 +527,33 @@ pub enum SqlExpr {
         /// Inner argument expression.
         arg: Box<SqlExpr>,
     },
+    /// Scalar subquery: `(SELECT ...)`.
+    Subquery(Box<SelectStatement>),
+    /// `EXISTS (SELECT ...)` or `NOT EXISTS (SELECT ...)`.
+    Exists {
+        /// Inner select statement.
+        subquery: Box<SelectStatement>,
+        /// Whether the predicate is negated (`NOT EXISTS`).
+        negated: bool,
+    },
+    /// `expr [NOT] IN (SELECT ...)`.
+    InSubquery {
+        /// Evaluated scalar expression.
+        expr: Box<SqlExpr>,
+        /// Subquery producing set of candidate values.
+        subquery: Box<SelectStatement>,
+        /// Whether the condition is negated (`NOT IN`).
+        negated: bool,
+    },
+    /// `expr [NOT] IN (val1, val2, ...)`.
+    InList {
+        /// Evaluated scalar expression.
+        expr: Box<SqlExpr>,
+        /// List of expressions.
+        list: Vec<SqlExpr>,
+        /// Whether the condition is negated (`NOT IN`).
+        negated: bool,
+    },
 }
 
 impl fmt::Display for SqlExpr {
@@ -541,6 +568,40 @@ impl fmt::Display for SqlExpr {
             SqlExpr::IsNotNull(expr) => write!(f, "({expr} IS NOT NULL)"),
             SqlExpr::CountAll => write!(f, "COUNT(*)"),
             SqlExpr::Aggregate { function, arg } => write!(f, "{function}({arg})"),
+            SqlExpr::Subquery(sub) => write!(f, "({sub})"),
+            SqlExpr::Exists { subquery, negated } => {
+                if *negated {
+                    write!(f, "NOT EXISTS ({subquery})")
+                } else {
+                    write!(f, "EXISTS ({subquery})")
+                }
+            }
+            SqlExpr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                if *negated {
+                    write!(f, "({expr} NOT IN ({subquery}))")
+                } else {
+                    write!(f, "({expr} IN ({subquery}))")
+                }
+            }
+            SqlExpr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let not = if *negated { "NOT " } else { "" };
+                write!(f, "({expr} {not}IN (")?;
+                for (i, item) in list.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, "))")
+            }
         }
     }
 }

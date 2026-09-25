@@ -210,6 +210,7 @@ impl fmt::Display for PhysicalPlan {
         if let Some(post_filter) = &self.post_join_filter {
             write_indent(f, indent)?;
             writeln!(f, "Filter [{}]", post_filter)?;
+            format_subqueries_in_expr(post_filter, f, indent + 1)?;
             indent += 1;
         }
 
@@ -231,6 +232,9 @@ impl fmt::Display for PhysicalPlan {
                     .map(|rf| format!(", filter: [{rf}]"))
                     .unwrap_or_default()
             )?;
+            if let Some(rf) = &self.base_table.residual_filter {
+                format_subqueries_in_expr(rf, f, indent + 1)?;
+            }
         } else {
             for (idx, join) in self.joins.iter().enumerate() {
                 write_indent(f, indent)?;
@@ -239,6 +243,7 @@ impl fmt::Display for PhysicalPlan {
                     "NestedLoopJoin ({:?}, on: [{}])",
                     join.join_type, join.on
                 )?;
+                format_subqueries_in_expr(&join.on, f, indent + 1)?;
                 indent += 1;
                 if idx == 0 {
                     write_indent(f, indent)?;
@@ -258,6 +263,9 @@ impl fmt::Display for PhysicalPlan {
                             .map(|rf| format!(", filter: [{rf}]"))
                             .unwrap_or_default()
                     )?;
+                    if let Some(rf) = &self.base_table.residual_filter {
+                        format_subqueries_in_expr(rf, f, indent + 1)?;
+                    }
                 }
                 write_indent(f, indent)?;
                 writeln!(
@@ -276,10 +284,83 @@ impl fmt::Display for PhysicalPlan {
                         .map(|rf| format!(", filter: [{rf}]"))
                         .unwrap_or_default()
                 )?;
+                if let Some(rf) = &join.right.residual_filter {
+                    format_subqueries_in_expr(rf, f, indent + 1)?;
+                }
             }
         }
 
         Ok(())
+    }
+}
+
+fn format_subqueries_in_expr(
+    expr: &Expr,
+    f: &mut fmt::Formatter<'_>,
+    indent: usize,
+) -> fmt::Result {
+    let write_indent = |f: &mut fmt::Formatter<'_>, lvl: usize| -> fmt::Result {
+        for _ in 0..lvl {
+            write!(f, "  ")?;
+        }
+        Ok(())
+    };
+
+    match expr {
+        Expr::Subquery(sub) => {
+            if sub.is_correlated {
+                write_indent(f, indent)?;
+                writeln!(f, "Correlated Subquery")?;
+                write_indent(f, indent + 1)?;
+                writeln!(f, "Outer references: [{}]", sub.outer_references.join(", "))?;
+            } else {
+                write_indent(f, indent)?;
+                writeln!(f, "Subquery")?;
+            }
+            write_indent(f, indent + 1)?;
+            let kind_str = match &sub.kind {
+                crate::query::expr::SubqueryKind::Scalar { .. } => "Scalar",
+                crate::query::expr::SubqueryKind::In { negated, .. } => {
+                    if *negated {
+                        "NOT IN"
+                    } else {
+                        "IN"
+                    }
+                }
+                crate::query::expr::SubqueryKind::Exists { negated } => {
+                    if *negated {
+                        "NOT EXISTS"
+                    } else {
+                        "EXISTS"
+                    }
+                }
+            };
+            writeln!(f, "Kind: {kind_str}")?;
+            write_indent(f, indent + 1)?;
+            writeln!(f, "Plan:")?;
+            let plan_str = format!("{}", sub.plan);
+            for line in plan_str.lines() {
+                write_indent(f, indent + 2)?;
+                writeln!(f, "{line}")?;
+            }
+            Ok(())
+        }
+        Expr::Binary { left, right, .. } => {
+            format_subqueries_in_expr(left, f, indent)?;
+            format_subqueries_in_expr(right, f, indent)?;
+            Ok(())
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            format_subqueries_in_expr(expr, f, indent)
+        }
+        Expr::InList { expr, list, .. } => {
+            format_subqueries_in_expr(expr, f, indent)?;
+            for item in list {
+                format_subqueries_in_expr(item, f, indent)?;
+            }
+            Ok(())
+        }
+        Expr::Literal(_) | Expr::Column(_) | Expr::OuterColumn { .. } => Ok(()),
     }
 }
 
@@ -464,18 +545,17 @@ impl Optimizer {
 fn plan_table_scan(
     table: &TableOptInfo,
     conjuncts: Vec<Expr>,
-    is_multi_table: bool,
+    _is_multi_table: bool,
 ) -> PhysicalTableScan {
     let qualifier = table.qualifier();
     // 1. Unqualify conjuncts so they match raw table schema column names
-    let unqual_conjuncts: Vec<Expr> = if is_multi_table {
-        conjuncts
-            .iter()
-            .map(|c| unqualify_expr(c, qualifier))
-            .collect()
-    } else {
-        conjuncts
-    };
+    let unqual_conjuncts: Vec<Expr> = conjuncts
+        .iter()
+        .map(|c| {
+            let unqual = unqualify_expr(c, qualifier);
+            unqualify_expr(&unqual, &table.name)
+        })
+        .collect();
 
     let schema = &table.schema;
     let pk_col = schema.primary_key_column();
@@ -638,6 +718,11 @@ fn collect_qualifiers(expr: &Expr, set: &mut HashSet<String>) {
                 set.insert(name[..dot_idx].to_string());
             }
         }
+        Expr::OuterColumn { name, .. } => {
+            if let Some(dot_idx) = name.find('.') {
+                set.insert(name[..dot_idx].to_string());
+            }
+        }
         Expr::Binary { left, right, .. } => {
             collect_qualifiers(left, set);
             collect_qualifiers(right, set);
@@ -645,7 +730,13 @@ fn collect_qualifiers(expr: &Expr, set: &mut HashSet<String>) {
         Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
             collect_qualifiers(expr, set);
         }
-        Expr::Literal(_) => {}
+        Expr::InList { expr, list, .. } => {
+            collect_qualifiers(expr, set);
+            for item in list {
+                collect_qualifiers(item, set);
+            }
+        }
+        Expr::Subquery(_) | Expr::Literal(_) => {}
     }
 }
 
@@ -660,6 +751,15 @@ pub fn unqualify_expr(expr: &Expr, qualifier: &str) -> Expr {
                 Expr::Column(name.clone())
             }
         }
+        Expr::OuterColumn {
+            name,
+            data_type,
+            scope_depth,
+        } => Expr::OuterColumn {
+            name: name.clone(),
+            data_type: *data_type,
+            scope_depth: *scope_depth,
+        },
         Expr::Binary { left, op, right } => Expr::Binary {
             left: Box::new(unqualify_expr(left, qualifier)),
             op: *op,
@@ -671,6 +771,19 @@ pub fn unqualify_expr(expr: &Expr, qualifier: &str) -> Expr {
         },
         Expr::IsNull(e) => Expr::IsNull(Box::new(unqualify_expr(e, qualifier))),
         Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(unqualify_expr(e, qualifier))),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(unqualify_expr(expr, qualifier)),
+            list: list
+                .iter()
+                .map(|item| unqualify_expr(item, qualifier))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::Subquery(sub) => Expr::Subquery(sub.clone()),
         Expr::Literal(val) => Expr::Literal(val.clone()),
     }
 }

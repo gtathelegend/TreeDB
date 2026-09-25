@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-use crate::engine::types::{DataType, Row, Schema, Value};
+use crate::engine::types::{Column, DataType, Row, Schema, Value};
 use crate::error::{Error, Result};
 
 /// Binary operators supported in query expressions.
@@ -212,13 +212,72 @@ impl fmt::Display for AggregateExpr {
     }
 }
 
+/// Result of pre-evaluating an uncorrelated subquery for reuse across row evaluations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MaterializedSubqueryResult {
+    /// Scalar subquery resulting value (or NULL if 0 rows).
+    Scalar(Value),
+    /// IN subquery resulting set of column values.
+    In(Vec<Value>),
+    /// EXISTS subquery resulting boolean.
+    Exists(bool),
+}
+
+/// Classification of subquery expressions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubqueryKind {
+    /// Scalar subquery returning at most one row and one column.
+    Scalar {
+        /// Inferred output data type of the single projected column.
+        data_type: DataType,
+    },
+    /// IN subquery predicate: `expr IN (SELECT ...)` or `expr NOT IN (SELECT ...)`.
+    In {
+        /// Left-hand argument expression.
+        expr: Box<Expr>,
+        /// Whether the IN predicate is negated (`NOT IN`).
+        negated: bool,
+    },
+    /// EXISTS subquery predicate: `EXISTS (SELECT ...)` or `NOT EXISTS (SELECT ...)`.
+    Exists {
+        /// Whether the EXISTS predicate is negated (`NOT EXISTS`).
+        negated: bool,
+    },
+}
+
+/// Fully bound and optimized subquery expression embedded in a physical expression tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubqueryExpr {
+    /// Subquery form and semantics.
+    pub kind: SubqueryKind,
+    /// Parsed AST statement representing the subquery.
+    pub statement: Box<crate::sql::ast::SelectStatement>,
+    /// Optimized physical plan for executing the subquery.
+    pub plan: crate::query::optimizer::PhysicalPlan,
+    /// Whether the subquery references columns from enclosing outer scopes.
+    pub is_correlated: bool,
+    /// List of outer column names referenced by the subquery.
+    pub outer_references: Vec<String>,
+    /// Materialized result for uncorrelated subqueries (if pre-evaluated).
+    pub materialized: Option<MaterializedSubqueryResult>,
+}
+
 /// Abstract Syntax Tree (AST) node for scalar expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// Constant literal scalar value.
     Literal(Value),
-    /// Column reference by name.
+    /// Column reference by name in the current scope.
     Column(String),
+    /// Correlated column reference from an enclosing outer scope.
+    OuterColumn {
+        /// Name or qualified name of the outer column.
+        name: String,
+        /// Data type of the column.
+        data_type: DataType,
+        /// Scope depth (1 = immediate enclosing scope, 2 = outer-outer, etc.).
+        scope_depth: usize,
+    },
     /// Binary operation on two sub-expressions.
     Binary {
         /// Left-hand operand.
@@ -239,6 +298,41 @@ pub enum Expr {
     IsNull(Box<Expr>),
     /// IS NOT NULL predicate.
     IsNotNull(Box<Expr>),
+    /// IN list expression: `expr IN (item1, item2, ...)` or `expr NOT IN (...)`.
+    InList {
+        /// Left-hand argument expression.
+        expr: Box<Expr>,
+        /// List of item expressions.
+        list: Vec<Expr>,
+        /// Whether the predicate is negated (`NOT IN`).
+        negated: bool,
+    },
+    /// Nested subquery expression.
+    Subquery(Box<SubqueryExpr>),
+}
+
+/// Resolves a column within a schema, handling exact match, qualified name (e.g. `u.id`),
+/// or unqualified name against a qualified schema (e.g. `id` against `users.id`).
+pub fn resolve_column_in_schema<'a>(schema: &'a Schema, name: &str) -> Option<(usize, &'a Column)> {
+    if let Some(idx) = schema.column_index(name) {
+        return Some((idx, &schema.columns[idx]));
+    }
+    if let Some((_qual, col)) = name.split_once('.') {
+        if let Some(idx) = schema.column_index(col) {
+            return Some((idx, &schema.columns[idx]));
+        }
+    }
+    let dot_name = format!(".{name}");
+    let mut matches = Vec::new();
+    for (idx, col) in schema.columns.iter().enumerate() {
+        if col.name == name || col.name.ends_with(&dot_name) {
+            matches.push((idx, col));
+        }
+    }
+    if matches.len() == 1 {
+        return Some(matches[0]);
+    }
+    None
 }
 
 impl Expr {
@@ -349,10 +443,10 @@ impl Expr {
     pub fn infer_type(&self, schema: &Schema) -> Result<DataType> {
         match self {
             Expr::Literal(v) => Ok(v.data_type()),
-            Expr::Column(name) => schema
-                .get_column(name)
-                .map(|c| c.data_type)
+            Expr::Column(name) => resolve_column_in_schema(schema, name)
+                .map(|(_, c)| c.data_type)
                 .ok_or_else(|| Error::ColumnNotFound(name.clone())),
+            Expr::OuterColumn { data_type, .. } => Ok(*data_type),
             Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(DataType::Boolean),
             Expr::Unary {
                 op: UnaryOp::Not,
@@ -417,6 +511,24 @@ impl Expr {
                     }
                 }
             }
+            Expr::InList { expr, list, .. } => {
+                let lt = expr.infer_type(schema)?;
+                for item in list {
+                    let rt = item.infer_type(schema)?;
+                    if lt != DataType::Null && rt != DataType::Null && lt != rt {
+                        return Err(Error::InvalidComparison {
+                            left: lt.to_string(),
+                            right: rt.to_string(),
+                            op: "IN".to_string(),
+                        });
+                    }
+                }
+                Ok(DataType::Boolean)
+            }
+            Expr::Subquery(subquery) => match &subquery.kind {
+                SubqueryKind::Scalar { data_type } => Ok(*data_type),
+                SubqueryKind::In { .. } | SubqueryKind::Exists { .. } => Ok(DataType::Boolean),
+            },
         }
     }
 
@@ -424,11 +536,21 @@ impl Expr {
     ///
     /// Implements SQL-compliant 3-valued logic (3VL) for boolean operations and NULL handling.
     pub fn evaluate(&self, row: &Row, schema: &Schema) -> Result<Value> {
+        self.evaluate_with_outer(row, schema, &[])
+    }
+
+    /// Evaluates this expression against a single table `Row`, its `Schema`, and any active
+    /// enclosing `outer_contexts` (for correlated subqueries and outer column resolution).
+    pub fn evaluate_with_outer(
+        &self,
+        row: &Row,
+        schema: &Schema,
+        outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<Value> {
         match self {
             Expr::Literal(v) => Ok(v.clone()),
             Expr::Column(name) => {
-                let idx = schema
-                    .column_index(name)
+                let (idx, _) = resolve_column_in_schema(schema, name)
                     .ok_or_else(|| Error::ColumnNotFound(name.clone()))?;
                 if idx >= row.values.len() {
                     return Err(Error::ColumnCountMismatch {
@@ -438,19 +560,41 @@ impl Expr {
                 }
                 Ok(row.values[idx].clone())
             }
+            Expr::OuterColumn {
+                name, scope_depth, ..
+            } => {
+                if outer_contexts.is_empty()
+                    || *scope_depth == 0
+                    || *scope_depth > outer_contexts.len()
+                {
+                    return Err(Error::ColumnNotFound(format!(
+                        "outer column '{name}' at depth {scope_depth} not available in execution context"
+                    )));
+                }
+                let (outer_row, outer_schema) = outer_contexts[outer_contexts.len() - scope_depth];
+                let (idx, _) = resolve_column_in_schema(outer_schema, name)
+                    .ok_or_else(|| Error::ColumnNotFound(name.clone()))?;
+                if idx >= outer_row.values.len() {
+                    return Err(Error::ColumnCountMismatch {
+                        expected: outer_schema.columns.len(),
+                        found: outer_row.values.len(),
+                    });
+                }
+                Ok(outer_row.values[idx].clone())
+            }
             Expr::IsNull(inner) => {
-                let val = inner.evaluate(row, schema)?;
+                let val = inner.evaluate_with_outer(row, schema, outer_contexts)?;
                 Ok(Value::Boolean(val.is_null()))
             }
             Expr::IsNotNull(inner) => {
-                let val = inner.evaluate(row, schema)?;
+                let val = inner.evaluate_with_outer(row, schema, outer_contexts)?;
                 Ok(Value::Boolean(!val.is_null()))
             }
             Expr::Unary {
                 op: UnaryOp::Not,
                 expr,
             } => {
-                let val = expr.evaluate(row, schema)?;
+                let val = expr.evaluate_with_outer(row, schema, outer_contexts)?;
                 match val {
                     Value::Null => Ok(Value::Null),
                     Value::Boolean(b) => Ok(Value::Boolean(!b)),
@@ -461,11 +605,11 @@ impl Expr {
             }
             Expr::Binary { left, op, right } => match op {
                 BinaryOp::And => {
-                    let l = left.evaluate(row, schema)?;
+                    let l = left.evaluate_with_outer(row, schema, outer_contexts)?;
                     match l {
                         Value::Boolean(false) => Ok(Value::Boolean(false)),
                         Value::Boolean(true) => {
-                            let r = right.evaluate(row, schema)?;
+                            let r = right.evaluate_with_outer(row, schema, outer_contexts)?;
                             match r {
                                 Value::Boolean(rb) => Ok(Value::Boolean(rb)),
                                 Value::Null => Ok(Value::Null),
@@ -475,7 +619,7 @@ impl Expr {
                             }
                         }
                         Value::Null => {
-                            let r = right.evaluate(row, schema)?;
+                            let r = right.evaluate_with_outer(row, schema, outer_contexts)?;
                             match r {
                                 Value::Boolean(false) => Ok(Value::Boolean(false)),
                                 Value::Boolean(true) | Value::Null => Ok(Value::Null),
@@ -490,11 +634,11 @@ impl Expr {
                     }
                 }
                 BinaryOp::Or => {
-                    let l = left.evaluate(row, schema)?;
+                    let l = left.evaluate_with_outer(row, schema, outer_contexts)?;
                     match l {
                         Value::Boolean(true) => Ok(Value::Boolean(true)),
                         Value::Boolean(false) => {
-                            let r = right.evaluate(row, schema)?;
+                            let r = right.evaluate_with_outer(row, schema, outer_contexts)?;
                             match r {
                                 Value::Boolean(rb) => Ok(Value::Boolean(rb)),
                                 Value::Null => Ok(Value::Null),
@@ -504,7 +648,7 @@ impl Expr {
                             }
                         }
                         Value::Null => {
-                            let r = right.evaluate(row, schema)?;
+                            let r = right.evaluate_with_outer(row, schema, outer_contexts)?;
                             match r {
                                 Value::Boolean(true) => Ok(Value::Boolean(true)),
                                 Value::Boolean(false) | Value::Null => Ok(Value::Null),
@@ -519,8 +663,8 @@ impl Expr {
                     }
                 }
                 BinaryOp::Eq | BinaryOp::NotEq => {
-                    let l = left.evaluate(row, schema)?;
-                    let r = right.evaluate(row, schema)?;
+                    let l = left.evaluate_with_outer(row, schema, outer_contexts)?;
+                    let r = right.evaluate_with_outer(row, schema, outer_contexts)?;
 
                     if l.is_null() || r.is_null() {
                         return Ok(Value::Null);
@@ -539,8 +683,8 @@ impl Expr {
                     Ok(Value::Boolean(result))
                 }
                 BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
-                    let l = left.evaluate(row, schema)?;
-                    let r = right.evaluate(row, schema)?;
+                    let l = left.evaluate_with_outer(row, schema, outer_contexts)?;
+                    let r = right.evaluate_with_outer(row, schema, outer_contexts)?;
 
                     if l.is_null() || r.is_null() {
                         return Ok(Value::Null);
@@ -578,7 +722,79 @@ impl Expr {
                     Ok(Value::Boolean(res))
                 }
             },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let target = expr.evaluate_with_outer(row, schema, outer_contexts)?;
+                let mut vals = Vec::with_capacity(list.len());
+                for item in list {
+                    vals.push(item.evaluate_with_outer(row, schema, outer_contexts)?);
+                }
+                Ok(eval_in_3vl(&target, &vals, *negated))
+            }
+            Expr::Subquery(subquery) => {
+                if let Some(mat) = &subquery.materialized {
+                    match mat {
+                        MaterializedSubqueryResult::Scalar(val) => Ok(val.clone()),
+                        MaterializedSubqueryResult::In(in_vals) => {
+                            if let SubqueryKind::In { expr, negated } = &subquery.kind {
+                                let target =
+                                    expr.evaluate_with_outer(row, schema, outer_contexts)?;
+                                Ok(eval_in_3vl(&target, in_vals, *negated))
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        MaterializedSubqueryResult::Exists(b) => {
+                            if let SubqueryKind::Exists { negated } = &subquery.kind {
+                                let res = if *negated { !*b } else { *b };
+                                Ok(Value::Boolean(res))
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                    }
+                } else {
+                    Err(Error::SqlBindingError(
+                        "unmaterialized subquery encountered during direct expression evaluation without transaction runner"
+                            .to_string(),
+                    ))
+                }
+            }
         }
+    }
+}
+
+/// Evaluates SQL 3-valued logic for `IN` and `NOT IN` predicates.
+///
+/// Rules:
+/// - If `in_vals` is empty: `IN` returns `FALSE`, `NOT IN` returns `TRUE`.
+/// - If `left_val` is `NULL`: returns `NULL`.
+/// - If `left_val` matches any non-NULL value in `in_vals`: `IN` returns `TRUE`, `NOT IN` returns `FALSE`.
+/// - If no match found:
+///   - If `in_vals` contains any `NULL`: returns `NULL`.
+///   - If `in_vals` has no `NULL`: `IN` returns `FALSE`, `NOT IN` returns `TRUE`.
+pub fn eval_in_3vl(left_val: &Value, in_vals: &[Value], negated: bool) -> Value {
+    if in_vals.is_empty() {
+        return Value::Boolean(negated);
+    }
+    if left_val.is_null() {
+        return Value::Null;
+    }
+    let mut has_null = false;
+    for v in in_vals {
+        if v.is_null() {
+            has_null = true;
+        } else if compare_values_eq(left_val, v) {
+            return Value::Boolean(!negated);
+        }
+    }
+    if has_null {
+        Value::Null
+    } else {
+        Value::Boolean(negated)
     }
 }
 
@@ -587,10 +803,31 @@ impl fmt::Display for Expr {
         match self {
             Expr::Literal(v) => write!(f, "{v}"),
             Expr::Column(name) => write!(f, "{name}"),
+            Expr::OuterColumn { name, .. } => write!(f, "{name}"),
             Expr::Binary { left, op, right } => write!(f, "({left} {op} {right})"),
             Expr::Unary { op, expr } => write!(f, "({op} {expr})"),
             Expr::IsNull(expr) => write!(f, "({expr} IS NULL)"),
             Expr::IsNotNull(expr) => write!(f, "({expr} IS NOT NULL)"),
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let items: Vec<String> = list.iter().map(|e| e.to_string()).collect();
+                let not = if *negated { "NOT " } else { "" };
+                write!(f, "({expr} {not}IN ({}))", items.join(", "))
+            }
+            Expr::Subquery(sub) => match &sub.kind {
+                SubqueryKind::Scalar { .. } => write!(f, "({})", sub.statement),
+                SubqueryKind::In { expr, negated } => {
+                    let not = if *negated { "NOT " } else { "" };
+                    write!(f, "({expr} {not}IN ({}))", sub.statement)
+                }
+                SubqueryKind::Exists { negated } => {
+                    let not = if *negated { "NOT " } else { "" };
+                    write!(f, "({not}EXISTS ({}))", sub.statement)
+                }
+            },
         }
     }
 }

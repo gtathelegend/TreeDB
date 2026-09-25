@@ -461,6 +461,41 @@ This document records key architectural and design choices, their rationale, and
   * **Unified Storage Architecture:** SQL is a transactional frontend, guaranteeing zero divergence between programmatic API operations and SQL mutations.
   * **Durability & Recovery:** All writes generate standard WAL records, automatically participating in ARIES crash recovery and checkpointing without custom recovery paths.
 
+---
+
+## Decision 37: SQL Subqueries, Nested Binding Scopes, Correlation, and 3VL Semantics
+
+* **Decision:** Implement a first-class SQL subquery system supporting scalar, `IN`/`NOT IN`, `EXISTS`/`NOT EXISTS`, and correlated subqueries directly integrated into the binder, optimizer, physical planner, and transactional execution engine without creating a separate query engine:
+  1. **AST Representation (`SqlExpr`):**
+     * `SqlExpr::Subquery(Box<SelectStatement>)`: Scalar subqueries returning at most one row and one column.
+     * `SqlExpr::Exists { subquery: Box<SelectStatement>, negated: bool }`: Row existence predicates (`EXISTS` / `NOT EXISTS`).
+     * `SqlExpr::InSubquery { expr: Box<SqlExpr>, subquery: Box<SelectStatement>, negated: bool }`: Subquery membership tests (`IN` / `NOT IN`).
+     * `SqlExpr::InList { expr: Box<SqlExpr>, list: Vec<SqlExpr>, negated: bool }`: Constant list membership tests.
+  2. **Nested Binding Scopes & Lexical Resolution:**
+     * `BindingContext` supports recursive parent links (`parent: Option<&'a BindingContext<'a>>`) and catalog access (`catalog: Option<&'a dyn TableCatalog>`).
+     * Column resolution searches the innermost scope first; if unresolved, it traverses outward through enclosing scopes.
+     * Outer column references are explicitly represented as `Expr::OuterColumn { name, data_type, scope_depth }` where `scope_depth >= 1`.
+     * Innermost columns shadow outer columns for unqualified identifiers; qualified identifiers (`u.id`) resolve to the visible matching table/alias in that scope.
+  3. **Shape & Cardinality Invariants:**
+     * **Scalar Subqueries:** Must project exactly 1 column (`Error::SubqueryColumnCountMismatch`). At runtime, 0 rows evaluate to `Value::Null`, 1 row returns the scalar value, and $>1$ rows fail with `Error::ScalarSubqueryMultipleRows`.
+     * **IN / NOT IN Subqueries:** Must project exactly 1 column (`Error::SubqueryColumnCountMismatch`).
+     * **EXISTS / NOT EXISTS:** May project any number of columns (`SELECT *`, `SELECT 1`, `SELECT NULL, NULL`); only row presence ($>0$ vs $0$) determines truth.
+  4. **SQL 3-Valued Logic (3VL) Preservation:**
+     * `x IN (subquery)` evaluates to `TRUE` if any matching non-NULL value is found, `NULL` if no match exists but the subquery contains a `NULL`, and `FALSE` if no match and no `NULL`s exist.
+     * `x NOT IN (subquery)` evaluates to `FALSE` if a match exists, `NULL` if no match exists but a `NULL` is present in the subquery or `x` is `NULL`, and `TRUE` if no match and no `NULL`s exist. Empty subqueries evaluate to `TRUE` under `NOT IN`.
+     * `EXISTS` is strictly 2-valued (`TRUE` / `FALSE`) and is unaffected by `NULL` values in projected columns.
+  5. **Rule-Based Optimizer Integration & Uncorrelated Materialization:**
+     * Every subquery statement is individually bound and optimized through `Optimizer::optimize`, selecting optimal access paths (`PrimaryPointLookup`, `SecondaryIndexScan`, etc.).
+     * Uncorrelated subqueries (with no outer column references) are pre-evaluated once per statement execution and materialized (`MaterializedSubqueryResult`) prior to scanning outer rows.
+     * Correlated subqueries execute per outer row with an execution context stack (`outer_contexts: &[(&Row, &Schema)]`) preserving complete outer row state across arbitrary nesting depths.
+  6. **Transaction Visibility & Composition:**
+     * Subqueries execute within the active `Transaction` context using `TxnBufferPoolCatalog`, observing uncommitted mutations and respecting transaction rollback without introducing new WAL records for reads.
+     * Subqueries compose seamlessly with JOINs, GROUP BY, aggregations, HAVING, ORDER BY, LIMIT, and DML `WHERE` clauses.
+* **Rationale:**
+  * **Unified Execution:** Reusing `PhysicalPlan` and `Optimizer` for subqueries avoids redundant execution engines while preserving full access-path optimization inside inner queries.
+  * **Decoupled Future Decorrelation:** Preserving explicit `SubqueryExpr` and `OuterColumn` representation allows future cost-based decorrelation or subquery flattening phases without modifying the binder or AST.
+
+
 
 
 

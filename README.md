@@ -65,6 +65,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **Relational JOINs** | **Implemented** | `INNER JOIN`, `LEFT JOIN` / `LEFT OUTER JOIN`, multi-table chained joins, table aliases, qualified/unqualified column ambiguity resolution, 3VL `ON` predicates, NULL padding, full query composition with WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET |
 | **Rule-Based Optimizer & Access-Path Planner** | **Implemented** | Decoupled logical/physical planning, deterministic access path selection (PK point/range, secondary index point/range, full scan), AND predicate decomposition, safe join pushdown, LEFT JOIN outer safety, residual filter preservation, plan inspection (`explain_sql`) |
 | **SQL DDL & DML Engine** | **Implemented** | `CREATE TABLE`, `DROP TABLE`, `INSERT INTO ... VALUES`, `UPDATE ... SET`, `DELETE FROM`, optimizer reuse for mutation access paths, transaction rollback, secondary index auto-maintenance, structured `StatementResult` |
+| **SQL Subqueries & Correlation** | **Implemented** | Scalar subqueries (0 rows -> `NULL`, 1 row -> value, >1 rows -> error), `IN` / `NOT IN` with SQL 3VL, `EXISTS` / `NOT EXISTS`, nested binding scopes, outer column references, subquery optimizer integration, uncorrelated pre-evaluation & materialization |
 
 
 ---

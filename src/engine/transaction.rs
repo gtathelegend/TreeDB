@@ -1,8 +1,31 @@
-use crate::engine::types::{DataType, Value};
+use crate::engine::types::{DataType, Row, Schema, Value};
 use crate::engine::TreeDb;
 use crate::error::{Error, Result};
 use crate::storage::page::{Key, PageId};
 use crate::wal::lsn::TxnId;
+
+struct TxnBufferPoolCatalog<'a, 'b> {
+    bp: &'a std::cell::RefCell<&'b mut crate::storage::buffer_pool::BufferPool>,
+}
+
+impl<'a, 'b> crate::sql::TableCatalog for TxnBufferPoolCatalog<'a, 'b> {
+    fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
+        let mut bp = self.bp.borrow_mut();
+        let meta = crate::engine::catalog::Catalog::get_table(&mut bp, table_name)?
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        Ok(meta.schema)
+    }
+
+    fn get_table_indexes(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::engine::catalog::IndexMetadata>> {
+        let mut bp = self.bp.borrow_mut();
+        let meta = crate::engine::catalog::Catalog::get_table(&mut bp, table_name)?
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        crate::engine::catalog::Catalog::list_indexes_for_table(&mut bp, meta.table_id)
+    }
+}
 
 /// Execution result returned by top-level SQL statements (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`).
 #[derive(Debug, Clone, PartialEq)]
@@ -426,7 +449,9 @@ impl<'db> Transaction<'db> {
             ));
         }
 
-        let bound = crate::sql::bind_select_multi(ast, &bindings)?;
+        let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
+        let catalog = TxnBufferPoolCatalog { bp: &bp_cell };
+        let bound = crate::sql::bind_select_multi_with_catalog(ast, &bindings, Some(&catalog))?;
         crate::query::optimizer::Optimizer::optimize(&bound, &table_infos)
     }
 
@@ -733,28 +758,10 @@ impl<'db> Transaction<'db> {
             limit: None,
             offset: None,
         };
-        let bound_select = crate::sql::bind_select_multi(
-            &select_ast,
-            &[crate::sql::TableBinding::new(
-                &stmt.table_name,
-                None,
-                &schema,
-            )],
-        )?;
-
-        let table_opt_info = {
-            let table = self.open_table(&stmt.table_name)?;
-            let indexes = table.indexes().iter().map(|(m, _)| m.clone()).collect();
-            crate::query::optimizer::TableOptInfo::new(
-                &stmt.table_name,
-                None::<String>,
-                schema.clone(),
-                indexes,
-            )
-        };
-        let plan = crate::query::optimizer::Optimizer::optimize(&bound_select, &[table_opt_info])?;
+        let mut plan = self.plan_select(&select_ast)?;
 
         // 3. Fetch candidate rows
+        self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
         let candidate_rows = {
             let mut table = self.open_table(&stmt.table_name)?;
             let initial_rows = match &plan.base_table.access_path {
@@ -783,21 +790,19 @@ impl<'db> Transaction<'db> {
             };
 
             match &plan.base_table.residual_filter {
-                Some(filter) => crate::query::FilterOperator::apply(initial_rows, &schema, filter)?,
+                Some(filter) => self.filter_rows_with_outer(initial_rows, &schema, filter, &[])?,
                 None => initial_rows,
             }
         };
 
         // 4. Update each matching row
-        let mut updated_count = 0;
-        let mut table = self.open_table(&stmt.table_name)?;
-
+        let mut updated_rows = Vec::new();
         for old_row in candidate_rows {
             let mut new_values = old_row.values.clone();
 
             for (col_idx, expr) in &col_assignments {
                 let target_col = &schema.columns[*col_idx];
-                let mut val = expr.evaluate(&old_row, &schema)?;
+                let mut val = self.evaluate_expr_with_outer(expr, &old_row, &schema, &[])?;
 
                 val = match (val, target_col.data_type) {
                     (Value::Int64(i), DataType::UInt64) if i >= 0 => Value::UInt64(i as u64),
@@ -826,7 +831,12 @@ impl<'db> Transaction<'db> {
                 new_values[*col_idx] = val;
             }
 
-            let new_row = crate::engine::types::Row::new(new_values);
+            updated_rows.push(crate::engine::types::Row::new(new_values));
+        }
+
+        let mut updated_count = 0;
+        let mut table = self.open_table(&stmt.table_name)?;
+        for new_row in updated_rows {
             table.update(&new_row)?;
             updated_count += 1;
         }
@@ -855,28 +865,10 @@ impl<'db> Transaction<'db> {
             limit: None,
             offset: None,
         };
-        let bound_select = crate::sql::bind_select_multi(
-            &select_ast,
-            &[crate::sql::TableBinding::new(
-                &stmt.table_name,
-                None,
-                &schema,
-            )],
-        )?;
-
-        let table_opt_info = {
-            let table = self.open_table(&stmt.table_name)?;
-            let indexes = table.indexes().iter().map(|(m, _)| m.clone()).collect();
-            crate::query::optimizer::TableOptInfo::new(
-                &stmt.table_name,
-                None::<String>,
-                schema.clone(),
-                indexes,
-            )
-        };
-        let plan = crate::query::optimizer::Optimizer::optimize(&bound_select, &[table_opt_info])?;
+        let mut plan = self.plan_select(&select_ast)?;
 
         // 2. Fetch candidate rows
+        self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
         let candidate_rows = {
             let mut table = self.open_table(&stmt.table_name)?;
             let initial_rows = match &plan.base_table.access_path {
@@ -905,7 +897,7 @@ impl<'db> Transaction<'db> {
             };
 
             match &plan.base_table.residual_filter {
-                Some(filter) => crate::query::FilterOperator::apply(initial_rows, &schema, filter)?,
+                Some(filter) => self.filter_rows_with_outer(initial_rows, &schema, filter, &[])?,
                 None => initial_rows,
             }
         };
@@ -931,7 +923,19 @@ impl<'db> Transaction<'db> {
         &mut self,
         plan: &crate::query::optimizer::PhysicalPlan,
     ) -> Result<crate::query::QueryResult> {
+        self.execute_physical_plan_with_outer(plan, &[])
+    }
+
+    /// Executes a fully optimized `PhysicalPlan` against this transaction with outer scope contexts.
+    pub fn execute_physical_plan_with_outer(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+        outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<crate::query::QueryResult> {
         self.ensure_active()?;
+
+        let mut plan = plan.clone();
+        self.pre_evaluate_uncorrelated_subqueries(&mut plan, outer_contexts)?;
 
         // 1. Execute base table scan
         let (mut current_schema, mut current_rows) = {
@@ -964,7 +968,7 @@ impl<'db> Transaction<'db> {
 
             let filtered_rows = match &plan.base_table.residual_filter {
                 Some(filter) => {
-                    crate::query::FilterOperator::apply(initial_rows, &raw_schema, filter)?
+                    self.filter_rows_with_outer(initial_rows, &raw_schema, filter, outer_contexts)?
                 }
                 None => initial_rows,
             };
@@ -1021,9 +1025,12 @@ impl<'db> Transaction<'db> {
                 };
 
                 let filtered_rows = match &join.right.residual_filter {
-                    Some(filter) => {
-                        crate::query::FilterOperator::apply(initial_rows, &raw_schema, filter)?
-                    }
+                    Some(filter) => self.filter_rows_with_outer(
+                        initial_rows,
+                        &raw_schema,
+                        filter,
+                        outer_contexts,
+                    )?,
                     None => initial_rows,
                 };
 
@@ -1045,13 +1052,14 @@ impl<'db> Transaction<'db> {
                 )
             };
 
-            let (next_schema, next_rows) = crate::query::JoinOperator::apply(
+            let (next_schema, next_rows) = self.join_rows_with_outer(
                 current_rows,
                 &current_schema,
                 &right_rows,
                 &right_schema,
                 join.join_type,
                 &join.on,
+                outer_contexts,
             )?;
             current_schema = next_schema;
             current_rows = next_rows;
@@ -1059,8 +1067,12 @@ impl<'db> Transaction<'db> {
 
         // 3. Post-Join Filter
         if let Some(post_filter) = &plan.post_join_filter {
-            current_rows =
-                crate::query::FilterOperator::apply(current_rows, &current_schema, post_filter)?;
+            current_rows = self.filter_rows_with_outer(
+                current_rows,
+                &current_schema,
+                post_filter,
+                outer_contexts,
+            )?;
         }
 
         // 4. Aggregation / Group By / Having vs Sort / Project
@@ -1074,9 +1086,12 @@ impl<'db> Transaction<'db> {
             )?;
 
             let having_rows = match &plan.having {
-                Some(predicate) => {
-                    crate::query::FilterOperator::apply(grouped_rows, &grouped_schema, predicate)?
-                }
+                Some(predicate) => self.filter_rows_with_outer(
+                    grouped_rows,
+                    &grouped_schema,
+                    predicate,
+                    outer_contexts,
+                )?,
                 None => grouped_rows,
             };
 
@@ -1110,6 +1125,374 @@ impl<'db> Transaction<'db> {
                 paginated_rows,
             ))
         }
+    }
+
+    /// Pre-evaluates all uncorrelated subqueries in the physical plan.
+    pub fn pre_evaluate_uncorrelated_subqueries(
+        &mut self,
+        plan: &mut crate::query::optimizer::PhysicalPlan,
+        outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<()> {
+        if let Some(rf) = &mut plan.base_table.residual_filter {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(rf, outer_contexts)?;
+        }
+        for join in &mut plan.joins {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(&mut join.on, outer_contexts)?;
+            if let Some(rf) = &mut join.right.residual_filter {
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(rf, outer_contexts)?;
+            }
+        }
+        if let Some(post_filter) = &mut plan.post_join_filter {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(post_filter, outer_contexts)?;
+        }
+        if let Some(having) = &mut plan.having {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(having, outer_contexts)?;
+        }
+        for (proj, _) in &mut plan.projections {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(proj, outer_contexts)?;
+        }
+        for sort_key in &mut plan.order_by {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr(
+                &mut sort_key.expression,
+                outer_contexts,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn pre_evaluate_uncorrelated_subqueries_in_expr(
+        &mut self,
+        expr: &mut crate::query::expr::Expr,
+        outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<()> {
+        match expr {
+            crate::query::expr::Expr::Subquery(sub) => {
+                if !sub.is_correlated && sub.materialized.is_none() {
+                    let mat = self.evaluate_subquery_materialized(sub, outer_contexts)?;
+                    sub.materialized = Some(mat);
+                }
+            }
+            crate::query::expr::Expr::Binary { left, right, .. } => {
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(left, outer_contexts)?;
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(right, outer_contexts)?;
+            }
+            crate::query::expr::Expr::Unary { expr, .. }
+            | crate::query::expr::Expr::IsNull(expr)
+            | crate::query::expr::Expr::IsNotNull(expr) => {
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(expr, outer_contexts)?;
+            }
+            crate::query::expr::Expr::InList { expr, list, .. } => {
+                self.pre_evaluate_uncorrelated_subqueries_in_expr(expr, outer_contexts)?;
+                for item in list {
+                    self.pre_evaluate_uncorrelated_subqueries_in_expr(item, outer_contexts)?;
+                }
+            }
+            crate::query::expr::Expr::Literal(_)
+            | crate::query::expr::Expr::Column(_)
+            | crate::query::expr::Expr::OuterColumn { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn evaluate_subquery_materialized(
+        &mut self,
+        subquery: &crate::query::expr::SubqueryExpr,
+        outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<crate::query::expr::MaterializedSubqueryResult> {
+        match &subquery.kind {
+            crate::query::expr::SubqueryKind::Scalar { .. } => {
+                let res = self.execute_physical_plan_with_outer(&subquery.plan, outer_contexts)?;
+                if res.rows.is_empty() {
+                    Ok(crate::query::expr::MaterializedSubqueryResult::Scalar(
+                        Value::Null,
+                    ))
+                } else if res.rows.len() == 1 {
+                    Ok(crate::query::expr::MaterializedSubqueryResult::Scalar(
+                        res.rows[0].values[0].clone(),
+                    ))
+                } else {
+                    Err(Error::ScalarSubqueryMultipleRows)
+                }
+            }
+            crate::query::expr::SubqueryKind::In { .. } => {
+                let res = self.execute_physical_plan_with_outer(&subquery.plan, outer_contexts)?;
+                let in_vals: Vec<Value> =
+                    res.rows.into_iter().map(|r| r.values[0].clone()).collect();
+                Ok(crate::query::expr::MaterializedSubqueryResult::In(in_vals))
+            }
+            crate::query::expr::SubqueryKind::Exists { .. } => {
+                let res = self.execute_physical_plan_with_outer(&subquery.plan, outer_contexts)?;
+                let exists = !res.rows.is_empty();
+                Ok(crate::query::expr::MaterializedSubqueryResult::Exists(
+                    exists,
+                ))
+            }
+        }
+    }
+
+    /// Evaluates an expression against a row in the current table and any enclosing outer scopes.
+    pub fn evaluate_expr_with_outer(
+        &mut self,
+        expr: &crate::query::expr::Expr,
+        row: &Row,
+        schema: &Schema,
+        outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<Value> {
+        match expr {
+            crate::query::expr::Expr::Subquery(sub) => {
+                if let Some(mat) = &sub.materialized {
+                    match mat {
+                        crate::query::expr::MaterializedSubqueryResult::Scalar(val) => {
+                            Ok(val.clone())
+                        }
+                        crate::query::expr::MaterializedSubqueryResult::In(in_vals) => {
+                            if let crate::query::expr::SubqueryKind::In { expr, negated } =
+                                &sub.kind
+                            {
+                                let left = self.evaluate_expr_with_outer(
+                                    expr,
+                                    row,
+                                    schema,
+                                    outer_contexts,
+                                )?;
+                                Ok(crate::query::expr::eval_in_3vl(&left, in_vals, *negated))
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        crate::query::expr::MaterializedSubqueryResult::Exists(b) => {
+                            if let crate::query::expr::SubqueryKind::Exists { negated } = &sub.kind
+                            {
+                                let res = if *negated { !*b } else { *b };
+                                Ok(Value::Boolean(res))
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                    }
+                } else {
+                    let mut nested = outer_contexts.to_vec();
+                    nested.push((row, schema));
+                    match &sub.kind {
+                        crate::query::expr::SubqueryKind::Scalar { .. } => {
+                            let res = self.execute_physical_plan_with_outer(&sub.plan, &nested)?;
+                            if res.rows.is_empty() {
+                                Ok(Value::Null)
+                            } else if res.rows.len() == 1 {
+                                Ok(res.rows[0].values[0].clone())
+                            } else {
+                                Err(Error::ScalarSubqueryMultipleRows)
+                            }
+                        }
+                        crate::query::expr::SubqueryKind::In { expr, negated } => {
+                            let left =
+                                self.evaluate_expr_with_outer(expr, row, schema, outer_contexts)?;
+                            let res = self.execute_physical_plan_with_outer(&sub.plan, &nested)?;
+                            let in_vals: Vec<Value> =
+                                res.rows.into_iter().map(|r| r.values[0].clone()).collect();
+                            Ok(crate::query::expr::eval_in_3vl(&left, &in_vals, *negated))
+                        }
+                        crate::query::expr::SubqueryKind::Exists { negated } => {
+                            let res = self.execute_physical_plan_with_outer(&sub.plan, &nested)?;
+                            let has_rows = !res.rows.is_empty();
+                            let b = if *negated { !has_rows } else { has_rows };
+                            Ok(Value::Boolean(b))
+                        }
+                    }
+                }
+            }
+            crate::query::expr::Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let target = self.evaluate_expr_with_outer(expr, row, schema, outer_contexts)?;
+                let mut vals = Vec::with_capacity(list.len());
+                for item in list {
+                    vals.push(self.evaluate_expr_with_outer(item, row, schema, outer_contexts)?);
+                }
+                Ok(crate::query::expr::eval_in_3vl(&target, &vals, *negated))
+            }
+            crate::query::expr::Expr::Binary { left, op, right } => match op {
+                crate::query::expr::BinaryOp::And => {
+                    let l = self.evaluate_expr_with_outer(left, row, schema, outer_contexts)?;
+                    match l {
+                        Value::Boolean(false) => Ok(Value::Boolean(false)),
+                        Value::Boolean(true) => {
+                            let r =
+                                self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                            match r {
+                                Value::Boolean(rb) => Ok(Value::Boolean(rb)),
+                                Value::Null => Ok(Value::Null),
+                                other => Err(Error::InvalidBooleanExpression {
+                                    found: other.data_type().to_string(),
+                                }),
+                            }
+                        }
+                        Value::Null => {
+                            let r =
+                                self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                            match r {
+                                Value::Boolean(false) => Ok(Value::Boolean(false)),
+                                Value::Boolean(true) | Value::Null => Ok(Value::Null),
+                                other => Err(Error::InvalidBooleanExpression {
+                                    found: other.data_type().to_string(),
+                                }),
+                            }
+                        }
+                        other => Err(Error::InvalidBooleanExpression {
+                            found: other.data_type().to_string(),
+                        }),
+                    }
+                }
+                crate::query::expr::BinaryOp::Or => {
+                    let l = self.evaluate_expr_with_outer(left, row, schema, outer_contexts)?;
+                    match l {
+                        Value::Boolean(true) => Ok(Value::Boolean(true)),
+                        Value::Boolean(false) => {
+                            let r =
+                                self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                            match r {
+                                Value::Boolean(rb) => Ok(Value::Boolean(rb)),
+                                Value::Null => Ok(Value::Null),
+                                other => Err(Error::InvalidBooleanExpression {
+                                    found: other.data_type().to_string(),
+                                }),
+                            }
+                        }
+                        Value::Null => {
+                            let r =
+                                self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                            match r {
+                                Value::Boolean(true) => Ok(Value::Boolean(true)),
+                                Value::Boolean(false) | Value::Null => Ok(Value::Null),
+                                other => Err(Error::InvalidBooleanExpression {
+                                    found: other.data_type().to_string(),
+                                }),
+                            }
+                        }
+                        other => Err(Error::InvalidBooleanExpression {
+                            found: other.data_type().to_string(),
+                        }),
+                    }
+                }
+                _ => {
+                    let l = self.evaluate_expr_with_outer(left, row, schema, outer_contexts)?;
+                    let r = self.evaluate_expr_with_outer(right, row, schema, outer_contexts)?;
+                    let tmp_schema = Schema::new_projected(Vec::new());
+                    let tmp_row = Row::new(Vec::new());
+                    let bin_expr = crate::query::expr::Expr::Binary {
+                        left: Box::new(crate::query::expr::Expr::Literal(l)),
+                        op: *op,
+                        right: Box::new(crate::query::expr::Expr::Literal(r)),
+                    };
+                    bin_expr.evaluate(&tmp_row, &tmp_schema)
+                }
+            },
+            crate::query::expr::Expr::Unary { op, expr } => {
+                let val = self.evaluate_expr_with_outer(expr, row, schema, outer_contexts)?;
+                let tmp_schema = Schema::new_projected(Vec::new());
+                let tmp_row = Row::new(Vec::new());
+                let un_expr = crate::query::expr::Expr::Unary {
+                    op: *op,
+                    expr: Box::new(crate::query::expr::Expr::Literal(val)),
+                };
+                un_expr.evaluate(&tmp_row, &tmp_schema)
+            }
+            crate::query::expr::Expr::IsNull(inner) => {
+                let val = self.evaluate_expr_with_outer(inner, row, schema, outer_contexts)?;
+                Ok(Value::Boolean(val.is_null()))
+            }
+            crate::query::expr::Expr::IsNotNull(inner) => {
+                let val = self.evaluate_expr_with_outer(inner, row, schema, outer_contexts)?;
+                Ok(Value::Boolean(!val.is_null()))
+            }
+            crate::query::expr::Expr::Literal(_)
+            | crate::query::expr::Expr::Column(_)
+            | crate::query::expr::Expr::OuterColumn { .. } => {
+                expr.evaluate_with_outer(row, schema, outer_contexts)
+            }
+        }
+    }
+
+    /// Filters rows evaluating predicate against active row and outer contexts.
+    pub fn filter_rows_with_outer(
+        &mut self,
+        rows: Vec<Row>,
+        schema: &Schema,
+        predicate: &crate::query::expr::Expr,
+        outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<Vec<Row>> {
+        let pred_type = predicate.infer_type(schema)?;
+        if pred_type != DataType::Boolean && pred_type != DataType::Null {
+            return Err(Error::InvalidBooleanExpression {
+                found: pred_type.to_string(),
+            });
+        }
+
+        let mut matched = Vec::new();
+        for row in rows {
+            let val = self.evaluate_expr_with_outer(predicate, &row, schema, outer_contexts)?;
+            if val == Value::Boolean(true) {
+                matched.push(row);
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Performs nested-loop join evaluating join condition against combined row and outer contexts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_rows_with_outer(
+        &mut self,
+        left_rows: Vec<Row>,
+        left_schema: &Schema,
+        right_rows: &[Row],
+        right_schema: &Schema,
+        join_type: crate::sql::ast::JoinType,
+        on: &crate::query::expr::Expr,
+        outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<(Schema, Vec<Row>)> {
+        let mut combined_columns = left_schema.columns.clone();
+        for col in &right_schema.columns {
+            let mut right_col = col.clone();
+            if join_type == crate::sql::ast::JoinType::Left {
+                right_col.nullable = true;
+            }
+            combined_columns.push(right_col);
+        }
+        let combined_schema = Schema::new_projected(combined_columns);
+
+        let right_null_values = vec![Value::Null; right_schema.columns.len()];
+        let mut result_rows = Vec::new();
+
+        for l_row in left_rows {
+            let mut matched = false;
+            for r_row in right_rows {
+                let mut combined_vals = Vec::with_capacity(l_row.values.len() + r_row.values.len());
+                combined_vals.extend_from_slice(&l_row.values);
+                combined_vals.extend_from_slice(&r_row.values);
+                let candidate_row = Row::new(combined_vals);
+
+                let on_val = self.evaluate_expr_with_outer(
+                    on,
+                    &candidate_row,
+                    &combined_schema,
+                    outer_contexts,
+                )?;
+                if on_val == Value::Boolean(true) {
+                    matched = true;
+                    result_rows.push(candidate_row);
+                }
+            }
+            if !matched && join_type == crate::sql::ast::JoinType::Left {
+                let mut combined_vals =
+                    Vec::with_capacity(l_row.values.len() + right_null_values.len());
+                combined_vals.extend_from_slice(&l_row.values);
+                combined_vals.extend_from_slice(&right_null_values);
+                result_rows.push(Row::new(combined_vals));
+            }
+        }
+        Ok((combined_schema, result_rows))
     }
 
     /// Drops a table from the catalog and reclaims its pages within this transaction.

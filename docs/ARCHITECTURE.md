@@ -309,7 +309,34 @@ Table
 
 ---
 
-## 6. Critical Invariants
+## 6. SQL, Optimizer & Subquery Engine (`src/sql`, `src/query`)
+
+```text
+SQL Statement
+     ↓
+Lexer & Parser (AST)
+     ↓
+Binder & Nested Scopes (BoundSelect)
+     ↓
+Rule-Based Optimizer (AccessPath Selection)
+     ↓
+Physical Plan Tree (PhysicalPlan + SubqueryPlan)
+     ↓
+Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
+```
+
+### Components
+* **Lexer & Parser:** Case-insensitive keyword tokenization (`IN`, `EXISTS`, `SELECT`, `FROM`, `WHERE`, `JOIN`, `CREATE`, `DROP`, `INSERT`, `UPDATE`, `DELETE`), recursive descent parsing with operator precedence.
+* **Semantic Binder & Scopes:** Resolves table and column bindings. Supports recursive parent contexts (`parent: Option<&BindingContext>`) for nested subqueries, resolving columns from innermost to outer scopes and producing `Expr::OuterColumn { name, data_type, scope_depth }`.
+* **Rule-Based Optimizer:** Deconstructs conjunctions, pushes single-table predicates down to access paths (`PrimaryPointLookup`, `PrimaryRangeScan`, `SecondaryIndexScan`, `FullTableScan`), preserves residual filters, and maintains safe post-join placement for `LEFT JOIN` filters.
+* **Subquery Execution:**
+  * **Uncorrelated Subqueries:** Pre-evaluated once per statement execution and materialized (`MaterializedSubqueryResult`) prior to scanning outer rows.
+  * **Correlated Subqueries:** Executed per outer row with an execution context stack (`outer_contexts: &[(&Row, &Schema)]`) preserving complete outer row state across arbitrary nesting depths.
+  * **3-Valued Logic (3VL):** Comprehensive 3VL support for `IN`, `NOT IN`, scalar comparisons, and `EXISTS` predicates.
+
+---
+
+## 7. Critical Invariants
 
 * **Write-Ahead Invariant:** `append WAL record -> WAL durable -> page modification -> page flush`. A dirty page with `page_lsn > wal.flushed_lsn` cannot reach disk without its WAL records first being flushed.
 * **PageLSN Semantics:** Every page modification stamps the page with its corresponding LSN. During Redo:
@@ -319,6 +346,7 @@ Table
 * **CLR Durability Invariant:** `append CLR -> flush WAL through CLR LSN -> write recovered page`. Recovery-generated modifications are never durable before their CLR is durable on disk.
 * **Engine Atomicity Boundary:** `TreeDb::put` and `TreeDb::delete` operations wrap both RecordStore heap modifications (inline and overflow) and B+ Tree index mutations in a single transaction (`TxnId`). If an uncommitted operation crashes, both index and record mutations are undone atomically.
 * **Secondary Index Invariant:** Every committed table row must have exactly the corresponding secondary-index entries required by its indexed columns, and every secondary-index entry must resolve to a valid current `RecordId`.
+* **Subquery Cardinality Invariant:** Scalar subqueries must return $\le 1$ row (0 rows -> `NULL`, 1 row -> value, $>1$ rows -> `Error::ScalarSubqueryMultipleRows`) and exactly 1 column.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -326,12 +354,15 @@ Table
 
 ---
 
-## 7. Intentionally Deferred Items
+## 8. Intentionally Deferred Items
 
 The following capabilities are intentionally deferred to subsequent phases:
 * Multi-column composite secondary indexes.
 * Index-only covering scans.
 * Full cost-based optimizer and cardinality statistics.
 * DDL statements (`CREATE INDEX`, `DROP INDEX`) in SQL grammar.
+* Common Table Expressions (CTEs) and derived tables (`FROM (SELECT ...)`).
+* Subquery flattening and cost-based decorrelation.
 * Multi-threading, concurrency control, and MVCC.
+
 

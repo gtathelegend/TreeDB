@@ -313,6 +313,8 @@ impl<'a> Lexer<'a> {
             "DELETE" => TokenKind::Delete,
             "PRIMARY" => TokenKind::Primary,
             "KEY" => TokenKind::Key,
+            "IN" => TokenKind::In,
+            "EXISTS" => TokenKind::Exists,
             "BOOLEAN" | "BOOL" => TokenKind::BooleanType,
             "BIGINT" | "INT64" | "INTEGER" | "INT" => TokenKind::BigIntType,
             "UBIGINT" | "UINT64" | "UINT" => TokenKind::UBigIntType,

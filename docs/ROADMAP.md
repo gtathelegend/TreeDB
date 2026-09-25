@@ -364,14 +364,35 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 22: Advanced Query Processing & Secondary Index DDL (Future)
+## Phase 22: SQL Subqueries & Correlated Subqueries (Completed)
+* [x] Subquery AST representation: `SqlExpr::Subquery`, `SqlExpr::Exists { subquery, negated }`, `SqlExpr::InSubquery { expr, subquery, negated }`, `SqlExpr::InList { expr, list, negated }`
+* [x] SQL Lexer & Parser keyword support for `IN` and `EXISTS` with case-insensitive tokenization and operator precedence
+* [x] Nested binding scopes (`BindingContext` parent chaining) with lexical scope resolution from innermost to outer scopes
+* [x] Structured correlation representation (`Expr::OuterColumn { name, data_type, scope_depth }`)
+* [x] Lexical shadowing: innermost table columns shadow outer enclosing scope columns unless explicitly qualified (`u.id`)
+* [x] Scalar subquery cardinality enforcement (0 rows -> `NULL`, 1 row -> value, >1 rows -> `Error::ScalarSubqueryMultipleRows`)
+* [x] Single-column projection shape enforcement for scalar and IN subqueries (`Error::SubqueryColumnCountMismatch`)
+* [x] Multi-column and NULL projection support for `EXISTS` and `NOT EXISTS` predicates
+* [x] SQL 3-valued logic (3VL) preservation for `IN` and `NOT IN` predicates with NULL values and empty subqueries
+* [x] Optimizer integration: inner subqueries fully bound and optimized using Phase 20 rule-based optimizer
+* [x] Uncorrelated subquery optimization: pre-evaluated once per statement execution and materialized (`MaterializedSubqueryResult`)
+* [x] Correlated subquery execution: executed per outer row with parent row contexts (`outer_contexts`) supporting arbitrary correlation depth
+* [x] Full composition with JOINs, GROUP BY, aggregation, HAVING, ORDER BY, LIMIT, and DML (`UPDATE`, `DELETE`)
+* [x] Transaction visibility: subqueries observe uncommitted writes within the active transaction and respect rollback/abort
+* [x] 24 dedicated integration tests in `tests/subquery.rs` and 2 new parser tests in `tests/sql.rs` including randomized 3VL reference oracle (405 total test suite)
+
+---
+
+## Phase 23: Advanced Query Processing & Secondary Index DDL (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
-* [ ] Subqueries and Common Table Expressions (CTEs)
+* [ ] Common Table Expressions (CTEs) and recursive CTEs
+* [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Cost-based join optimization and cardinality estimation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 
