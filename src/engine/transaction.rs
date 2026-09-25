@@ -632,6 +632,20 @@ impl<'db> Transaction<'db> {
             current_schema
         };
 
+        let intermediate_schema = if !plan.window_exprs.is_empty() {
+            let mut w_cols = intermediate_schema.columns.clone();
+            for we in &plan.window_exprs {
+                w_cols.push(crate::engine::types::Column::new(
+                    we.display_name.clone(),
+                    we.output_type,
+                    true,
+                ));
+            }
+            crate::engine::types::Schema::new_projected(w_cols)
+        } else {
+            intermediate_schema
+        };
+
         let mut out_cols = Vec::with_capacity(plan.projections.len());
         for (idx, (expr, alias)) in plan.projections.iter().enumerate() {
             let dt = expr.infer_type(&intermediate_schema)?;
@@ -1513,9 +1527,9 @@ impl<'db> Transaction<'db> {
             )?;
         }
 
-        // 4. Aggregation / Group By / Having vs Sort / Project
+        // 4. Aggregation / Group By / Having
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
-        if is_aggregate {
+        let (mut working_schema, mut working_rows) = if is_aggregate {
             let (grouped_schema, grouped_rows) = crate::query::AggregateOperator::apply(
                 current_rows,
                 &current_schema,
@@ -1533,37 +1547,40 @@ impl<'db> Transaction<'db> {
                 )?,
                 None => grouped_rows,
             };
-
-            let sorted_rows =
-                crate::query::SortOperator::apply(having_rows, &grouped_schema, &plan.order_by)?;
-
-            let (projected_schema, projected_rows) = crate::query::ProjectOperator::apply_named(
-                sorted_rows,
-                &grouped_schema,
-                &plan.projections,
-            )?;
-            let paginated_rows =
-                crate::query::OffsetLimitOperator::apply(projected_rows, plan.offset, plan.limit);
-            Ok(crate::query::QueryResult::new(
-                projected_schema,
-                paginated_rows,
-            ))
+            (grouped_schema, having_rows)
         } else {
-            let sorted_rows =
-                crate::query::SortOperator::apply(current_rows, &current_schema, &plan.order_by)?;
+            (current_schema, current_rows)
+        };
 
-            let (projected_schema, projected_rows) = crate::query::ProjectOperator::apply_named(
-                sorted_rows,
-                &current_schema,
-                &plan.projections,
+        // 5. Window Operator
+        if !plan.window_exprs.is_empty() {
+            let (win_schema, win_rows) = crate::query::WindowOperator::apply(
+                working_rows,
+                &working_schema,
+                &plan.window_exprs,
             )?;
-            let paginated_rows =
-                crate::query::OffsetLimitOperator::apply(projected_rows, plan.offset, plan.limit);
-            Ok(crate::query::QueryResult::new(
-                projected_schema,
-                paginated_rows,
-            ))
+            working_schema = win_schema;
+            working_rows = win_rows;
         }
+
+        // 6. Sort Operator (ORDER BY)
+        let sorted_rows =
+            crate::query::SortOperator::apply(working_rows, &working_schema, &plan.order_by)?;
+
+        // 7. Projection
+        let (projected_schema, projected_rows) = crate::query::ProjectOperator::apply_named(
+            sorted_rows,
+            &working_schema,
+            &plan.projections,
+        )?;
+
+        // 8. Pagination (OFFSET / LIMIT)
+        let paginated_rows =
+            crate::query::OffsetLimitOperator::apply(projected_rows, plan.offset, plan.limit);
+        Ok(crate::query::QueryResult::new(
+            projected_schema,
+            paginated_rows,
+        ))
     }
 
     /// Pre-evaluates all uncorrelated subqueries in the physical plan.

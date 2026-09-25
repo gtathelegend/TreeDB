@@ -212,6 +212,85 @@ impl fmt::Display for AggregateExpr {
     }
 }
 
+/// Bound window frame specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundWindowFrame {
+    /// Frame start bound.
+    pub start: crate::sql::ast::WindowFrameBound,
+    /// Frame end bound.
+    pub end: crate::sql::ast::WindowFrameBound,
+}
+
+impl fmt::Display for BoundWindowFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ROWS BETWEEN {} AND {}", self.start, self.end)
+    }
+}
+
+/// Fully bound window specification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundWindowSpec {
+    /// Partitioning expressions.
+    pub partition_by: Vec<Expr>,
+    /// Ordering sort keys.
+    pub order_by: Vec<crate::query::operator::SortKey>,
+    /// Frame specification.
+    pub frame: BoundWindowFrame,
+}
+
+impl fmt::Display for BoundWindowSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OVER (")?;
+        let mut parts = Vec::new();
+        if !self.partition_by.is_empty() {
+            let p: Vec<String> = self.partition_by.iter().map(|e| e.to_string()).collect();
+            parts.push(format!("PARTITION BY {}", p.join(", ")));
+        }
+        if !self.order_by.is_empty() {
+            let o: Vec<String> = self
+                .order_by
+                .iter()
+                .map(|k| format!("{} {:?}", k.expression, k.direction))
+                .collect();
+            parts.push(format!("ORDER BY {}", o.join(", ")));
+        }
+        parts.push(format!("{}", self.frame));
+        write!(f, "{})", parts.join(" "))
+    }
+}
+
+/// Fully bound window expression ready for physical window operator evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowExpr {
+    /// Window function type.
+    pub function: crate::sql::ast::WindowFunction,
+    /// Function argument expressions.
+    pub args: Vec<Expr>,
+    /// Explicit non-negative offset for LAG/LEAD (default 1).
+    pub offset: Option<usize>,
+    /// Explicit default value expression for LAG/LEAD.
+    pub default: Option<Expr>,
+    /// Window specification.
+    pub window_spec: BoundWindowSpec,
+    /// Output data type.
+    pub output_type: DataType,
+    /// Canonical display / column name.
+    pub display_name: String,
+}
+
+impl WindowExpr {
+    /// Canonical display name for the window expression.
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+}
+
+impl fmt::Display for WindowExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display_name)
+    }
+}
+
 /// Result of pre-evaluating an uncorrelated subquery for reuse across row evaluations.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MaterializedSubqueryResult {

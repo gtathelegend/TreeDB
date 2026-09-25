@@ -340,6 +340,13 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Dependency DAG & Acyclicity:** Tracks dependencies across base tables, joins, and nested subqueries; 3-color DFS detector enforces acyclicity (`Error::CyclicCteDependency`).
   * **Materialization & Non-Persistence:** Statement-local in-memory relation storage (`cte_store`) evaluated on query invocation; zero page allocations, zero catalog modifications, zero freelist changes, and zero WAL records for read queries.
   * **Engine Integration:** Full composition with `INNER JOIN`, `LEFT JOIN`, `GROUP BY`, `HAVING`, scalar/IN/EXISTS subqueries, correlated subqueries, and deterministic `explain_sql` formatting.
+* **SQL Window Functions:**
+  * **AST Representation:** `WindowFunction` (`RowNumber`, `Rank`, `DenseRank`, `Lag`, `Lead`, `FirstValue`, `LastValue`), `WindowSpec` (`partition_by`, `order_by`, `frame`), `WindowFrame` with `WindowFrameBound` endpoints, and `SqlExpr::Window`.
+  * **Dedicated Physical Operator (`WindowOperator`):** Evaluates between aggregation/HAVING and final query `ORDER BY`/projection, preserving input row cardinality ($N \to N$).
+  * **Partitioning & Deterministic Tie-Breaking:** Partitions evaluated via `CanonicalValue` (`NULL = NULL` for partition membership); intra-partition ordering uses SQL 3VL with stable row-index tie-breaking.
+  * **Framing Semantics & Defaults:** Standard SQL defaults (`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` with `ORDER BY`; `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` without `ORDER BY`) and validated `ROWS` frames.
+  * **Semantic Validation:** Structured errors rejecting window functions in `WHERE`, `GROUP BY`, `HAVING`, `JOIN ON`, and nested window functions.
+  * **Statement-Local Execution:** Non-persistent, zero-WAL, in-memory execution fully integrated with CTEs, joins, aggregations, and transaction visibility.
 
 ---
 
@@ -355,6 +362,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **Secondary Index Invariant:** Every committed table row must have exactly the corresponding secondary-index entries required by its indexed columns, and every secondary-index entry must resolve to a valid current `RecordId`.
 * **Subquery Cardinality Invariant:** Scalar subqueries must return $\le 1$ row (0 rows -> `NULL`, 1 row -> value, $>1$ rows -> `Error::ScalarSubqueryMultipleRows`) and exactly 1 column.
 * **CTE Non-Persistence Invariant:** Executing CTE queries never modifies persistent database pages, freelist state, catalog metadata, or WAL logs.
+* **Window Cardinality Invariant:** Window function evaluation never collapses or filters rows; the output row cardinality of `WindowOperator` strictly equals input row cardinality.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.

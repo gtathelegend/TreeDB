@@ -399,7 +399,24 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 24: Advanced Query Processing & Secondary Index DDL (Future)
+## Phase 24: SQL Window Functions (Completed)
+* [x] Explicit AST representation: `WindowFunction`, `WindowSpec`, `WindowFrame`, `WindowFrameBound`, `SqlExpr::Window`
+* [x] Parser support for `OVER (...)`, `PARTITION BY`, `ORDER BY`, `ROWS BETWEEN ... AND ...`
+* [x] Ranking functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` with deterministic tie-breaking on peer rows
+* [x] Navigation functions: `LAG(expr [, offset [, default]])`, `LEAD(expr [, offset [, default]])` with non-negative constant offset validation
+* [x] Value functions: `FIRST_VALUE(expr)`, `LAST_VALUE(expr)` evaluated across defined window frames
+* [x] Framing semantics: standard default frames (`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` when `ORDER BY` present; `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` when absent) and explicit `ROWS` ranges
+* [x] Dedicated physical execution operator (`WindowOperator`) executing after aggregation/HAVING and before query ORDER BY/projections, preserving input cardinality ($N \to N$)
+* [x] Semantic validation: structured rejections for window functions in `WHERE`, `GROUP BY`, `HAVING`, `JOIN ON`, and nested window functions
+* [x] Integration with CTEs, subqueries, joins, aggregations, aliases, final `ORDER BY`, and `LIMIT`/`OFFSET`
+* [x] Optimizer integration with deterministic `explain_sql` output detailing functions, partitions, orders, and frame bounds
+* [x] Statement-local in-memory evaluation model: read-only, zero persistent page allocation, zero catalog mutation, zero WAL writes
+* [x] Transaction visibility and crash recovery safety
+* [x] 17 dedicated integration tests in `tests/window.rs` including randomized reference oracle comparing against an independent evaluator (445 total test suite)
+
+---
+
+## Phase 25: Advanced Query Processing & Secondary Index DDL (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans
@@ -408,6 +425,7 @@ This roadmap outlines the planned development phases for TreeDB.
 * [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Cost-based join optimization and cardinality estimation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

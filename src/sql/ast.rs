@@ -3,6 +3,7 @@ use std::fmt;
 use crate::engine::types::DataType;
 
 /// Top-level AST node representing an executable SQL statement.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     /// SQL `SELECT` query statement.
@@ -530,6 +531,111 @@ impl fmt::Display for AggregateFunction {
     }
 }
 
+/// Supported SQL window functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WindowFunction {
+    /// ROW_NUMBER()
+    RowNumber,
+    /// RANK()
+    Rank,
+    /// DENSE_RANK()
+    DenseRank,
+    /// LAG(expr [, offset [, default]])
+    Lag,
+    /// LEAD(expr [, offset [, default]])
+    Lead,
+    /// FIRST_VALUE(expr)
+    FirstValue,
+    /// LAST_VALUE(expr)
+    LastValue,
+}
+
+impl fmt::Display for WindowFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WindowFunction::RowNumber => write!(f, "ROW_NUMBER"),
+            WindowFunction::Rank => write!(f, "RANK"),
+            WindowFunction::DenseRank => write!(f, "DENSE_RANK"),
+            WindowFunction::Lag => write!(f, "LAG"),
+            WindowFunction::Lead => write!(f, "LEAD"),
+            WindowFunction::FirstValue => write!(f, "FIRST_VALUE"),
+            WindowFunction::LastValue => write!(f, "LAST_VALUE"),
+        }
+    }
+}
+
+/// Boundary bound for a `ROWS` window frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowFrameBound {
+    /// UNBOUNDED PRECEDING
+    UnboundedPreceding,
+    /// <n> PRECEDING
+    Preceding(u64),
+    /// CURRENT ROW
+    CurrentRow,
+    /// <n> FOLLOWING
+    Following(u64),
+    /// UNBOUNDED FOLLOWING
+    UnboundedFollowing,
+}
+
+impl fmt::Display for WindowFrameBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WindowFrameBound::UnboundedPreceding => write!(f, "UNBOUNDED PRECEDING"),
+            WindowFrameBound::Preceding(n) => write!(f, "{n} PRECEDING"),
+            WindowFrameBound::CurrentRow => write!(f, "CURRENT ROW"),
+            WindowFrameBound::Following(n) => write!(f, "{n} FOLLOWING"),
+            WindowFrameBound::UnboundedFollowing => write!(f, "UNBOUNDED FOLLOWING"),
+        }
+    }
+}
+
+/// A window frame specification (`ROWS BETWEEN <start> AND <end>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowFrame {
+    /// Frame starting boundary.
+    pub start: WindowFrameBound,
+    /// Frame ending boundary.
+    pub end: WindowFrameBound,
+}
+
+impl fmt::Display for WindowFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ROWS BETWEEN {} AND {}", self.start, self.end)
+    }
+}
+
+/// A window specification (`OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS ...])`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowSpec {
+    /// Optional partitioning expressions (`PARTITION BY ...`).
+    pub partition_by: Vec<SqlExpr>,
+    /// Optional ordering expressions (`ORDER BY ...`).
+    pub order_by: Vec<OrderByExpr>,
+    /// Optional explicit framing specification (`ROWS ...`).
+    pub frame: Option<WindowFrame>,
+}
+
+impl fmt::Display for WindowSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OVER (")?;
+        let mut parts = Vec::new();
+        if !self.partition_by.is_empty() {
+            let p: Vec<String> = self.partition_by.iter().map(|e| e.to_string()).collect();
+            parts.push(format!("PARTITION BY {}", p.join(", ")));
+        }
+        if !self.order_by.is_empty() {
+            let o: Vec<String> = self.order_by.iter().map(|e| e.to_string()).collect();
+            parts.push(format!("ORDER BY {}", o.join(", ")));
+        }
+        if let Some(frame) = &self.frame {
+            parts.push(format!("{frame}"));
+        }
+        write!(f, "{})", parts.join(" "))
+    }
+}
+
 /// Abstract Syntax Tree (AST) node for SQL scalar expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlExpr {
@@ -573,6 +679,15 @@ pub enum SqlExpr {
         /// Inner argument expression.
         arg: Box<SqlExpr>,
     },
+    /// Window function applied to arguments with an OVER specification (`FUNC(...) OVER (...)`).
+    Window {
+        /// Window function kind.
+        function: WindowFunction,
+        /// Function arguments.
+        args: Vec<SqlExpr>,
+        /// Window specification.
+        window_spec: WindowSpec,
+    },
     /// Scalar subquery: `(SELECT ...)`.
     Subquery(Box<SelectStatement>),
     /// `EXISTS (SELECT ...)` or `NOT EXISTS (SELECT ...)`.
@@ -614,6 +729,14 @@ impl fmt::Display for SqlExpr {
             SqlExpr::IsNotNull(expr) => write!(f, "({expr} IS NOT NULL)"),
             SqlExpr::CountAll => write!(f, "COUNT(*)"),
             SqlExpr::Aggregate { function, arg } => write!(f, "{function}({arg})"),
+            SqlExpr::Window {
+                function,
+                args,
+                window_spec,
+            } => {
+                let args_str: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                write!(f, "{function}({}) {window_spec}", args_str.join(", "))
+            }
             SqlExpr::Subquery(sub) => write!(f, "({sub})"),
             SqlExpr::Exists { subquery, negated } => {
                 if *negated {

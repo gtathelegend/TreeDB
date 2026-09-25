@@ -4,7 +4,7 @@ use crate::sql::ast::{
     ColumnDef, CreateTableStatement, Cte, DeleteStatement, DropTableStatement, InsertStatement,
     JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp,
     SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement,
-    WithClause,
+    WindowFrame, WindowFrameBound, WindowFunction, WindowSpec, WithClause,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};
@@ -1542,6 +1542,27 @@ impl<'a> Parser<'a> {
                                 });
                             }
                         }
+                        "ROW_NUMBER" => {
+                            return self.parse_window_function(WindowFunction::RowNumber);
+                        }
+                        "RANK" => {
+                            return self.parse_window_function(WindowFunction::Rank);
+                        }
+                        "DENSE_RANK" => {
+                            return self.parse_window_function(WindowFunction::DenseRank);
+                        }
+                        "LAG" => {
+                            return self.parse_window_function(WindowFunction::Lag);
+                        }
+                        "LEAD" => {
+                            return self.parse_window_function(WindowFunction::Lead);
+                        }
+                        "FIRST_VALUE" => {
+                            return self.parse_window_function(WindowFunction::FirstValue);
+                        }
+                        "LAST_VALUE" => {
+                            return self.parse_window_function(WindowFunction::LastValue);
+                        }
                         _ => {
                             return Err(Error::UnknownAggregateFunction(val));
                         }
@@ -1971,5 +1992,232 @@ impl<'a> Parser<'a> {
             };
             &EOF_TOKEN
         })
+    }
+
+    fn parse_window_function(&mut self, func: WindowFunction) -> Result<SqlExpr> {
+        self.advance(); // consume function identifier
+        self.advance(); // consume '('
+        let mut args = Vec::new();
+        if self.peek().kind != TokenKind::RParen {
+            loop {
+                let arg = self.parse_expr()?;
+                args.push(arg);
+                if self.peek().kind == TokenKind::Comma {
+                    self.advance(); // consume comma
+                } else {
+                    break;
+                }
+            }
+        }
+        if self.peek().kind != TokenKind::RParen {
+            let close = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected ')' after {func} arguments, found {}", close.kind),
+                start: close.span.start,
+                end: close.span.end,
+            });
+        }
+        self.advance(); // consume ')'
+
+        if self.peek().kind != TokenKind::Over {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "window function {func} requires an OVER clause, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume OVER
+
+        let window_spec = self.parse_window_spec()?;
+        Ok(SqlExpr::Window {
+            function: func,
+            args,
+            window_spec,
+        })
+    }
+
+    fn parse_window_spec(&mut self) -> Result<WindowSpec> {
+        if self.peek().kind != TokenKind::LParen {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected '(' after OVER, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume '('
+
+        let mut partition_by = Vec::new();
+        if self.peek().kind == TokenKind::Partition {
+            self.advance(); // consume PARTITION
+            if self.peek().kind != TokenKind::By {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected BY after PARTITION, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+            self.advance(); // consume BY
+            loop {
+                let expr = self.parse_expr()?;
+                partition_by.push(expr);
+                if self.peek().kind == TokenKind::Comma {
+                    self.advance(); // consume comma
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let mut order_by = Vec::new();
+        if self.peek().kind == TokenKind::Order {
+            self.advance(); // consume ORDER
+            if self.peek().kind != TokenKind::By {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected BY after ORDER, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+            self.advance(); // consume BY
+            order_by = self.parse_order_by_list()?;
+        }
+
+        let mut frame = None;
+        if self.peek().kind == TokenKind::Rows {
+            self.advance(); // consume ROWS
+            if self.peek().kind == TokenKind::Between {
+                self.advance(); // consume BETWEEN
+                let start = self.parse_window_frame_bound()?;
+                if self.peek().kind != TokenKind::And {
+                    let tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: format!("expected AND in ROWS BETWEEN frame, found {}", tok.kind),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+                self.advance(); // consume AND
+                let end = self.parse_window_frame_bound()?;
+                frame = Some(WindowFrame { start, end });
+            } else {
+                let start = self.parse_window_frame_bound()?;
+                frame = Some(WindowFrame {
+                    start,
+                    end: WindowFrameBound::CurrentRow,
+                });
+            }
+        } else if self.peek().kind == TokenKind::Range {
+            return Err(Error::InvalidWindowFrame(
+                "RANGE frames are not supported in this phase".to_string(),
+            ));
+        } else if self.peek().kind == TokenKind::Groups {
+            return Err(Error::InvalidWindowFrame(
+                "GROUPS frames are not supported in this phase".to_string(),
+            ));
+        }
+
+        if self.peek().kind != TokenKind::RParen {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "expected ')' at end of OVER specification, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume ')'
+
+        Ok(WindowSpec {
+            partition_by,
+            order_by,
+            frame,
+        })
+    }
+
+    fn parse_window_frame_bound(&mut self) -> Result<WindowFrameBound> {
+        match self.peek().kind {
+            TokenKind::Unbounded => {
+                self.advance(); // consume UNBOUNDED
+                match self.peek().kind {
+                    TokenKind::Preceding => {
+                        self.advance();
+                        Ok(WindowFrameBound::UnboundedPreceding)
+                    }
+                    TokenKind::Following => {
+                        self.advance();
+                        Ok(WindowFrameBound::UnboundedFollowing)
+                    }
+                    ref other => {
+                        let tok = self.peek().clone();
+                        Err(Error::SqlParseError {
+                            message: format!(
+                                "expected PRECEDING or FOLLOWING after UNBOUNDED, found {other}"
+                            ),
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        })
+                    }
+                }
+            }
+            TokenKind::Current => {
+                self.advance(); // consume CURRENT
+                if self.peek().kind != TokenKind::Row {
+                    let tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: format!("expected ROW after CURRENT, found {}", tok.kind),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+                self.advance(); // consume ROW
+                Ok(WindowFrameBound::CurrentRow)
+            }
+            TokenKind::Integer(n) => {
+                if n < 0 {
+                    return Err(Error::InvalidWindowFrame(
+                        "negative frame bound is not allowed".to_string(),
+                    ));
+                }
+                let bound_n = n as u64;
+                self.advance(); // consume integer
+                match self.peek().kind {
+                    TokenKind::Preceding => {
+                        self.advance();
+                        Ok(WindowFrameBound::Preceding(bound_n))
+                    }
+                    TokenKind::Following => {
+                        self.advance();
+                        Ok(WindowFrameBound::Following(bound_n))
+                    }
+                    ref other => {
+                        let tok = self.peek().clone();
+                        Err(Error::SqlParseError {
+                            message: format!(
+                                "expected PRECEDING or FOLLOWING after frame offset, found {other}"
+                            ),
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        })
+                    }
+                }
+            }
+            ref other => {
+                let tok = self.peek().clone();
+                Err(Error::SqlParseError {
+                    message: format!("invalid window frame boundary specification, found {other}"),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                })
+            }
+        }
     }
 }

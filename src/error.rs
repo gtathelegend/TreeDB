@@ -345,6 +345,26 @@ pub enum Error {
     #[error("Cyclic CTE dependency detected: {0}")]
     CyclicCteDependency(String),
 
+    /// Window function appears in an invalid clause (e.g. WHERE, GROUP BY, HAVING).
+    #[error("Window functions are not allowed in {0}")]
+    InvalidWindowPlacement(&'static str),
+
+    /// Nested window functions are not allowed.
+    #[error("Nested window functions are not allowed: {0}")]
+    NestedWindowFunction(String),
+
+    /// Window frame definition is invalid.
+    #[error("Invalid window frame: {0}")]
+    InvalidWindowFrame(String),
+
+    /// Window offset for LAG/LEAD is invalid.
+    #[error("Invalid window offset: {0}")]
+    InvalidWindowOffset(String),
+
+    /// Unknown window function name.
+    #[error("Unknown window function '{0}'")]
+    UnknownWindowFunction(String),
+
     /// Unsupported SQL statement or clause.
     #[error("Unsupported statement: {0}")]
     UnsupportedStatement(String),

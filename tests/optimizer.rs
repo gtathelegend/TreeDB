@@ -974,6 +974,7 @@ fn baseline_execute(
         group_by: bound.group_by.clone(),
         aggregates: bound.aggregates.clone(),
         having: bound.having.clone(),
+        window_exprs: bound.window_exprs.clone(),
         projections: bound.projections.clone(),
         order_by: bound.order_by.clone(),
         offset: bound.offset,

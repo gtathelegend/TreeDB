@@ -525,7 +525,40 @@ This document records key architectural and design choices, their rationale, and
      * Recursive CTE execution (`WITH RECURSIVE`) is deferred to a future dedicated phase. Recursive syntax without fixed-point iteration operators is rejected with structured errors rather than silently executing as non-recursive CTEs.
 * **Rationale:**
   * **Zero Duplication:** Materializing statement-local relations in memory and reading from `cte_store` in `execute_physical_plan_internal` allows complete reuse of all downstream physical operators (`Filter`, `Project`, `Join`, `Aggregate`, `Sort`, `OffsetLimit`) without creating temporary persistent tables or a second query execution engine.
-  * **Guaranteed Engine Safety:** Strict cycle detection and non-persistence ensure that complex CTE queries never cause stack overflow, catalog pollution, or disk storage leaks.
+## Decision 39: SQL Window Functions, Framing Semantics, Partitioning, and Pipeline Integration
+
+* **Decision:** Implement SQL window functions (`OVER (...)`) as a dedicated, first-class relational execution stage within TreeDB's existing Lexer, Parser, AST, Binder, Optimizer, and Physical Operator pipelines without creating a secondary execution engine:
+  1. **AST Representation & Grammar:**
+     * `WindowFunction`: `RowNumber`, `Rank`, `DenseRank`, `Lag`, `Lead`, `FirstValue`, `LastValue`.
+     * `WindowSpec`: Contains `partition_by: Vec<SqlExpr>`, `order_by: Vec<OrderByExpr>`, and optional `frame: Option<WindowFrame>`.
+     * `WindowFrame`: Structured range over `WindowFrameBound` (`UnboundedPreceding`, `Preceding(u64)`, `CurrentRow`, `Following(u64)`, `UnboundedFollowing`).
+     * `SqlExpr::Window`: Retains function type, arguments, and window specification.
+  2. **Default Window Frames & Semantics:**
+     * **With `ORDER BY` and no explicit frame:** Defaults to `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` per SQL standards.
+     * **Without `ORDER BY` and no explicit frame:** Defaults to `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`.
+     * Explicit `ROWS BETWEEN <start> AND <end>` frames are validated during binding (`Error::InvalidWindowFrame`), rejecting invalid configurations (e.g., `FOLLOWING` before `PRECEDING`, or `start` offset < `end` offset).
+     * `RANGE` and `GROUPS` framing keywords are reserved and rejected with structured errors.
+  3. **Pipeline Placement & Cardinality Preservation:**
+     * Unlike `GROUP BY` aggregation which collapses multiple input rows into one row per group, window evaluation is strictly non-collapsing, preserving input row cardinality ($N \to N$).
+     * The physical `WindowOperator` executes deterministically after grouping/aggregation/HAVING and before final query `ORDER BY` and `Projection`:
+       $$\text{Scan} \to \text{Joins} \to \text{Filter} \to \text{GroupBy / Aggregate} \to \text{Having} \to \mathbf{WindowOperator} \to \text{Sort} \to \text{Projection} \to \text{Limit / Offset}$$
+  4. **Partitioning & Deterministic Tie-Breaking:**
+     * Partition keys evaluate using canonical grouping semantics where `NULL = NULL` for partition membership.
+     * Intra-partition sorting reuses TreeDB's SQL 3VL comparator. When ordering keys are equal (peer rows), ties are broken deterministically by the original row index, ensuring reproducible execution and test stability.
+  5. **Function Semantics & Validation:**
+     * `ROW_NUMBER()`: Assigns 1-based sequential integers within each partition.
+     * `RANK()`: Assigns equal rank to peer ordering values, skipping subsequent ranks according to peer count (e.g., 1, 1, 3).
+     * `DENSE_RANK()`: Assigns equal rank to peer ordering values without gaps (e.g., 1, 1, 2).
+     * `LAG(expr [, offset [, default]])` / `LEAD(expr [, offset [, default]])`: Offsets must be non-negative constants (`Error::InvalidWindowOffset`); missing rows return `default` or `NULL`.
+     * `FIRST_VALUE(expr)` / `LAST_VALUE(expr)`: Evaluated across the specified window frame (e.g., `LAST_VALUE` returns current row under default frame, or partition-last value under unbounded following frame).
+  6. **Structured Semantic Rejections:**
+     * Rejects window expressions in `WHERE`, `GROUP BY`, `HAVING`, `JOIN ON` (`Error::InvalidWindowPlacement`), and nested window expressions (`Error::NestedWindowFunction`).
+  7. **Statement-Local Execution & Persistence Safety:**
+     * Window computation is purely statement-local and in-memory. It does not write WAL records, allocate persistent buffer pages, or mutate catalog metadata.
+     * Fully composable with CTEs (`WITH ... SELECT ...`), subqueries, inner/left joins, and multi-aggregate queries.
+* **Rationale:**
+  * Dedicated physical operator placement cleanly separates window calculation from aggregation while enabling seamless composition with CTEs, joins, and access-path optimization.
+
 
 
 

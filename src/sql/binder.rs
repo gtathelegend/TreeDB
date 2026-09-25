@@ -351,6 +351,8 @@ pub struct BoundSelect {
     pub table_alias: Option<String>,
     /// Bound JOIN clauses in order of evaluation.
     pub joins: Vec<BoundJoin>,
+    /// Window expressions to compute before projection.
+    pub window_exprs: Vec<crate::query::expr::WindowExpr>,
     /// Output projection expressions with optional output column aliases.
     pub projections: Vec<(Expr, Option<String>)>,
     /// Optional boolean filtering predicate expression (WHERE).
@@ -369,6 +371,27 @@ pub struct BoundSelect {
     pub offset: Option<usize>,
 }
 
+/// Helper function to check if a SQL AST expression contains any window function.
+pub fn contains_window(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Window { .. } => true,
+        SqlExpr::Binary { left, right, .. } => contains_window(left) || contains_window(right),
+        SqlExpr::Unary { expr, .. } | SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
+            contains_window(expr)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            contains_window(expr) || list.iter().any(contains_window)
+        }
+        SqlExpr::InSubquery { expr, .. } => contains_window(expr),
+        SqlExpr::Aggregate { arg, .. } => contains_window(arg),
+        SqlExpr::Subquery(_) | SqlExpr::Exists { .. } => false,
+        SqlExpr::CountAll
+        | SqlExpr::Literal(_)
+        | SqlExpr::Identifier(_)
+        | SqlExpr::QualifiedIdentifier { .. } => false,
+    }
+}
+
 /// Helper function to check if a SQL AST expression contains any aggregate function.
 pub fn contains_aggregate(expr: &SqlExpr) -> bool {
     match expr {
@@ -383,6 +406,16 @@ pub fn contains_aggregate(expr: &SqlExpr) -> bool {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
         }
         SqlExpr::InSubquery { expr, .. } => contains_aggregate(expr),
+        SqlExpr::Window {
+            args, window_spec, ..
+        } => {
+            args.iter().any(contains_aggregate)
+                || window_spec.partition_by.iter().any(contains_aggregate)
+                || window_spec
+                    .order_by
+                    .iter()
+                    .any(|o| contains_aggregate(&o.expr))
+        }
         SqlExpr::Subquery(_) | SqlExpr::Exists { .. } => false,
         SqlExpr::Literal(_) | SqlExpr::Identifier(_) | SqlExpr::QualifiedIdentifier { .. } => false,
     }
@@ -423,6 +456,20 @@ fn collect_aggregates(
             let _ = agg.infer_type(&ctx.combined_schema)?;
             if !aggs.contains(&agg) {
                 aggs.push(agg);
+            }
+            Ok(())
+        }
+        SqlExpr::Window {
+            args, window_spec, ..
+        } => {
+            for arg in args {
+                collect_aggregates(arg, ctx, aggs)?;
+            }
+            for p in &window_spec.partition_by {
+                collect_aggregates(p, ctx, aggs)?;
+            }
+            for o in &window_spec.order_by {
+                collect_aggregates(&o.expr, ctx, aggs)?;
             }
             Ok(())
         }
@@ -486,6 +533,28 @@ pub fn bind_select_with_context(
     let tables = &ctx.tables;
     let schema = &ctx.combined_schema;
 
+    // Validate window placement
+    if let Some(selection) = &statement.selection {
+        if contains_window(selection) {
+            return Err(Error::InvalidWindowPlacement("WHERE clause"));
+        }
+    }
+    for join_clause in &statement.joins {
+        if contains_window(&join_clause.on) {
+            return Err(Error::InvalidWindowPlacement("JOIN ON clause"));
+        }
+    }
+    for gb_expr in &statement.group_by {
+        if contains_window(gb_expr) {
+            return Err(Error::InvalidWindowPlacement("GROUP BY clause"));
+        }
+    }
+    if let Some(having_expr) = &statement.having {
+        if contains_window(having_expr) {
+            return Err(Error::InvalidWindowPlacement("HAVING clause"));
+        }
+    }
+
     // 1. Bind JOIN clauses
     let mut bound_joins = Vec::with_capacity(statement.joins.len());
     for join_clause in &statement.joins {
@@ -542,6 +611,7 @@ pub fn bind_select_with_context(
 
     if !is_aggregate {
         // Standard non-aggregate query path
+        let mut window_exprs = Vec::new();
         let mut projections = Vec::new();
         for item in &statement.projection {
             match item {
@@ -581,14 +651,28 @@ pub fn bind_select_with_context(
                     }
                 }
                 SelectItem::Expression { expr, alias } => {
-                    let bound = bind_expr(expr, ctx)?;
-                    let _ = bound.infer_type(schema)?;
-                    let default_alias = match expr {
-                        SqlExpr::Identifier(ident) => Some(ident.clone()),
-                        SqlExpr::QualifiedIdentifier { name, .. } => Some(name.clone()),
-                        _ => None,
+                    let (bound, final_alias) = if let SqlExpr::Window {
+                        function,
+                        args,
+                        window_spec,
+                    } = expr
+                    {
+                        let we = bind_window_expr(*function, args, window_spec, ctx, schema)?;
+                        let col_name = we.display_name.clone();
+                        let default_alias = alias.clone().or_else(|| Some(col_name.clone()));
+                        window_exprs.push(we);
+                        (Expr::Column(col_name), default_alias)
+                    } else {
+                        let bound = bind_expr(expr, ctx)?;
+                        let _ = bound.infer_type(schema)?;
+                        let default_alias = match expr {
+                            SqlExpr::Identifier(ident) => Some(ident.clone()),
+                            SqlExpr::QualifiedIdentifier { name, .. } => Some(name.clone()),
+                            _ => None,
+                        };
+                        let final_alias = alias.clone().or(default_alias);
+                        (bound, final_alias)
                     };
-                    let final_alias = alias.clone().or(default_alias);
                     projections.push((bound, final_alias));
                 }
             }
@@ -611,11 +695,37 @@ pub fn bind_select_with_context(
                 } else {
                     bind_expr(&order_item.expr, ctx)?
                 }
+            } else if let SqlExpr::Window {
+                function,
+                args,
+                window_spec,
+            } = &order_item.expr
+            {
+                let we = bind_window_expr(*function, args, window_spec, ctx, schema)?;
+                let col_name = we.display_name.clone();
+                if !window_exprs
+                    .iter()
+                    .any(|existing: &crate::query::expr::WindowExpr| {
+                        existing.display_name == col_name
+                    })
+                {
+                    window_exprs.push(we);
+                }
+                Expr::Column(col_name)
             } else {
                 bind_expr(&order_item.expr, ctx)?
             };
 
-            let _ = bound_expr.infer_type(schema)?;
+            let _ = if let Expr::Column(cname) = &bound_expr {
+                if let Some(we) = window_exprs.iter().find(|w| &w.display_name == cname) {
+                    we.output_type
+                } else {
+                    bound_expr.infer_type(schema)?
+                }
+            } else {
+                bound_expr.infer_type(schema)?
+            };
+
             let direction = match order_item.direction {
                 OrderDirection::Asc => SortDirection::Ascending,
                 OrderDirection::Desc => SortDirection::Descending,
@@ -628,6 +738,7 @@ pub fn bind_select_with_context(
             table_name: statement.from.name.clone(),
             table_alias: statement.from.alias.clone(),
             joins: bound_joins,
+            window_exprs,
             projections,
             filter,
             group_by: Vec::new(),
@@ -681,6 +792,7 @@ pub fn bind_select_with_context(
     }
     let grouped_schema = Schema::new_projected(grouped_columns);
 
+    let mut window_exprs = Vec::new();
     let mut projections = Vec::new();
     for item in &statement.projection {
         match item {
@@ -726,16 +838,37 @@ pub fn bind_select_with_context(
                 }
             }
             SelectItem::Expression { expr, alias } => {
-                let bound = bind_grouped_expr(expr, ctx, &bound_group_by, &grouped_schema)?;
-                let _ = bound.infer_type(&grouped_schema)?;
-                let default_alias = match expr {
-                    SqlExpr::CountAll => Some("COUNT(*)".to_string()),
-                    SqlExpr::Aggregate { function, arg } => Some(format!("{function}({arg})")),
-                    SqlExpr::Identifier(ident) => Some(ident.clone()),
-                    SqlExpr::QualifiedIdentifier { name, .. } => Some(name.clone()),
-                    _ => None,
+                let (bound, final_alias) = if let SqlExpr::Window {
+                    function,
+                    args,
+                    window_spec,
+                } = expr
+                {
+                    let we = bind_grouped_window_expr(
+                        *function,
+                        args,
+                        window_spec,
+                        ctx,
+                        &bound_group_by,
+                        &grouped_schema,
+                    )?;
+                    let col_name = we.display_name.clone();
+                    let default_alias = alias.clone().or_else(|| Some(col_name.clone()));
+                    window_exprs.push(we);
+                    (Expr::Column(col_name), default_alias)
+                } else {
+                    let bound = bind_grouped_expr(expr, ctx, &bound_group_by, &grouped_schema)?;
+                    let _ = bound.infer_type(&grouped_schema)?;
+                    let default_alias = match expr {
+                        SqlExpr::CountAll => Some("COUNT(*)".to_string()),
+                        SqlExpr::Aggregate { function, arg } => Some(format!("{function}({arg})")),
+                        SqlExpr::Identifier(ident) => Some(ident.clone()),
+                        SqlExpr::QualifiedIdentifier { name, .. } => Some(name.clone()),
+                        _ => None,
+                    };
+                    let final_alias = alias.clone().or(default_alias);
+                    (bound, final_alias)
                 };
-                let final_alias = alias.clone().or(default_alias);
                 projections.push((bound, final_alias));
             }
         }
@@ -779,11 +912,42 @@ pub fn bind_select_with_context(
             } else {
                 bind_grouped_expr(&order_item.expr, ctx, &bound_group_by, &grouped_schema)?
             }
+        } else if let SqlExpr::Window {
+            function,
+            args,
+            window_spec,
+        } = &order_item.expr
+        {
+            let we = bind_grouped_window_expr(
+                *function,
+                args,
+                window_spec,
+                ctx,
+                &bound_group_by,
+                &grouped_schema,
+            )?;
+            let col_name = we.display_name.clone();
+            if !window_exprs
+                .iter()
+                .any(|existing: &crate::query::expr::WindowExpr| existing.display_name == col_name)
+            {
+                window_exprs.push(we);
+            }
+            Expr::Column(col_name)
         } else {
             bind_grouped_expr(&order_item.expr, ctx, &bound_group_by, &grouped_schema)?
         };
 
-        let _ = bound_expr.infer_type(&grouped_schema)?;
+        let _ = if let Expr::Column(cname) = &bound_expr {
+            if let Some(we) = window_exprs.iter().find(|w| &w.display_name == cname) {
+                we.output_type
+            } else {
+                bound_expr.infer_type(&grouped_schema)?
+            }
+        } else {
+            bound_expr.infer_type(&grouped_schema)?
+        };
+
         let direction = match order_item.direction {
             OrderDirection::Asc => SortDirection::Ascending,
             OrderDirection::Desc => SortDirection::Descending,
@@ -796,6 +960,7 @@ pub fn bind_select_with_context(
         table_name: statement.from.name.clone(),
         table_alias: statement.from.alias.clone(),
         joins: bound_joins,
+        window_exprs,
         projections,
         filter,
         group_by: bound_group_by,
@@ -804,6 +969,442 @@ pub fn bind_select_with_context(
         order_by,
         limit,
         offset,
+    })
+}
+
+fn validate_frame(frame: &crate::sql::ast::WindowFrame) -> Result<()> {
+    match (&frame.start, &frame.end) {
+        (crate::sql::ast::WindowFrameBound::UnboundedFollowing, _) => {
+            return Err(Error::InvalidWindowFrame(
+                "frame start cannot be UNBOUNDED FOLLOWING".to_string(),
+            ));
+        }
+        (_, crate::sql::ast::WindowFrameBound::UnboundedPreceding) => {
+            return Err(Error::InvalidWindowFrame(
+                "frame end cannot be UNBOUNDED PRECEDING".to_string(),
+            ));
+        }
+        (
+            crate::sql::ast::WindowFrameBound::CurrentRow,
+            crate::sql::ast::WindowFrameBound::Preceding(_),
+        ) => {
+            return Err(Error::InvalidWindowFrame(
+                "frame start CURRENT ROW cannot precede PRECEDING end bound".to_string(),
+            ));
+        }
+        (
+            crate::sql::ast::WindowFrameBound::Following(_),
+            crate::sql::ast::WindowFrameBound::Preceding(_),
+        ) => {
+            return Err(Error::InvalidWindowFrame(
+                "frame start FOLLOWING cannot precede PRECEDING end bound".to_string(),
+            ));
+        }
+        (
+            crate::sql::ast::WindowFrameBound::Following(_),
+            crate::sql::ast::WindowFrameBound::CurrentRow,
+        ) => {
+            return Err(Error::InvalidWindowFrame(
+                "frame start FOLLOWING cannot precede CURRENT ROW end bound".to_string(),
+            ));
+        }
+        (
+            crate::sql::ast::WindowFrameBound::Following(start_n),
+            crate::sql::ast::WindowFrameBound::Following(end_n),
+        ) => {
+            if start_n > end_n {
+                return Err(Error::InvalidWindowFrame(format!(
+                    "frame start {start_n} FOLLOWING is greater than end {end_n} FOLLOWING"
+                )));
+            }
+        }
+        (
+            crate::sql::ast::WindowFrameBound::Preceding(start_n),
+            crate::sql::ast::WindowFrameBound::Preceding(end_n),
+        ) if start_n < end_n => {
+            return Err(Error::InvalidWindowFrame(format!(
+                "frame start {start_n} PRECEDING is less than end {end_n} PRECEDING"
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn bind_window_expr(
+    function: crate::sql::ast::WindowFunction,
+    args: &[SqlExpr],
+    window_spec: &crate::sql::ast::WindowSpec,
+    ctx: &BindingContext<'_>,
+    schema: &Schema,
+) -> Result<crate::query::expr::WindowExpr> {
+    // 1. Nested window check
+    for arg in args {
+        if contains_window(arg) {
+            return Err(Error::NestedWindowFunction(format!(
+                "nested window function inside {function}: {arg}"
+            )));
+        }
+    }
+    for p in &window_spec.partition_by {
+        if contains_window(p) {
+            return Err(Error::NestedWindowFunction(format!(
+                "nested window function inside PARTITION BY: {p}"
+            )));
+        }
+    }
+    for o in &window_spec.order_by {
+        if contains_window(&o.expr) {
+            return Err(Error::NestedWindowFunction(format!(
+                "nested window function inside ORDER BY: {}",
+                o.expr
+            )));
+        }
+    }
+
+    // 2. Validate function argument count and semantics
+    let mut bound_args = Vec::with_capacity(args.len());
+    let mut offset = None;
+    let mut default = None;
+    let output_type;
+
+    match function {
+        crate::sql::ast::WindowFunction::RowNumber
+        | crate::sql::ast::WindowFunction::Rank
+        | crate::sql::ast::WindowFunction::DenseRank => {
+            if !args.is_empty() {
+                return Err(Error::SqlBindingError(format!(
+                    "{function}() takes 0 arguments, found {}",
+                    args.len()
+                )));
+            }
+            output_type = DataType::UInt64;
+        }
+        crate::sql::ast::WindowFunction::FirstValue
+        | crate::sql::ast::WindowFunction::LastValue => {
+            if args.len() != 1 {
+                return Err(Error::SqlBindingError(format!(
+                    "{function}() takes exactly 1 argument, found {}",
+                    args.len()
+                )));
+            }
+            let b_arg = bind_expr(&args[0], ctx)?;
+            output_type = b_arg.infer_type(schema)?;
+            bound_args.push(b_arg);
+        }
+        crate::sql::ast::WindowFunction::Lag | crate::sql::ast::WindowFunction::Lead => {
+            if args.is_empty() || args.len() > 3 {
+                return Err(Error::SqlBindingError(format!(
+                    "{function}() takes 1 to 3 arguments, found {}",
+                    args.len()
+                )));
+            }
+            let b_arg = bind_expr(&args[0], ctx)?;
+            output_type = b_arg.infer_type(schema)?;
+            bound_args.push(b_arg);
+
+            if args.len() >= 2 {
+                match &args[1] {
+                    SqlExpr::Literal(SqlLiteral::Integer(i)) => {
+                        if *i < 0 {
+                            return Err(Error::InvalidWindowOffset(format!(
+                                "{function} offset cannot be negative: {i}"
+                            )));
+                        }
+                        offset = Some(*i as usize);
+                    }
+                    SqlExpr::Literal(SqlLiteral::Null) => {
+                        return Err(Error::InvalidWindowOffset(format!(
+                            "{function} offset cannot be NULL"
+                        )));
+                    }
+                    other => {
+                        return Err(Error::InvalidWindowOffset(format!(
+                            "{function} offset must be a non-negative integer constant, found: {other}"
+                        )));
+                    }
+                }
+            } else {
+                offset = Some(1);
+            }
+
+            if args.len() == 3 {
+                let mut def = bind_expr(&args[2], ctx)?;
+                if let Ok(def_type) = def.infer_type(schema) {
+                    if def_type != DataType::Null && def_type != output_type {
+                        if output_type == DataType::UInt64 && def_type == DataType::Int64 {
+                            if let Expr::Literal(Value::Int64(i)) = def {
+                                if i >= 0 {
+                                    def = Expr::Literal(Value::UInt64(i as u64));
+                                }
+                            }
+                        } else if output_type == DataType::Float64 && def_type == DataType::Int64 {
+                            if let Expr::Literal(Value::Int64(i)) = def {
+                                def = Expr::Literal(Value::Float64(i as f64));
+                            }
+                        }
+                    }
+                }
+                default = Some(def);
+            }
+        }
+    }
+
+    // 3. Bind Partition By
+    let mut bound_partition_by = Vec::with_capacity(window_spec.partition_by.len());
+    for p in &window_spec.partition_by {
+        let b = bind_expr(p, ctx)?;
+        let _ = b.infer_type(schema)?;
+        bound_partition_by.push(b);
+    }
+
+    // 4. Bind Order By
+    let mut bound_order_by = Vec::with_capacity(window_spec.order_by.len());
+    for o in &window_spec.order_by {
+        let b = bind_expr(&o.expr, ctx)?;
+        let _ = b.infer_type(schema)?;
+        let direction = match o.direction {
+            OrderDirection::Asc => SortDirection::Ascending,
+            OrderDirection::Desc => SortDirection::Descending,
+        };
+        bound_order_by.push(SortKey::new(b, direction));
+    }
+
+    // 5. Frame calculation and validation
+    let bound_frame = if let Some(frame) = &window_spec.frame {
+        validate_frame(frame)?;
+        crate::query::expr::BoundWindowFrame {
+            start: frame.start.clone(),
+            end: frame.end.clone(),
+        }
+    } else if !bound_order_by.is_empty() {
+        crate::query::expr::BoundWindowFrame {
+            start: crate::sql::ast::WindowFrameBound::UnboundedPreceding,
+            end: crate::sql::ast::WindowFrameBound::CurrentRow,
+        }
+    } else {
+        crate::query::expr::BoundWindowFrame {
+            start: crate::sql::ast::WindowFrameBound::UnboundedPreceding,
+            end: crate::sql::ast::WindowFrameBound::UnboundedFollowing,
+        }
+    };
+
+    let bound_spec = crate::query::expr::BoundWindowSpec {
+        partition_by: bound_partition_by,
+        order_by: bound_order_by,
+        frame: bound_frame,
+    };
+
+    let display_name = {
+        let mut arg_strs: Vec<String> = bound_args.iter().map(|e| e.to_string()).collect();
+        if let Some(off) = offset {
+            if off != 1 || default.is_some() {
+                arg_strs.push(off.to_string());
+            }
+        }
+        if let Some(def) = &default {
+            arg_strs.push(def.to_string());
+        }
+        format!("{function}({}) {bound_spec}", arg_strs.join(", "))
+    };
+
+    Ok(crate::query::expr::WindowExpr {
+        function,
+        args: bound_args,
+        offset,
+        default,
+        window_spec: bound_spec,
+        output_type,
+        display_name,
+    })
+}
+
+fn bind_grouped_window_expr(
+    function: crate::sql::ast::WindowFunction,
+    args: &[SqlExpr],
+    window_spec: &crate::sql::ast::WindowSpec,
+    ctx: &BindingContext<'_>,
+    group_by: &[Expr],
+    grouped_schema: &Schema,
+) -> Result<crate::query::expr::WindowExpr> {
+    // 1. Nested window check
+    for arg in args {
+        if contains_window(arg) {
+            return Err(Error::NestedWindowFunction(format!(
+                "nested window function inside {function}: {arg}"
+            )));
+        }
+    }
+    for p in &window_spec.partition_by {
+        if contains_window(p) {
+            return Err(Error::NestedWindowFunction(format!(
+                "nested window function inside PARTITION BY: {p}"
+            )));
+        }
+    }
+    for o in &window_spec.order_by {
+        if contains_window(&o.expr) {
+            return Err(Error::NestedWindowFunction(format!(
+                "nested window function inside ORDER BY: {}",
+                o.expr
+            )));
+        }
+    }
+
+    // 2. Validate function argument count and semantics
+    let mut bound_args = Vec::with_capacity(args.len());
+    let mut offset = None;
+    let mut default = None;
+    let output_type;
+
+    match function {
+        crate::sql::ast::WindowFunction::RowNumber
+        | crate::sql::ast::WindowFunction::Rank
+        | crate::sql::ast::WindowFunction::DenseRank => {
+            if !args.is_empty() {
+                return Err(Error::SqlBindingError(format!(
+                    "{function}() takes 0 arguments, found {}",
+                    args.len()
+                )));
+            }
+            output_type = DataType::UInt64;
+        }
+        crate::sql::ast::WindowFunction::FirstValue
+        | crate::sql::ast::WindowFunction::LastValue => {
+            if args.len() != 1 {
+                return Err(Error::SqlBindingError(format!(
+                    "{function}() takes exactly 1 argument, found {}",
+                    args.len()
+                )));
+            }
+            let b_arg = bind_grouped_expr(&args[0], ctx, group_by, grouped_schema)?;
+            output_type = b_arg.infer_type(grouped_schema)?;
+            bound_args.push(b_arg);
+        }
+        crate::sql::ast::WindowFunction::Lag | crate::sql::ast::WindowFunction::Lead => {
+            if args.is_empty() || args.len() > 3 {
+                return Err(Error::SqlBindingError(format!(
+                    "{function}() takes 1 to 3 arguments, found {}",
+                    args.len()
+                )));
+            }
+            let b_arg = bind_grouped_expr(&args[0], ctx, group_by, grouped_schema)?;
+            output_type = b_arg.infer_type(grouped_schema)?;
+            bound_args.push(b_arg);
+
+            if args.len() >= 2 {
+                match &args[1] {
+                    SqlExpr::Literal(SqlLiteral::Integer(i)) => {
+                        if *i < 0 {
+                            return Err(Error::InvalidWindowOffset(format!(
+                                "{function} offset cannot be negative: {i}"
+                            )));
+                        }
+                        offset = Some(*i as usize);
+                    }
+                    SqlExpr::Literal(SqlLiteral::Null) => {
+                        return Err(Error::InvalidWindowOffset(format!(
+                            "{function} offset cannot be NULL"
+                        )));
+                    }
+                    other => {
+                        return Err(Error::InvalidWindowOffset(format!(
+                            "{function} offset must be a non-negative integer constant, found: {other}"
+                        )));
+                    }
+                }
+            } else {
+                offset = Some(1);
+            }
+
+            if args.len() == 3 {
+                let mut def = bind_grouped_expr(&args[2], ctx, group_by, grouped_schema)?;
+                if let Ok(def_type) = def.infer_type(grouped_schema) {
+                    if def_type != DataType::Null && def_type != output_type {
+                        if output_type == DataType::UInt64 && def_type == DataType::Int64 {
+                            if let Expr::Literal(Value::Int64(i)) = def {
+                                if i >= 0 {
+                                    def = Expr::Literal(Value::UInt64(i as u64));
+                                }
+                            }
+                        } else if output_type == DataType::Float64 && def_type == DataType::Int64 {
+                            if let Expr::Literal(Value::Int64(i)) = def {
+                                def = Expr::Literal(Value::Float64(i as f64));
+                            }
+                        }
+                    }
+                }
+                default = Some(def);
+            }
+        }
+    }
+
+    // 3. Bind Partition By
+    let mut bound_partition_by = Vec::with_capacity(window_spec.partition_by.len());
+    for p in &window_spec.partition_by {
+        let b = bind_grouped_expr(p, ctx, group_by, grouped_schema)?;
+        let _ = b.infer_type(grouped_schema)?;
+        bound_partition_by.push(b);
+    }
+
+    // 4. Bind Order By
+    let mut bound_order_by = Vec::with_capacity(window_spec.order_by.len());
+    for o in &window_spec.order_by {
+        let b = bind_grouped_expr(&o.expr, ctx, group_by, grouped_schema)?;
+        let _ = b.infer_type(grouped_schema)?;
+        let direction = match o.direction {
+            OrderDirection::Asc => SortDirection::Ascending,
+            OrderDirection::Desc => SortDirection::Descending,
+        };
+        bound_order_by.push(SortKey::new(b, direction));
+    }
+
+    // 5. Frame
+    let bound_frame = if let Some(frame) = &window_spec.frame {
+        validate_frame(frame)?;
+        crate::query::expr::BoundWindowFrame {
+            start: frame.start.clone(),
+            end: frame.end.clone(),
+        }
+    } else if !bound_order_by.is_empty() {
+        crate::query::expr::BoundWindowFrame {
+            start: crate::sql::ast::WindowFrameBound::UnboundedPreceding,
+            end: crate::sql::ast::WindowFrameBound::CurrentRow,
+        }
+    } else {
+        crate::query::expr::BoundWindowFrame {
+            start: crate::sql::ast::WindowFrameBound::UnboundedPreceding,
+            end: crate::sql::ast::WindowFrameBound::UnboundedFollowing,
+        }
+    };
+
+    let bound_spec = crate::query::expr::BoundWindowSpec {
+        partition_by: bound_partition_by,
+        order_by: bound_order_by,
+        frame: bound_frame,
+    };
+
+    let display_name = {
+        let mut arg_strs: Vec<String> = bound_args.iter().map(|e| e.to_string()).collect();
+        if let Some(off) = offset {
+            if off != 1 || default.is_some() {
+                arg_strs.push(off.to_string());
+            }
+        }
+        if let Some(def) = &default {
+            arg_strs.push(def.to_string());
+        }
+        format!("{function}({}) {bound_spec}", arg_strs.join(", "))
+    };
+
+    Ok(crate::query::expr::WindowExpr {
+        function,
+        args: bound_args,
+        offset,
+        default,
+        window_spec: bound_spec,
+        output_type,
+        display_name,
     })
 }
 
@@ -964,6 +1565,9 @@ pub fn bind_grouped_expr(
         SqlExpr::Exists { subquery, negated } => {
             bind_subquery_internal(SubqueryKindTag::Exists { negated: *negated }, subquery, ctx)
         }
+        SqlExpr::Window { .. } => Err(Error::SqlBindingError(
+            "window expressions cannot be bound as scalar expressions directly".to_string(),
+        )),
     }
 }
 
@@ -1090,6 +1694,9 @@ pub fn bind_expr(expr: &SqlExpr, ctx: &BindingContext<'_>) -> Result<Expr> {
         SqlExpr::Exists { subquery, negated } => {
             bind_subquery_internal(SubqueryKindTag::Exists { negated: *negated }, subquery, ctx)
         }
+        SqlExpr::Window { .. } => Err(Error::SqlBindingError(
+            "window expressions cannot be bound as scalar table expressions".to_string(),
+        )),
     }
 }
 
@@ -1166,7 +1773,16 @@ fn bind_subquery_internal(
             let dt = agg.infer_type(&inner_ctx.combined_schema)?;
             grouped_columns.push(Column::new(agg.display_name(), dt, true));
         }
+        for we in &bound_select.window_exprs {
+            grouped_columns.push(Column::new(we.display_name.clone(), we.output_type, true));
+        }
         Schema::new_projected(grouped_columns)
+    } else if !bound_select.window_exprs.is_empty() {
+        let mut cols = inner_ctx.combined_schema.columns.clone();
+        for we in &bound_select.window_exprs {
+            cols.push(Column::new(we.display_name.clone(), we.output_type, true));
+        }
+        Schema::new_projected(cols)
     } else {
         inner_ctx.combined_schema.clone()
     };

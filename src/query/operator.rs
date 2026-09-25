@@ -786,3 +786,244 @@ impl AggregateOperator {
         Ok((out_schema, out_rows))
     }
 }
+
+/// Logical window function execution operator.
+pub struct WindowOperator;
+
+impl WindowOperator {
+    /// Applies a sequence of window expressions to input rows, returning an updated `Schema`
+    /// and `Row`s with appended window function calculation columns.
+    pub fn apply(
+        rows: Vec<Row>,
+        input_schema: &Schema,
+        window_exprs: &[crate::query::expr::WindowExpr],
+    ) -> Result<(Schema, Vec<Row>)> {
+        if window_exprs.is_empty() {
+            return Ok((input_schema.clone(), rows));
+        }
+
+        let mut output_columns = input_schema.columns.clone();
+        for we in window_exprs {
+            output_columns.push(Column::new(we.display_name.clone(), we.output_type, true));
+        }
+        let output_schema = Schema::new_projected(output_columns);
+
+        if rows.is_empty() {
+            return Ok((output_schema, Vec::new()));
+        }
+
+        let mut all_computed_cols: Vec<Vec<Value>> = Vec::with_capacity(window_exprs.len());
+
+        for we in window_exprs {
+            let mut computed_col = vec![Value::Null; rows.len()];
+
+            // Step 1: Partition rows into groups
+            let mut partitions: HashMap<GroupKey, Vec<usize>> = HashMap::new();
+            let mut partition_order: Vec<GroupKey> = Vec::new();
+
+            for (row_idx, row) in rows.iter().enumerate() {
+                let mut keys = Vec::with_capacity(we.window_spec.partition_by.len());
+                for p_expr in &we.window_spec.partition_by {
+                    let val = p_expr.evaluate(row, input_schema)?;
+                    keys.push(CanonicalValue::from_value(&val));
+                }
+                let key = GroupKey(keys);
+                if let Some(indices) = partitions.get_mut(&key) {
+                    indices.push(row_idx);
+                } else {
+                    partition_order.push(key.clone());
+                    partitions.insert(key, vec![row_idx]);
+                }
+            }
+
+            // Step 2: Sort each partition and compute window values
+            for key in &partition_order {
+                let mut partition_indices = partitions.remove(key).unwrap();
+
+                let mut sort_err: Result<()> = Ok(());
+                if !we.window_spec.order_by.is_empty() {
+                    partition_indices.sort_by(|&idx_a, &idx_b| {
+                        if sort_err.is_err() {
+                            return Ordering::Equal;
+                        }
+                        match compare_rows_by_sort_keys(
+                            &rows[idx_a],
+                            &rows[idx_b],
+                            input_schema,
+                            &we.window_spec.order_by,
+                        ) {
+                            Ok(Ordering::Equal) => idx_a.cmp(&idx_b),
+                            Ok(ord) => ord,
+                            Err(e) => {
+                                sort_err = Err(e);
+                                Ordering::Equal
+                            }
+                        }
+                    });
+                }
+                sort_err?;
+
+                let p_len = partition_indices.len();
+                let mut prev_rank: u64 = 1;
+                let mut prev_dense_rank: u64 = 1;
+
+                for p in 0..p_len {
+                    let orig_idx = partition_indices[p];
+                    let val = match we.function {
+                        crate::sql::ast::WindowFunction::RowNumber => Value::UInt64((p + 1) as u64),
+                        crate::sql::ast::WindowFunction::Rank => {
+                            if p == 0 {
+                                prev_rank = 1;
+                                Value::UInt64(1)
+                            } else {
+                                let is_peer = if we.window_spec.order_by.is_empty() {
+                                    true
+                                } else {
+                                    compare_rows_by_sort_keys(
+                                        &rows[partition_indices[p]],
+                                        &rows[partition_indices[p - 1]],
+                                        input_schema,
+                                        &we.window_spec.order_by,
+                                    )? == Ordering::Equal
+                                };
+                                if is_peer {
+                                    Value::UInt64(prev_rank)
+                                } else {
+                                    let curr_rank = (p + 1) as u64;
+                                    prev_rank = curr_rank;
+                                    Value::UInt64(curr_rank)
+                                }
+                            }
+                        }
+                        crate::sql::ast::WindowFunction::DenseRank => {
+                            if p == 0 {
+                                prev_dense_rank = 1;
+                                Value::UInt64(1)
+                            } else {
+                                let is_peer = if we.window_spec.order_by.is_empty() {
+                                    true
+                                } else {
+                                    compare_rows_by_sort_keys(
+                                        &rows[partition_indices[p]],
+                                        &rows[partition_indices[p - 1]],
+                                        input_schema,
+                                        &we.window_spec.order_by,
+                                    )? == Ordering::Equal
+                                };
+                                if is_peer {
+                                    Value::UInt64(prev_dense_rank)
+                                } else {
+                                    prev_dense_rank += 1;
+                                    Value::UInt64(prev_dense_rank)
+                                }
+                            }
+                        }
+                        crate::sql::ast::WindowFunction::Lag => {
+                            let offset = we.offset.unwrap_or(1);
+                            if offset <= p {
+                                let target_idx = partition_indices[p - offset];
+                                we.args[0].evaluate(&rows[target_idx], input_schema)?
+                            } else if let Some(def_expr) = &we.default {
+                                def_expr.evaluate(&rows[orig_idx], input_schema)?
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        crate::sql::ast::WindowFunction::Lead => {
+                            let offset = we.offset.unwrap_or(1);
+                            if p + offset < p_len {
+                                let target_idx = partition_indices[p + offset];
+                                we.args[0].evaluate(&rows[target_idx], input_schema)?
+                            } else if let Some(def_expr) = &we.default {
+                                def_expr.evaluate(&rows[orig_idx], input_schema)?
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        crate::sql::ast::WindowFunction::FirstValue => {
+                            let start_idx = match we.window_spec.frame.start {
+                                crate::sql::ast::WindowFrameBound::UnboundedPreceding => 0,
+                                crate::sql::ast::WindowFrameBound::Preceding(n) => {
+                                    p.saturating_sub(n as usize)
+                                }
+                                crate::sql::ast::WindowFrameBound::CurrentRow => p,
+                                crate::sql::ast::WindowFrameBound::Following(n) => p + (n as usize),
+                                crate::sql::ast::WindowFrameBound::UnboundedFollowing => {
+                                    p_len.saturating_sub(1)
+                                }
+                            };
+                            let end_idx = match we.window_spec.frame.end {
+                                crate::sql::ast::WindowFrameBound::UnboundedPreceding => 0,
+                                crate::sql::ast::WindowFrameBound::Preceding(n) => {
+                                    p.saturating_sub(n as usize)
+                                }
+                                crate::sql::ast::WindowFrameBound::CurrentRow => p,
+                                crate::sql::ast::WindowFrameBound::Following(n) => {
+                                    (p + (n as usize)).min(p_len.saturating_sub(1))
+                                }
+                                crate::sql::ast::WindowFrameBound::UnboundedFollowing => {
+                                    p_len.saturating_sub(1)
+                                }
+                            };
+
+                            if start_idx > end_idx || start_idx >= p_len {
+                                Value::Null
+                            } else {
+                                let target_idx = partition_indices[start_idx];
+                                we.args[0].evaluate(&rows[target_idx], input_schema)?
+                            }
+                        }
+                        crate::sql::ast::WindowFunction::LastValue => {
+                            let start_idx = match we.window_spec.frame.start {
+                                crate::sql::ast::WindowFrameBound::UnboundedPreceding => 0,
+                                crate::sql::ast::WindowFrameBound::Preceding(n) => {
+                                    p.saturating_sub(n as usize)
+                                }
+                                crate::sql::ast::WindowFrameBound::CurrentRow => p,
+                                crate::sql::ast::WindowFrameBound::Following(n) => p + (n as usize),
+                                crate::sql::ast::WindowFrameBound::UnboundedFollowing => {
+                                    p_len.saturating_sub(1)
+                                }
+                            };
+                            let end_idx = match we.window_spec.frame.end {
+                                crate::sql::ast::WindowFrameBound::UnboundedPreceding => 0,
+                                crate::sql::ast::WindowFrameBound::Preceding(n) => {
+                                    p.saturating_sub(n as usize)
+                                }
+                                crate::sql::ast::WindowFrameBound::CurrentRow => p,
+                                crate::sql::ast::WindowFrameBound::Following(n) => {
+                                    (p + (n as usize)).min(p_len.saturating_sub(1))
+                                }
+                                crate::sql::ast::WindowFrameBound::UnboundedFollowing => {
+                                    p_len.saturating_sub(1)
+                                }
+                            };
+
+                            if start_idx > end_idx || start_idx >= p_len {
+                                Value::Null
+                            } else {
+                                let target_idx = partition_indices[end_idx.min(p_len - 1)];
+                                we.args[0].evaluate(&rows[target_idx], input_schema)?
+                            }
+                        }
+                    };
+
+                    computed_col[orig_idx] = val;
+                }
+            }
+
+            all_computed_cols.push(computed_col);
+        }
+
+        let mut out_rows = Vec::with_capacity(rows.len());
+        for (row_idx, row) in rows.into_iter().enumerate() {
+            let mut values = row.values;
+            for col in &all_computed_cols {
+                values.push(col[row_idx].clone());
+            }
+            out_rows.push(Row::new(values));
+        }
+
+        Ok((output_schema, out_rows))
+    }
+}

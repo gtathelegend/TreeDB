@@ -135,6 +135,8 @@ pub struct PhysicalPlan {
     pub aggregates: Vec<AggregateExpr>,
     /// Post-aggregation filter predicate (HAVING).
     pub having: Option<Expr>,
+    /// Window expressions to compute.
+    pub window_exprs: Vec<crate::query::expr::WindowExpr>,
     /// Output projection expressions with optional aliases.
     pub projections: Vec<(Expr, Option<String>)>,
     /// Sort keys (ORDER BY).
@@ -206,6 +208,51 @@ impl fmt::Display for PhysicalPlan {
                 .map(|k| format!("{} {:?}", k.expression, k.direction))
                 .collect();
             writeln!(f, "Sort [{}]", keys.join(", "))?;
+            indent += 1;
+        }
+
+        if !self.window_exprs.is_empty() {
+            write_indent(f, indent)?;
+            writeln!(f, "Window")?;
+            for we in &self.window_exprs {
+                write_indent(f, indent + 1)?;
+                writeln!(f, "Functions:")?;
+                write_indent(f, indent + 2)?;
+                let args_str = if we.args.is_empty() {
+                    String::new()
+                } else {
+                    let a: Vec<String> = we.args.iter().map(|e| e.to_string()).collect();
+                    a.join(", ")
+                };
+                writeln!(f, "{}({})", we.function, args_str)?;
+
+                if !we.window_spec.partition_by.is_empty() {
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "Partition By:")?;
+                    for p in &we.window_spec.partition_by {
+                        write_indent(f, indent + 2)?;
+                        writeln!(f, "{p}")?;
+                    }
+                }
+
+                if !we.window_spec.order_by.is_empty() {
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "Order By:")?;
+                    for o in &we.window_spec.order_by {
+                        write_indent(f, indent + 2)?;
+                        writeln!(f, "{} {:?}", o.expression, o.direction)?;
+                    }
+                }
+
+                write_indent(f, indent + 1)?;
+                writeln!(f, "Frame:")?;
+                write_indent(f, indent + 2)?;
+                writeln!(
+                    f,
+                    "{} -> {}",
+                    we.window_spec.frame.start, we.window_spec.frame.end
+                )?;
+            }
             indent += 1;
         }
 
@@ -555,6 +602,7 @@ impl Optimizer {
             group_by: bound.group_by.clone(),
             aggregates: bound.aggregates.clone(),
             having: bound.having.clone(),
+            window_exprs: bound.window_exprs.clone(),
             projections: bound.projections.clone(),
             order_by: bound.order_by.clone(),
             offset: bound.offset,
