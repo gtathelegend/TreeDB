@@ -416,12 +416,30 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 25: Advanced Query Processing & Secondary Index DDL (Future)
+## Phase 25: Recursive Common Table Expressions (WITH RECURSIVE) (Completed)
+* [x] Lexer & Parser support for `WITH RECURSIVE`, `UNION ALL`, arithmetic expressions (`+`, `-`, `*`, `/`), and case-insensitivity
+* [x] Structured AST representation: `WithClause.recursive` flag and `CteQuery::Recursive { anchor, recursive }`
+* [x] Scoped recursive CTE binding: anchor cannot reference recursive relation (`RecursiveCteAnchorSelfReference`); recursive member references working relation with precedence over physical tables
+* [x] Schema compatibility & derivation: validates matching column counts and data types between anchor and recursive member branches (`RecursiveCteColumnCountMismatch`, `RecursiveCteSchemaMismatch`)
+* [x] Explicit recursive CTE column list support and arity/uniqueness validation
+* [x] Explicit delta/working-set iterative evaluation loop model with statement-local memory management
+* [x] Configurable termination limits and structured error safeguards: `DEFAULT_MAX_RECURSION_ITERATIONS = 1000` (`RecursiveCteIterationLimit`) and `DEFAULT_MAX_RECURSION_ROWS = 1_000_000` (`RecursiveCteRowLimit`)
+* [x] `UNION ALL` duplicate preservation semantics
+* [x] Cycle detection and mutual recursion rejection: static detection across CTE definitions (`MutualRecursion`)
+* [x] Relational composition: recursive CTEs in `INNER JOIN`, `LEFT JOIN`, filters, aliases, preceding CTE references, subqueries, final `ORDER BY`, `LIMIT`, and window functions
+* [x] Semantic validation: structured rejection of unsupported recursive aggregation and window functions in recursive member
+* [x] Optimizer integration with deterministic `explain_sql` output displaying anchor, recursive member, iteration limit, and row limit
+* [x] Transaction visibility: recursive CTEs observe uncommitted mutations in active transactions and respect transaction rollback
+* [x] Statement-local in-memory evaluation model: read-only, zero persistent page allocation, zero catalog mutation, zero WAL writes
+* [x] 20 dedicated integration tests in `tests/recursive_cte.rs` and 1 new parser test in `tests/sql.rs` including randomized reference evaluator oracle (467 total test suite)
+
+---
+
+## Phase 26: Advanced Query Processing & Secondary Index DDL (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
-* [ ] Recursive CTEs (`WITH RECURSIVE`) and fixed-point iteration
 * [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Cost-based join optimization and cardinality estimation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)

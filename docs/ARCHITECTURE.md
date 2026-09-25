@@ -347,6 +347,13 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Framing Semantics & Defaults:** Standard SQL defaults (`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` with `ORDER BY`; `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` without `ORDER BY`) and validated `ROWS` frames.
   * **Semantic Validation:** Structured errors rejecting window functions in `WHERE`, `GROUP BY`, `HAVING`, `JOIN ON`, and nested window functions.
   * **Statement-Local Execution:** Non-persistent, zero-WAL, in-memory execution fully integrated with CTEs, joins, aggregations, and transaction visibility.
+* **Recursive Common Table Expressions (WITH RECURSIVE):**
+  * **AST Representation & Grammar:** `WithClause { recursive: bool, ctes: Vec<Cte> }`, `CteQuery::Recursive { anchor, recursive }`, requiring explicit `UNION ALL` separation between anchor and recursive member branches.
+  * **Explicit Delta Iteration Model:** Evaluates via working-set delta loop (`working_rows = anchor_rows` -> `recursive_plan(working_rows)` -> `working_rows = next_rows`) appending rows to `accumulated_rows`.
+  * **Hard Execution Bounds:** Protected against runaway recursion via configurable iteration limit (`DEFAULT_MAX_RECURSION_ITERATIONS = 1000`, `Error::RecursiveCteIterationLimit`) and row count limit (`DEFAULT_MAX_RECURSION_ROWS = 1_000_000`, `Error::RecursiveCteRowLimit`).
+  * **Scope & Shadowing Rules:** Recursive CTE name is visible only within the recursive member query, shadowing catalog tables of the same name. Self-reference in anchor is rejected (`Error::RecursiveCteAnchorSelfReference`). Mutual recursion (`a -> b -> a`) is statically rejected (`Error::MutualRecursion`).
+  * **Schema Validation:** Enforces exact column count matching and data type compatibility between anchor and recursive member projections.
+  * **Relational Integration:** Seamlessly composes with joins (`INNER`/`LEFT`), filters, aliases, preceding CTEs, subqueries, and outer query `ORDER BY`, `LIMIT`, and window functions.
 
 ---
 
@@ -361,7 +368,8 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **Engine Atomicity Boundary:** `TreeDb::put` and `TreeDb::delete` operations wrap both RecordStore heap modifications (inline and overflow) and B+ Tree index mutations in a single transaction (`TxnId`). If an uncommitted operation crashes, both index and record mutations are undone atomically.
 * **Secondary Index Invariant:** Every committed table row must have exactly the corresponding secondary-index entries required by its indexed columns, and every secondary-index entry must resolve to a valid current `RecordId`.
 * **Subquery Cardinality Invariant:** Scalar subqueries must return $\le 1$ row (0 rows -> `NULL`, 1 row -> value, $>1$ rows -> `Error::ScalarSubqueryMultipleRows`) and exactly 1 column.
-* **CTE Non-Persistence Invariant:** Executing CTE queries never modifies persistent database pages, freelist state, catalog metadata, or WAL logs.
+* **CTE Non-Persistence Invariant:** Executing CTE and recursive CTE queries never modifies persistent database pages, freelist state, catalog metadata, or WAL logs.
+* **Recursive Boundedness Invariant:** Recursive CTE execution never uses unbounded call stacks and deterministically terminates when the working set is empty or upon reaching configured iteration/row safety thresholds.
 * **Window Cardinality Invariant:** Window function evaluation never collapses or filters rows; the output row cardinality of `WindowOperator` strictly equals input row cardinality.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
@@ -377,7 +385,8 @@ The following capabilities are intentionally deferred to subsequent phases:
 * Index-only covering scans.
 * Full cost-based optimizer and cardinality statistics.
 * DDL statements (`CREATE INDEX`, `DROP INDEX`) in SQL grammar.
-* Recursive CTEs (`WITH RECURSIVE`) and derived tables (`FROM (SELECT ...)`).
+* Recursive CTE `UNION DISTINCT`, `SEARCH`, `CYCLE` clauses, and mutual recursion.
+* Derived tables (`FROM (SELECT ...)`).
 * Subquery flattening and cost-based decorrelation.
 * Multi-threading, concurrency control, and MVCC.
 

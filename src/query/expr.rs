@@ -19,6 +19,14 @@ pub enum BinaryOp {
     Gt,
     /// Greater than or equal (`>=`)
     GtEq,
+    /// Addition (`+`)
+    Add,
+    /// Subtraction (`-`)
+    Sub,
+    /// Multiplication (`*`)
+    Mul,
+    /// Division (`/`)
+    Div,
     /// Logical AND (3-valued logic)
     And,
     /// Logical OR (3-valued logic)
@@ -34,6 +42,10 @@ impl fmt::Display for BinaryOp {
             BinaryOp::LtEq => write!(f, "<="),
             BinaryOp::Gt => write!(f, ">"),
             BinaryOp::GtEq => write!(f, ">="),
+            BinaryOp::Add => write!(f, "+"),
+            BinaryOp::Sub => write!(f, "-"),
+            BinaryOp::Mul => write!(f, "*"),
+            BinaryOp::Div => write!(f, "/"),
             BinaryOp::And => write!(f, "AND"),
             BinaryOp::Or => write!(f, "OR"),
         }
@@ -479,6 +491,46 @@ impl Expr {
         }
     }
 
+    /// Creates an addition (`left + right`).
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(left: Expr, right: Expr) -> Self {
+        Expr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::Add,
+            right: Box::new(right),
+        }
+    }
+
+    /// Creates a subtraction (`left - right`).
+    #[allow(clippy::should_implement_trait)]
+    pub fn sub(left: Expr, right: Expr) -> Self {
+        Expr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::Sub,
+            right: Box::new(right),
+        }
+    }
+
+    /// Creates a multiplication (`left * right`).
+    #[allow(clippy::should_implement_trait)]
+    pub fn mul(left: Expr, right: Expr) -> Self {
+        Expr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::Mul,
+            right: Box::new(right),
+        }
+    }
+
+    /// Creates a division (`left / right`).
+    #[allow(clippy::should_implement_trait)]
+    pub fn div(left: Expr, right: Expr) -> Self {
+        Expr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::Div,
+            right: Box::new(right),
+        }
+    }
+
     /// Creates a logical AND conjunction (`left AND right`).
     pub fn and(left: Expr, right: Expr) -> Self {
         Expr::Binary {
@@ -586,6 +638,28 @@ impl Expr {
                                 right: rt.to_string(),
                                 op: op.to_string(),
                             })
+                        }
+                    }
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                        if lt == DataType::Boolean
+                            || rt == DataType::Boolean
+                            || lt == DataType::String
+                            || rt == DataType::String
+                            || lt == DataType::Bytes
+                            || rt == DataType::Bytes
+                        {
+                            return Err(Error::InvalidComparison {
+                                left: lt.to_string(),
+                                right: rt.to_string(),
+                                op: op.to_string(),
+                            });
+                        }
+                        if lt == DataType::Float64 || rt == DataType::Float64 {
+                            Ok(DataType::Float64)
+                        } else if lt == DataType::UInt64 && rt == DataType::UInt64 {
+                            Ok(DataType::UInt64)
+                        } else {
+                            Ok(DataType::Int64)
                         }
                     }
                 }
@@ -799,6 +873,105 @@ impl Expr {
                     };
 
                     Ok(Value::Boolean(res))
+                }
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                    let l = left.evaluate_with_outer(row, schema, outer_contexts)?;
+                    let r = right.evaluate_with_outer(row, schema, outer_contexts)?;
+
+                    if l.is_null() || r.is_null() {
+                        return Ok(Value::Null);
+                    }
+
+                    match (l, r) {
+                        (Value::Int64(a), Value::Int64(b)) => match op {
+                            BinaryOp::Add => Ok(Value::Int64(a.wrapping_add(b))),
+                            BinaryOp::Sub => Ok(Value::Int64(a.wrapping_sub(b))),
+                            BinaryOp::Mul => Ok(Value::Int64(a.wrapping_mul(b))),
+                            BinaryOp::Div => {
+                                Ok(a.checked_div(b).map(Value::Int64).unwrap_or(Value::Null))
+                            }
+                            _ => unreachable!(),
+                        },
+                        (Value::UInt64(a), Value::UInt64(b)) => match op {
+                            BinaryOp::Add => Ok(Value::UInt64(a.wrapping_add(b))),
+                            BinaryOp::Sub => Ok(Value::UInt64(a.wrapping_sub(b))),
+                            BinaryOp::Mul => Ok(Value::UInt64(a.wrapping_mul(b))),
+                            BinaryOp::Div => {
+                                Ok(a.checked_div(b).map(Value::UInt64).unwrap_or(Value::Null))
+                            }
+                            _ => unreachable!(),
+                        },
+                        (Value::Float64(a), Value::Float64(b)) => match op {
+                            BinaryOp::Add => Ok(Value::Float64(a + b)),
+                            BinaryOp::Sub => Ok(Value::Float64(a - b)),
+                            BinaryOp::Mul => Ok(Value::Float64(a * b)),
+                            BinaryOp::Div => {
+                                if b == 0.0 {
+                                    Ok(Value::Null)
+                                } else {
+                                    Ok(Value::Float64(a / b))
+                                }
+                            }
+                            _ => unreachable!(),
+                        },
+                        (Value::Int64(a), Value::Float64(b)) => match op {
+                            BinaryOp::Add => Ok(Value::Float64(a as f64 + b)),
+                            BinaryOp::Sub => Ok(Value::Float64(a as f64 - b)),
+                            BinaryOp::Mul => Ok(Value::Float64(a as f64 * b)),
+                            BinaryOp::Div => {
+                                if b == 0.0 {
+                                    Ok(Value::Null)
+                                } else {
+                                    Ok(Value::Float64(a as f64 / b))
+                                }
+                            }
+                            _ => unreachable!(),
+                        },
+                        (Value::Float64(a), Value::Int64(b)) => match op {
+                            BinaryOp::Add => Ok(Value::Float64(a + b as f64)),
+                            BinaryOp::Sub => Ok(Value::Float64(a - b as f64)),
+                            BinaryOp::Mul => Ok(Value::Float64(a * b as f64)),
+                            BinaryOp::Div => {
+                                if b == 0 {
+                                    Ok(Value::Null)
+                                } else {
+                                    Ok(Value::Float64(a / b as f64))
+                                }
+                            }
+                            _ => unreachable!(),
+                        },
+                        (Value::Int64(a), Value::UInt64(b)) => match op {
+                            BinaryOp::Add => Ok(Value::Int64(a.wrapping_add(b as i64))),
+                            BinaryOp::Sub => Ok(Value::Int64(a.wrapping_sub(b as i64))),
+                            BinaryOp::Mul => Ok(Value::Int64(a.wrapping_mul(b as i64))),
+                            BinaryOp::Div => {
+                                if b == 0 {
+                                    Ok(Value::Null)
+                                } else {
+                                    Ok(Value::Int64(a / b as i64))
+                                }
+                            }
+                            _ => unreachable!(),
+                        },
+                        (Value::UInt64(a), Value::Int64(b)) => match op {
+                            BinaryOp::Add => Ok(Value::Int64((a as i64).wrapping_add(b))),
+                            BinaryOp::Sub => Ok(Value::Int64((a as i64).wrapping_sub(b))),
+                            BinaryOp::Mul => Ok(Value::Int64((a as i64).wrapping_mul(b))),
+                            BinaryOp::Div => {
+                                if b == 0 {
+                                    Ok(Value::Null)
+                                } else {
+                                    Ok(Value::Int64(a as i64 / b))
+                                }
+                            }
+                            _ => unreachable!(),
+                        },
+                        (l, r) => Err(Error::InvalidComparison {
+                            left: l.data_type().to_string(),
+                            right: r.data_type().to_string(),
+                            op: op.to_string(),
+                        }),
+                    }
                 }
             },
             Expr::InList {

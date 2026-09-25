@@ -1159,7 +1159,10 @@ fn test_parser_with_ctes() {
     assert_eq!(with.ctes.len(), 1);
     assert_eq!(with.ctes[0].name, "active_users");
     assert!(with.ctes[0].columns.is_none());
-    assert_eq!(with.ctes[0].query.from.name, "users");
+    match &with.ctes[0].query {
+        treedb::sql::CteQuery::NonRecursive(q) => assert_eq!(q.from.name, "users"),
+        _ => panic!("expected non-recursive CTE query"),
+    }
 
     // 2. Case-insensitivity for WITH / with / WiTh
     let sql = "WiTh a AS (SELECT id FROM users) SeLeCt * FrOm a;";
@@ -1185,6 +1188,52 @@ fn test_parser_with_ctes() {
 }
 
 #[test]
+fn test_parser_with_recursive_ctes() {
+    // 1. Basic WITH RECURSIVE
+    let sql = "WITH RECURSIVE nums(n) AS (SELECT 1 FROM numbers UNION ALL SELECT n + 1 FROM nums WHERE n < 10) SELECT * FROM nums;";
+    let stmt = parse_sql(sql).unwrap();
+    let with = stmt.with.expect("expected WITH clause");
+    assert!(with.recursive);
+    assert_eq!(with.ctes.len(), 1);
+    assert_eq!(with.ctes[0].name, "nums");
+    assert_eq!(
+        with.ctes[0].columns.as_ref().unwrap(),
+        &vec!["n".to_string()]
+    );
+    match &with.ctes[0].query {
+        treedb::sql::CteQuery::Recursive { anchor, recursive } => {
+            assert_eq!(anchor.from.name, "numbers");
+            assert_eq!(recursive.from.name, "nums");
+        }
+        _ => panic!("expected recursive CTE query"),
+    }
+
+    // 2. Case-insensitivity: WiTh ReCuRsIvE / UnIoN aLl
+    let sql = "WiTh ReCuRsIvE r AS (SELECT 1 FROM t UnIoN aLl SELECT n FROM r) SELECT * FROM r;";
+    let stmt = parse_sql(sql).unwrap();
+    let with = stmt.with.unwrap();
+    assert!(with.recursive);
+    assert!(matches!(
+        with.ctes[0].query,
+        treedb::sql::CteQuery::Recursive { .. }
+    ));
+
+    // 3. Preceding non-recursive CTE and recursive CTE under WITH RECURSIVE
+    let sql = "WITH RECURSIVE non_rec AS (SELECT * FROM base), rec AS (SELECT 1 FROM non_rec UNION ALL SELECT n + 1 FROM rec) SELECT * FROM rec;";
+    let stmt = parse_sql(sql).unwrap();
+    let with = stmt.with.unwrap();
+    assert_eq!(with.ctes.len(), 2);
+    assert!(matches!(
+        with.ctes[0].query,
+        treedb::sql::CteQuery::NonRecursive(_)
+    ));
+    assert!(matches!(
+        with.ctes[1].query,
+        treedb::sql::CteQuery::Recursive { .. }
+    ));
+}
+
+#[test]
 fn test_parser_invalid_with_ctes() {
     let invalid = [
         "WITH",
@@ -1198,6 +1247,11 @@ fn test_parser_invalid_with_ctes() {
         "WITH a AS SELECT * FROM users SELECT * FROM a;",
         "WITH a(id,) AS (SELECT 1) SELECT * FROM a;",
         "WITH a() AS (SELECT 1) SELECT * FROM a;",
+        // Recursive specific errors
+        "WITH a AS (SELECT 1 FROM t UNION ALL SELECT 2 FROM a) SELECT * FROM a;", // UNION ALL without WITH RECURSIVE
+        "WITH RECURSIVE a AS (SELECT 1 FROM t UNION SELECT 2 FROM a) SELECT * FROM a;", // UNION without ALL
+        "WITH RECURSIVE a AS (SELECT 1 FROM t UNION ALL SELECT 2 FROM a UNION ALL SELECT 3 FROM a) SELECT * FROM a;", // 3 branches
+        "WITH RECURSIVE a AS (SELECT 1 FROM t UNION ALL) SELECT * FROM a;",
     ];
 
     for &sql in &invalid {

@@ -207,15 +207,40 @@ impl fmt::Display for DeleteStatement {
     }
 }
 
-/// A Common Table Expression (`WITH cte_name [(col1, ...)] AS (SELECT ...)`).
+/// Query definition of a CTE (non-recursive query or recursive anchor/member pair).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CteQuery {
+    /// Non-recursive single SELECT query.
+    NonRecursive(Box<SelectStatement>),
+    /// Recursive query with anchor and recursive member connected by `UNION ALL`.
+    Recursive {
+        /// Initial anchor relation query.
+        anchor: Box<SelectStatement>,
+        /// Recursive member relation query referencing the recursive CTE name.
+        recursive: Box<SelectStatement>,
+    },
+}
+
+impl fmt::Display for CteQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CteQuery::NonRecursive(q) => write!(f, "{q}"),
+            CteQuery::Recursive { anchor, recursive } => {
+                write!(f, "{anchor} UNION ALL {recursive}")
+            }
+        }
+    }
+}
+
+/// A Common Table Expression (`[WITH [RECURSIVE]] cte_name [(col1, ...)] AS (...)`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cte {
     /// Name of the CTE relation.
     pub name: String,
     /// Optional explicit column name list.
     pub columns: Option<Vec<String>>,
-    /// Inner SELECT query defining the CTE relation.
-    pub query: Box<SelectStatement>,
+    /// Inner query defining the CTE relation.
+    pub query: CteQuery,
 }
 
 impl fmt::Display for Cte {
@@ -228,16 +253,22 @@ impl fmt::Display for Cte {
     }
 }
 
-/// A `WITH` clause containing one or more CTE definitions.
+/// A `WITH [RECURSIVE]` clause containing one or more CTE definitions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WithClause {
+    /// Whether `RECURSIVE` was specified.
+    pub recursive: bool,
     /// CTE definitions in declaration order.
     pub ctes: Vec<Cte>,
 }
 
 impl fmt::Display for WithClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WITH ")?;
+        if self.recursive {
+            write!(f, "WITH RECURSIVE ")?;
+        } else {
+            write!(f, "WITH ")?;
+        }
         for (i, cte) in self.ctes.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
@@ -438,6 +469,14 @@ pub enum SqlBinaryOp {
     Gt,
     /// Greater than or equal (`>=`)
     GtEq,
+    /// Addition (`+`)
+    Add,
+    /// Subtraction (`-`)
+    Sub,
+    /// Multiplication (`*`)
+    Mul,
+    /// Division (`/`)
+    Div,
     /// Logical conjunction (`AND`)
     And,
     /// Logical disjunction (`OR`)
@@ -453,6 +492,10 @@ impl fmt::Display for SqlBinaryOp {
             SqlBinaryOp::LtEq => write!(f, "<="),
             SqlBinaryOp::Gt => write!(f, ">"),
             SqlBinaryOp::GtEq => write!(f, ">="),
+            SqlBinaryOp::Add => write!(f, "+"),
+            SqlBinaryOp::Sub => write!(f, "-"),
+            SqlBinaryOp::Mul => write!(f, "*"),
+            SqlBinaryOp::Div => write!(f, "/"),
             SqlBinaryOp::And => write!(f, "AND"),
             SqlBinaryOp::Or => write!(f, "OR"),
         }

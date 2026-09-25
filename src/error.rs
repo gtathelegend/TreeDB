@@ -365,6 +365,70 @@ pub enum Error {
     #[error("Unknown window function '{0}'")]
     UnknownWindowFunction(String),
 
+    /// Recursive CTE iteration limit exceeded.
+    #[error(
+        "Recursive CTE iteration limit reached for '{cte}': reached {iterations} (limit {limit})"
+    )]
+    RecursiveCteIterationLimit {
+        cte: String,
+        iterations: usize,
+        limit: usize,
+    },
+
+    /// Recursive CTE row generation limit exceeded.
+    #[error("Recursive CTE row limit reached for '{cte}': reached {rows} (limit {limit})")]
+    RecursiveCteRowLimit {
+        cte: String,
+        rows: usize,
+        limit: usize,
+    },
+
+    /// Recursive CTE anchor and recursive member schemas do not match.
+    #[error("Recursive CTE '{cte}' schema mismatch: anchor column '{anchor_col}' ({anchor_type}) does not match recursive column '{rec_col}' ({rec_type})")]
+    RecursiveCteSchemaMismatch {
+        cte: String,
+        anchor_col: String,
+        anchor_type: String,
+        rec_col: String,
+        rec_type: String,
+    },
+
+    /// Recursive CTE anchor and recursive member column count mismatch.
+    #[error("Recursive CTE '{cte}' column count mismatch: anchor produced {anchor_cols} columns, recursive member produced {rec_cols} columns")]
+    RecursiveCteColumnCountMismatch {
+        cte: String,
+        anchor_cols: usize,
+        rec_cols: usize,
+    },
+
+    /// Anchor query of a recursive CTE references the recursive relation.
+    #[error("Anchor query of recursive CTE '{0}' cannot reference the recursive relation")]
+    RecursiveCteAnchorSelfReference(String),
+
+    /// Mutual recursion is not supported.
+    #[error("Mutual recursion is not supported: {0}")]
+    MutualRecursion(String),
+
+    /// Invalid recursive CTE structure (requires anchor UNION ALL recursive).
+    #[error("Invalid recursive CTE '{0}': recursive CTE requires exactly two UNION ALL branches (anchor UNION ALL recursive)")]
+    InvalidRecursiveCteShape(String),
+
+    /// Unsupported set operation.
+    #[error("Unsupported set operation in CTE: expected UNION ALL, found {0}")]
+    UnsupportedSetOperation(String),
+
+    /// Recursive CTE query used without WITH RECURSIVE.
+    #[error("Recursive CTE '{0}' requires WITH RECURSIVE")]
+    RecursiveWithoutWithRecursive(String),
+
+    /// Aggregation in recursive member referencing the recursive relation is not supported.
+    #[error("Unsupported aggregation in recursive CTE: {0}")]
+    UnsupportedRecursiveAggregation(String),
+
+    /// Window functions in recursive member referencing the recursive relation are not supported.
+    #[error("Unsupported window function in recursive CTE: {0}")]
+    UnsupportedRecursiveWindow(String),
+
     /// Unsupported SQL statement or clause.
     #[error("Unsupported statement: {0}")]
     UnsupportedStatement(String),

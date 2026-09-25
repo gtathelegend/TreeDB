@@ -556,8 +556,43 @@ This document records key architectural and design choices, their rationale, and
   7. **Statement-Local Execution & Persistence Safety:**
      * Window computation is purely statement-local and in-memory. It does not write WAL records, allocate persistent buffer pages, or mutate catalog metadata.
      * Fully composable with CTEs (`WITH ... SELECT ...`), subqueries, inner/left joins, and multi-aggregate queries.
+## Decision 40: Recursive Common Table Expressions (WITH RECURSIVE), Delta Iteration Model, and Bounded Termination Safeguards
+
+* **Decision:** Implement bounded, iterative SQL recursive Common Table Expressions (`WITH RECURSIVE cte_name [(cols)] AS (anchor UNION ALL recursive) SELECT ...`) integrated into TreeDB's SQL, binding, planning, optimization, and transaction execution engines:
+  1. **AST Representation & Grammar:**
+     * `WithClause`: Contains `recursive: bool` flag and `ctes: Vec<Cte>`.
+     * `CteQuery`: Explicit enumeration distinguishing `NonRecursive(Box<SelectStatement>)` from `Recursive { anchor: Box<SelectStatement>, recursive: Box<SelectStatement> }`.
+     * `UNION ALL`: Required separator between anchor query and recursive member query. Ordinary `UNION` (without `ALL`) returns `Error::UnsupportedSetOperation`.
+  2. **Scope Rules & Recursive Self-Reference:**
+     * **Anchor Scope:** Evaluates against preceding visible CTEs and physical catalog tables. Self-reference to the recursive CTE inside the anchor branch is rejected (`Error::RecursiveCteAnchorSelfReference`).
+     * **Recursive Member Scope:** Can reference preceding CTEs, catalog tables, and self-reference the recursive CTE name.
+     * **Table Shadowing:** Within the recursive member, the recursive CTE relation shadows any catalog physical table with the same name.
+     * **Forward References & Mutual Recursion:** Mutual recursion across different CTEs (`a -> b -> a`) and forward references are statically detected and rejected with `Error::MutualRecursion` or `Error::CyclicCteDependency`.
+  3. **Schema Compatibility & Derivation:**
+     * Anchor and recursive member schemas must match in column count (`Error::RecursiveCteColumnCountMismatch`) and compatible column data types (`Error::RecursiveCteSchemaMismatch`).
+     * Explicit column aliases on the CTE (`WITH RECURSIVE nums(n) AS ...`) rename output columns and validate arity/uniqueness.
+  4. **Delta / Working-Set Iterative Execution Model:**
+     * Evaluates using a delta-set iteration loop:
+       1. Execute `anchor_plan` to produce initial `anchor_rows`.
+       2. Initialize `accumulated_rows = anchor_rows` and `working_rows = anchor_rows`.
+       3. Loop: If `working_rows` is empty, break. Otherwise, bind `working_rows` into the statement-local `cte_store` under the CTE relation name. Execute `recursive_plan`.
+       4. If `recursive_rows` is empty, terminate.
+       5. Check row safety limits (`accumulated_rows.len() + recursive_rows.len() <= max_rows`).
+       6. Append `recursive_rows` to `accumulated_rows` (`UNION ALL` semantics preserve duplicates). Set `working_rows = recursive_rows`. Increment and check iteration limits (`iterations <= max_iterations`).
+  5. **Deterministic Termination & Limits:**
+     * `DEFAULT_MAX_RECURSION_ITERATIONS = 1000`: Exceeding aborts the statement with `Error::RecursiveCteIterationLimit`.
+     * `DEFAULT_MAX_RECURSION_ROWS = 1_000_000`: Exceeding aborts the statement with `Error::RecursiveCteRowLimit`.
+     * Safe termination occurs when `working_rows` becomes empty (e.g. empty anchor or recursive member filter evaluates to false).
+  6. **Relational & Operator Composition:**
+     * Recursive CTE relations participate seamlessly in joins (`JOIN reachable r ON ...`), filters (`WHERE n < 10`), aliases (`FROM nums x`), subqueries, and preceding ordinary CTE references.
+     * Outer queries can apply final `ORDER BY`, `LIMIT`, and window functions over completed recursive CTE results.
+     * Recursive aggregation (`GROUP BY` / aggregates over active self-reference) and window functions in the recursive member are rejected with structured errors (`Error::UnsupportedRecursiveAggregation`, `Error::UnsupportedRecursiveWindow`).
+  7. **Statement-Local Memory Model & Transaction Safety:**
+     * Recursive relations are statement-local in-memory working sets that do not write WAL records, mutate catalog metadata, or allocate disk pages.
+     * Respects active transaction visibility (reads uncommitted transaction writes, respects rollback/commit).
 * **Rationale:**
-  * Dedicated physical operator placement cleanly separates window calculation from aggregation while enabling seamless composition with CTEs, joins, and access-path optimization.
+  * Modeling recursion as an explicit delta iteration loop over in-memory working sets prevents unbounded call stacks, provides deterministic memory consumption, and ensures mathematical fixpoint correctness without persistent side effects.
+
 
 
 

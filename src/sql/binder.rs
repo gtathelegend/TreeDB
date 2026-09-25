@@ -327,6 +327,28 @@ pub struct BoundJoin {
     pub on: Expr,
 }
 
+/// Kind of execution plan underlying a Common Table Expression.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum BoundCteKind {
+    /// Standard non-recursive CTE evaluated once.
+    NonRecursive {
+        /// Fully optimized physical execution plan.
+        plan: crate::query::optimizer::PhysicalPlan,
+    },
+    /// Recursive CTE evaluated iteratively until fixpoint or configured limits.
+    Recursive {
+        /// Anchor query physical plan.
+        anchor_plan: crate::query::optimizer::PhysicalPlan,
+        /// Recursive member query physical plan.
+        recursive_plan: crate::query::optimizer::PhysicalPlan,
+        /// Maximum allowed recursive iterations.
+        max_iterations: usize,
+        /// Maximum allowed accumulated generated rows.
+        max_rows: usize,
+    },
+}
+
 /// A bound Common Table Expression (CTE) definition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundCte {
@@ -334,10 +356,17 @@ pub struct BoundCte {
     pub name: String,
     /// Output schema produced by the CTE query projection.
     pub output_schema: Schema,
-    /// Fully optimized physical execution plan for evaluating the CTE.
-    pub plan: crate::query::optimizer::PhysicalPlan,
+    /// Execution kind and physical plans.
+    pub kind: BoundCteKind,
     /// Names of any earlier CTE relations that this CTE depends on.
     pub dependencies: Vec<String>,
+}
+
+impl BoundCte {
+    /// Returns true if this CTE is recursive.
+    pub fn is_recursive(&self) -> bool {
+        matches!(self.kind, BoundCteKind::Recursive { .. })
+    }
 }
 
 /// A fully validated, bound SQL query ready for execution against TreeDB's query engine.
@@ -1509,6 +1538,10 @@ pub fn bind_grouped_expr(
                 SqlBinaryOp::LtEq => BinaryOp::LtEq,
                 SqlBinaryOp::Gt => BinaryOp::Gt,
                 SqlBinaryOp::GtEq => BinaryOp::GtEq,
+                SqlBinaryOp::Add => BinaryOp::Add,
+                SqlBinaryOp::Sub => BinaryOp::Sub,
+                SqlBinaryOp::Mul => BinaryOp::Mul,
+                SqlBinaryOp::Div => BinaryOp::Div,
                 SqlBinaryOp::And => BinaryOp::And,
                 SqlBinaryOp::Or => BinaryOp::Or,
             };
@@ -1638,6 +1671,10 @@ pub fn bind_expr(expr: &SqlExpr, ctx: &BindingContext<'_>) -> Result<Expr> {
                 SqlBinaryOp::LtEq => BinaryOp::LtEq,
                 SqlBinaryOp::Gt => BinaryOp::Gt,
                 SqlBinaryOp::GtEq => BinaryOp::GtEq,
+                SqlBinaryOp::Add => BinaryOp::Add,
+                SqlBinaryOp::Sub => BinaryOp::Sub,
+                SqlBinaryOp::Mul => BinaryOp::Mul,
+                SqlBinaryOp::Div => BinaryOp::Div,
                 SqlBinaryOp::And => BinaryOp::And,
                 SqlBinaryOp::Or => BinaryOp::Or,
             };

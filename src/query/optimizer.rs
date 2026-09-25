@@ -160,15 +160,49 @@ impl fmt::Display for PhysicalPlan {
         if !self.ctes.is_empty() {
             for cte in &self.ctes {
                 write_indent(f, indent)?;
-                writeln!(f, "CTE {}", cte.name)?;
-                if !cte.dependencies.is_empty() {
-                    write_indent(f, indent + 1)?;
-                    writeln!(f, "depends on: [{}]", cte.dependencies.join(", "))?;
-                }
-                let plan_str = format!("{}", cte.plan);
-                for line in plan_str.lines() {
-                    write_indent(f, indent + 1)?;
-                    writeln!(f, "{line}")?;
+                match &cte.kind {
+                    crate::sql::binder::BoundCteKind::NonRecursive { plan } => {
+                        writeln!(f, "CTE {}", cte.name)?;
+                        if !cte.dependencies.is_empty() {
+                            write_indent(f, indent + 1)?;
+                            writeln!(f, "depends on: [{}]", cte.dependencies.join(", "))?;
+                        }
+                        let plan_str = format!("{}", plan);
+                        for line in plan_str.lines() {
+                            write_indent(f, indent + 1)?;
+                            writeln!(f, "{line}")?;
+                        }
+                    }
+                    crate::sql::binder::BoundCteKind::Recursive {
+                        anchor_plan,
+                        recursive_plan,
+                        max_iterations,
+                        max_rows,
+                    } => {
+                        writeln!(f, "Recursive CTE {}", cte.name)?;
+                        if !cte.dependencies.is_empty() {
+                            write_indent(f, indent + 1)?;
+                            writeln!(f, "depends on: [{}]", cte.dependencies.join(", "))?;
+                        }
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Anchor")?;
+                        let anchor_str = format!("{}", anchor_plan);
+                        for line in anchor_str.lines() {
+                            write_indent(f, indent + 2)?;
+                            writeln!(f, "{line}")?;
+                        }
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Recursive Member")?;
+                        let rec_str = format!("{}", recursive_plan);
+                        for line in rec_str.lines() {
+                            write_indent(f, indent + 2)?;
+                            writeln!(f, "{line}")?;
+                        }
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Max Iterations: {max_iterations}")?;
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Max Rows: {max_rows}")?;
+                    }
                 }
             }
             write_indent(f, indent)?;
@@ -443,6 +477,8 @@ pub struct TableOptInfo {
     pub schema: Schema,
     /// Attached secondary indexes.
     pub indexes: Vec<IndexMetadata>,
+    /// Whether this table represents an in-memory CTE or derived relation without persistent indexes.
+    pub is_cte: bool,
 }
 
 impl TableOptInfo {
@@ -458,7 +494,14 @@ impl TableOptInfo {
             alias: alias.map(|a| a.into()),
             schema,
             indexes,
+            is_cte: false,
         }
+    }
+
+    /// Sets whether this table is a CTE.
+    pub fn with_cte(mut self, is_cte: bool) -> Self {
+        self.is_cte = is_cte;
+        self
     }
 
     /// Returns the active qualifier (alias if present, otherwise table name).
@@ -626,6 +669,17 @@ fn plan_table_scan(
             unqualify_expr(&unqual, &table.name)
         })
         .collect();
+
+    // If this is a CTE / in-memory relation, it does not possess a physical B-Tree index or primary key path.
+    if table.is_cte {
+        let residual_filter = recombine_conjunction(unqual_conjuncts);
+        return PhysicalTableScan {
+            table_name: table.name.clone(),
+            table_alias: table.alias.clone(),
+            access_path: AccessPath::FullTableScan,
+            residual_filter,
+        };
+    }
 
     let schema = &table.schema;
     let pk_col = schema.primary_key_column();

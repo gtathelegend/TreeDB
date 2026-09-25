@@ -68,6 +68,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **SQL Subqueries & Correlation** | **Implemented** | Scalar subqueries (0 rows -> `NULL`, 1 row -> value, >1 rows -> error), `IN` / `NOT IN` with SQL 3VL, `EXISTS` / `NOT EXISTS`, nested binding scopes, outer column references, subquery optimizer integration, uncorrelated pre-evaluation & materialization |
 | **Common Table Expressions (CTEs)** | **Implemented** | Non-recursive `WITH cte AS (...) SELECT ...`, multiple CTEs, dependency chains, explicit column renaming `cte(c1, c2)`, table shadowing, cycle detection, optimizer integration, statement-local in-memory materialization, transaction visibility |
 | **SQL Window Functions** | **Implemented** | Dedicated `WindowOperator`, ranking (`ROW_NUMBER`, `RANK`, `DENSE_RANK`), navigation (`LAG`, `LEAD`), value functions (`FIRST_VALUE`, `LAST_VALUE`), `PARTITION BY`, `ORDER BY`, `ROWS` frames, default framing, deterministic tie-breaking, CTE & JOIN composition |
+| **Recursive CTEs (WITH RECURSIVE)** | **Implemented** | Iterative `WITH RECURSIVE cte AS (anchor UNION ALL recursive) SELECT ...`, delta working-set loop, iteration & row limit safeguards, schema validation, mutual recursion rejection, composition with joins, filters, subqueries, and window functions |
 
 
 ---

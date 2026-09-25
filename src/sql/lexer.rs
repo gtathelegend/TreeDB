@@ -96,10 +96,24 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 Ok(Token::new(TokenKind::Eq, SourceSpan::new(start, start + 1)))
             }
+            '+' => {
+                self.advance();
+                Ok(Token::new(
+                    TokenKind::Plus,
+                    SourceSpan::new(start, start + 1),
+                ))
+            }
             '-' => {
                 self.advance();
                 Ok(Token::new(
                     TokenKind::Minus,
+                    SourceSpan::new(start, start + 1),
+                ))
+            }
+            '/' => {
+                self.advance();
+                Ok(Token::new(
+                    TokenKind::Slash,
                     SourceSpan::new(start, start + 1),
                 ))
             }
@@ -316,6 +330,9 @@ impl<'a> Lexer<'a> {
             "IN" => TokenKind::In,
             "EXISTS" => TokenKind::Exists,
             "WITH" => TokenKind::With,
+            "RECURSIVE" => TokenKind::Recursive,
+            "UNION" => TokenKind::Union,
+            "ALL" => TokenKind::All,
             "OVER" => TokenKind::Over,
             "PARTITION" => TokenKind::Partition,
             "ROWS" => TokenKind::Rows,

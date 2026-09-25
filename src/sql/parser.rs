@@ -1,10 +1,11 @@
 use crate::engine::types::DataType;
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    ColumnDef, CreateTableStatement, Cte, DeleteStatement, DropTableStatement, InsertStatement,
-    JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp,
-    SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement,
-    WindowFrame, WindowFrameBound, WindowFunction, WindowSpec, WithClause,
+    ColumnDef, CreateTableStatement, Cte, CteQuery, DeleteStatement, DropTableStatement,
+    InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem,
+    SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
+    UpdateAssignment, UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction, WindowSpec,
+    WithClause,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};
@@ -18,7 +19,9 @@ enum Precedence {
     Not = 3,
     Comparison = 4,
     IsNull = 5,
-    UnaryNeg = 6,
+    AddSub = 6,
+    MulDiv = 7,
+    UnaryNeg = 8,
 }
 
 /// Recursive descent and Pratt precedence parser for SQL statements.
@@ -994,16 +997,19 @@ impl<'a> Parser<'a> {
         self.advance(); // consume WITH
 
         // Check for WITH RECURSIVE
-        if let TokenKind::Ident(s) = &self.peek().kind {
+        let recursive = if self.peek().kind == TokenKind::Recursive {
+            self.advance();
+            true
+        } else if let TokenKind::Ident(s) = &self.peek().kind {
             if s.eq_ignore_ascii_case("RECURSIVE") {
-                let tok = self.peek().clone();
-                return Err(Error::SqlParseError {
-                    message: "WITH RECURSIVE is not supported".to_string(),
-                    start: tok.span.start,
-                    end: tok.span.end,
-                });
+                self.advance();
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
 
         let mut ctes = Vec::new();
         loop {
@@ -1121,8 +1127,48 @@ impl<'a> Parser<'a> {
                 });
             }
 
-            // Parse query inside CTE
-            let query = self.parse_select_clauses()?;
+            // Parse first query inside CTE
+            let first_query = self.parse_select_clauses()?;
+
+            let query = if self.peek().kind == TokenKind::Union {
+                self.advance(); // consume UNION
+                if self.peek().kind == TokenKind::All {
+                    self.advance(); // consume ALL
+                } else {
+                    return Err(Error::UnsupportedSetOperation(
+                        "UNION without ALL is not supported".to_string(),
+                    ));
+                }
+
+                if !recursive {
+                    return Err(Error::RecursiveWithoutWithRecursive(cte_name.clone()));
+                }
+
+                let body_tok = self.peek().clone();
+                if body_tok.kind != TokenKind::Select && body_tok.kind != TokenKind::With {
+                    return Err(Error::SqlParseError {
+                        message: format!(
+                            "expected SELECT after UNION ALL in CTE body, found {}",
+                            body_tok.kind
+                        ),
+                        start: body_tok.span.start,
+                        end: body_tok.span.end,
+                    });
+                }
+
+                let second_query = self.parse_select_clauses()?;
+
+                if self.peek().kind == TokenKind::Union {
+                    return Err(Error::InvalidRecursiveCteShape(cte_name.clone()));
+                }
+
+                CteQuery::Recursive {
+                    anchor: Box::new(first_query),
+                    recursive: Box::new(second_query),
+                }
+            } else {
+                CteQuery::NonRecursive(Box::new(first_query))
+            };
 
             // Expect `)`
             let rparen_tok = self.peek().clone();
@@ -1138,7 +1184,7 @@ impl<'a> Parser<'a> {
             ctes.push(Cte {
                 name: cte_name,
                 columns,
-                query: Box::new(query),
+                query,
             });
 
             if self.peek().kind == TokenKind::Comma {
@@ -1156,7 +1202,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        Ok(WithClause { ctes })
+        Ok(WithClause { recursive, ctes })
     }
 
     fn parse_projection_list(&mut self) -> Result<Vec<SelectItem>> {
@@ -1909,6 +1955,42 @@ impl<'a> Parser<'a> {
                     right: Box::new(right),
                 })
             }
+            TokenKind::Plus => {
+                self.advance();
+                let right = self.parse_precedence(Precedence::AddSub)?;
+                Ok(SqlExpr::Binary {
+                    left: Box::new(left),
+                    op: SqlBinaryOp::Add,
+                    right: Box::new(right),
+                })
+            }
+            TokenKind::Minus => {
+                self.advance();
+                let right = self.parse_precedence(Precedence::AddSub)?;
+                Ok(SqlExpr::Binary {
+                    left: Box::new(left),
+                    op: SqlBinaryOp::Sub,
+                    right: Box::new(right),
+                })
+            }
+            TokenKind::Asterisk => {
+                self.advance();
+                let right = self.parse_precedence(Precedence::MulDiv)?;
+                Ok(SqlExpr::Binary {
+                    left: Box::new(left),
+                    op: SqlBinaryOp::Mul,
+                    right: Box::new(right),
+                })
+            }
+            TokenKind::Slash => {
+                self.advance();
+                let right = self.parse_precedence(Precedence::MulDiv)?;
+                Ok(SqlExpr::Binary {
+                    left: Box::new(left),
+                    op: SqlBinaryOp::Div,
+                    right: Box::new(right),
+                })
+            }
             TokenKind::Is => {
                 self.advance(); // consume IS
                 let next = self.peek();
@@ -1956,6 +2038,8 @@ impl<'a> Parser<'a> {
             | TokenKind::Gt
             | TokenKind::GtEq => Precedence::Comparison,
             TokenKind::Is => Precedence::IsNull,
+            TokenKind::Plus | TokenKind::Minus => Precedence::AddSub,
+            TokenKind::Asterisk | TokenKind::Slash => Precedence::MulDiv,
             _ => Precedence::Lowest,
         }
     }

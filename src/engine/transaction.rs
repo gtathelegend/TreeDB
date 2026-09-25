@@ -4,6 +4,214 @@ use crate::error::{Error, Result};
 use crate::storage::page::{Key, PageId};
 use crate::wal::lsn::TxnId;
 
+/// Default maximum allowed recursive CTE iterations before aborting with an error.
+pub const DEFAULT_MAX_RECURSION_ITERATIONS: usize = 1000;
+
+/// Default maximum allowed recursive CTE total generated rows before aborting with an error.
+pub const DEFAULT_MAX_RECURSION_ROWS: usize = 1_000_000;
+
+fn ast_references_table(stmt: &crate::sql::SelectStatement, target_table: &str) -> bool {
+    if stmt.from.name == target_table || stmt.from.alias.as_deref() == Some(target_table) {
+        return true;
+    }
+    for join in &stmt.joins {
+        if join.table.name == target_table || join.table.alias.as_deref() == Some(target_table) {
+            return true;
+        }
+        if ast_expr_references_table(&join.on, target_table) {
+            return true;
+        }
+    }
+    if let Some(w) = &stmt.selection {
+        if ast_expr_references_table(w, target_table) {
+            return true;
+        }
+    }
+    if let Some(h) = &stmt.having {
+        if ast_expr_references_table(h, target_table) {
+            return true;
+        }
+    }
+    for item in &stmt.projection {
+        match item {
+            crate::sql::SelectItem::Expression { expr, .. } => {
+                if ast_expr_references_table(expr, target_table) {
+                    return true;
+                }
+            }
+            crate::sql::SelectItem::QualifiedWildcard(tbl) => {
+                if tbl == target_table {
+                    return true;
+                }
+            }
+            crate::sql::SelectItem::Wildcard => {}
+        }
+    }
+    for item in &stmt.group_by {
+        if ast_expr_references_table(item, target_table) {
+            return true;
+        }
+    }
+    for item in &stmt.order_by {
+        if ast_expr_references_table(&item.expr, target_table) {
+            return true;
+        }
+    }
+    false
+}
+
+fn ast_expr_references_table(expr: &crate::sql::SqlExpr, target_table: &str) -> bool {
+    match expr {
+        crate::sql::SqlExpr::QualifiedIdentifier { qualifier, .. } => qualifier == target_table,
+        crate::sql::SqlExpr::Identifier(_)
+        | crate::sql::SqlExpr::Literal(_)
+        | crate::sql::SqlExpr::CountAll => false,
+        crate::sql::SqlExpr::Subquery(sub) => ast_references_table(sub, target_table),
+        crate::sql::SqlExpr::Binary { left, right, .. } => {
+            ast_expr_references_table(left, target_table)
+                || ast_expr_references_table(right, target_table)
+        }
+        crate::sql::SqlExpr::Unary { expr, .. }
+        | crate::sql::SqlExpr::IsNull(expr)
+        | crate::sql::SqlExpr::IsNotNull(expr) => ast_expr_references_table(expr, target_table),
+        crate::sql::SqlExpr::InList { expr, list, .. } => {
+            ast_expr_references_table(expr, target_table)
+                || list
+                    .iter()
+                    .any(|e| ast_expr_references_table(e, target_table))
+        }
+        crate::sql::SqlExpr::InSubquery { expr, subquery, .. } => {
+            ast_expr_references_table(expr, target_table)
+                || ast_references_table(subquery, target_table)
+        }
+        crate::sql::SqlExpr::Exists { subquery, .. } => {
+            ast_references_table(subquery, target_table)
+        }
+        crate::sql::SqlExpr::Aggregate { arg, .. } => ast_expr_references_table(arg, target_table),
+        crate::sql::SqlExpr::Window {
+            args, window_spec, ..
+        } => {
+            args.iter()
+                .any(|e| ast_expr_references_table(e, target_table))
+                || window_spec
+                    .partition_by
+                    .iter()
+                    .any(|e| ast_expr_references_table(e, target_table))
+                || window_spec
+                    .order_by
+                    .iter()
+                    .any(|o| ast_expr_references_table(&o.expr, target_table))
+        }
+    }
+}
+
+fn plan_references_table(plan: &crate::query::optimizer::PhysicalPlan, target_table: &str) -> bool {
+    if plan.base_table.table_name == target_table
+        || plan.base_table.table_alias.as_deref() == Some(target_table)
+    {
+        return true;
+    }
+    for join in &plan.joins {
+        if join.right.table_name == target_table
+            || join.right.table_alias.as_deref() == Some(target_table)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_ast_cte_acyclicity(ctes: &[crate::sql::Cte]) -> Result<()> {
+    let mut adj: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    let mut is_rec = std::collections::HashMap::new();
+
+    for cte in ctes {
+        let mut deps = Vec::new();
+        for other in ctes {
+            if other.name == cte.name {
+                continue;
+            }
+            let refs = match &cte.query {
+                crate::sql::CteQuery::NonRecursive(select) => {
+                    ast_references_table(select, &other.name)
+                }
+                crate::sql::CteQuery::Recursive { anchor, recursive } => {
+                    ast_references_table(anchor, &other.name)
+                        || ast_references_table(recursive, &other.name)
+                }
+            };
+            if refs {
+                deps.push(other.name.as_str());
+            }
+        }
+        adj.insert(cte.name.as_str(), deps);
+        is_rec.insert(
+            cte.name.as_str(),
+            matches!(cte.query, crate::sql::CteQuery::Recursive { .. }),
+        );
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum VisitState {
+        Unvisited,
+        Visiting,
+        Visited,
+    }
+
+    let mut state = std::collections::HashMap::new();
+    for cte in ctes {
+        state.insert(cte.name.as_str(), VisitState::Unvisited);
+    }
+
+    fn dfs<'a>(
+        node: &'a str,
+        adj: &std::collections::HashMap<&'a str, Vec<&'a str>>,
+        is_rec: &std::collections::HashMap<&'a str, bool>,
+        state: &mut std::collections::HashMap<&'a str, VisitState>,
+        path: &mut Vec<&'a str>,
+    ) -> Result<()> {
+        state.insert(node, VisitState::Visiting);
+        path.push(node);
+
+        if let Some(neighbors) = adj.get(node) {
+            for &neighbor in neighbors {
+                match state
+                    .get(neighbor)
+                    .copied()
+                    .unwrap_or(VisitState::Unvisited)
+                {
+                    VisitState::Visiting => {
+                        path.push(neighbor);
+                        let cycle_repr = path.join(" -> ");
+                        let has_rec = path.iter().any(|n| is_rec.get(n).copied().unwrap_or(false));
+                        if has_rec {
+                            return Err(Error::MutualRecursion(cycle_repr));
+                        }
+                        return Err(Error::CyclicCteDependency(cycle_repr));
+                    }
+                    VisitState::Unvisited => {
+                        dfs(neighbor, adj, is_rec, state, path)?;
+                    }
+                    VisitState::Visited => {}
+                }
+            }
+        }
+
+        path.pop();
+        state.insert(node, VisitState::Visited);
+        Ok(())
+    }
+
+    let mut path = Vec::new();
+    for cte in ctes {
+        if state.get(cte.name.as_str()).copied() == Some(VisitState::Unvisited) {
+            dfs(cte.name.as_str(), &adj, &is_rec, &mut state, &mut path)?;
+        }
+    }
+
+    Ok(())
+}
+
 struct TxnBufferPoolCatalog<'a, 'b> {
     bp: &'a std::cell::RefCell<&'b mut crate::storage::buffer_pool::BufferPool>,
     ctes: Option<&'a [crate::sql::BoundCte]>,
@@ -438,67 +646,208 @@ impl<'db> Transaction<'db> {
         let mut visible_ctes: Vec<crate::sql::BoundCte> = outer_ctes.to_vec();
 
         if let Some(with_clause) = &ast.with {
+            validate_ast_cte_acyclicity(&with_clause.ctes)?;
             let mut declared_names = std::collections::HashSet::new();
             for cte in &with_clause.ctes {
                 if !declared_names.insert(&cte.name) {
                     return Err(Error::DuplicateCteName(cte.name.clone()));
                 }
 
-                // Bind and plan the CTE query using currently visible CTEs
-                let cte_plan = self.plan_select_with_outer_ctes(&cte.query, &visible_ctes)?;
+                match &cte.query {
+                    crate::sql::CteQuery::NonRecursive(select_stmt) => {
+                        // Bind and plan the CTE query using currently visible CTEs
+                        let cte_plan =
+                            self.plan_select_with_outer_ctes(select_stmt, &visible_ctes)?;
 
-                // Derive the CTE output schema from cte_plan projections
-                let projected_schema = self.derive_cte_output_schema(&cte_plan, &visible_ctes)?;
+                        // Derive the CTE output schema from cte_plan projections
+                        let projected_schema =
+                            self.derive_cte_output_schema(&cte_plan, &visible_ctes)?;
 
-                // If explicit column list was provided, validate and rename columns
-                let final_schema = if let Some(cols) = &cte.columns {
-                    if cols.len() != projected_schema.columns.len() {
-                        return Err(Error::CteColumnCountMismatch {
-                            cte: cte.name.clone(),
-                            expected: cols.len(),
-                            found: projected_schema.columns.len(),
+                        // If explicit column list was provided, validate and rename columns
+                        let final_schema = if let Some(cols) = &cte.columns {
+                            if cols.len() != projected_schema.columns.len() {
+                                return Err(Error::CteColumnCountMismatch {
+                                    cte: cte.name.clone(),
+                                    expected: cols.len(),
+                                    found: projected_schema.columns.len(),
+                                });
+                            }
+                            let mut seen = std::collections::HashSet::new();
+                            let mut renamed_cols = Vec::with_capacity(cols.len());
+                            for (col_name, orig_col) in
+                                cols.iter().zip(projected_schema.columns.iter())
+                            {
+                                if !seen.insert(col_name) {
+                                    return Err(Error::DuplicateCteColumnName {
+                                        cte: cte.name.clone(),
+                                        column: col_name.clone(),
+                                    });
+                                }
+                                renamed_cols.push(crate::engine::types::Column::new(
+                                    col_name,
+                                    orig_col.data_type,
+                                    orig_col.nullable,
+                                ));
+                            }
+                            crate::engine::types::Schema::new_projected(renamed_cols)
+                        } else {
+                            projected_schema
+                        };
+
+                        // Track dependencies
+                        let mut dependencies = Vec::new();
+                        collect_cte_dependencies(&cte_plan, &visible_ctes, &mut dependencies);
+
+                        // Check for cyclic dependencies in visible_ctes + this CTE
+                        let mut temp_ctes = visible_ctes.clone();
+                        temp_ctes.push(crate::sql::BoundCte {
+                            name: cte.name.clone(),
+                            output_schema: final_schema.clone(),
+                            kind: crate::sql::BoundCteKind::NonRecursive {
+                                plan: cte_plan.clone(),
+                            },
+                            dependencies: dependencies.clone(),
+                        });
+                        validate_cte_acyclicity(&temp_ctes)?;
+
+                        visible_ctes.push(crate::sql::BoundCte {
+                            name: cte.name.clone(),
+                            output_schema: final_schema,
+                            kind: crate::sql::BoundCteKind::NonRecursive { plan: cte_plan },
+                            dependencies,
                         });
                     }
-                    let mut seen = std::collections::HashSet::new();
-                    let mut renamed_cols = Vec::with_capacity(cols.len());
-                    for (col_name, orig_col) in cols.iter().zip(projected_schema.columns.iter()) {
-                        if !seen.insert(col_name) {
-                            return Err(Error::DuplicateCteColumnName {
+                    crate::sql::CteQuery::Recursive { anchor, recursive } => {
+                        // 1. Check anchor does not reference cte.name
+                        if ast_references_table(anchor, &cte.name) {
+                            return Err(Error::RecursiveCteAnchorSelfReference(cte.name.clone()));
+                        }
+
+                        // 2. Bind and plan anchor
+                        let anchor_plan =
+                            self.plan_select_with_outer_ctes(anchor, &visible_ctes)?;
+                        let projected_schema =
+                            self.derive_cte_output_schema(&anchor_plan, &visible_ctes)?;
+
+                        // 3. Rename columns if explicit columns given
+                        let final_schema = if let Some(cols) = &cte.columns {
+                            if cols.len() != projected_schema.columns.len() {
+                                return Err(Error::CteColumnCountMismatch {
+                                    cte: cte.name.clone(),
+                                    expected: cols.len(),
+                                    found: projected_schema.columns.len(),
+                                });
+                            }
+                            let mut seen = std::collections::HashSet::new();
+                            let mut renamed_cols = Vec::with_capacity(cols.len());
+                            for (col_name, orig_col) in
+                                cols.iter().zip(projected_schema.columns.iter())
+                            {
+                                if !seen.insert(col_name) {
+                                    return Err(Error::DuplicateCteColumnName {
+                                        cte: cte.name.clone(),
+                                        column: col_name.clone(),
+                                    });
+                                }
+                                renamed_cols.push(crate::engine::types::Column::new(
+                                    col_name,
+                                    orig_col.data_type,
+                                    orig_col.nullable,
+                                ));
+                            }
+                            crate::engine::types::Schema::new_projected(renamed_cols)
+                        } else {
+                            projected_schema
+                        };
+
+                        // 4. Create scope where cte.name is available with final_schema
+                        let mut rec_visible_ctes = visible_ctes.clone();
+                        rec_visible_ctes.push(crate::sql::BoundCte {
+                            name: cte.name.clone(),
+                            output_schema: final_schema.clone(),
+                            kind: crate::sql::BoundCteKind::NonRecursive {
+                                plan: anchor_plan.clone(),
+                            },
+                            dependencies: Vec::new(),
+                        });
+
+                        // 5. Plan recursive member
+                        let rec_plan =
+                            self.plan_select_with_outer_ctes(recursive, &rec_visible_ctes)?;
+
+                        // 6. Check unsupported recursive aggregation or window functions
+                        let self_ref_in_rec = plan_references_table(&rec_plan, &cte.name);
+                        if self_ref_in_rec {
+                            if !rec_plan.group_by.is_empty() || !rec_plan.aggregates.is_empty() {
+                                return Err(Error::UnsupportedRecursiveAggregation(
+                                    cte.name.clone(),
+                                ));
+                            }
+                            if !rec_plan.window_exprs.is_empty() {
+                                return Err(Error::UnsupportedRecursiveWindow(cte.name.clone()));
+                            }
+                        }
+
+                        // 7. Derive recursive member output schema
+                        let rec_projected_schema =
+                            self.derive_cte_output_schema(&rec_plan, &rec_visible_ctes)?;
+
+                        // 8. Validate schema compatibility between anchor and recursive member
+                        if final_schema.columns.len() != rec_projected_schema.columns.len() {
+                            return Err(Error::RecursiveCteColumnCountMismatch {
                                 cte: cte.name.clone(),
-                                column: col_name.clone(),
+                                anchor_cols: final_schema.columns.len(),
+                                rec_cols: rec_projected_schema.columns.len(),
                             });
                         }
-                        renamed_cols.push(crate::engine::types::Column::new(
-                            col_name,
-                            orig_col.data_type,
-                            orig_col.nullable,
-                        ));
+                        for (a_col, r_col) in final_schema
+                            .columns
+                            .iter()
+                            .zip(rec_projected_schema.columns.iter())
+                        {
+                            if a_col.data_type != r_col.data_type {
+                                return Err(Error::RecursiveCteSchemaMismatch {
+                                    cte: cte.name.clone(),
+                                    anchor_col: a_col.name.clone(),
+                                    anchor_type: format!("{:?}", a_col.data_type),
+                                    rec_col: r_col.name.clone(),
+                                    rec_type: format!("{:?}", r_col.data_type),
+                                });
+                            }
+                        }
+
+                        // 9. Collect dependencies on earlier CTEs (from both anchor and rec member, excluding cte.name)
+                        let mut dependencies = Vec::new();
+                        collect_cte_dependencies(&anchor_plan, &visible_ctes, &mut dependencies);
+                        collect_cte_dependencies(&rec_plan, &visible_ctes, &mut dependencies);
+
+                        let mut temp_ctes = visible_ctes.clone();
+                        temp_ctes.push(crate::sql::BoundCte {
+                            name: cte.name.clone(),
+                            output_schema: final_schema.clone(),
+                            kind: crate::sql::BoundCteKind::Recursive {
+                                anchor_plan: anchor_plan.clone(),
+                                recursive_plan: rec_plan.clone(),
+                                max_iterations: DEFAULT_MAX_RECURSION_ITERATIONS,
+                                max_rows: DEFAULT_MAX_RECURSION_ROWS,
+                            },
+                            dependencies: dependencies.clone(),
+                        });
+                        validate_cte_acyclicity(&temp_ctes)?;
+
+                        visible_ctes.push(crate::sql::BoundCte {
+                            name: cte.name.clone(),
+                            output_schema: final_schema,
+                            kind: crate::sql::BoundCteKind::Recursive {
+                                anchor_plan,
+                                recursive_plan: rec_plan,
+                                max_iterations: DEFAULT_MAX_RECURSION_ITERATIONS,
+                                max_rows: DEFAULT_MAX_RECURSION_ROWS,
+                            },
+                            dependencies,
+                        });
                     }
-                    crate::engine::types::Schema::new_projected(renamed_cols)
-                } else {
-                    projected_schema
-                };
-
-                // Track dependencies
-                let mut dependencies = Vec::new();
-                collect_cte_dependencies(&cte_plan, &visible_ctes, &mut dependencies);
-
-                // Check for cyclic dependencies in visible_ctes + this CTE
-                let mut temp_ctes = visible_ctes.clone();
-                temp_ctes.push(crate::sql::BoundCte {
-                    name: cte.name.clone(),
-                    output_schema: final_schema.clone(),
-                    plan: cte_plan.clone(),
-                    dependencies: dependencies.clone(),
-                });
-                validate_cte_acyclicity(&temp_ctes)?;
-
-                visible_ctes.push(crate::sql::BoundCte {
-                    name: cte.name.clone(),
-                    output_schema: final_schema,
-                    plan: cte_plan,
-                    dependencies,
-                });
+                }
             }
         }
 
@@ -508,26 +857,32 @@ impl<'db> Transaction<'db> {
 
         // 1. Resolve FROM table
         {
-            let (schema, indexes) =
+            let (schema, indexes, is_cte) =
                 self.resolve_table_for_planning(&ast.from.name, &visible_ctes)?;
-            table_infos.push(crate::query::optimizer::TableOptInfo::new(
-                &ast.from.name,
-                ast.from.alias.as_deref(),
-                schema,
-                indexes,
-            ));
+            table_infos.push(
+                crate::query::optimizer::TableOptInfo::new(
+                    &ast.from.name,
+                    ast.from.alias.as_deref(),
+                    schema,
+                    indexes,
+                )
+                .with_cte(is_cte),
+            );
         }
 
         // 2. Resolve JOIN tables
         for j in &ast.joins {
-            let (schema, indexes) =
+            let (schema, indexes, is_cte) =
                 self.resolve_table_for_planning(&j.table.name, &visible_ctes)?;
-            table_infos.push(crate::query::optimizer::TableOptInfo::new(
-                &j.table.name,
-                j.table.alias.as_deref(),
-                schema,
-                indexes,
-            ));
+            table_infos.push(
+                crate::query::optimizer::TableOptInfo::new(
+                    &j.table.name,
+                    j.table.alias.as_deref(),
+                    schema,
+                    indexes,
+                )
+                .with_cte(is_cte),
+            );
         }
 
         for t in &table_infos {
@@ -555,17 +910,18 @@ impl<'db> Transaction<'db> {
     ) -> Result<(
         crate::engine::types::Schema,
         Vec<crate::engine::catalog::IndexMetadata>,
+        bool,
     )> {
         // CTEs shadow physical tables
         for cte in visible_ctes {
             if cte.name == table_name {
-                return Ok((cte.output_schema.clone(), Vec::new()));
+                return Ok((cte.output_schema.clone(), Vec::new(), true));
             }
         }
         let table = self.open_table(table_name)?;
         let schema = table.schema().clone();
         let indexes = table.indexes().iter().map(|(m, _)| m.clone()).collect();
-        Ok((schema, indexes))
+        Ok((schema, indexes, false))
     }
 
     fn derive_cte_output_schema(
@@ -575,7 +931,7 @@ impl<'db> Transaction<'db> {
     ) -> Result<crate::engine::types::Schema> {
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
 
-        let (base_schema, _) =
+        let (base_schema, _, _) =
             self.resolve_table_for_planning(&plan.base_table.table_name, visible_ctes)?;
 
         let current_schema = if plan.joins.is_empty() {
@@ -591,7 +947,7 @@ impl<'db> Transaction<'db> {
                 ));
             }
             for join in &plan.joins {
-                let (right_schema, _) =
+                let (right_schema, _, _) =
                     self.resolve_table_for_planning(&join.right.table_name, visible_ctes)?;
                 let rq = join.right.qualifier();
                 for col in &right_schema.columns {
@@ -770,6 +1126,7 @@ fn validate_cte_acyclicity(ctes: &[crate::sql::BoundCte]) -> Result<()> {
         adj: &std::collections::HashMap<&'a str, &'a Vec<String>>,
         state: &mut std::collections::HashMap<&'a str, VisitState>,
         path: &mut Vec<&'a str>,
+        ctes: &[crate::sql::BoundCte],
     ) -> Result<()> {
         state.insert(node, VisitState::Visiting);
         path.push(node);
@@ -781,10 +1138,15 @@ fn validate_cte_acyclicity(ctes: &[crate::sql::BoundCte]) -> Result<()> {
                     VisitState::Visiting => {
                         path.push(n_str);
                         let cycle_repr = path.join(" -> ");
+                        if ctes.iter().any(|c| {
+                            (c.name == n_str || path.contains(&c.name.as_str())) && c.is_recursive()
+                        }) {
+                            return Err(Error::MutualRecursion(cycle_repr));
+                        }
                         return Err(Error::CyclicCteDependency(cycle_repr));
                     }
                     VisitState::Unvisited => {
-                        dfs(n_str, adj, state, path)?;
+                        dfs(n_str, adj, state, path, ctes)?;
                     }
                     VisitState::Visited => {}
                 }
@@ -799,7 +1161,7 @@ fn validate_cte_acyclicity(ctes: &[crate::sql::BoundCte]) -> Result<()> {
     let mut path = Vec::new();
     for cte in ctes {
         if state.get(cte.name.as_str()).copied() == Some(VisitState::Unvisited) {
-            dfs(cte.name.as_str(), &adj, &mut state, &mut path)?;
+            dfs(cte.name.as_str(), &adj, &mut state, &mut path, ctes)?;
         }
     }
 
@@ -1303,9 +1665,78 @@ impl<'db> Transaction<'db> {
         // 0. Materialize any CTEs defined on this plan (in declaration order)
         for cte in &plan.ctes {
             if !cte_store.contains_key(&cte.name) {
-                let res =
-                    self.execute_physical_plan_internal(&cte.plan, outer_contexts, cte_store)?;
-                cte_store.insert(cte.name.clone(), (cte.output_schema.clone(), res.rows));
+                match &cte.kind {
+                    crate::sql::BoundCteKind::NonRecursive { plan } => {
+                        let res =
+                            self.execute_physical_plan_internal(plan, outer_contexts, cte_store)?;
+                        cte_store.insert(cte.name.clone(), (cte.output_schema.clone(), res.rows));
+                    }
+                    crate::sql::BoundCteKind::Recursive {
+                        anchor_plan,
+                        recursive_plan,
+                        max_iterations,
+                        max_rows,
+                    } => {
+                        let anchor_res = self.execute_physical_plan_internal(
+                            anchor_plan,
+                            outer_contexts,
+                            cte_store,
+                        )?;
+                        let mut accumulated_rows = anchor_res.rows;
+                        if accumulated_rows.len() > *max_rows {
+                            return Err(Error::RecursiveCteRowLimit {
+                                cte: cte.name.clone(),
+                                rows: accumulated_rows.len(),
+                                limit: *max_rows,
+                            });
+                        }
+                        let mut working_rows = accumulated_rows.clone();
+                        let mut iterations = 0;
+
+                        while !working_rows.is_empty() {
+                            iterations += 1;
+                            if iterations > *max_iterations {
+                                return Err(Error::RecursiveCteIterationLimit {
+                                    cte: cte.name.clone(),
+                                    iterations,
+                                    limit: *max_iterations,
+                                });
+                            }
+
+                            cte_store.insert(
+                                cte.name.clone(),
+                                (cte.output_schema.clone(), working_rows),
+                            );
+
+                            let next_res = self.execute_physical_plan_internal(
+                                recursive_plan,
+                                outer_contexts,
+                                cte_store,
+                            )?;
+                            let next_working_rows = next_res.rows;
+
+                            if next_working_rows.is_empty() {
+                                break;
+                            }
+
+                            if accumulated_rows.len() + next_working_rows.len() > *max_rows {
+                                return Err(Error::RecursiveCteRowLimit {
+                                    cte: cte.name.clone(),
+                                    rows: accumulated_rows.len() + next_working_rows.len(),
+                                    limit: *max_rows,
+                                });
+                            }
+
+                            accumulated_rows.extend(next_working_rows.clone());
+                            working_rows = next_working_rows;
+                        }
+
+                        cte_store.insert(
+                            cte.name.clone(),
+                            (cte.output_schema.clone(), accumulated_rows),
+                        );
+                    }
+                }
             }
         }
 
