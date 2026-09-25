@@ -64,6 +64,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **Aggregation, GROUP BY & HAVING** | **Implemented** | `COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX`, single/multi-key `GROUP BY`, `HAVING` filter, deterministic `CanonicalValue` grouping, incremental accumulators, semantic validation |
 | **Relational JOINs** | **Implemented** | `INNER JOIN`, `LEFT JOIN` / `LEFT OUTER JOIN`, multi-table chained joins, table aliases, qualified/unqualified column ambiguity resolution, 3VL `ON` predicates, NULL padding, full query composition with WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET |
 | **Rule-Based Optimizer & Access-Path Planner** | **Implemented** | Decoupled logical/physical planning, deterministic access path selection (PK point/range, secondary index point/range, full scan), AND predicate decomposition, safe join pushdown, LEFT JOIN outer safety, residual filter preservation, plan inspection (`explain_sql`) |
+| **SQL DDL & DML Engine** | **Implemented** | `CREATE TABLE`, `DROP TABLE`, `INSERT INTO ... VALUES`, `UPDATE ... SET`, `DELETE FROM`, optimizer reuse for mutation access paths, transaction rollback, secondary index auto-maintenance, structured `StatementResult` |
 
 
 ---

@@ -347,7 +347,24 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 21: Advanced Query Processing & DDL (Future)
+## Phase 21: SQL DDL & DML (Completed)
+* [x] Top-level statement AST: `Statement` enum (`Select`, `CreateTable`, `DropTable`, `Insert`, `Update`, `Delete`)
+* [x] SQL Lexer & Parser support for `CREATE TABLE`, `DROP TABLE`, `INSERT INTO ... VALUES`, `UPDATE ... SET`, `DELETE FROM`
+* [x] Column definitions, data type mappings (`BIGINT`, `UBIGINT`, `DOUBLE`, `TEXT`, `BLOB`, `BOOLEAN`), single column `PRIMARY KEY` and `NOT NULL` constraints
+* [x] Transactional DDL execution: `CREATE TABLE` and `DROP TABLE` participating in active transactions with rollback and crash recovery
+* [x] INSERT execution with explicit column lists and positional tuples, multi-row batches, and numeric literal coercion
+* [x] UPDATE execution with multi-assignment, WHERE predicate filtering, and all-rows updates
+* [x] DELETE execution with WHERE predicate filtering and all-rows updates
+* [x] Rule-based optimizer reuse for UPDATE and DELETE access paths (`PrimaryPointLookup`, `PrimaryRangeScan`, `SecondaryIndexScan`, `FullTableScan` with residual filters)
+* [x] Atomic secondary index maintenance on INSERT, UPDATE, and DELETE with unique index constraint validation
+* [x] Primary key immutability protection on UPDATE (`Error::InvalidPrimaryKey`)
+* [x] Structured result API: `StatementResult` (`Query`, `Inserted`, `Updated`, `Deleted`, `CreatedTable`, `DroppedTable`)
+* [x] SQL vs programmatic mutation equivalence tests and randomized reference oracle
+* [x] 16 dedicated integration tests in `tests/sql_ddl_dml.rs` and 7 new parser tests in `tests/sql.rs` (381 total test suite)
+
+---
+
+## Phase 22: Advanced Query Processing & Secondary Index DDL (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans

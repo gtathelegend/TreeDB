@@ -729,3 +729,283 @@ fn test_parser_invalid_join_syntax() {
         );
     }
 }
+
+// ============================================================================
+// 6. DDL & DML Parser Tests
+// ============================================================================
+
+#[test]
+fn test_lexer_ddl_dml_keywords() {
+    let sql = "CREATE TABLE DROP INSERT INTO VALUES UPDATE SET DELETE PRIMARY KEY BOOLEAN BOOL BIGINT INT64 INTEGER INT UBIGINT UINT64 UINT DOUBLE FLOAT64 FLOAT TEXT STRING VARCHAR BLOB BYTES BYTEA";
+    let tokens = tokenize_sql(sql).unwrap();
+
+    let kinds: Vec<TokenKind> = tokens.into_iter().map(|t| t.kind).collect();
+    assert_eq!(kinds[0], TokenKind::Create);
+    assert_eq!(kinds[1], TokenKind::Table);
+    assert_eq!(kinds[2], TokenKind::Drop);
+    assert_eq!(kinds[3], TokenKind::Insert);
+    assert_eq!(kinds[4], TokenKind::Into);
+    assert_eq!(kinds[5], TokenKind::Values);
+    assert_eq!(kinds[6], TokenKind::Update);
+    assert_eq!(kinds[7], TokenKind::Set);
+    assert_eq!(kinds[8], TokenKind::Delete);
+    assert_eq!(kinds[9], TokenKind::Primary);
+    assert_eq!(kinds[10], TokenKind::Key);
+    assert_eq!(kinds[11], TokenKind::BooleanType);
+    assert_eq!(kinds[12], TokenKind::BooleanType);
+    assert_eq!(kinds[13], TokenKind::BigIntType);
+    assert_eq!(kinds[14], TokenKind::BigIntType);
+    assert_eq!(kinds[15], TokenKind::BigIntType);
+    assert_eq!(kinds[16], TokenKind::BigIntType);
+    assert_eq!(kinds[17], TokenKind::UBigIntType);
+    assert_eq!(kinds[18], TokenKind::UBigIntType);
+    assert_eq!(kinds[19], TokenKind::UBigIntType);
+    assert_eq!(kinds[20], TokenKind::DoubleType);
+    assert_eq!(kinds[21], TokenKind::DoubleType);
+    assert_eq!(kinds[22], TokenKind::DoubleType);
+    assert_eq!(kinds[23], TokenKind::TextType);
+    assert_eq!(kinds[24], TokenKind::TextType);
+    assert_eq!(kinds[25], TokenKind::TextType);
+    assert_eq!(kinds[26], TokenKind::BlobType);
+    assert_eq!(kinds[27], TokenKind::BlobType);
+    assert_eq!(kinds[28], TokenKind::BlobType);
+}
+
+#[test]
+fn test_parser_create_table() {
+    use treedb::engine::types::DataType;
+    use treedb::sql::{parse_statement_sql, ColumnDef, CreateTableStatement, Statement};
+
+    let sql = "CREATE TABLE users (
+        id BIGINT PRIMARY KEY,
+        name TEXT NOT NULL,
+        age INT64,
+        score DOUBLE,
+        active BOOLEAN,
+        payload BLOB
+    );";
+
+    let stmt = parse_statement_sql(sql).unwrap();
+    match stmt {
+        Statement::CreateTable(CreateTableStatement {
+            table_name,
+            columns,
+        }) => {
+            assert_eq!(table_name, "users");
+            assert_eq!(columns.len(), 6);
+            assert_eq!(
+                columns[0],
+                ColumnDef::new("id", DataType::Int64, true, false)
+            );
+            assert_eq!(
+                columns[1],
+                ColumnDef::new("name", DataType::String, false, false)
+            );
+            assert_eq!(
+                columns[2],
+                ColumnDef::new("age", DataType::Int64, false, true)
+            );
+            assert_eq!(
+                columns[3],
+                ColumnDef::new("score", DataType::Float64, false, true)
+            );
+            assert_eq!(
+                columns[4],
+                ColumnDef::new("active", DataType::Boolean, false, true)
+            );
+            assert_eq!(
+                columns[5],
+                ColumnDef::new("payload", DataType::Bytes, false, true)
+            );
+        }
+        other => panic!("expected CreateTable, found {other:?}"),
+    }
+
+    // Constraint style PRIMARY KEY (id)
+    let sql2 = "CREATE TABLE products (
+        sku UBIGINT,
+        title STRING,
+        PRIMARY KEY (sku)
+    )";
+    let stmt2 = parse_statement_sql(sql2).unwrap();
+    match stmt2 {
+        Statement::CreateTable(CreateTableStatement {
+            table_name,
+            columns,
+        }) => {
+            assert_eq!(table_name, "products");
+            assert_eq!(columns.len(), 2);
+            assert_eq!(
+                columns[0],
+                ColumnDef::new("sku", DataType::UInt64, true, false)
+            );
+            assert_eq!(
+                columns[1],
+                ColumnDef::new("title", DataType::String, false, true)
+            );
+        }
+        other => panic!("expected CreateTable, found {other:?}"),
+    }
+}
+
+#[test]
+fn test_parser_drop_table() {
+    use treedb::sql::{parse_statement_sql, DropTableStatement, Statement};
+
+    let sql = "DROP TABLE users;";
+    let stmt = parse_statement_sql(sql).unwrap();
+    assert_eq!(
+        stmt,
+        Statement::DropTable(DropTableStatement {
+            table_name: "users".into()
+        })
+    );
+}
+
+#[test]
+fn test_parser_insert() {
+    use treedb::sql::{parse_statement_sql, InsertStatement, Statement};
+
+    // Column list form
+    let sql = "INSERT INTO users (id, name, active) VALUES (1, 'Alice', true);";
+    let stmt = parse_statement_sql(sql).unwrap();
+    match stmt {
+        Statement::Insert(InsertStatement {
+            table_name,
+            columns,
+            values,
+        }) => {
+            assert_eq!(table_name, "users");
+            assert_eq!(
+                columns,
+                Some(vec!["id".into(), "name".into(), "active".into()])
+            );
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].len(), 3);
+        }
+        other => panic!("expected Insert, found {other:?}"),
+    }
+
+    // Multi-row without column list
+    let sql2 = "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');";
+    let stmt2 = parse_statement_sql(sql2).unwrap();
+    match stmt2 {
+        Statement::Insert(InsertStatement {
+            table_name,
+            columns,
+            values,
+        }) => {
+            assert_eq!(table_name, "users");
+            assert_eq!(columns, None);
+            assert_eq!(values.len(), 2);
+        }
+        other => panic!("expected Insert, found {other:?}"),
+    }
+}
+
+#[test]
+fn test_parser_update() {
+    use treedb::sql::{parse_statement_sql, Statement, UpdateStatement};
+
+    // Multiple SET assignments with WHERE
+    let sql = "UPDATE users SET age = 21, active = true WHERE id = 1;";
+    let stmt = parse_statement_sql(sql).unwrap();
+    match stmt {
+        Statement::Update(UpdateStatement {
+            table_name,
+            assignments,
+            selection,
+        }) => {
+            assert_eq!(table_name, "users");
+            assert_eq!(assignments.len(), 2);
+            assert_eq!(assignments[0].column_name, "age");
+            assert_eq!(assignments[1].column_name, "active");
+            assert!(selection.is_some());
+        }
+        other => panic!("expected Update, found {other:?}"),
+    }
+
+    // UPDATE without WHERE
+    let sql2 = "UPDATE users SET active = false;";
+    let stmt2 = parse_statement_sql(sql2).unwrap();
+    match stmt2 {
+        Statement::Update(UpdateStatement {
+            table_name,
+            assignments,
+            selection,
+        }) => {
+            assert_eq!(table_name, "users");
+            assert_eq!(assignments.len(), 1);
+            assert_eq!(assignments[0].column_name, "active");
+            assert_eq!(selection, None);
+        }
+        other => panic!("expected Update, found {other:?}"),
+    }
+}
+
+#[test]
+fn test_parser_delete() {
+    use treedb::sql::{parse_statement_sql, DeleteStatement, Statement};
+
+    // DELETE with WHERE
+    let sql = "DELETE FROM users WHERE id = 42;";
+    let stmt = parse_statement_sql(sql).unwrap();
+    match stmt {
+        Statement::Delete(DeleteStatement {
+            table_name,
+            selection,
+        }) => {
+            assert_eq!(table_name, "users");
+            assert!(selection.is_some());
+        }
+        other => panic!("expected Delete, found {other:?}"),
+    }
+
+    // DELETE without WHERE (all rows)
+    let sql2 = "DELETE FROM users;";
+    let stmt2 = parse_statement_sql(sql2).unwrap();
+    match stmt2 {
+        Statement::Delete(DeleteStatement {
+            table_name,
+            selection,
+        }) => {
+            assert_eq!(table_name, "users");
+            assert_eq!(selection, None);
+        }
+        other => panic!("expected Delete, found {other:?}"),
+    }
+}
+
+#[test]
+fn test_parser_invalid_ddl_dml_syntax() {
+    use treedb::sql::parse_statement_sql;
+
+    let invalid = [
+        "CREATE TABLE;",                                                 // Missing table name
+        "CREATE TABLE users;",                                           // Missing columns paren
+        "CREATE TABLE users ();",                                        // Empty columns
+        "CREATE TABLE users (id INVALID_TYPE);",                         // Invalid data type
+        "CREATE TABLE users (id INT PK);",                               // Invalid PK syntax
+        "CREATE TABLE users (id INT PRIMARY KEY, id2 INT PRIMARY KEY);", // Multiple PKs
+        "CREATE TABLE users (id INT, PRIMARY KEY);",                     // Missing PK column name
+        "DROP TABLE;",                                                   // Missing table name
+        "INSERT users VALUES (1);",                                      // Missing INTO
+        "INSERT INTO users;",                                            // Missing VALUES
+        "INSERT INTO users VALUES;",                                     // Missing tuple paren
+        "INSERT INTO users VALUES ();",                                  // Empty tuple
+        "INSERT INTO users () VALUES (1);",                              // Empty column list
+        "UPDATE users;",                                                 // Missing SET
+        "UPDATE users SET;",                                             // Missing assignments
+        "UPDATE users SET id = ;",                                       // Missing RHS expr
+        "DELETE users;",                                                 // Missing FROM
+        "DELETE FROM;",                                                  // Missing table name
+    ];
+
+    for &sql in &invalid {
+        let result = parse_statement_sql(sql);
+        assert!(
+            result.is_err(),
+            "Expected parse error for statement: '{sql}', but succeeded: {result:?}"
+        );
+    }
+}

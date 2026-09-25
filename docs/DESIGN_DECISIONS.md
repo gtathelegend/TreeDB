@@ -438,9 +438,28 @@ This document records key architectural and design choices, their rationale, and
      * `ON` predicates referencing only the right side are safely pushed down to the right table scan before the join.
   7. **Plan Inspection (`PhysicalPlan::Display`, `EXPLAIN`):**
      * Textual representation provides inspectable, deterministic plan trees for debugging, tests, and future tooling.
+---
+
+## Decision 36: SQL DDL & DML Transactional Mutation Engine
+
+* **Decision:** Implement complete SQL DDL (`CREATE TABLE`, `DROP TABLE`) and DML (`INSERT INTO`, `UPDATE`, `DELETE FROM`) directly integrated into the existing transactional, storage, catalog, WAL, freelist, and recovery engine without duplicating storage semantics:
+  1. **Statement AST & Result Representation:**
+     * Dedicated AST types: `Statement` enum (`Select`, `CreateTable`, `DropTable`, `Insert`, `Update`, `Delete`).
+     * Dedicated structured execution result: `StatementResult` (`Query(QueryResult)`, `Inserted { rows }`, `Updated { rows }`, `Deleted { rows }`, `CreatedTable { table }`, `DroppedTable { table }`).
+  2. **Catalog & Storage Integration for DDL:**
+     * `CREATE TABLE table_name (col type [PRIMARY KEY] [NOT NULL], ...)` maps directly to `Transaction::create_table(name, schema)`.
+     * `DROP TABLE table_name` maps to `Transaction::drop_table(name)` which cascades page reclamation to freelist.
+     * All DDL operations participate in the active transaction with full rollback and crash-recovery support.
+  3. **DML Execution & Optimizer Reuse:**
+     * `INSERT INTO table [(cols...)] VALUES ((vals...), ...)` validates schema types, evaluates expressions, applies numeric literal coercion (`Int64 -> UInt64/Float64`), enforces `NOT NULL` and primary key uniqueness, updates all secondary indexes, and appends WAL records.
+     * `UPDATE table SET col = expr, ... [WHERE predicate]` reuses the Phase 20 rule-based optimizer (`AccessPath` selection: `PrimaryPointLookup`, `PrimaryRangeScan`, `SecondaryIndexScan`, `FullTableScan` with residual filter) to fetch candidate rows, evaluates SET expressions against candidate rows, enforces PK immutability, validates types/nullability, applies atomic secondary index maintenance, and updates record store tuples.
+     * `DELETE FROM table [WHERE predicate]` similarly reuses the Phase 20 optimizer to fetch candidate rows and invokes `Table::delete` to reclaim primary keys, record store slots, overflow chains, and secondary index entries.
+  4. **Strict Primary Key & Index Invariants:**
+     * Direct PK mutation via UPDATE is strictly rejected with `Error::InvalidPrimaryKey`.
+     * Unique secondary index collisions during INSERT or UPDATE atomically fail with `Error::DuplicateIndexKey` and rollback any partial modifications.
 * **Rationale:**
-  * **Conservatism & Semantic Equivalence:** Optimizations are applied only when provably semantics-preserving.
-  * **Zero Storage Impact:** Storage, buffer pool, WAL, and transaction engines remain completely decoupled from query optimization.
+  * **Unified Storage Architecture:** SQL is a transactional frontend, guaranteeing zero divergence between programmatic API operations and SQL mutations.
+  * **Durability & Recovery:** All writes generate standard WAL records, automatically participating in ARIES crash recovery and checkpointing without custom recovery paths.
 
 
 

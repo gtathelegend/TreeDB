@@ -6,8 +6,10 @@ pub mod span;
 pub mod token;
 
 pub use ast::{
-    AggregateFunction, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem,
-    SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, TableRef,
+    AggregateFunction, ColumnDef, CreateTableStatement, DeleteStatement, DropTableStatement,
+    InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem,
+    SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
+    UpdateAssignment, UpdateStatement,
 };
 pub use binder::{
     bind_expr, bind_select, bind_select_multi, BindingContext, BoundJoin, BoundSelect, TableBinding,
@@ -25,6 +27,13 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
     lexer.tokenize()
 }
 
+/// Parses an SQL string into a top-level `Statement` AST (`SELECT`, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`).
+pub fn parse_statement(sql: &str) -> Result<Statement> {
+    let tokens = tokenize(sql)?;
+    let mut parser = Parser::new(&tokens);
+    parser.parse_statement()
+}
+
 /// Parses an SQL query string into a `SelectStatement` AST.
 pub fn parse(sql: &str) -> Result<SelectStatement> {
     let tokens = tokenize(sql)?;
@@ -33,4 +42,5 @@ pub fn parse(sql: &str) -> Result<SelectStatement> {
 }
 
 pub use parse as parse_sql;
+pub use parse_statement as parse_statement_sql;
 pub use tokenize as tokenize_sql;

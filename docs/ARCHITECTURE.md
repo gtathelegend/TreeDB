@@ -78,9 +78,15 @@ v                                                             v
   * **Comments & Whitespace:** Preserves byte offsets while skipping whitespace and single-line SQL comments (`-- ...`).
 
 ### `Parser` & Pratt Expression Parser (`src/sql/parser.rs`)
-* **Role:** Recursive descent parser and Pratt precedence climbing expression parser for the scoped SQL `SELECT` dialect.
+* **Role:** Recursive descent parser and Pratt precedence climbing expression parser for SQL queries, DDL, and DML statements.
 * **Responsibilities:**
-  * **Clause Grammar:** Enforces strict clause order: `SELECT [wildcard | expressions [AS alias]] FROM table [AS alias] [JOIN table [AS alias] ON expr]* [WHERE expr] [GROUP BY expr, ...] [HAVING expr] [ORDER BY expr [ASC | DESC], ...] [LIMIT n] [OFFSET n];`.
+  * **Statements Supported:**
+    * `SELECT ... FROM ... [JOIN ...]* [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT n] [OFFSET n];`
+    * `CREATE TABLE table (col type [PRIMARY KEY] [NOT NULL], ...);`
+    * `DROP TABLE table;`
+    * `INSERT INTO table [(cols...)] VALUES ((vals...), ...);`
+    * `UPDATE table SET col = expr, ... [WHERE expr];`
+    * `DELETE FROM table [WHERE expr];`
   * **Join Syntax:** Supports `INNER JOIN`, shorthand `JOIN`, `LEFT JOIN`, and `LEFT OUTER JOIN` with table aliases and boolean `ON` expressions. Preserves source join order.
   * **Aggregate Expressions:** Case-insensitive parsing for `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)`. Rejects nested aggregates (e.g. `SUM(COUNT(*))`), empty aggregate calls, and wildcard arguments for non-COUNT functions (`SUM(*)`).
   * **Precedence Hierarchy:**
@@ -92,7 +98,16 @@ v                                                             v
     6. Logical `NOT` (SQL standard precedence binding looser than comparisons)
     7. Logical `AND`
     8. Logical `OR`
-  * **Standalone Boundary:** Operates completely decoupled from runtime storage, schemas, or buffer pools via `treedb::sql::parse(sql)`.
+  * **Standalone Boundary:** Operates completely decoupled from runtime storage, schemas, or buffer pools via `treedb::sql::parse_sql(sql)` and `treedb::sql::parse_statement_sql(sql)`.
+
+### `StatementResult` & Transactional Execution Engine (`src/engine/transaction.rs`)
+* **Role:** Transactional execution coordinator for DDL and DML statements (`txn.execute_statement(sql)`).
+* **Responsibilities:**
+  * **Statement Routing:** Dispatches parsed `Statement` AST nodes to dedicated transactional execution routines (`execute_create_table`, `execute_drop_table`, `execute_insert`, `execute_update`, `execute_delete`, and `execute_select`).
+  * **Optimizer Reuse:** UPDATE and DELETE statements with WHERE clauses reuse the Phase 20 rule-based optimizer (`TableOptInfo`, `Optimizer::optimize`) to pick primary key lookups, primary range scans, or secondary index scans before executing table mutations.
+  * **Constraint & Schema Validation:** Validates schema column types, converts numeric literals contextually (`Int64` -> `UInt64`/`Float64`), enforces `NOT NULL` constraints, rejects primary key updates, and validates unique index constraints.
+  * **Result Typing:** Returns structured `StatementResult` variants (`Query`, `Inserted`, `Updated`, `Deleted`, `CreatedTable`, `DroppedTable`).
+  * **WAL & Durability:** All mutations execute through existing `Table` and `Catalog` APIs, ensuring complete WAL generation, ARIES recovery compatibility, and rollback on abort.
 
 ### `BindingContext`, `BoundSelect`, `TableBinding` & SQL Binder (`src/sql/binder.rs`)
 * **Role:** Semantic analysis and translation layer bridging SQL ASTs with Phase 14/18/19 query execution structures.

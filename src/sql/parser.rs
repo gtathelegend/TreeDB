@@ -1,7 +1,9 @@
+use crate::engine::types::DataType;
 use crate::error::{Error, Result};
 use crate::sql::ast::{
+    ColumnDef, CreateTableStatement, DeleteStatement, DropTableStatement, InsertStatement,
     JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SqlBinaryOp,
-    SqlExpr, SqlLiteral, SqlUnaryOp, TableRef,
+    SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};
@@ -18,7 +20,7 @@ enum Precedence {
     UnaryNeg = 6,
 }
 
-/// Recursive descent and Pratt precedence parser for SQL `SELECT` queries.
+/// Recursive descent and Pratt precedence parser for SQL statements.
 pub struct Parser<'a> {
     tokens: &'a [Token],
     cursor: usize,
@@ -28,6 +30,735 @@ impl<'a> Parser<'a> {
     /// Creates a new `Parser` over the provided slice of tokens.
     pub fn new(tokens: &'a [Token]) -> Self {
         Self { tokens, cursor: 0 }
+    }
+
+    /// Parses an arbitrary top-level SQL statement (`SELECT`, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`).
+    pub fn parse_statement(&mut self) -> Result<Statement> {
+        let token = self.peek();
+        match token.kind {
+            TokenKind::Select => Ok(Statement::Select(self.parse_select()?)),
+            TokenKind::Create => Ok(Statement::CreateTable(self.parse_create_table()?)),
+            TokenKind::Drop => Ok(Statement::DropTable(self.parse_drop_table()?)),
+            TokenKind::Insert => Ok(Statement::Insert(self.parse_insert()?)),
+            TokenKind::Update => Ok(Statement::Update(self.parse_update()?)),
+            TokenKind::Delete => Ok(Statement::Delete(self.parse_delete()?)),
+            _ => Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected token {}, expected SQL statement (SELECT, CREATE, DROP, INSERT, UPDATE, DELETE)",
+                    token.kind
+                ),
+                start: token.span.start,
+                end: token.span.end,
+            }),
+        }
+    }
+
+    /// Parses a complete SQL `CREATE TABLE` statement.
+    ///
+    /// # Syntax
+    /// `CREATE TABLE <table_name> ( <col_def> [, <col_def> ...] [, PRIMARY KEY (<col>)] ) [;]`
+    pub fn parse_create_table(&mut self) -> Result<CreateTableStatement> {
+        let start_span = self.peek().span;
+        if self.peek().kind != TokenKind::Create {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected CREATE statement, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume CREATE
+
+        if self.peek().kind != TokenKind::Table {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected TABLE after CREATE, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume TABLE
+
+        let table_name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected table name in CREATE TABLE, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume table name
+
+        if self.peek().kind != TokenKind::LParen {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "expected '(' after table name in CREATE TABLE, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume '('
+
+        let mut columns: Vec<ColumnDef> = Vec::new();
+        let mut table_pk_col: Option<String> = None;
+
+        loop {
+            if self.peek().kind == TokenKind::RParen {
+                break;
+            }
+
+            if self.peek().kind == TokenKind::Primary {
+                let primary_span = self.peek().span;
+                self.advance(); // consume PRIMARY
+                if self.peek().kind != TokenKind::Key {
+                    let tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: format!("expected KEY after PRIMARY, found {}", tok.kind),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+                self.advance(); // consume KEY
+
+                if self.peek().kind != TokenKind::LParen {
+                    let tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: format!("expected '(' after PRIMARY KEY, found {}", tok.kind),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+                self.advance(); // consume '('
+
+                let pk_col_name = match &self.peek().kind {
+                    TokenKind::Ident(s) => s.clone(),
+                    _ => {
+                        let tok = self.peek().clone();
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected column name in PRIMARY KEY (...), found {}",
+                                tok.kind
+                            ),
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        });
+                    }
+                };
+                self.advance(); // consume column name
+
+                if self.peek().kind != TokenKind::RParen {
+                    let tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: format!(
+                            "expected ')' after column name in PRIMARY KEY, found {}",
+                            tok.kind
+                        ),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+                let end_pk_span = self.peek().span;
+                self.advance(); // consume ')'
+
+                if table_pk_col.is_some() {
+                    return Err(Error::SqlParseError {
+                        message: "multiple PRIMARY KEY constraints defined in CREATE TABLE"
+                            .to_string(),
+                        start: primary_span.start,
+                        end: end_pk_span.end,
+                    });
+                }
+                table_pk_col = Some(pk_col_name);
+            } else {
+                let col_name = match &self.peek().kind {
+                    TokenKind::Ident(s) => s.clone(),
+                    _ => {
+                        let tok = self.peek().clone();
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected column name in CREATE TABLE, found {}",
+                                tok.kind
+                            ),
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        });
+                    }
+                };
+                self.advance(); // consume column name
+
+                let data_type = match self.peek().kind {
+                    TokenKind::BooleanType => DataType::Boolean,
+                    TokenKind::BigIntType => DataType::Int64,
+                    TokenKind::UBigIntType => DataType::UInt64,
+                    TokenKind::DoubleType => DataType::Float64,
+                    TokenKind::TextType => DataType::String,
+                    TokenKind::BlobType => DataType::Bytes,
+                    _ => {
+                        let tok = self.peek().clone();
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected data type for column '{col_name}', found {}",
+                                tok.kind
+                            ),
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        });
+                    }
+                };
+                self.advance(); // consume type
+
+                let mut is_pk = false;
+                let mut nullable = true;
+
+                loop {
+                    match self.peek().kind {
+                        TokenKind::Primary => {
+                            self.advance(); // consume PRIMARY
+                            if self.peek().kind != TokenKind::Key {
+                                let tok = self.peek().clone();
+                                return Err(Error::SqlParseError {
+                                    message: format!(
+                                        "expected KEY after PRIMARY, found {}",
+                                        tok.kind
+                                    ),
+                                    start: tok.span.start,
+                                    end: tok.span.end,
+                                });
+                            }
+                            self.advance(); // consume KEY
+                            is_pk = true;
+                            nullable = false;
+                        }
+                        TokenKind::Not => {
+                            self.advance(); // consume NOT
+                            if self.peek().kind != TokenKind::Null {
+                                let tok = self.peek().clone();
+                                return Err(Error::SqlParseError {
+                                    message: format!("expected NULL after NOT, found {}", tok.kind),
+                                    start: tok.span.start,
+                                    end: tok.span.end,
+                                });
+                            }
+                            self.advance(); // consume NULL
+                            nullable = false;
+                        }
+                        TokenKind::Null => {
+                            self.advance(); // consume NULL
+                            nullable = true;
+                        }
+                        _ => break,
+                    }
+                }
+
+                columns.push(ColumnDef::new(col_name, data_type, is_pk, nullable));
+            }
+
+            if self.peek().kind == TokenKind::Comma {
+                self.advance(); // consume ','
+            } else if self.peek().kind == TokenKind::RParen {
+                break;
+            } else {
+                let err_tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!(
+                        "expected ',' or ')' in CREATE TABLE column definitions, found {}",
+                        err_tok.kind
+                    ),
+                    start: err_tok.span.start,
+                    end: err_tok.span.end,
+                });
+            }
+        }
+
+        if self.peek().kind != TokenKind::RParen {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "expected ')' at end of CREATE TABLE column definitions, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        let end_span = self.peek().span;
+        self.advance(); // consume ')'
+
+        // Apply table-level primary key constraint if specified
+        if let Some(pk_name) = table_pk_col {
+            let col = columns
+                .iter_mut()
+                .find(|c| c.name == pk_name)
+                .ok_or_else(|| Error::SqlParseError {
+                    message: format!(
+                        "PRIMARY KEY column '{pk_name}' not found in CREATE TABLE column list"
+                    ),
+                    start: start_span.start,
+                    end: end_span.end,
+                })?;
+            if col.is_primary_key {
+                return Err(Error::SqlParseError {
+                    message: format!("column '{pk_name}' is already defined as PRIMARY KEY"),
+                    start: start_span.start,
+                    end: end_span.end,
+                });
+            }
+            col.is_primary_key = true;
+            col.nullable = false;
+        }
+
+        // Validate that exactly one column is primary key
+        let pk_count = columns.iter().filter(|c| c.is_primary_key).count();
+        if pk_count == 0 {
+            return Err(Error::SqlParseError {
+                message: "table must contain a PRIMARY KEY column".to_string(),
+                start: start_span.start,
+                end: end_span.end,
+            });
+        }
+        if pk_count > 1 {
+            return Err(Error::SqlParseError {
+                message: "multiple PRIMARY KEY columns are not supported".to_string(),
+                start: start_span.start,
+                end: end_span.end,
+            });
+        }
+
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after CREATE TABLE statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        Ok(CreateTableStatement {
+            table_name,
+            columns,
+        })
+    }
+
+    /// Parses a complete SQL `DROP TABLE` statement.
+    ///
+    /// # Syntax
+    /// `DROP TABLE <table_name> [;]`
+    pub fn parse_drop_table(&mut self) -> Result<DropTableStatement> {
+        if self.peek().kind != TokenKind::Drop {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected DROP statement, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume DROP
+
+        if self.peek().kind != TokenKind::Table {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected TABLE after DROP, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume TABLE
+
+        let table_name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected table name in DROP TABLE, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume table name
+
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after DROP TABLE statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        Ok(DropTableStatement { table_name })
+    }
+
+    /// Parses a complete SQL `INSERT INTO` statement.
+    ///
+    /// # Syntax
+    /// `INSERT INTO <table_name> [(col1, ...)] VALUES (val1, ...), (val2, ...) [;]`
+    pub fn parse_insert(&mut self) -> Result<InsertStatement> {
+        let start_span = self.peek().span;
+        if self.peek().kind != TokenKind::Insert {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected INSERT statement, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume INSERT
+
+        if self.peek().kind != TokenKind::Into {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected INTO after INSERT, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume INTO
+
+        let table_name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected table name in INSERT INTO, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume table name
+
+        let columns = if self.peek().kind == TokenKind::LParen {
+            self.advance(); // consume '('
+            let mut cols = Vec::new();
+            loop {
+                let col_name = match &self.peek().kind {
+                    TokenKind::Ident(s) => s.clone(),
+                    _ => {
+                        let tok = self.peek().clone();
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected column identifier in INSERT INTO column list, found {}",
+                                tok.kind
+                            ),
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        });
+                    }
+                };
+                self.advance();
+                cols.push(col_name);
+
+                if self.peek().kind == TokenKind::Comma {
+                    self.advance();
+                } else if self.peek().kind == TokenKind::RParen {
+                    break;
+                } else {
+                    let err_tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: format!(
+                            "expected ',' or ')' in INSERT INTO column list, found {}",
+                            err_tok.kind
+                        ),
+                        start: err_tok.span.start,
+                        end: err_tok.span.end,
+                    });
+                }
+            }
+            self.advance(); // consume ')'
+            Some(cols)
+        } else {
+            None
+        };
+
+        if self.peek().kind != TokenKind::Values {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "expected VALUES in INSERT INTO statement, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        let values_span = self.peek().span;
+        self.advance(); // consume VALUES
+
+        let mut values = Vec::new();
+        loop {
+            if self.peek().kind != TokenKind::LParen {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!(
+                        "expected '(' before row values in INSERT, found {}",
+                        tok.kind
+                    ),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+            self.advance(); // consume '('
+
+            let mut row = Vec::new();
+            loop {
+                let expr = self.parse_expr()?;
+                row.push(expr);
+
+                if self.peek().kind == TokenKind::Comma {
+                    self.advance();
+                } else if self.peek().kind == TokenKind::RParen {
+                    break;
+                } else {
+                    let err_tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: format!(
+                            "expected ',' or ')' in INSERT row values, found {}",
+                            err_tok.kind
+                        ),
+                        start: err_tok.span.start,
+                        end: err_tok.span.end,
+                    });
+                }
+            }
+            self.advance(); // consume ')'
+            values.push(row);
+
+            if self.peek().kind == TokenKind::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        if values.is_empty() {
+            return Err(Error::SqlParseError {
+                message: "INSERT INTO must have at least one VALUES row".to_string(),
+                start: start_span.start,
+                end: values_span.end,
+            });
+        }
+
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after INSERT statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        Ok(InsertStatement {
+            table_name,
+            columns,
+            values,
+        })
+    }
+
+    /// Parses a complete SQL `UPDATE` statement.
+    ///
+    /// # Syntax
+    /// `UPDATE <table_name> SET <col1> = <expr1> [, <col2> = <expr2> ...] [WHERE <expr>] [;]`
+    pub fn parse_update(&mut self) -> Result<UpdateStatement> {
+        if self.peek().kind != TokenKind::Update {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected UPDATE statement, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume UPDATE
+
+        let table_name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected table name in UPDATE, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume table name
+
+        if self.peek().kind != TokenKind::Set {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "expected SET after table name in UPDATE, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume SET
+
+        let mut assignments = Vec::new();
+        loop {
+            let column_name = match &self.peek().kind {
+                TokenKind::Ident(s) => s.clone(),
+                _ => {
+                    let tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: format!(
+                            "expected column identifier in UPDATE SET, found {}",
+                            tok.kind
+                        ),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+            };
+            self.advance(); // consume column name
+
+            if self.peek().kind != TokenKind::Eq {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!(
+                        "expected '=' after column in UPDATE SET, found {}",
+                        tok.kind
+                    ),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+            self.advance(); // consume '='
+
+            let expr = self.parse_expr()?;
+            assignments.push(UpdateAssignment { column_name, expr });
+
+            if self.peek().kind == TokenKind::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        let selection = if self.peek().kind == TokenKind::Where {
+            self.advance(); // consume WHERE
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after UPDATE statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        Ok(UpdateStatement {
+            table_name,
+            assignments,
+            selection,
+        })
+    }
+
+    /// Parses a complete SQL `DELETE FROM` statement.
+    ///
+    /// # Syntax
+    /// `DELETE FROM <table_name> [WHERE <expr>] [;]`
+    pub fn parse_delete(&mut self) -> Result<DeleteStatement> {
+        if self.peek().kind != TokenKind::Delete {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected DELETE statement, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume DELETE
+
+        if self.peek().kind != TokenKind::From {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected FROM after DELETE, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume FROM
+
+        let table_name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected table name in DELETE FROM, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume table name
+
+        let selection = if self.peek().kind == TokenKind::Where {
+            self.advance(); // consume WHERE
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after DELETE statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        Ok(DeleteStatement {
+            table_name,
+            selection,
+        })
     }
 
     /// Parses a complete SQL `SELECT` statement.

@@ -1,5 +1,211 @@
 use std::fmt;
 
+use crate::engine::types::DataType;
+
+/// Top-level AST node representing an executable SQL statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Statement {
+    /// SQL `SELECT` query statement.
+    Select(SelectStatement),
+    /// SQL `CREATE TABLE` DDL statement.
+    CreateTable(CreateTableStatement),
+    /// SQL `DROP TABLE` DDL statement.
+    DropTable(DropTableStatement),
+    /// SQL `INSERT INTO` DML statement.
+    Insert(InsertStatement),
+    /// SQL `UPDATE` DML statement.
+    Update(UpdateStatement),
+    /// SQL `DELETE FROM` DML statement.
+    Delete(DeleteStatement),
+}
+
+impl fmt::Display for Statement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Statement::Select(s) => write!(f, "{s}"),
+            Statement::CreateTable(s) => write!(f, "{s}"),
+            Statement::DropTable(s) => write!(f, "{s}"),
+            Statement::Insert(s) => write!(f, "{s}"),
+            Statement::Update(s) => write!(f, "{s}"),
+            Statement::Delete(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// Column definition within a `CREATE TABLE` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDef {
+    /// Column identifier name.
+    pub name: String,
+    /// Column data type.
+    pub data_type: DataType,
+    /// Whether this column is declared as the primary key.
+    pub is_primary_key: bool,
+    /// Whether this column permits `NULL` values.
+    pub nullable: bool,
+}
+
+impl ColumnDef {
+    /// Creates a new `ColumnDef`.
+    pub fn new(
+        name: impl Into<String>,
+        data_type: DataType,
+        is_primary_key: bool,
+        nullable: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            is_primary_key,
+            nullable,
+        }
+    }
+}
+
+impl fmt::Display for ColumnDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.name, self.data_type)?;
+        if self.is_primary_key {
+            write!(f, " PRIMARY KEY")?;
+        }
+        if !self.nullable && !self.is_primary_key {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+/// AST node representing a `CREATE TABLE` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableStatement {
+    /// Target table name.
+    pub table_name: String,
+    /// List of declared column definitions.
+    pub columns: Vec<ColumnDef>,
+}
+
+impl fmt::Display for CreateTableStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CREATE TABLE {} (", self.table_name)?;
+        for (i, col) in self.columns.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{col}")?;
+        }
+        write!(f, ")")
+    }
+}
+
+/// AST node representing a `DROP TABLE` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTableStatement {
+    /// Target table name to drop.
+    pub table_name: String,
+}
+
+impl fmt::Display for DropTableStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DROP TABLE {}", self.table_name)
+    }
+}
+
+/// AST node representing an `INSERT INTO` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertStatement {
+    /// Target table name.
+    pub table_name: String,
+    /// Optional explicit column list mapping.
+    pub columns: Option<Vec<String>>,
+    /// List of row expressions to insert.
+    pub values: Vec<Vec<SqlExpr>>,
+}
+
+impl fmt::Display for InsertStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "INSERT INTO {}", self.table_name)?;
+        if let Some(cols) = &self.columns {
+            write!(f, " ({})", cols.join(", "))?;
+        }
+        write!(f, " VALUES ")?;
+        for (i, row) in self.values.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "(")?;
+            for (j, expr) in row.iter().enumerate() {
+                if j > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{expr}")?;
+            }
+            write!(f, ")")?;
+        }
+        Ok(())
+    }
+}
+
+/// An individual assignment in an `UPDATE` statement (`col = expr`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateAssignment {
+    /// Column name being assigned.
+    pub column_name: String,
+    /// Value expression assigned to the column.
+    pub expr: SqlExpr,
+}
+
+impl fmt::Display for UpdateAssignment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} = {}", self.column_name, self.expr)
+    }
+}
+
+/// AST node representing an `UPDATE` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStatement {
+    /// Target table name.
+    pub table_name: String,
+    /// List of column assignments.
+    pub assignments: Vec<UpdateAssignment>,
+    /// Optional filtering predicate in `WHERE`.
+    pub selection: Option<SqlExpr>,
+}
+
+impl fmt::Display for UpdateStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UPDATE {} SET ", self.table_name)?;
+        for (i, assign) in self.assignments.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{assign}")?;
+        }
+        if let Some(sel) = &self.selection {
+            write!(f, " WHERE {sel}")?;
+        }
+        Ok(())
+    }
+}
+
+/// AST node representing a `DELETE FROM` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStatement {
+    /// Target table name.
+    pub table_name: String,
+    /// Optional filtering predicate in `WHERE`.
+    pub selection: Option<SqlExpr>,
+}
+
+impl fmt::Display for DeleteStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DELETE FROM {}", self.table_name)?;
+        if let Some(sel) = &self.selection {
+            write!(f, " WHERE {sel}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Top-level AST node representing a SQL `SELECT` query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
@@ -21,6 +227,53 @@ pub struct SelectStatement {
     pub limit: Option<u64>,
     /// Optional non-negative row skip count in the `OFFSET` clause.
     pub offset: Option<u64>,
+}
+
+impl fmt::Display for SelectStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SELECT ")?;
+        for (i, item) in self.projection.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{item}")?;
+        }
+        write!(f, " FROM {}", self.from)?;
+        for join in &self.joins {
+            write!(f, " {join}")?;
+        }
+        if let Some(sel) = &self.selection {
+            write!(f, " WHERE {sel}")?;
+        }
+        if !self.group_by.is_empty() {
+            write!(f, " GROUP BY ")?;
+            for (i, item) in self.group_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{item}")?;
+            }
+        }
+        if let Some(having) = &self.having {
+            write!(f, " HAVING {having}")?;
+        }
+        if !self.order_by.is_empty() {
+            write!(f, " ORDER BY ")?;
+            for (i, item) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{item}")?;
+            }
+        }
+        if let Some(limit) = self.limit {
+            write!(f, " LIMIT {limit}")?;
+        }
+        if let Some(offset) = self.offset {
+            write!(f, " OFFSET {offset}")?;
+        }
+        Ok(())
+    }
 }
 
 /// An individual item in a `SELECT` projection list.

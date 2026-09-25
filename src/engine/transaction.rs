@@ -1,7 +1,64 @@
+use crate::engine::types::{DataType, Value};
 use crate::engine::TreeDb;
 use crate::error::{Error, Result};
 use crate::storage::page::{Key, PageId};
 use crate::wal::lsn::TxnId;
+
+/// Execution result returned by top-level SQL statements (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatementResult {
+    /// Result of an SQL `SELECT` query.
+    Query(crate::query::QueryResult),
+    /// Result of an SQL `INSERT` statement.
+    Inserted {
+        /// Number of rows successfully inserted.
+        rows: usize,
+    },
+    /// Result of an SQL `UPDATE` statement.
+    Updated {
+        /// Number of rows successfully updated.
+        rows: usize,
+    },
+    /// Result of an SQL `DELETE` statement.
+    Deleted {
+        /// Number of rows successfully deleted.
+        rows: usize,
+    },
+    /// Result of an SQL `CREATE TABLE` statement.
+    CreatedTable {
+        /// Name of the created table.
+        table: String,
+    },
+    /// Result of an SQL `DROP TABLE` statement.
+    DroppedTable {
+        /// Name of the dropped table.
+        table: String,
+    },
+}
+
+impl StatementResult {
+    /// Unwraps this result as a `QueryResult`, returning an error if it is not a query.
+    pub fn into_query(self) -> Result<crate::query::QueryResult> {
+        match self {
+            StatementResult::Query(qr) => Ok(qr),
+            other => Err(Error::QueryExecutionError(format!(
+                "expected query result, found statement result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Returns the number of rows affected by an `INSERT`, `UPDATE`, or `DELETE` statement,
+    /// or the number of rows returned by a `SELECT` query.
+    pub fn rows_affected(&self) -> usize {
+        match self {
+            StatementResult::Query(qr) => qr.rows.len(),
+            StatementResult::Inserted { rows }
+            | StatementResult::Updated { rows }
+            | StatementResult::Deleted { rows } => *rows,
+            StatementResult::CreatedTable { .. } | StatementResult::DroppedTable { .. } => 0,
+        }
+    }
+}
 
 /// State of an explicit transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,11 +381,12 @@ impl<'db> Transaction<'db> {
         Ok(crate::query::Query::new(table))
     }
 
-    /// Parses, binds, and produces an optimized physical execution plan (`PhysicalPlan`) for the given SQL query.
-    pub fn plan_sql(&mut self, sql: &str) -> Result<crate::query::optimizer::PhysicalPlan> {
+    /// Plans a parsed `SelectStatement` AST into an optimized physical execution plan (`PhysicalPlan`).
+    pub fn plan_select(
+        &mut self,
+        ast: &crate::sql::SelectStatement,
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
         self.ensure_active()?;
-        let ast = crate::sql::parse(sql)?;
-
         let mut table_infos = Vec::new();
         let mut bindings = Vec::new();
 
@@ -368,8 +426,48 @@ impl<'db> Transaction<'db> {
             ));
         }
 
-        let bound = crate::sql::bind_select_multi(&ast, &bindings)?;
+        let bound = crate::sql::bind_select_multi(ast, &bindings)?;
         crate::query::optimizer::Optimizer::optimize(&bound, &table_infos)
+    }
+
+    /// Parses, binds, and produces an optimized physical execution plan (`PhysicalPlan`) for the given SQL query or DML filter.
+    pub fn plan_sql(&mut self, sql: &str) -> Result<crate::query::optimizer::PhysicalPlan> {
+        self.ensure_active()?;
+        let stmt = crate::sql::parse_statement(sql)?;
+        match stmt {
+            crate::sql::Statement::Select(select_stmt) => self.plan_select(&select_stmt),
+            crate::sql::Statement::Update(update_stmt) => {
+                let select_ast = crate::sql::SelectStatement {
+                    projection: vec![crate::sql::SelectItem::Wildcard],
+                    from: crate::sql::TableRef::new(&update_stmt.table_name),
+                    joins: Vec::new(),
+                    selection: update_stmt.selection,
+                    group_by: Vec::new(),
+                    having: None,
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                };
+                self.plan_select(&select_ast)
+            }
+            crate::sql::Statement::Delete(delete_stmt) => {
+                let select_ast = crate::sql::SelectStatement {
+                    projection: vec![crate::sql::SelectItem::Wildcard],
+                    from: crate::sql::TableRef::new(&delete_stmt.table_name),
+                    joins: Vec::new(),
+                    selection: delete_stmt.selection,
+                    group_by: Vec::new(),
+                    having: None,
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                };
+                self.plan_select(&select_ast)
+            }
+            _ => Err(Error::QueryExecutionError(format!(
+                "cannot plan statement: {stmt}"
+            ))),
+        }
     }
 
     /// Generates a human-readable text explanation of the optimized physical execution plan for the given SQL query.
@@ -378,13 +476,454 @@ impl<'db> Transaction<'db> {
         Ok(plan.to_string())
     }
 
+    /// Executes an arbitrary top-level SQL statement (`SELECT`, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`)
+    /// within this transaction.
+    ///
+    /// Observes prior uncommitted mutations made within the same transaction.
+    pub fn execute_statement(&mut self, sql: &str) -> Result<StatementResult> {
+        self.ensure_active()?;
+        let stmt = crate::sql::parse_statement(sql)?;
+        match stmt {
+            crate::sql::Statement::Select(select_stmt) => {
+                let plan = self.plan_select(&select_stmt)?;
+                let query_result = self.execute_physical_plan(&plan)?;
+                Ok(StatementResult::Query(query_result))
+            }
+            crate::sql::Statement::CreateTable(create_stmt) => {
+                self.execute_create_table(&create_stmt)
+            }
+            crate::sql::Statement::DropTable(drop_stmt) => self.execute_drop_table(&drop_stmt),
+            crate::sql::Statement::Insert(insert_stmt) => self.execute_insert(&insert_stmt),
+            crate::sql::Statement::Update(update_stmt) => self.execute_update(&update_stmt),
+            crate::sql::Statement::Delete(delete_stmt) => self.execute_delete(&delete_stmt),
+        }
+    }
+
     /// Parses, binds, optimizes, and executes an SQL `SELECT` statement within this transaction.
     ///
     /// Observes prior uncommitted mutations made within the same transaction.
     pub fn execute_sql(&mut self, sql: &str) -> Result<crate::query::QueryResult> {
         self.ensure_active()?;
-        let plan = self.plan_sql(sql)?;
-        self.execute_physical_plan(&plan)
+        let res = self.execute_statement(sql)?;
+        res.into_query()
+    }
+
+    fn execute_create_table(
+        &mut self,
+        stmt: &crate::sql::CreateTableStatement,
+    ) -> Result<StatementResult> {
+        self.ensure_active()?;
+        let mut columns = Vec::with_capacity(stmt.columns.len());
+        let mut pk_idx = None;
+
+        for (i, col_def) in stmt.columns.iter().enumerate() {
+            if col_def.is_primary_key {
+                pk_idx = Some(i);
+            }
+            columns.push(crate::engine::types::Column::new(
+                &col_def.name,
+                col_def.data_type,
+                col_def.nullable,
+            ));
+        }
+
+        let pk_index = pk_idx.ok_or_else(|| {
+            Error::TableSchemaMismatch("table must define a primary key column".to_string())
+        })?;
+
+        let schema = crate::engine::types::Schema::new(columns, pk_index)?;
+        self.create_table(&stmt.table_name, schema)?;
+        Ok(StatementResult::CreatedTable {
+            table: stmt.table_name.clone(),
+        })
+    }
+
+    fn execute_drop_table(
+        &mut self,
+        stmt: &crate::sql::DropTableStatement,
+    ) -> Result<StatementResult> {
+        self.ensure_active()?;
+        self.drop_table(&stmt.table_name)?;
+        Ok(StatementResult::DroppedTable {
+            table: stmt.table_name.clone(),
+        })
+    }
+
+    fn execute_insert(&mut self, stmt: &crate::sql::InsertStatement) -> Result<StatementResult> {
+        self.ensure_active()?;
+        let mut table = self.open_table(&stmt.table_name)?;
+        let schema = table.schema().clone();
+
+        // 1. Resolve column mapping
+        let col_indices: Vec<usize> = if let Some(col_names) = &stmt.columns {
+            let mut indices = Vec::with_capacity(col_names.len());
+            let mut seen = std::collections::HashSet::new();
+            for name in col_names {
+                if !seen.insert(name) {
+                    return Err(Error::TableSchemaMismatch(format!(
+                        "duplicate column '{name}' in INSERT column list"
+                    )));
+                }
+                let idx = schema
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .ok_or_else(|| Error::ColumnNotFound(name.clone()))?;
+                indices.push(idx);
+            }
+            indices
+        } else {
+            (0..schema.columns.len()).collect()
+        };
+
+        // 2. Validate and assemble each row
+        let mut rows_to_insert = Vec::with_capacity(stmt.values.len());
+        let empty_row = crate::engine::types::Row::new(Vec::new());
+
+        for value_tuple in &stmt.values {
+            if value_tuple.len() != col_indices.len() {
+                return Err(Error::ColumnCountMismatch {
+                    expected: col_indices.len(),
+                    found: value_tuple.len(),
+                });
+            }
+
+            let mut row_values = vec![Value::Null; schema.columns.len()];
+            let mut populated = vec![false; schema.columns.len()];
+
+            for (expr, &target_idx) in value_tuple.iter().zip(col_indices.iter()) {
+                let target_col = &schema.columns[target_idx];
+                let bound_expr = crate::sql::bind_expr(
+                    expr,
+                    &crate::sql::BindingContext::new_single(&stmt.table_name, None, &schema),
+                )?;
+                let mut evaluated_val = bound_expr.evaluate(&empty_row, &schema)?;
+
+                // Type coercion for numeric literals
+                evaluated_val = match (evaluated_val, target_col.data_type) {
+                    (Value::Int64(i), DataType::UInt64) if i >= 0 => Value::UInt64(i as u64),
+                    (Value::Int64(i), DataType::Float64) => Value::Float64(i as f64),
+                    (Value::UInt64(u), DataType::Int64) if u <= i64::MAX as u64 => {
+                        Value::Int64(u as i64)
+                    }
+                    (Value::UInt64(u), DataType::Float64) => Value::Float64(u as f64),
+                    (val, _) => val,
+                };
+
+                // Validate nullability and type compatibility
+                if evaluated_val.is_null() {
+                    if !target_col.nullable {
+                        return Err(Error::NullConstraintViolation {
+                            column: target_col.name.clone(),
+                        });
+                    }
+                } else if evaluated_val.data_type() != target_col.data_type {
+                    return Err(Error::TypeMismatch {
+                        column: target_col.name.clone(),
+                        expected: target_col.data_type.to_string(),
+                        found: evaluated_val.data_type().to_string(),
+                    });
+                }
+
+                row_values[target_idx] = evaluated_val;
+                populated[target_idx] = true;
+            }
+
+            // Check any omitted columns: must be nullable
+            for (i, is_pop) in populated.iter().enumerate() {
+                if !is_pop {
+                    let col = &schema.columns[i];
+                    if !col.nullable {
+                        return Err(Error::NullConstraintViolation {
+                            column: col.name.clone(),
+                        });
+                    }
+                    row_values[i] = Value::Null;
+                }
+            }
+
+            rows_to_insert.push(crate::engine::types::Row::new(row_values));
+        }
+
+        // 3. Perform inserts through Table handle
+        let mut inserted_count = 0;
+        for row in rows_to_insert {
+            table.insert(&row)?;
+            inserted_count += 1;
+        }
+
+        Ok(StatementResult::Inserted {
+            rows: inserted_count,
+        })
+    }
+
+    fn execute_update(&mut self, stmt: &crate::sql::UpdateStatement) -> Result<StatementResult> {
+        self.ensure_active()?;
+        let schema = {
+            let table = self.open_table(&stmt.table_name)?;
+            table.schema().clone()
+        };
+
+        // 1. Validate assignments
+        let mut col_assignments: Vec<(usize, crate::query::expr::Expr)> =
+            Vec::with_capacity(stmt.assignments.len());
+        let mut assigned_cols = std::collections::HashSet::new();
+
+        for assign in &stmt.assignments {
+            if !assigned_cols.insert(&assign.column_name) {
+                return Err(Error::TableSchemaMismatch(format!(
+                    "duplicate assignment to column '{}' in UPDATE",
+                    assign.column_name
+                )));
+            }
+
+            let col_idx = schema
+                .columns
+                .iter()
+                .position(|c| c.name == assign.column_name)
+                .ok_or_else(|| Error::ColumnNotFound(assign.column_name.clone()))?;
+
+            // Reject primary key column modification
+            if col_idx == schema.primary_key_idx {
+                return Err(Error::InvalidPrimaryKey(format!(
+                    "cannot update primary key column '{}'",
+                    assign.column_name
+                )));
+            }
+
+            let bound_expr = crate::sql::bind_expr(
+                &assign.expr,
+                &crate::sql::BindingContext::new_single(&stmt.table_name, None, &schema),
+            )?;
+            let expr_type = bound_expr.infer_type(&schema)?;
+            let target_col = &schema.columns[col_idx];
+
+            if expr_type != DataType::Null && expr_type != target_col.data_type {
+                let can_coerce = matches!(
+                    (&bound_expr, target_col.data_type),
+                    (crate::query::expr::Expr::Literal(Value::Int64(i)), DataType::UInt64) if *i >= 0
+                ) || matches!(
+                    (&bound_expr, target_col.data_type),
+                    (
+                        crate::query::expr::Expr::Literal(Value::Int64(_)),
+                        DataType::Float64
+                    )
+                );
+                if !can_coerce {
+                    return Err(Error::TypeMismatch {
+                        column: target_col.name.clone(),
+                        expected: target_col.data_type.to_string(),
+                        found: expr_type.to_string(),
+                    });
+                }
+            }
+
+            col_assignments.push((col_idx, bound_expr));
+        }
+
+        // 2. Use optimizer to select access path and candidate rows
+        let select_ast = crate::sql::SelectStatement {
+            projection: vec![crate::sql::SelectItem::Wildcard],
+            from: crate::sql::TableRef::new(&stmt.table_name),
+            joins: Vec::new(),
+            selection: stmt.selection.clone(),
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let bound_select = crate::sql::bind_select_multi(
+            &select_ast,
+            &[crate::sql::TableBinding::new(
+                &stmt.table_name,
+                None,
+                &schema,
+            )],
+        )?;
+
+        let table_opt_info = {
+            let table = self.open_table(&stmt.table_name)?;
+            let indexes = table.indexes().iter().map(|(m, _)| m.clone()).collect();
+            crate::query::optimizer::TableOptInfo::new(
+                &stmt.table_name,
+                None::<String>,
+                schema.clone(),
+                indexes,
+            )
+        };
+        let plan = crate::query::optimizer::Optimizer::optimize(&bound_select, &[table_opt_info])?;
+
+        // 3. Fetch candidate rows
+        let candidate_rows = {
+            let mut table = self.open_table(&stmt.table_name)?;
+            let initial_rows = match &plan.base_table.access_path {
+                crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
+                    match table.get(key)? {
+                        Some(row) => vec![row],
+                        None => Vec::new(),
+                    }
+                }
+                crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
+                    table.scan(start.as_ref(), end.as_ref())?
+                }
+                crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                    index_name,
+                    scan_type,
+                    ..
+                } => match scan_type {
+                    crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                        table.index_lookup(index_name, val)?
+                    }
+                    crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
+                        table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                    }
+                },
+                crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
+            };
+
+            match &plan.base_table.residual_filter {
+                Some(filter) => crate::query::FilterOperator::apply(initial_rows, &schema, filter)?,
+                None => initial_rows,
+            }
+        };
+
+        // 4. Update each matching row
+        let mut updated_count = 0;
+        let mut table = self.open_table(&stmt.table_name)?;
+
+        for old_row in candidate_rows {
+            let mut new_values = old_row.values.clone();
+
+            for (col_idx, expr) in &col_assignments {
+                let target_col = &schema.columns[*col_idx];
+                let mut val = expr.evaluate(&old_row, &schema)?;
+
+                val = match (val, target_col.data_type) {
+                    (Value::Int64(i), DataType::UInt64) if i >= 0 => Value::UInt64(i as u64),
+                    (Value::Int64(i), DataType::Float64) => Value::Float64(i as f64),
+                    (Value::UInt64(u), DataType::Int64) if u <= i64::MAX as u64 => {
+                        Value::Int64(u as i64)
+                    }
+                    (Value::UInt64(u), DataType::Float64) => Value::Float64(u as f64),
+                    (v, _) => v,
+                };
+
+                if val.is_null() {
+                    if !target_col.nullable {
+                        return Err(Error::NullConstraintViolation {
+                            column: target_col.name.clone(),
+                        });
+                    }
+                } else if val.data_type() != target_col.data_type {
+                    return Err(Error::TypeMismatch {
+                        column: target_col.name.clone(),
+                        expected: target_col.data_type.to_string(),
+                        found: val.data_type().to_string(),
+                    });
+                }
+
+                new_values[*col_idx] = val;
+            }
+
+            let new_row = crate::engine::types::Row::new(new_values);
+            table.update(&new_row)?;
+            updated_count += 1;
+        }
+
+        Ok(StatementResult::Updated {
+            rows: updated_count,
+        })
+    }
+
+    fn execute_delete(&mut self, stmt: &crate::sql::DeleteStatement) -> Result<StatementResult> {
+        self.ensure_active()?;
+        let schema = {
+            let table = self.open_table(&stmt.table_name)?;
+            table.schema().clone()
+        };
+
+        // 1. Use optimizer to select access path and candidate rows
+        let select_ast = crate::sql::SelectStatement {
+            projection: vec![crate::sql::SelectItem::Wildcard],
+            from: crate::sql::TableRef::new(&stmt.table_name),
+            joins: Vec::new(),
+            selection: stmt.selection.clone(),
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let bound_select = crate::sql::bind_select_multi(
+            &select_ast,
+            &[crate::sql::TableBinding::new(
+                &stmt.table_name,
+                None,
+                &schema,
+            )],
+        )?;
+
+        let table_opt_info = {
+            let table = self.open_table(&stmt.table_name)?;
+            let indexes = table.indexes().iter().map(|(m, _)| m.clone()).collect();
+            crate::query::optimizer::TableOptInfo::new(
+                &stmt.table_name,
+                None::<String>,
+                schema.clone(),
+                indexes,
+            )
+        };
+        let plan = crate::query::optimizer::Optimizer::optimize(&bound_select, &[table_opt_info])?;
+
+        // 2. Fetch candidate rows
+        let candidate_rows = {
+            let mut table = self.open_table(&stmt.table_name)?;
+            let initial_rows = match &plan.base_table.access_path {
+                crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
+                    match table.get(key)? {
+                        Some(row) => vec![row],
+                        None => Vec::new(),
+                    }
+                }
+                crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
+                    table.scan(start.as_ref(), end.as_ref())?
+                }
+                crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                    index_name,
+                    scan_type,
+                    ..
+                } => match scan_type {
+                    crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                        table.index_lookup(index_name, val)?
+                    }
+                    crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
+                        table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                    }
+                },
+                crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
+            };
+
+            match &plan.base_table.residual_filter {
+                Some(filter) => crate::query::FilterOperator::apply(initial_rows, &schema, filter)?,
+                None => initial_rows,
+            }
+        };
+
+        // 3. Delete matching rows by primary key
+        let mut deleted_count = 0;
+        let mut table = self.open_table(&stmt.table_name)?;
+
+        for row in candidate_rows {
+            let pk_val = &row.values[schema.primary_key_idx];
+            if table.delete(pk_val)?.is_some() {
+                deleted_count += 1;
+            }
+        }
+
+        Ok(StatementResult::Deleted {
+            rows: deleted_count,
+        })
     }
 
     /// Executes a fully optimized `PhysicalPlan` against this transaction.

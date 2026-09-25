@@ -8,7 +8,7 @@ pub use catalog::{
     CURRENT_CATALOG_VERSION, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
 };
 pub use table::Table;
-pub use transaction::{Transaction, TxnState};
+pub use transaction::{StatementResult, Transaction, TxnState};
 pub use types::{Column, DataType, Row, Schema, Value, MAX_COLUMN_NAME_LEN, TUPLE_FORMAT_VERSION};
 
 use std::path::{Path, PathBuf};
@@ -373,6 +373,15 @@ impl TreeDb {
         let explanation = txn.explain_sql(sql)?;
         txn.commit()?;
         Ok(explanation)
+    }
+
+    /// Executes an arbitrary top-level SQL statement (`SELECT`, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`)
+    /// directly on the database engine within an auto-committed transaction.
+    pub fn execute_statement(&mut self, sql: &str) -> Result<StatementResult> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.execute_statement(sql)?;
+        txn.commit()?;
+        Ok(result)
     }
 
     /// Parses, binds, optimizes, and executes an SQL `SELECT` statement directly on the database engine.

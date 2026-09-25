@@ -9,9 +9,10 @@ pub mod storage;
 pub mod wal;
 
 pub use engine::{
-    Catalog, CatalogPage, Column, DataType, IndexId, IndexMetadata, Row, Schema, Table, TableId,
-    TableMetadata, Transaction, TreeDb, TxnState, Value, CATALOG_MAGIC, CURRENT_CATALOG_VERSION,
-    MAX_COLUMN_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN, TUPLE_FORMAT_VERSION,
+    Catalog, CatalogPage, Column, DataType, IndexId, IndexMetadata, Row, Schema, StatementResult,
+    Table, TableId, TableMetadata, Transaction, TreeDb, TxnState, Value, CATALOG_MAGIC,
+    CURRENT_CATALOG_VERSION, MAX_COLUMN_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
+    TUPLE_FORMAT_VERSION,
 };
 pub use error::{Error, Result};
 pub use index::{
@@ -26,9 +27,11 @@ pub use query::{
     SortDirection, SortKey, SortOperator, UnaryOp,
 };
 pub use sql::{
-    bind_select, parse as parse_sql, tokenize as tokenize_sql, BindingContext, BoundSelect, Lexer,
-    OrderByExpr, OrderDirection, Parser, SelectItem, SelectStatement, SourceSpan, SqlBinaryOp,
-    SqlExpr, SqlLiteral, SqlUnaryOp, TableRef, Token, TokenKind, MAX_IDENTIFIER_LEN,
+    bind_select, parse as parse_sql, parse_statement as parse_statement_sql,
+    tokenize as tokenize_sql, BindingContext, BoundSelect, ColumnDef, CreateTableStatement,
+    DeleteStatement, DropTableStatement, InsertStatement, Lexer, OrderByExpr, OrderDirection,
+    Parser, SelectItem, SelectStatement, SourceSpan, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp,
+    Statement, TableRef, Token, TokenKind, UpdateAssignment, UpdateStatement, MAX_IDENTIFIER_LEN,
 };
 
 pub use storage::{
