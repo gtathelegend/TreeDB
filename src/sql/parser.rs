@@ -1,11 +1,11 @@
 use crate::engine::types::DataType;
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    ColumnDef, CreateTableStatement, Cte, CteQuery, DeleteStatement, DropTableStatement,
-    InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem,
-    SelectStatement, SetOperator, SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral,
-    SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement, WindowFrame,
-    WindowFrameBound, WindowFunction, WindowSpec, WithClause,
+    ColumnDef, CreateIndexStatement, CreateTableStatement, Cte, CteQuery, DeleteStatement,
+    DropIndexStatement, DropTableStatement, InsertStatement, JoinClause, JoinType, OrderByExpr,
+    OrderDirection, SelectItem, SelectStatement, SetOperator, SetQuery, SetQueryBody, SqlBinaryOp,
+    SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement,
+    WindowFrame, WindowFrameBound, WindowFunction, WindowSpec, WithClause,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};
@@ -43,8 +43,38 @@ impl<'a> Parser<'a> {
             TokenKind::Select | TokenKind::With | TokenKind::LParen => {
                 self.parse_query_statement()
             }
-            TokenKind::Create => Ok(Statement::CreateTable(self.parse_create_table()?)),
-            TokenKind::Drop => Ok(Statement::DropTable(self.parse_drop_table()?)),
+            TokenKind::Create => match self.peek_ahead(1).kind {
+                TokenKind::Table => Ok(Statement::CreateTable(self.parse_create_table()?)),
+                TokenKind::Index | TokenKind::Unique => {
+                    Ok(Statement::CreateIndex(self.parse_create_index()?))
+                }
+                _ => {
+                    let tok = self.peek_ahead(1).clone();
+                    Err(Error::SqlParseError {
+                        message: format!(
+                            "expected TABLE, INDEX, or UNIQUE after CREATE, found {}",
+                            tok.kind
+                        ),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    })
+                }
+            },
+            TokenKind::Drop => match self.peek_ahead(1).kind {
+                TokenKind::Table => Ok(Statement::DropTable(self.parse_drop_table()?)),
+                TokenKind::Index => Ok(Statement::DropIndex(self.parse_drop_index()?)),
+                _ => {
+                    let tok = self.peek_ahead(1).clone();
+                    Err(Error::SqlParseError {
+                        message: format!(
+                            "expected TABLE or INDEX after DROP, found {}",
+                            tok.kind
+                        ),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    })
+                }
+            },
             TokenKind::Insert => Ok(Statement::Insert(self.parse_insert()?)),
             TokenKind::Update => Ok(Statement::Update(self.parse_update()?)),
             TokenKind::Delete => Ok(Statement::Delete(self.parse_delete()?)),
@@ -413,6 +443,222 @@ impl<'a> Parser<'a> {
         }
 
         Ok(DropTableStatement { table_name })
+    }
+
+    /// Parses a complete SQL `CREATE INDEX` or `CREATE UNIQUE INDEX` statement.
+    ///
+    /// # Syntax
+    /// `CREATE [UNIQUE] INDEX <index_name> ON <table_name> ( <col_name> ) [;]`
+    pub fn parse_create_index(&mut self) -> Result<CreateIndexStatement> {
+        if self.peek().kind != TokenKind::Create {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected CREATE statement, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume CREATE
+
+        let mut unique = false;
+        if self.peek().kind == TokenKind::Unique {
+            self.advance(); // consume UNIQUE
+            unique = true;
+        }
+
+        if self.peek().kind != TokenKind::Index {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "expected INDEX in CREATE INDEX statement, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume INDEX
+
+        let name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected index name in CREATE INDEX, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume index name
+
+        if self.peek().kind != TokenKind::On {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "expected ON after index name in CREATE INDEX, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume ON
+
+        let table_name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected table name in CREATE INDEX, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume table name
+
+        if self.peek().kind != TokenKind::LParen {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "expected '(' after table name in CREATE INDEX, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume '('
+
+        if self.peek().kind == TokenKind::RParen {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: "CREATE INDEX requires exactly one column name, found empty column list"
+                    .to_string(),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+
+        let column_name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!(
+                        "expected column name in CREATE INDEX, expressions and function calls are not supported; found {}",
+                        tok.kind
+                    ),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume column name
+
+        if self.peek().kind == TokenKind::Comma {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: "composite indexes (multiple columns) are not supported in CREATE INDEX"
+                    .to_string(),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+
+        if self.peek().kind != TokenKind::RParen {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "expected ')' after column name in CREATE INDEX, found {}",
+                    tok.kind
+                ),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume ')'
+
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after CREATE INDEX statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        Ok(CreateIndexStatement {
+            name,
+            table_name,
+            column_name,
+            unique,
+        })
+    }
+
+    /// Parses a complete SQL `DROP INDEX` statement.
+    ///
+    /// # Syntax
+    /// `DROP INDEX <index_name> [;]`
+    pub fn parse_drop_index(&mut self) -> Result<DropIndexStatement> {
+        if self.peek().kind != TokenKind::Drop {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected DROP statement, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume DROP
+
+        if self.peek().kind != TokenKind::Index {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected INDEX after DROP, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume INDEX
+
+        let name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected index name in DROP INDEX, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume index name
+
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after DROP INDEX statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        Ok(DropIndexStatement { name })
     }
 
     /// Parses a complete SQL `INSERT INTO` statement.

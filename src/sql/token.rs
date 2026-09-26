@@ -60,6 +60,8 @@ pub enum TokenKind {
     Unbounded,
     Range,
     Groups,
+    Index,
+    Unique,
 
     // Data Type Keywords
     BooleanType,
@@ -156,6 +158,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Unbounded => write!(f, "UNBOUNDED"),
             TokenKind::Range => write!(f, "RANGE"),
             TokenKind::Groups => write!(f, "GROUPS"),
+            TokenKind::Index => write!(f, "INDEX"),
+            TokenKind::Unique => write!(f, "UNIQUE"),
             TokenKind::BooleanType => write!(f, "BOOLEAN"),
             TokenKind::BigIntType => write!(f, "BIGINT"),
             TokenKind::UBigIntType => write!(f, "UBIGINT"),

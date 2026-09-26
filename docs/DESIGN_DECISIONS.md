@@ -625,6 +625,41 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * Implementing set operations as a single composable physical operator (`PhysicalSetOp`) preserves the existing query engine as the single source of truth for expression evaluation, 3VL, schema coercion, and row representations without duplicating relational execution mechanics.
 
+## Decision 42: SQL Secondary-Index DDL Integration & Single-Column Architecture
+
+* **Decision:** Expose TreeDB's existing persistent secondary-index subsystem through SQL DDL (`CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`) by delegating directly to `Transaction` and the catalog rather than creating a separate index subsystem:
+  1. **Syntax & AST Representation:**
+     * `CREATE [UNIQUE] INDEX index_name ON table_name (column_name);`
+     * `DROP INDEX index_name;`
+     * Represented explicitly as `Statement::CreateIndex(CreateIndexStatement)` and `Statement::DropIndex(DropIndexStatement)`.
+     * Keywords are case-insensitive (`CREATE INDEX`, `create index`, `CrEaTe InDeX`). Identifiers are case-sensitive following TreeDB rules.
+  2. **Single-Column Grammar Invariant & Explicit Error Handling:**
+     * The grammar strictly requires a single column identifier: `(column_name)`.
+     * Multi-column/composite indexes, expression indexes (`LOWER(a)`, `a + 1`), partial indexes (`WHERE ...`), covering indexes (`INCLUDE ...`), and concurrent index creation are explicitly rejected with structured parse errors (`Error::ParserError`).
+     * `DROP INDEX` requires only the index name (resolved globally through the catalog).
+  3. **Semantic Binding & Validation:**
+     * `bind_create_index`: Resolves table and column against the persistent catalog, rejects unknown tables (`Error::TableNotFound`), unknown columns (`Error::ColumnNotFound`), duplicate index names (`Error::DuplicateIndex`), and verifies that the column type is supported.
+     * `bind_drop_index`: Resolves the index through the catalog, rejecting unknown indexes (`Error::IndexNotFound`).
+  4. **Supported Index Key Types:**
+     * Reuses Phase 17 `IndexKey` canonical encodings: `Null`, `Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`.
+  5. **Direct Delegation to Storage Layer & Index Population:**
+     * `execute_create_index` delegates directly to `Transaction::create_secondary_index(table_name, index_name, column_name, unique)`.
+     * Creating an index on an already-populated table scans all existing table rows and indexes them in the persistent B+ Tree, enforcing uniqueness constraints if specified.
+     * `execute_drop_index` delegates directly to `Transaction::drop_secondary_index(index_name)`, which unlinks the index from catalog metadata and reclaims all B+ Tree pages to the persistent freelist.
+  6. **Unique Index NULL Semantics:**
+     * Preserves TreeDB's Phase 17 design decision: a unique secondary index treats `NULL` as a normal unique key. Only one `NULL` value is permitted across all rows for that column. A second `NULL` causes a uniqueness violation (`Error::UniqueIndexViolation`).
+  7. **Transaction Atomicity, Rollback & ARIES Recovery:**
+     * Index creation and drops participate fully in transactions. Aborting/rolling back a transaction that created an index restores the catalog and leaves zero orphaned pages. Rolling back a dropped index restores the index structure and catalog metadata.
+     * Integrates transparently with WAL, checkpoints, and ARIES crash recovery.
+  8. **Optimizer & EXPLAIN Visibility:**
+     * The rule-based optimizer automatically detects newly created indexes on subsequent queries and selects `SecondaryIndexScan` (point lookup or range scan) when index predicates match. Dropping an index immediately reverts query plans to `FullTableScan`.
+     * `EXPLAIN` deterministically reflects the index lifecycle.
+  9. **Deferred Features:**
+     * Composite (multi-column) secondary indexes, expression indexes, partial indexes, covering/index-only scans, and online/concurrent index creation are deferred to future phases.
+* **Rationale:**
+  * Reusing the existing persistent secondary B+ Tree implementation guarantees that storage formats, WAL records, crash recovery, page recycling, and table mutation hooks remain unified and battle-tested without code or engine duplication.
+
+
 
 
 

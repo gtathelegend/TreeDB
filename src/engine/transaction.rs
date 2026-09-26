@@ -329,9 +329,14 @@ impl<'a, 'b> crate::sql::TableCatalog for TxnBufferPoolCatalog<'a, 'b> {
             .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
         crate::engine::catalog::Catalog::list_indexes_for_table(&mut bp, meta.table_id)
     }
+
+    fn get_index(&self, index_name: &str) -> Result<Option<crate::engine::catalog::IndexMetadata>> {
+        let mut bp = self.bp.borrow_mut();
+        crate::engine::catalog::Catalog::get_index(&mut bp, index_name)
+    }
 }
 
-/// Execution result returned by top-level SQL statements (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`).
+/// Execution result returned by top-level SQL statements (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatementResult {
     /// Result of an SQL `SELECT` query.
@@ -361,6 +366,16 @@ pub enum StatementResult {
         /// Name of the dropped table.
         table: String,
     },
+    /// Result of an SQL `CREATE INDEX` statement.
+    CreatedIndex {
+        /// Name of the created index.
+        index: String,
+    },
+    /// Result of an SQL `DROP INDEX` statement.
+    DroppedIndex {
+        /// Name of the dropped index.
+        index: String,
+    },
 }
 
 impl StatementResult {
@@ -382,7 +397,10 @@ impl StatementResult {
             StatementResult::Inserted { rows }
             | StatementResult::Updated { rows }
             | StatementResult::Deleted { rows } => *rows,
-            StatementResult::CreatedTable { .. } | StatementResult::DroppedTable { .. } => 0,
+            StatementResult::CreatedTable { .. }
+            | StatementResult::DroppedTable { .. }
+            | StatementResult::CreatedIndex { .. }
+            | StatementResult::DroppedIndex { .. } => 0,
         }
     }
 }
@@ -1517,6 +1535,10 @@ impl<'db> Transaction<'db> {
                 self.execute_create_table(&create_stmt)
             }
             crate::sql::Statement::DropTable(drop_stmt) => self.execute_drop_table(&drop_stmt),
+            crate::sql::Statement::CreateIndex(create_stmt) => {
+                self.execute_create_index(&create_stmt)
+            }
+            crate::sql::Statement::DropIndex(drop_stmt) => self.execute_drop_index(&drop_stmt),
             crate::sql::Statement::Insert(insert_stmt) => self.execute_insert(&insert_stmt),
             crate::sql::Statement::Update(update_stmt) => self.execute_update(&update_stmt),
             crate::sql::Statement::Delete(delete_stmt) => self.execute_delete(&delete_stmt),
@@ -1570,6 +1592,44 @@ impl<'db> Transaction<'db> {
         self.drop_table(&stmt.table_name)?;
         Ok(StatementResult::DroppedTable {
             table: stmt.table_name.clone(),
+        })
+    }
+
+    fn execute_create_index(
+        &mut self,
+        stmt: &crate::sql::CreateIndexStatement,
+    ) -> Result<StatementResult> {
+        self.ensure_active()?;
+        {
+            let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
+            let catalog = TxnBufferPoolCatalog {
+                bp: &bp_cell,
+                ctes: None,
+            };
+            crate::sql::binder::bind_create_index(stmt, &catalog)?;
+        }
+        self.create_index(&stmt.table_name, &stmt.name, &stmt.column_name, stmt.unique)?;
+        Ok(StatementResult::CreatedIndex {
+            index: stmt.name.clone(),
+        })
+    }
+
+    fn execute_drop_index(
+        &mut self,
+        stmt: &crate::sql::DropIndexStatement,
+    ) -> Result<StatementResult> {
+        self.ensure_active()?;
+        {
+            let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
+            let catalog = TxnBufferPoolCatalog {
+                bp: &bp_cell,
+                ctes: None,
+            };
+            crate::sql::binder::bind_drop_index(stmt, &catalog)?;
+        }
+        self.drop_index(&stmt.name)?;
+        Ok(StatementResult::DroppedIndex {
+            index: stmt.name.clone(),
         })
     }
 

@@ -18,6 +18,13 @@ pub trait TableCatalog {
     ) -> Result<Vec<crate::engine::catalog::IndexMetadata>> {
         Ok(Vec::new())
     }
+    /// Retrieves index metadata for an index by canonical index name.
+    fn get_index(
+        &self,
+        _index_name: &str,
+    ) -> Result<Option<crate::engine::catalog::IndexMetadata>> {
+        Ok(None)
+    }
 }
 
 impl<'a> TableCatalog for &[TableBinding<'a>] {
@@ -398,6 +405,94 @@ pub struct BoundSelect {
     pub limit: Option<usize>,
     /// Number of rows to skip (OFFSET).
     pub offset: Option<usize>,
+}
+
+/// Fully validated, bound SQL `CREATE INDEX` statement ready for execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundCreateIndex {
+    /// Name of the index.
+    pub name: String,
+    /// Target table name.
+    pub table_name: String,
+    /// Target column name.
+    pub column_name: String,
+    /// Target column index in the table schema.
+    pub column_index: usize,
+    /// Target column data type.
+    pub data_type: DataType,
+    /// Whether this index enforces uniqueness.
+    pub unique: bool,
+}
+
+/// Fully validated, bound SQL `DROP INDEX` statement ready for execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundDropIndex {
+    /// Name of the index to drop.
+    pub name: String,
+}
+
+/// Validates and binds a `CREATE INDEX` AST statement against the catalog and table schema.
+pub fn bind_create_index(
+    stmt: &crate::sql::CreateIndexStatement,
+    catalog: &dyn TableCatalog,
+) -> Result<BoundCreateIndex> {
+    crate::engine::catalog::validate_index_name(&stmt.name)?;
+
+    // 1. Resolve table schema through catalog
+    let schema = catalog.get_table_schema(&stmt.table_name)?;
+
+    // 2. Resolve column in table schema
+    let (col_idx, col) = schema
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.name == stmt.column_name)
+        .ok_or_else(|| Error::IndexColumnNotFound(stmt.column_name.clone()))?;
+
+    // 3. Check duplicate index name
+    if catalog.get_index(&stmt.name)?.is_some() {
+        return Err(Error::DuplicateIndexName(stmt.name.clone()));
+    }
+
+    // 4. Validate data type is supported by IndexKey
+    match col.data_type {
+        DataType::Boolean
+        | DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::String
+        | DataType::Bytes => {}
+        DataType::Null => {
+            return Err(Error::InvalidIndexDefinition(
+                "cannot index column of type Null".to_string(),
+            ));
+        }
+    }
+
+    Ok(BoundCreateIndex {
+        name: stmt.name.clone(),
+        table_name: stmt.table_name.clone(),
+        column_name: stmt.column_name.clone(),
+        column_index: col_idx,
+        data_type: col.data_type,
+        unique: stmt.unique,
+    })
+}
+
+/// Validates and binds a `DROP INDEX` AST statement against the catalog.
+pub fn bind_drop_index(
+    stmt: &crate::sql::DropIndexStatement,
+    catalog: &dyn TableCatalog,
+) -> Result<BoundDropIndex> {
+    crate::engine::catalog::validate_index_name(&stmt.name)?;
+
+    if catalog.get_index(&stmt.name)?.is_none() {
+        return Err(Error::IndexNotFound(stmt.name.clone()));
+    }
+
+    Ok(BoundDropIndex {
+        name: stmt.name.clone(),
+    })
 }
 
 /// Helper function to check if a SQL AST expression contains any window function.

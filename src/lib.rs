@@ -28,10 +28,11 @@ pub use query::{
 };
 pub use sql::{
     bind_select, parse as parse_sql, parse_statement as parse_statement_sql,
-    tokenize as tokenize_sql, BindingContext, BoundSelect, ColumnDef, CreateTableStatement,
-    DeleteStatement, DropTableStatement, InsertStatement, Lexer, OrderByExpr, OrderDirection,
-    Parser, SelectItem, SelectStatement, SourceSpan, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp,
-    Statement, TableRef, Token, TokenKind, UpdateAssignment, UpdateStatement, MAX_IDENTIFIER_LEN,
+    tokenize as tokenize_sql, BindingContext, BoundSelect, ColumnDef, CreateIndexStatement,
+    CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement, InsertStatement,
+    Lexer, OrderByExpr, OrderDirection, Parser, SelectItem, SelectStatement, SourceSpan,
+    SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, Token, TokenKind,
+    UpdateAssignment, UpdateStatement, MAX_IDENTIFIER_LEN,
 };
 
 pub use storage::{

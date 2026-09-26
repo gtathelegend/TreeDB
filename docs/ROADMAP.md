@@ -452,14 +452,35 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 27: Advanced Query Processing & Secondary Index DDL (Future)
+## Phase 27: SQL Secondary-Index DDL (Completed)
+* [x] Lexer & Parser support for `CREATE INDEX`, `CREATE UNIQUE INDEX`, and `DROP INDEX` with case-insensitive keywords and case-sensitive identifiers
+* [x] Structured AST representation: `CreateIndexStatement { name, table_name, column_name, unique }` and `DropIndexStatement { name }` integrated into `Statement` enum
+* [x] Grammar invariants: strict single-column restriction `(column_name)`; structured syntax errors rejecting multi-column, expression, partial, covering, and concurrent index syntax
+* [x] Semantic binding & validation: `bind_create_index` resolving table/column against catalog, rejecting unknown relations (`Error::TableNotFound`), unknown columns (`Error::ColumnNotFound`), duplicate index names (`Error::DuplicateIndex`), and unsupported data types
+* [x] `bind_drop_index` resolving index globally through catalog (`Error::IndexNotFound`)
+* [x] Storage engine delegation: directly delegates execution to `Transaction::create_secondary_index` and `Transaction::drop_secondary_index` without duplicating the B+ Tree engine
+* [x] Existing row population: `CREATE INDEX` scans and indexes all existing table rows into the persistent secondary B+ Tree
+* [x] Unique index semantics: strict single-`NULL` uniqueness rule preserved from Phase 17 (`Error::UniqueIndexViolation` on duplicate values or multiple `NULL`s)
+* [x] Supported index key types: canonical `IndexKey` encodings for `Null`, `Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`
+* [x] Page recycling & cleanup: `DROP INDEX` unlinks catalog metadata and recycles all index pages via the persistent freelist
+* [x] Table mutation maintenance: subsequent `INSERT`, `UPDATE`, `DELETE` automatically maintain SQL-created secondary indexes via existing table mutation hooks
+* [x] Optimizer integration: query access path planner selects `SecondaryIndexScan` on matching equality/range predicates; `DROP INDEX` immediately reverts plans to `FullTableScan`; deterministic `explain_sql` visibility
+* [x] Transaction atomicity: index creation and drop participate in transactions; full rollback on `abort()` with zero leaked pages and pristine catalog state
+* [x] WAL & ARIES crash recovery: index DDL operations participate in WAL logging, checkpoints, and crash recovery across restarts
+* [x] Persistence: full catalog validation and index usability verified across database close and reopen
+* [x] 19 dedicated integration tests in `tests/index_ddl.rs` including randomized reference oracle comparing against an in-memory BTreeMap (510 total test suite)
+
+---
+
+## Phase 28: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Hash join and merge join physical execution operators
-* [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
+* [ ] Expression indexes & partial indexes
 * [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Cost-based join optimization and cardinality estimation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

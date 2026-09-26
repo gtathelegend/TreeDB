@@ -14,6 +14,10 @@ pub enum Statement {
     CreateTable(CreateTableStatement),
     /// SQL `DROP TABLE` DDL statement.
     DropTable(DropTableStatement),
+    /// SQL `CREATE INDEX` DDL statement.
+    CreateIndex(CreateIndexStatement),
+    /// SQL `DROP INDEX` DDL statement.
+    DropIndex(DropIndexStatement),
     /// SQL `INSERT INTO` DML statement.
     Insert(InsertStatement),
     /// SQL `UPDATE` DML statement.
@@ -29,6 +33,8 @@ impl fmt::Display for Statement {
             Statement::SetQuery(s) => write!(f, "{s}"),
             Statement::CreateTable(s) => write!(f, "{s}"),
             Statement::DropTable(s) => write!(f, "{s}"),
+            Statement::CreateIndex(s) => write!(f, "{s}"),
+            Statement::DropIndex(s) => write!(f, "{s}"),
             Statement::Insert(s) => write!(f, "{s}"),
             Statement::Update(s) => write!(f, "{s}"),
             Statement::Delete(s) => write!(f, "{s}"),
@@ -111,6 +117,74 @@ pub struct DropTableStatement {
 impl fmt::Display for DropTableStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DROP TABLE {}", self.table_name)
+    }
+}
+
+/// AST node representing a `CREATE INDEX` or `CREATE UNIQUE INDEX` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateIndexStatement {
+    /// Name of the index to create.
+    pub name: String,
+    /// Target table name.
+    pub table_name: String,
+    /// Target column name to index.
+    pub column_name: String,
+    /// Whether this index enforces uniqueness.
+    pub unique: bool,
+}
+
+impl CreateIndexStatement {
+    /// Creates a new `CreateIndexStatement`.
+    pub fn new(
+        name: impl Into<String>,
+        table_name: impl Into<String>,
+        column_name: impl Into<String>,
+        unique: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            table_name: table_name.into(),
+            column_name: column_name.into(),
+            unique,
+        }
+    }
+}
+
+impl fmt::Display for CreateIndexStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.unique {
+            write!(
+                f,
+                "CREATE UNIQUE INDEX {} ON {} ({})",
+                self.name, self.table_name, self.column_name
+            )
+        } else {
+            write!(
+                f,
+                "CREATE INDEX {} ON {} ({})",
+                self.name, self.table_name, self.column_name
+            )
+        }
+    }
+}
+
+/// AST node representing a `DROP INDEX` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropIndexStatement {
+    /// Name of the index to drop.
+    pub name: String,
+}
+
+impl DropIndexStatement {
+    /// Creates a new `DropIndexStatement`.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl fmt::Display for DropIndexStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DROP INDEX {}", self.name)
     }
 }
 

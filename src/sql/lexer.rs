@@ -346,6 +346,8 @@ impl<'a> Lexer<'a> {
             "UNBOUNDED" => TokenKind::Unbounded,
             "RANGE" => TokenKind::Range,
             "GROUPS" => TokenKind::Groups,
+            "INDEX" => TokenKind::Index,
+            "UNIQUE" => TokenKind::Unique,
             "BOOLEAN" | "BOOL" => TokenKind::BooleanType,
             "BIGINT" | "INT64" | "INTEGER" | "INT" => TokenKind::BigIntType,
             "UBIGINT" | "UINT64" | "UINT" => TokenKind::UBigIntType,

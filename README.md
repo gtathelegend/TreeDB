@@ -70,6 +70,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **SQL Window Functions** | **Implemented** | Dedicated `WindowOperator`, ranking (`ROW_NUMBER`, `RANK`, `DENSE_RANK`), navigation (`LAG`, `LEAD`), value functions (`FIRST_VALUE`, `LAST_VALUE`), `PARTITION BY`, `ORDER BY`, `ROWS` frames, default framing, deterministic tie-breaking, CTE & JOIN composition |
 | **Recursive CTEs (WITH RECURSIVE)** | **Implemented** | Iterative `WITH RECURSIVE cte AS (anchor UNION ALL recursive) SELECT ...`, delta working-set loop, iteration & row limit safeguards, schema validation, mutual recursion rejection, composition with joins, filters, subqueries, and window functions |
 | **SQL Set Operations** | **Implemented** | `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`, precedence (`INTERSECT` > `UNION`/`EXCEPT`), parenthesized query expressions, `NULL = NULL` row identity equality, type coercion & output schema derivation from left operand, multiset arithmetic, subquery/CTE/JOIN/window/order-by integration |
+| **SQL Secondary-Index DDL** | **Implemented** | `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, single-column index specification, canonical `IndexKey` types, strict single-`NULL` uniqueness, persistent B+ Tree integration, existing row indexing, optimizer access-path visibility, transactional rollback & ARIES recovery |
 
 
 ---

@@ -33,20 +33,47 @@ fn main() -> Result<()> {
                 process::exit(1);
             });
 
-            let result = db.execute_sql(sql).unwrap_or_else(|e| {
+            let stmt_result = db.execute_statement(sql).unwrap_or_else(|e| {
                 eprintln!("SQL Execution Error: {e}");
                 process::exit(1);
             });
 
-            let schema = result.schema();
-            let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            println!("{}", col_names.join(" | "));
-            println!("{}", "-".repeat(col_names.join(" | ").len().max(10)));
-            for row in result.rows() {
-                let row_str: Vec<String> = row.values.iter().map(|v| v.to_string()).collect();
-                println!("{}", row_str.join(" | "));
+            match stmt_result {
+                treedb::StatementResult::Query(result) => {
+                    let schema = result.schema();
+                    let col_names: Vec<String> =
+                        schema.columns.iter().map(|c| c.name.clone()).collect();
+                    println!("{}", col_names.join(" | "));
+                    println!("{}", "-".repeat(col_names.join(" | ").len().max(10)));
+                    for row in result.rows() {
+                        let row_str: Vec<String> =
+                            row.values.iter().map(|v| v.to_string()).collect();
+                        println!("{}", row_str.join(" | "));
+                    }
+                    println!("({} row(s) returned)", result.len());
+                }
+                treedb::StatementResult::CreatedIndex { index } => {
+                    println!("Created index '{index}'");
+                }
+                treedb::StatementResult::DroppedIndex { index } => {
+                    println!("Dropped index '{index}'");
+                }
+                treedb::StatementResult::CreatedTable { table } => {
+                    println!("Created table '{table}'");
+                }
+                treedb::StatementResult::DroppedTable { table } => {
+                    println!("Dropped table '{table}'");
+                }
+                treedb::StatementResult::Inserted { rows } => {
+                    println!("Inserted {rows} row(s)");
+                }
+                treedb::StatementResult::Updated { rows } => {
+                    println!("Updated {rows} row(s)");
+                }
+                treedb::StatementResult::Deleted { rows } => {
+                    println!("Deleted {rows} row(s)");
+                }
             }
-            println!("({} row(s) returned)", result.len());
         }
         "init" => {
             if args.len() < 3 {

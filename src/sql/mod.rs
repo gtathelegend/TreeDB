@@ -6,16 +6,17 @@ pub mod span;
 pub mod token;
 
 pub use ast::{
-    AggregateFunction, ColumnDef, CreateTableStatement, Cte, CteQuery, DeleteStatement,
-    DropTableStatement, InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection,
-    SelectItem, SelectStatement, SetOperator, SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr,
-    SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement, WindowFrame,
-    WindowFrameBound, WindowFunction, WindowSpec, WithClause,
+    AggregateFunction, ColumnDef, CreateIndexStatement, CreateTableStatement, Cte, CteQuery,
+    DeleteStatement, DropIndexStatement, DropTableStatement, InsertStatement, JoinClause, JoinType,
+    OrderByExpr, OrderDirection, SelectItem, SelectStatement, SetOperator, SetQuery, SetQueryBody,
+    SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment,
+    UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction, WindowSpec, WithClause,
 };
 pub use binder::{
-    bind_expr, bind_grouped_expr, bind_select, bind_select_multi, bind_select_multi_with_catalog,
-    bind_select_with_context, BindingContext, BoundCte, BoundCteKind, BoundJoin, BoundSelect,
-    TableBinding, TableCatalog,
+    bind_create_index, bind_drop_index, bind_expr, bind_grouped_expr, bind_select,
+    bind_select_multi, bind_select_multi_with_catalog, bind_select_with_context, BindingContext,
+    BoundCreateIndex, BoundCte, BoundCteKind, BoundDropIndex, BoundJoin, BoundSelect, TableBinding,
+    TableCatalog,
 };
 pub use lexer::{Lexer, MAX_IDENTIFIER_LEN};
 pub use parser::Parser;
