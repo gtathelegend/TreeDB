@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
+use crate::query::external_sort::SortConfig;
 use crate::query::plan_cache::{PlanCache, PlanCacheStats};
 use crate::query::stats::{StatsRegistry, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
@@ -38,6 +39,7 @@ pub struct TreeDb {
     pub(crate) index_generation: u64,
     pub(crate) statistics_generation: u64,
     pub(crate) plan_cache: PlanCache,
+    pub(crate) sort_config: SortConfig,
 }
 
 impl TreeDb {
@@ -71,6 +73,7 @@ impl TreeDb {
             index_generation: 1,
             statistics_generation: 1,
             plan_cache: PlanCache::new(),
+            sort_config: SortConfig::default(),
         })
     }
 
@@ -96,6 +99,7 @@ impl TreeDb {
             index_generation: 1,
             statistics_generation: 1,
             plan_cache: PlanCache::new(),
+            sort_config: SortConfig::default(),
         })
     }
 
@@ -115,6 +119,7 @@ impl TreeDb {
             index_generation: 1,
             statistics_generation: 1,
             plan_cache: PlanCache::new(),
+            sort_config: SortConfig::default(),
         }
     }
 
@@ -707,5 +712,20 @@ impl TreeDb {
     /// Returns the current statistics generation counter.
     pub fn statistics_generation(&self) -> u64 {
         self.statistics_generation
+    }
+
+    /// Returns a reference to the active external sort configuration.
+    pub fn sort_config(&self) -> &SortConfig {
+        &self.sort_config
+    }
+
+    /// Returns a mutable reference to the active external sort configuration.
+    pub fn sort_config_mut(&mut self) -> &mut SortConfig {
+        &mut self.sort_config
+    }
+
+    /// Sets the active external sort configuration.
+    pub fn set_sort_config(&mut self, config: SortConfig) {
+        self.sort_config = config;
     }
 }

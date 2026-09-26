@@ -2681,6 +2681,21 @@ impl<'db> Transaction<'db> {
         self.db.clear_statistics(table_name);
     }
 
+    /// Returns a reference to the active external sort configuration.
+    pub fn sort_config(&self) -> &crate::query::external_sort::SortConfig {
+        self.db.sort_config()
+    }
+
+    /// Returns a mutable reference to the active external sort configuration.
+    pub fn sort_config_mut(&mut self) -> &mut crate::query::external_sort::SortConfig {
+        self.db.sort_config_mut()
+    }
+
+    /// Sets the active external sort configuration.
+    pub fn set_sort_config(&mut self, config: crate::query::external_sort::SortConfig) {
+        self.db.set_sort_config(config);
+    }
+
     /// Executes a fully optimized `PhysicalPlan` against this transaction.
     pub fn execute_physical_plan(
         &mut self,
@@ -2877,18 +2892,23 @@ impl<'db> Transaction<'db> {
             let mut current_rows = set_rows;
 
             if !plan.order_by.is_empty() {
-                let sorted_rows = crate::query::SortOperator::apply(
+                let (sorted_rows, sort_metrics) = crate::query::SortOperator::apply_with_config(
                     current_rows,
                     &set_op.schema,
                     &plan.order_by,
+                    &self.db.sort_config,
                 )?;
                 let mut sort_metric = crate::query::OperatorMetrics::new(
                     crate::query::OperatorKind::Sort,
                     Some(plan.estimated_rows),
                     Some(plan.total_cost),
                 );
-                sort_metric.input_rows = sorted_rows.len();
+                sort_metric.input_rows = sort_metrics.rows_input;
                 sort_metric.actual_rows = sorted_rows.len();
+                sort_metric.counters.runs_created = sort_metrics.runs_created;
+                sort_metric.counters.bytes_spilled = sort_metrics.bytes_spilled;
+                sort_metric.counters.merge_passes = sort_metrics.merge_passes;
+                sort_metric.counters.peak_memory_bytes = sort_metrics.peak_memory_bytes;
                 sort_metric.add_child(current_op);
                 current_op = sort_metric;
                 current_rows = sorted_rows;
@@ -3377,16 +3397,23 @@ impl<'db> Transaction<'db> {
 
         // 6. Sort Operator (ORDER BY)
         let sorted_rows = if !plan.order_by.is_empty() {
-            let pre_sort_count = working_rows.len();
-            let sorted =
-                crate::query::SortOperator::apply(working_rows, &working_schema, &plan.order_by)?;
+            let (sorted, sort_metrics) = crate::query::SortOperator::apply_with_config(
+                working_rows,
+                &working_schema,
+                &plan.order_by,
+                &self.db.sort_config,
+            )?;
             let mut sort_metric = crate::query::OperatorMetrics::new(
                 crate::query::OperatorKind::Sort,
                 Some(plan.estimated_rows),
                 Some(plan.total_cost),
             );
-            sort_metric.input_rows = pre_sort_count;
+            sort_metric.input_rows = sort_metrics.rows_input;
             sort_metric.actual_rows = sorted.len();
+            sort_metric.counters.runs_created = sort_metrics.runs_created;
+            sort_metric.counters.bytes_spilled = sort_metrics.bytes_spilled;
+            sort_metric.counters.merge_passes = sort_metrics.merge_passes;
+            sort_metric.counters.peak_memory_bytes = sort_metrics.peak_memory_bytes;
             sort_metric.add_child(current_op);
             current_op = sort_metric;
             sorted

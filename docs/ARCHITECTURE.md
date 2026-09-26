@@ -391,6 +391,11 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Generations & Invalidation:** `TreeDb` tracks monotonic version counters (`catalog_generation`, `index_generation`, `statistics_generation`). Operations (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `ANALYZE`, `set_statistics`, `clear_statistics`) bump corresponding generations and invalidate dependent cache entries.
   * **Transaction Safety & DDL Isolation:** Transactions with uncommitted catalog modifications bypass the shared plan cache. On commit or rollback, generations increment and affected cache entries are cleared, preventing uncommitted plan leakage.
   * **Capacity & Deterministic LRU Eviction:** Default capacity of 128 entries with deterministic LRU eviction. Exposes diagnostic telemetry via `PlanCacheStats` and tracks `plan_cache_hit` flag in `QueryExecutionMetrics`.
+* **External Sort & Spill-to-Disk Execution (`ExternalSorter`, `SortConfig`, `TempRunFile`, `RunReader`, `SortExecutionMetrics`):**
+  * **Dual-Path Execution:** Evaluates input rows against configured memory budget (`SortConfig.memory_budget_bytes`, default 64 KB). Sub-budget inputs sort via fast in-memory paths without I/O; super-budget inputs spill sorted runs to disk and perform a bounded k-way merge.
+  * **Authoritative Ordering:** Reuses canonical comparison engine (`compare_rows_by_sort_keys`) preserving `ASC`/`DESC`, `NULLS FIRST`/`LAST`, IEEE NaN float semantics (`f64::total_cmp`), and stable tie-breaking via monotonic sequence numbers.
+  * **External Runtime Lifecycle:** Spilled runs are written to dedicated temporary files outside `.treedb` pages, freelist, and WAL logs. Automatic cleanup on `Drop` via RAII wrappers guarantees zero orphaned temporary files across queries, errors, and transaction rollbacks.
+  * **Bounded K-Way & Multi-Pass Merge:** Merges runs concurrently in chunks bounded by `max_temp_files` (default 32) using a min-heap (`BinaryHeap<MergeItem>`), bounding merge memory to $O(\text{number\_of\_runs})$.
 
 ---
 
@@ -412,6 +417,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **Parameter Invariant & 3VL:** Bound parameter expressions evaluate consistently with SQL 3VL semantics (`WHERE col = ?` with `Value::Null` evaluates to False/Unknown, not `IS NULL`). Parameters in DDL or table/column identifiers are strictly prohibited.
 * **Prepared Statement Non-Persistence Invariant:** Preparing statements and parameter binding are strictly memory-resident, generating zero WAL records and zero page allocations.
 * **Plan Cache Invariant:** A cached physical plan is never reused when schema, index state, statistics assumptions, transaction visibility, or parameter-dependent planning conditions are no longer valid. Cache hits and misses produce semantically identical query results.
+* **External Sort Non-Persistence & Equivalence Invariant:** Temporary sort runs are strictly runtime external artifacts excluded from WAL and persistent database pages. Spilling decisions never alter query results, row ordering, duplicates, or column structures compared to in-memory execution.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -425,11 +431,13 @@ The following capabilities are intentionally deferred to subsequent phases:
 * Multi-column composite secondary indexes.
 * Index-only covering scans.
 * Hash join and merge join physical operators.
+* External aggregation and external hash join spilling.
 * DDL statements (`ALTER TABLE`) in SQL grammar.
 * Recursive CTE `UNION DISTINCT`, `SEARCH`, `CYCLE` clauses, and mutual recursion.
 * Derived tables (`FROM (SELECT ...)`).
 * Subquery flattening and cost-based decorrelation.
 * Multi-threading, concurrency control, and MVCC.
+
 
 
 

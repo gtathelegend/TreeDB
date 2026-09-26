@@ -2,6 +2,7 @@ pub mod builder;
 pub mod cardinality;
 pub mod cost;
 pub mod expr;
+pub mod external_sort;
 pub mod metrics;
 pub mod operator;
 pub mod optimizer;
@@ -22,9 +23,14 @@ pub use expr::{
     AggregateExpr, AggregateFunction, BinaryOp, BoundWindowFrame, BoundWindowSpec, Expr, UnaryOp,
     WindowExpr,
 };
+pub use external_sort::{
+    estimate_row_memory, write_sorted_run, ExternalSorter, RunReader, SortConfig,
+    SortExecutionMetrics, TempRunFile, DEFAULT_MAX_MERGE_PASSES, DEFAULT_MAX_TEMP_BYTES,
+    DEFAULT_MAX_TEMP_FILES, DEFAULT_SORT_MEMORY_BUDGET_BYTES, TEMP_RUN_MAGIC, TEMP_RUN_VERSION,
+};
 pub use metrics::{
-    estimate_error_ratio, format_plan_with_metrics, OperatorCounters, OperatorKind,
-    OperatorMetrics, QueryExecutionMetrics,
+    estimate_error_ratio, find_operator_metrics, format_plan_with_metrics, OperatorCounters,
+    OperatorKind, OperatorMetrics, QueryExecutionMetrics,
 };
 pub use operator::{
     compare_rows_by_sort_keys, compare_values_for_sort, AggregateOperator, AggregateState,

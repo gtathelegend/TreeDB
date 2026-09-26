@@ -554,7 +554,23 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 33: Advanced Query Processing & Optimizer Enhancements (Future)
+## Phase 33: External Sort & Spill-to-Disk Execution (Completed)
+* [x] Dedicated external sorting subsystem (`ExternalSorter`, `SortConfig`, `TempRunFile`, `RunReader`, `SortExecutionMetrics`)
+* [x] Dual-path execution: in-memory fast path for sub-budget inputs, spilling to disk for super-budget inputs
+* [x] Deterministic binary run file format (`TEMP_RUN_MAGIC = b"TSRN"`, little-endian encoded tagged rows `(sequence, Row)`)
+* [x] Full ORDER BY semantics preservation: `ASC`/`DESC`, `NULLS FIRST`/`LAST`, multi-key, all scalar types, `f64::total_cmp` float/NaN ordering
+* [x] Stable tie-breaking via monotonic sequence numbers matching in-memory sort order
+* [x] Bounded K-way merge using min-heap priority queue (`BinaryHeap<MergeItem>`)
+* [x] Multi-pass merge support for large numbers of runs exceeding `max_temp_files`
+* [x] RAII-managed temporary file lifecycle with automatic deletion on `Drop`
+* [x] Exclusion from WAL, transaction commit/rollback, and `.treedb` database pages
+* [x] Resource safeguards: `max_temp_bytes` (`Error::ExternalSortQuotaExceeded`) and `max_merge_passes` (`Error::ExternalSortMaxPassesExceeded`)
+* [x] Execution metrics & `EXPLAIN ANALYZE` integration reporting `runs_created`, `bytes_spilled`, `merge_passes`, `peak_memory_bytes`
+* [x] 12 dedicated integration tests in `tests/external_sort.rs` including randomized differential reference oracle (592 total passing test suite)
+
+---
+
+## Phase 34: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
@@ -562,6 +578,7 @@ This roadmap outlines the planned development phases for TreeDB.
 * [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Subquery flattening and decorrelation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

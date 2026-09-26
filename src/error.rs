@@ -474,4 +474,22 @@ pub enum Error {
     /// Invalid parameter usage or definition.
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
+
+    /// External sort temporary file I/O or directory error.
+    #[error("External sort I/O error: {0}")]
+    ExternalSortIo(String),
+
+    /// External sort temporary disk quota exceeded.
+    #[error(
+        "External sort disk quota exceeded: spilled {bytes_spilled} bytes, limit is {limit} bytes"
+    )]
+    ExternalSortQuotaExceeded { bytes_spilled: usize, limit: usize },
+
+    /// External sort maximum merge passes exceeded.
+    #[error("External sort max merge passes exceeded: reached {passes}, limit is {limit}")]
+    ExternalSortMaxPassesExceeded { passes: usize, limit: usize },
+
+    /// Corrupted or truncated temporary sort run file.
+    #[error("External sort run corruption detected: {0}")]
+    ExternalSortRunCorrupted(String),
 }

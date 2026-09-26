@@ -812,6 +812,39 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * **Correctness Before Performance:** Query result semantics must be 100% invariant under cache hits vs. cache misses. Rigorous multi-generation invalidation and transaction isolation guarantee that stale or invalid physical plans are never executed.
 
+## Decision 48: External Sort and Spill-to-Disk Execution for Large Intermediate Queries
+
+* **Decision:** Introduce an external sorting subsystem (`ExternalSorter`, `SortConfig`, `TempRunFile`, `RunReader`, `SortExecutionMetrics`) capable of spilling intermediate query sort batches to disk when memory budgets are exceeded:
+  1. **Dual-Path Sort Architecture (In-Memory Fast Path & Spill Path):**
+     * Inputs whose estimated memory footprint fits within the configured memory budget (`SortConfig.memory_budget_bytes`, default 64 KB) execute entirely in memory via standard in-memory sorting, avoiding all disk I/O.
+     * When the in-memory budget is exceeded, intermediate batches are sorted in-memory and flushed to temporary on-disk run files (`TempRunFile`), followed by a deterministic k-way merge.
+  2. **Authoritative ORDER BY Semantics & Strict Equivalence:**
+     * The external sorter directly reuses the existing `compare_rows_by_sort_keys` comparison engine across all data types (`Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`, `Null`), direction flags (`ASC`/`DESC`), and explicit/default NULL placement (`NULLS FIRST`/`NULLS LAST`).
+     * Preserves `f64::total_cmp` floating-point ordering (including IEEE NaN semantics) and stable tie-breaking via monotonic sequence numbers (`(sequence: u64, Row)`).
+     * Output rows are 100% semantically identical between in-memory and spilled execution.
+  3. **Temporary Files as External Runtime Resources:**
+     * Temporary sort run files are external filesystem artifacts created in a dedicated temporary directory (`SortConfig.temp_dir`, default `std::env::temp_dir()`).
+     * Temporary runs are strictly excluded from TreeDB `.treedb` database pages, freelist allocation, and WAL logging. Spilling is a transient runtime execution strategy rather than persistent database state.
+  4. **RAII-Managed File Lifecycle & Leak Prevention:**
+     * `TempRunFile` guarantees deterministic automatic removal on `Drop` (`std::fs::remove_file`).
+     * Temporary files are cleaned up reliably upon normal query completion, query error, transaction abort, or transaction drop.
+  5. **Deterministic Binary Format (`TEMP_RUN_MAGIC = b"TSRN"`):**
+     * Temporary runs use an explicit little-endian binary format featuring a 16-byte header (`magic`, `version`, `reserved`, `row_count`) followed by serialized tagged rows (`sequence`, column count, typed value discriminants and payloads).
+     * Truncated or corrupt run files are detected with structured errors (`Error::ExternalSortRunCorrupted`).
+  6. **Bounded K-Way and Multi-Pass Merge:**
+     * Merges up to `max_temp_files` (default 32) runs concurrently using a min-heap priority queue (`BinaryHeap<MergeItem>`).
+     * Memory consumption during merge is bounded to $O(\text{number\_of\_runs})$ rather than $O(\text{total\_input\_rows})$.
+     * If the number of runs exceeds `max_temp_files`, multi-pass merging groups runs into intermediate runs until a final merge pass can be completed directly to the output stream.
+  7. **Resource Safeguards & Structured Errors:**
+     * Enforces configurable hard limits: `max_temp_bytes` (default 1 GB, `Error::ExternalSortQuotaExceeded`) and `max_merge_passes` (default 100, `Error::ExternalSortMaxPassesExceeded`).
+  8. **Metrics & EXPLAIN ANALYZE Integration:**
+     * `SortExecutionMetrics` tracks `rows_input`, `rows_output`, `runs_created`, `bytes_spilled`, `merge_passes`, and `peak_memory_bytes`.
+     * `EXPLAIN ANALYZE` formats sort execution details (`runs_created`, `bytes_spilled`, `merge_passes`) when spilling occurs, while standard `EXPLAIN` remains purely logical.
+* **Rationale:**
+  * **Memory Boundedness & Resilience:** Large intermediate query results (e.g. sorting large joins, aggregations, or full tables) should not exhaust available process memory or cause out-of-memory crashes.
+  * **Exclusion from WAL and Persistent Storage:** Temporary sort data is strictly transient and query-scoped. Keeping it outside the WAL and database page allocation engine eliminates lock contention, avoids freelist churn, and ensures zero crash-recovery overhead.
+
+
 
 
 

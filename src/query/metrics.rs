@@ -78,6 +78,14 @@ pub struct OperatorCounters {
     pub matched_rows: usize,
     /// Distinct group keys produced during aggregation.
     pub group_count: usize,
+    /// Number of temporary runs created during external sort spilling.
+    pub runs_created: usize,
+    /// Total bytes written/spilled to temporary files during external sort.
+    pub bytes_spilled: usize,
+    /// Number of merge passes executed during external sorting.
+    pub merge_passes: usize,
+    /// Peak in-memory bytes used during sort operations.
+    pub peak_memory_bytes: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -328,6 +336,23 @@ pub fn format_plan_with_metrics(
             .map(|k| format!("{} {:?}", k.expression, k.direction))
             .collect();
         out.push_str(&format!("Sort [{}]\n", keys.join(", ")));
+        if let Some(root) = &metrics.root_operator {
+            if let Some(sort_op) = find_operator_metrics(root, &|k| matches!(k, OperatorKind::Sort))
+            {
+                write_indent(&mut out, indent + 1);
+                if sort_op.counters.runs_created > 0 {
+                    out.push_str(&format!(
+                        "actual_rows: {}, runs_created: {}, bytes_spilled: {}, merge_passes: {}\n",
+                        sort_op.actual_rows,
+                        sort_op.counters.runs_created,
+                        sort_op.counters.bytes_spilled,
+                        sort_op.counters.merge_passes
+                    ));
+                } else {
+                    out.push_str(&format!("actual_rows: {}\n", sort_op.actual_rows));
+                }
+            }
+        }
         indent += 1;
     }
 
@@ -514,4 +539,23 @@ pub fn format_plan_with_metrics(
     }
 
     out
+}
+
+/// Recursively searches an operator metrics tree for the first node matching `predicate`.
+pub fn find_operator_metrics<'a, F>(
+    node: &'a OperatorMetrics,
+    predicate: &F,
+) -> Option<&'a OperatorMetrics>
+where
+    F: Fn(&OperatorKind) -> bool,
+{
+    if predicate(&node.kind) {
+        return Some(node);
+    }
+    for child in &node.children {
+        if let Some(m) = find_operator_metrics(child, predicate) {
+            return Some(m);
+        }
+    }
+    None
 }

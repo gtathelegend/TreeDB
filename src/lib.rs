@@ -24,12 +24,15 @@ pub use index::{
 };
 pub use query::{
     estimate_error_ratio, BinaryOp, CardinalityEstimator, ColumnStatistics, CostModel, Expr,
-    FilterOperator, IndexStatistics, OffsetLimitOperator, OperatorCounters, OperatorKind,
-    OperatorMetrics, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,
+    ExternalSorter, FilterOperator, IndexStatistics, OffsetLimitOperator, OperatorCounters,
+    OperatorKind, OperatorMetrics, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,
     PlanCacheStats, PlanCost, PlanValidity, ProjectOperator, Query, QueryExecutionMetrics,
-    QueryResult, SortDirection, SortKey, SortOperator, StatisticsProvider, StatsRegistry,
-    TableStatistics, UnaryOp, DEFAULT_PLAN_CACHE_CAPACITY,
+    QueryResult, RunReader, SortConfig, SortDirection, SortExecutionMetrics, SortKey, SortOperator,
+    StatisticsProvider, StatsRegistry, TableStatistics, TempRunFile, UnaryOp,
+    DEFAULT_MAX_MERGE_PASSES, DEFAULT_MAX_TEMP_BYTES, DEFAULT_MAX_TEMP_FILES,
+    DEFAULT_PLAN_CACHE_CAPACITY, DEFAULT_SORT_MEMORY_BUDGET_BYTES,
 };
+
 pub use sql::{
     bind_select, parse as parse_sql, parse_statement as parse_statement_sql,
     tokenize as tokenize_sql, AnalyzeStatement, BindingContext, BoundSelect, ColumnDef,

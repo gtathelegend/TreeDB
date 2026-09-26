@@ -329,32 +329,28 @@ impl ProjectOperator {
 pub struct SortOperator;
 
 impl SortOperator {
-    /// Sorts rows according to the specified sort keys.
-    pub fn apply(mut rows: Vec<Row>, schema: &Schema, sort_keys: &[SortKey]) -> Result<Vec<Row>> {
-        if sort_keys.is_empty() {
-            return Ok(rows);
-        }
+    /// Sorts rows according to the specified sort keys using the default sort configuration.
+    pub fn apply(rows: Vec<Row>, schema: &Schema, sort_keys: &[SortKey]) -> Result<Vec<Row>> {
+        Self::apply_with_config(
+            rows,
+            schema,
+            sort_keys,
+            &crate::query::external_sort::SortConfig::default(),
+        )
+        .map(|(r, _)| r)
+    }
 
-        for key in sort_keys {
-            key.expression.infer_type(schema)?;
-        }
-
-        let mut sort_err = Ok(());
-        rows.sort_by(|a, b| {
-            if sort_err.is_err() {
-                return Ordering::Equal;
-            }
-            match compare_rows_by_sort_keys(a, b, schema, sort_keys) {
-                Ok(ord) => ord,
-                Err(e) => {
-                    sort_err = Err(e);
-                    Ordering::Equal
-                }
-            }
-        });
-
-        sort_err?;
-        Ok(rows)
+    /// Sorts rows according to the specified sort keys and configuration, returning the sorted rows
+    /// and execution telemetry.
+    pub fn apply_with_config(
+        rows: Vec<Row>,
+        schema: &Schema,
+        sort_keys: &[SortKey],
+        config: &crate::query::external_sort::SortConfig,
+    ) -> Result<(Vec<Row>, crate::query::external_sort::SortExecutionMetrics)> {
+        let sorter =
+            crate::query::external_sort::ExternalSorter::new(schema, sort_keys, config.clone());
+        sorter.sort(rows)
     }
 }
 
