@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
+use crate::query::plan_cache::{PlanCache, PlanCacheStats};
 use crate::query::stats::{StatsRegistry, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::{Key, PageId};
@@ -33,6 +34,10 @@ pub struct TreeDb {
     buffer_pool: BufferPool,
     active_txn: Option<TxnId>,
     stats: StatsRegistry,
+    pub(crate) catalog_generation: u64,
+    pub(crate) index_generation: u64,
+    pub(crate) statistics_generation: u64,
+    pub(crate) plan_cache: PlanCache,
 }
 
 impl TreeDb {
@@ -62,6 +67,10 @@ impl TreeDb {
             buffer_pool,
             active_txn: None,
             stats: StatsRegistry::new(),
+            catalog_generation: 1,
+            index_generation: 1,
+            statistics_generation: 1,
+            plan_cache: PlanCache::new(),
         })
     }
 
@@ -83,6 +92,10 @@ impl TreeDb {
             buffer_pool,
             active_txn: None,
             stats: StatsRegistry::new(),
+            catalog_generation: 1,
+            index_generation: 1,
+            statistics_generation: 1,
+            plan_cache: PlanCache::new(),
         })
     }
 
@@ -98,6 +111,10 @@ impl TreeDb {
             buffer_pool,
             active_txn: None,
             stats: StatsRegistry::new(),
+            catalog_generation: 1,
+            index_generation: 1,
+            statistics_generation: 1,
+            plan_cache: PlanCache::new(),
         }
     }
 
@@ -322,6 +339,11 @@ impl TreeDb {
 
         let result = Catalog::create_table(&mut self.buffer_pool, name, schema);
 
+        if result.is_ok() {
+            self.catalog_generation += 1;
+            self.plan_cache.invalidate_all();
+        }
+
         if let Some(tid) = auto_txn {
             if result.is_ok() {
                 self.commit_txn(tid)?;
@@ -505,6 +527,12 @@ impl TreeDb {
             unique,
         );
 
+        if result.is_ok() {
+            self.catalog_generation += 1;
+            self.index_generation += 1;
+            self.plan_cache.invalidate_all();
+        }
+
         if let Some(tid) = auto_txn {
             if result.is_ok() {
                 self.commit_txn(tid)?;
@@ -525,6 +553,12 @@ impl TreeDb {
         };
 
         let result = Catalog::drop_index(&mut self.buffer_pool, name);
+
+        if result.is_ok() {
+            self.catalog_generation += 1;
+            self.index_generation += 1;
+            self.plan_cache.invalidate_all();
+        }
 
         if let Some(tid) = auto_txn {
             if result.is_ok() {
@@ -558,6 +592,11 @@ impl TreeDb {
         };
 
         let result = Catalog::drop_table(&mut self.buffer_pool, name);
+
+        if result.is_ok() {
+            self.catalog_generation += 1;
+            self.plan_cache.invalidate_all();
+        }
 
         if let Some(tid) = auto_txn {
             if result.is_ok() {
@@ -595,6 +634,8 @@ impl TreeDb {
         let mut table = self.open_table(table_name)?;
         let stats = table.collect_statistics()?;
         self.stats.set_table_stats(stats.clone());
+        self.statistics_generation += 1;
+        self.plan_cache.invalidate_statistics(table_name);
         Ok(stats)
     }
 
@@ -605,12 +646,17 @@ impl TreeDb {
 
     /// Sets or overrides statistics for a table.
     pub fn set_statistics(&mut self, stats: TableStatistics) {
+        let table_name = stats.table_name.clone();
         self.stats.set_table_stats(stats);
+        self.statistics_generation += 1;
+        self.plan_cache.invalidate_statistics(&table_name);
     }
 
     /// Removes registered statistics for a table.
     pub fn clear_statistics(&mut self, table_name: &str) {
         self.stats.remove_table_stats(table_name);
+        self.statistics_generation += 1;
+        self.plan_cache.invalidate_statistics(table_name);
     }
 
     /// Returns a reference to the database statistics registry.
@@ -621,5 +667,45 @@ impl TreeDb {
     /// Returns a mutable reference to the database statistics registry.
     pub fn statistics_registry_mut(&mut self) -> &mut StatsRegistry {
         &mut self.stats
+    }
+
+    /// Returns a reference to the physical plan cache.
+    pub fn plan_cache(&self) -> &PlanCache {
+        &self.plan_cache
+    }
+
+    /// Returns a mutable reference to the physical plan cache.
+    pub fn plan_cache_mut(&mut self) -> &mut PlanCache {
+        &mut self.plan_cache
+    }
+
+    /// Returns diagnostic plan cache statistics.
+    pub fn plan_cache_stats(&self) -> PlanCacheStats {
+        self.plan_cache.stats()
+    }
+
+    /// Clears all entries from the physical plan cache.
+    pub fn clear_plan_cache(&mut self) {
+        self.plan_cache.clear();
+    }
+
+    /// Sets the maximum capacity of the physical plan cache.
+    pub fn set_plan_cache_capacity(&mut self, capacity: usize) {
+        self.plan_cache.set_capacity(capacity);
+    }
+
+    /// Returns the current catalog/schema generation counter.
+    pub fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+
+    /// Returns the current index generation counter.
+    pub fn index_generation(&self) -> u64 {
+        self.index_generation
+    }
+
+    /// Returns the current statistics generation counter.
+    pub fn statistics_generation(&self) -> u64 {
+        self.statistics_generation
     }
 }

@@ -434,6 +434,7 @@ pub struct Transaction<'db> {
     initial_freelist_head: PageId,
     initial_free_page_count: u32,
     initial_page_count: u32,
+    pub(crate) has_catalog_mutations: bool,
 }
 
 impl<'db> Transaction<'db> {
@@ -453,6 +454,7 @@ impl<'db> Transaction<'db> {
             initial_freelist_head,
             initial_free_page_count,
             initial_page_count,
+            has_catalog_mutations: false,
         }
     }
 
@@ -558,7 +560,14 @@ impl<'db> Transaction<'db> {
         schema: crate::engine::types::Schema,
     ) -> Result<crate::engine::catalog::TableId> {
         self.ensure_active()?;
-        crate::engine::catalog::Catalog::create_table(&mut self.db.buffer_pool, name, schema)
+        let res =
+            crate::engine::catalog::Catalog::create_table(&mut self.db.buffer_pool, name, schema);
+        if res.is_ok() {
+            self.has_catalog_mutations = true;
+            self.db.catalog_generation += 1;
+            self.db.plan_cache.invalidate_all();
+        }
+        res
     }
 
     /// Opens an existing table handle for relational operations within this transaction.
@@ -598,19 +607,33 @@ impl<'db> Transaction<'db> {
         unique: bool,
     ) -> Result<crate::engine::catalog::IndexId> {
         self.ensure_active()?;
-        crate::engine::catalog::Catalog::create_index(
+        let res = crate::engine::catalog::Catalog::create_index(
             &mut self.db.buffer_pool,
             table_name,
             index_name,
             column_name,
             unique,
-        )
+        );
+        if res.is_ok() {
+            self.has_catalog_mutations = true;
+            self.db.catalog_generation += 1;
+            self.db.index_generation += 1;
+            self.db.plan_cache.invalidate_all();
+        }
+        res
     }
 
     /// Drops a persistent secondary index and reclaims its pages within this transaction.
     pub fn drop_index(&mut self, index_name: &str) -> Result<()> {
         self.ensure_active()?;
-        crate::engine::catalog::Catalog::drop_index(&mut self.db.buffer_pool, index_name)
+        let res = crate::engine::catalog::Catalog::drop_index(&mut self.db.buffer_pool, index_name);
+        if res.is_ok() {
+            self.has_catalog_mutations = true;
+            self.db.catalog_generation += 1;
+            self.db.index_generation += 1;
+            self.db.plan_cache.invalidate_all();
+        }
+        res
     }
 
     /// Retrieves metadata for a secondary index by name.
@@ -1928,12 +1951,74 @@ impl<'db> Transaction<'db> {
 
         match &stmt.statement {
             crate::sql::Statement::Select(select_stmt) => {
-                let plan = self.plan_select_with_params(select_stmt, Some(params))?;
+                let plan = if self.has_catalog_mutations {
+                    self.plan_select_with_params(select_stmt, Some(params))?
+                } else {
+                    let param_sig = crate::query::ParamPlanningSignature::from_values(params);
+                    let key = crate::query::PlanCacheKey::new(
+                        &stmt.sql,
+                        param_sig,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    );
+                    if let Some(cached_plan) = self.db.plan_cache.get(
+                        &key,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    ) {
+                        cached_plan
+                    } else {
+                        let new_plan = self.plan_select_with_params(select_stmt, Some(params))?;
+                        let (tables, indexes) = crate::query::extract_plan_references(&new_plan);
+                        let validity = crate::query::PlanValidity::new(
+                            self.db.catalog_generation,
+                            self.db.index_generation,
+                            self.db.statistics_generation,
+                            tables,
+                            indexes,
+                        );
+                        self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                        new_plan
+                    }
+                };
                 let query_result = self.execute_physical_plan(&plan)?;
                 Ok(StatementResult::Query(query_result))
             }
             crate::sql::Statement::SetQuery(set_stmt) => {
-                let plan = self.plan_set_query_with_params(set_stmt, Some(params))?;
+                let plan = if self.has_catalog_mutations {
+                    self.plan_set_query_with_params(set_stmt, Some(params))?
+                } else {
+                    let param_sig = crate::query::ParamPlanningSignature::from_values(params);
+                    let key = crate::query::PlanCacheKey::new(
+                        &stmt.sql,
+                        param_sig,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    );
+                    if let Some(cached_plan) = self.db.plan_cache.get(
+                        &key,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    ) {
+                        cached_plan
+                    } else {
+                        let new_plan = self.plan_set_query_with_params(set_stmt, Some(params))?;
+                        let (tables, indexes) = crate::query::extract_plan_references(&new_plan);
+                        let validity = crate::query::PlanValidity::new(
+                            self.db.catalog_generation,
+                            self.db.index_generation,
+                            self.db.statistics_generation,
+                            tables,
+                            indexes,
+                        );
+                        self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                        new_plan
+                    }
+                };
                 let query_result = self.execute_physical_plan(&plan)?;
                 Ok(StatementResult::Query(query_result))
             }
@@ -2020,23 +2105,93 @@ impl<'db> Transaction<'db> {
 
         match &stmt.statement {
             crate::sql::Statement::Select(select_stmt) => {
-                let plan = self.plan_select_with_params(select_stmt, Some(params))?;
+                let (plan, is_hit) = if self.has_catalog_mutations {
+                    (
+                        self.plan_select_with_params(select_stmt, Some(params))?,
+                        false,
+                    )
+                } else {
+                    let param_sig = crate::query::ParamPlanningSignature::from_values(params);
+                    let key = crate::query::PlanCacheKey::new(
+                        &stmt.sql,
+                        param_sig,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    );
+                    if let Some(cached_plan) = self.db.plan_cache.get(
+                        &key,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    ) {
+                        (cached_plan, true)
+                    } else {
+                        let new_plan = self.plan_select_with_params(select_stmt, Some(params))?;
+                        let (tables, indexes) = crate::query::extract_plan_references(&new_plan);
+                        let validity = crate::query::PlanValidity::new(
+                            self.db.catalog_generation,
+                            self.db.index_generation,
+                            self.db.statistics_generation,
+                            tables,
+                            indexes,
+                        );
+                        self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                        (new_plan, false)
+                    }
+                };
                 let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
                 let metrics = crate::query::QueryExecutionMetrics::new(
                     start.elapsed(),
                     qr.rows.len(),
                     Some(root_op),
-                );
+                )
+                .with_plan_cache_hit(is_hit);
                 Ok((qr, metrics))
             }
             crate::sql::Statement::SetQuery(set_stmt) => {
-                let plan = self.plan_set_query_with_params(set_stmt, Some(params))?;
+                let (plan, is_hit) = if self.has_catalog_mutations {
+                    (
+                        self.plan_set_query_with_params(set_stmt, Some(params))?,
+                        false,
+                    )
+                } else {
+                    let param_sig = crate::query::ParamPlanningSignature::from_values(params);
+                    let key = crate::query::PlanCacheKey::new(
+                        &stmt.sql,
+                        param_sig,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    );
+                    if let Some(cached_plan) = self.db.plan_cache.get(
+                        &key,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    ) {
+                        (cached_plan, true)
+                    } else {
+                        let new_plan = self.plan_set_query_with_params(set_stmt, Some(params))?;
+                        let (tables, indexes) = crate::query::extract_plan_references(&new_plan);
+                        let validity = crate::query::PlanValidity::new(
+                            self.db.catalog_generation,
+                            self.db.index_generation,
+                            self.db.statistics_generation,
+                            tables,
+                            indexes,
+                        );
+                        self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                        (new_plan, false)
+                    }
+                };
                 let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
                 let metrics = crate::query::QueryExecutionMetrics::new(
                     start.elapsed(),
                     qr.rows.len(),
                     Some(root_op),
-                );
+                )
+                .with_plan_cache_hit(is_hit);
                 Ok((qr, metrics))
             }
             _ => {
@@ -3865,7 +4020,13 @@ impl<'db> Transaction<'db> {
     /// Drops a table from the catalog and reclaims its pages within this transaction.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         self.ensure_active()?;
-        crate::engine::catalog::Catalog::drop_table(&mut self.db.buffer_pool, name)
+        let res = crate::engine::catalog::Catalog::drop_table(&mut self.db.buffer_pool, name);
+        if res.is_ok() {
+            self.has_catalog_mutations = true;
+            self.db.catalog_generation += 1;
+            self.db.plan_cache.invalidate_all();
+        }
+        res
     }
 
     /// Retrieves table metadata for `name` within this transaction.
@@ -3918,11 +4079,25 @@ impl<'db> Transaction<'db> {
         self.db.buffer_pool_mut()
     }
 
+    /// Returns diagnostic plan cache statistics.
+    pub fn plan_cache_stats(&self) -> crate::query::plan_cache::PlanCacheStats {
+        self.db.plan_cache_stats()
+    }
+
+    /// Clears all entries from the physical plan cache.
+    pub fn clear_plan_cache(&mut self) {
+        self.db.clear_plan_cache();
+    }
+
     /// Commits all mutations performed in this transaction, flushing the WAL through the commit LSN.
     pub fn commit(mut self) -> Result<()> {
         self.ensure_active()?;
         self.db.commit_txn(self.txn_id)?;
         self.state = TxnState::Committed;
+        if self.has_catalog_mutations {
+            self.db.catalog_generation += 1;
+            self.db.plan_cache.invalidate_all();
+        }
         Ok(())
     }
 
@@ -3973,6 +4148,11 @@ impl<'db> Transaction<'db> {
                 .write_header_to_disk();
             self.db.tree =
                 crate::index::bplus_tree::BPlusTree::from_root(self.initial_root_page_id);
+            if self.has_catalog_mutations {
+                self.db.catalog_generation += 1;
+                self.db.index_generation += 1;
+                self.db.plan_cache.invalidate_all();
+            }
             self.state = TxnState::Aborted;
         }
         Ok(())

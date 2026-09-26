@@ -25,9 +25,10 @@ pub use index::{
 pub use query::{
     estimate_error_ratio, BinaryOp, CardinalityEstimator, ColumnStatistics, CostModel, Expr,
     FilterOperator, IndexStatistics, OffsetLimitOperator, OperatorCounters, OperatorKind,
-    OperatorMetrics, PlanCost, ProjectOperator, Query, QueryExecutionMetrics, QueryResult,
-    SortDirection, SortKey, SortOperator, StatisticsProvider, StatsRegistry, TableStatistics,
-    UnaryOp,
+    OperatorMetrics, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,
+    PlanCacheStats, PlanCost, PlanValidity, ProjectOperator, Query, QueryExecutionMetrics,
+    QueryResult, SortDirection, SortKey, SortOperator, StatisticsProvider, StatsRegistry,
+    TableStatistics, UnaryOp, DEFAULT_PLAN_CACHE_CAPACITY,
 };
 pub use sql::{
     bind_select, parse as parse_sql, parse_statement as parse_statement_sql,

@@ -159,6 +159,8 @@ pub struct QueryExecutionMetrics {
     pub total_index_lookups: usize,
     /// Aggregate count of tuples fetched from record storage.
     pub total_tuples_fetched: usize,
+    /// Whether the physical plan was retrieved from the plan cache.
+    pub plan_cache_hit: bool,
 }
 
 impl QueryExecutionMetrics {
@@ -188,7 +190,14 @@ impl QueryExecutionMetrics {
             total_rows_scanned,
             total_index_lookups,
             total_tuples_fetched,
+            plan_cache_hit: false,
         }
+    }
+
+    /// Sets whether this query execution was a plan cache hit.
+    pub fn with_plan_cache_hit(mut self, hit: bool) -> Self {
+        self.plan_cache_hit = hit;
+        self
     }
 
     fn accumulate_totals(

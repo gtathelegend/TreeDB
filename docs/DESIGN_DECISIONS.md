@@ -777,9 +777,41 @@ This document records key architectural and design choices, their rationale, and
      * This avoids complex plan invalidation logic, schema evolution hazards, and suboptimal parameter-sniffing plans when data distributions are skewed.
   6. **Prepared Statement Diagnostics & Runtime Metrics:**
      * Provides `explain_prepared`, `explain_prepared_with_metrics`, and `execute_prepared_with_metrics` APIs on both `Transaction` and `TreeDb`.
+## Decision 47: Bounded, Invalidation-Aware Physical Plan Cache for Prepared Statements
+
+* **Decision:** Introduce a runtime-only, bounded, deterministic, invalidation-aware, transaction-safe, statistics-aware, parameter-sensitive physical plan cache for prepared statements:
+  1. **Runtime-Only & Zero-Persistence Scope:**
+     * The physical plan cache is strictly memory-resident and scoped to an active `TreeDb` instance.
+     * Never serialized to disk, never logged to WAL, and never recovered across database crashes or restarts. Reopening a database starts with an empty cache.
+  2. **Strongly Typed Cache Key (`PlanCacheKey`):**
+     * Keyed by a strongly typed, deterministic structure combining:
+       - Prepared statement SQL / AST representation (`sql: String`)
+       - Parameter planning signature (`params: ParamPlanningSignature`) capturing canonical bound values via `CanonicalValue`
+       - Monotonic generation identifiers (`catalog_generation`, `index_generation`, `statistics_generation`)
+  3. **Monotonic Generation Versioning & Explicit Invalidation:**
+     * `TreeDb` maintains monotonic version counters: `catalog_generation: u64`, `index_generation: u64`, and `statistics_generation: u64`.
+     * `CREATE TABLE` and `DROP TABLE` increment `catalog_generation` and invalidate affected schema entries.
+     * `CREATE INDEX` and `DROP INDEX` increment `index_generation` and invalidate index-dependent plans.
+     * `ANALYZE` and manual statistics modifications increment `statistics_generation` and invalidate statistics-dependent plans.
+     * `PlanValidity` records the referenced table names, referenced index names, and generation snapshot at optimization time to guarantee validity before reuse.
+  4. **Transaction Safety & Uncommitted DDL Isolation:**
+     * Transactions track uncommitted catalog modifications (`has_catalog_mutations: bool`).
+     * Any transaction with uncommitted DDL bypasses the shared plan cache to prevent uncommitted schema/index assumptions from leaking to other transactions.
+     * On commit or abort of catalog-mutating transactions, generation counters are bumped and affected cache entries are cleared.
+  5. **Parameter-Sensitive Planning Signature:**
+     * Re-planning or cache lookup is parameter-sensitive: concrete parameter values are converted into a canonical representation (`ParamPlanningSignature`) to distinguish queries whose cardinality, access paths (point lookup vs. range scan vs. full scan), or join order vary based on bound values.
+  6. **Bounded Capacity & Deterministic LRU Eviction:**
+     * The cache is strictly bounded with a configurable capacity (`DEFAULT_PLAN_CACHE_CAPACITY = 128`).
+     * Eviction uses a deterministic Least Recently Used (LRU) policy backed by access tracking.
+  7. **Diagnostics, Metrics & EXPLAIN Integration:**
+     * Exposes `PlanCacheStats` (`hits`, `misses`, `evictions`, `entries`, `capacity`) via `db.plan_cache_stats()` and `txn.plan_cache_stats()`.
+     * `QueryExecutionMetrics` tracks `plan_cache_hit: bool` across prepared executions, allowing `EXPLAIN ANALYZE` and metrics APIs to report cache reuse without contaminating physical execution timings.
+  8. **Owned Plan Structures & No Unsafe Rust:**
+     * Cached physical plans are self-contained, fully owned `PhysicalPlan` trees with zero borrowed lifetimes or references to active transactions, buffer pool frames, or catalog structures.
+     * 100% safe Rust without `unsafe`, raw pointers, or transmutation.
 * **Rationale:**
-  * **Safety & Security:** Parameterization eliminates SQL injection risks and provides clean separation between query structure and user data.
-  * **Optimal Access Paths:** Re-optimizing at execution time with concrete parameter values ensures the cost-based optimizer selects optimal index access paths without generic plan degradation or cache invalidation overhead.
+  * **Correctness Before Performance:** Query result semantics must be 100% invariant under cache hits vs. cache misses. Rigorous multi-generation invalidation and transaction isolation guarantee that stale or invalid physical plans are never executed.
+
 
 
 

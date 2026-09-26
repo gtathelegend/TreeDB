@@ -5,6 +5,7 @@ pub mod expr;
 pub mod metrics;
 pub mod operator;
 pub mod optimizer;
+pub mod plan_cache;
 pub mod stats;
 
 pub use builder::Query;
@@ -33,6 +34,10 @@ pub use operator::{
 pub use optimizer::{
     AccessPath, Optimizer, PhysicalJoin, PhysicalPlan, PhysicalSetOp, PhysicalTableScan,
     SecondaryScanType, TableOptInfo,
+};
+pub use plan_cache::{
+    extract_plan_references, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,
+    PlanCacheStats, PlanValidity, DEFAULT_PLAN_CACHE_CAPACITY,
 };
 pub use stats::{
     ColumnStatistics, IndexStatistics, StatisticsProvider, StatsRegistry, TableStatistics,

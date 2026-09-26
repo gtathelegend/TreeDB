@@ -538,7 +538,23 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 32: Advanced Query Processing & Optimizer Enhancements (Future)
+## Phase 32: Physical Plan Cache & Prepared-Statement Reuse (Completed)
+* [x] Dedicated plan cache subsystem (`PlanCache`, `PlanCacheKey`, `PlanValidity`, `PlanCacheEntry`, `PlanCacheStats`)
+* [x] Strongly typed cache key: normalized SQL string, canonical parameter planning signature (`ParamPlanningSignature` using `CanonicalValue`), monotonic catalog generation, index generation, and statistics generation
+* [x] Monotonic generation tracking on `TreeDb`: `catalog_generation`, `index_generation`, `statistics_generation`
+* [x] Multi-level explicit cache invalidation: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `ANALYZE`, `set_statistics`, `clear_statistics`
+* [x] Transaction safety & DDL isolation: uncommitted catalog modifications (`has_catalog_mutations`) bypass global cache; generation bumps on commit/abort prevent uncommitted plan leakage
+* [x] Parameter-sensitive planning: distinguishable cache keys for differing parameter values, preventing plan regression across parameter-dependent access paths
+* [x] Bounded capacity & deterministic LRU eviction (`DEFAULT_PLAN_CACHE_CAPACITY = 128`)
+* [x] Cache diagnostics: `PlanCacheStats` exposing `hits`, `misses`, `evictions`, `entries`, `capacity` on `TreeDb` and `Transaction`
+* [x] Execution metrics & EXPLAIN ANALYZE integration: `plan_cache_hit: bool` tracked in `QueryExecutionMetrics`
+* [x] Strict runtime-only memory residence: zero WAL records, zero disk persistence, fresh empty cache upon open/reopen
+* [x] Correctness invariant: 100% semantic equivalence between cached and uncached executions
+* [x] 12 dedicated integration tests in `tests/plan_cache.rs` including randomized differential reference oracle (580 total passing test suite)
+
+---
+
+## Phase 33: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
@@ -546,6 +562,7 @@ This roadmap outlines the planned development phases for TreeDB.
 * [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Subquery flattening and decorrelation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

@@ -384,7 +384,13 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Strict Execution Validation:** `execute_prepared` validates parameter count (`Error::ParameterCountMismatch`) and type compatibility against inferred types (`Error::ParameterTypeMismatch`), permitting `Value::Null` across all types.
   * **SQL 3-Valued Logic (3VL):** Parameter values evaluate strictly according to SQL 3VL rules (`WHERE col = ?` with `NULL` produces `Null`/`False`, not `IS NULL`).
   * **Value-Sensitive Optimization:** Parameter values are bound into `Expr::Parameter { index, value }` prior to query planning, allowing the cost-based optimizer to select optimal index access paths (PK point lookup, PK range scan, secondary index scan) based on concrete values rather than generic fallback plans.
-  * **Diagnostics & Plan Cache Separation:** Includes `explain_prepared`, `explain_prepared_with_metrics`, and `execute_prepared_with_metrics`. Physical plan caching across executions is intentionally separated to prevent plan invalidation overhead and parameter sniffing skew.
+  * **Diagnostics & Plan Cache Separation:** Includes `explain_prepared`, `explain_prepared_with_metrics`, and `execute_prepared_with_metrics`.
+* **Physical Plan Cache & Prepared Statement Reuse (`PlanCache`, `PlanCacheKey`, `PlanValidity`):**
+  * **Runtime-Only Cache:** In-memory, bounded plan cache scoped to an active `TreeDb` instance. Never persisted to disk, never logged to WAL, and begins empty upon database open/reopen.
+  * **Keying Strategy:** Uses strongly typed `PlanCacheKey` containing the prepared statement SQL, parameter planning signature (`ParamPlanningSignature` with `CanonicalValue`), `catalog_generation`, `index_generation`, and `statistics_generation`.
+  * **Generations & Invalidation:** `TreeDb` tracks monotonic version counters (`catalog_generation`, `index_generation`, `statistics_generation`). Operations (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `ANALYZE`, `set_statistics`, `clear_statistics`) bump corresponding generations and invalidate dependent cache entries.
+  * **Transaction Safety & DDL Isolation:** Transactions with uncommitted catalog modifications bypass the shared plan cache. On commit or rollback, generations increment and affected cache entries are cleared, preventing uncommitted plan leakage.
+  * **Capacity & Deterministic LRU Eviction:** Default capacity of 128 entries with deterministic LRU eviction. Exposes diagnostic telemetry via `PlanCacheStats` and tracks `plan_cache_hit` flag in `QueryExecutionMetrics`.
 
 ---
 
@@ -405,6 +411,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **Window Cardinality Invariant:** Window function evaluation never collapses or filters rows; the output row cardinality of `WindowOperator` strictly equals input row cardinality.
 * **Parameter Invariant & 3VL:** Bound parameter expressions evaluate consistently with SQL 3VL semantics (`WHERE col = ?` with `Value::Null` evaluates to False/Unknown, not `IS NULL`). Parameters in DDL or table/column identifiers are strictly prohibited.
 * **Prepared Statement Non-Persistence Invariant:** Preparing statements and parameter binding are strictly memory-resident, generating zero WAL records and zero page allocations.
+* **Plan Cache Invariant:** A cached physical plan is never reused when schema, index state, statistics assumptions, transaction visibility, or parameter-dependent planning conditions are no longer valid. Cache hits and misses produce semantically identical query results.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -415,15 +422,15 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 ## 8. Intentionally Deferred Items
 
 The following capabilities are intentionally deferred to subsequent phases:
-* Physical plan caching and cached plan invalidation across prepared statement executions.
 * Multi-column composite secondary indexes.
 * Index-only covering scans.
-* Full cost-based optimizer and cardinality statistics.
-* DDL statements (`CREATE INDEX`, `DROP INDEX`) in SQL grammar.
+* Hash join and merge join physical operators.
+* DDL statements (`ALTER TABLE`) in SQL grammar.
 * Recursive CTE `UNION DISTINCT`, `SEARCH`, `CYCLE` clauses, and mutual recursion.
 * Derived tables (`FROM (SELECT ...)`).
 * Subquery flattening and cost-based decorrelation.
 * Multi-threading, concurrency control, and MVCC.
+
 
 
 
