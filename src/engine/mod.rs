@@ -397,6 +397,21 @@ impl TreeDb {
         Ok(result)
     }
 
+    /// Parses, binds, optimizes, and executes an SQL statement directly on the database engine,
+    /// returning both the query result and runtime query execution metrics within an auto-committed transaction.
+    pub fn execute_sql_with_metrics(
+        &mut self,
+        sql: &str,
+    ) -> Result<(
+        crate::query::QueryResult,
+        crate::query::QueryExecutionMetrics,
+    )> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.execute_sql_with_metrics(sql)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
     /// Creates a persistent secondary index.
     pub fn create_index(
         &mut self,

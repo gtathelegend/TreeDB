@@ -2,6 +2,7 @@ pub mod builder;
 pub mod cardinality;
 pub mod cost;
 pub mod expr;
+pub mod metrics;
 pub mod operator;
 pub mod optimizer;
 pub mod stats;
@@ -19,6 +20,10 @@ pub use cost::{
 pub use expr::{
     AggregateExpr, AggregateFunction, BinaryOp, BoundWindowFrame, BoundWindowSpec, Expr, UnaryOp,
     WindowExpr,
+};
+pub use metrics::{
+    estimate_error_ratio, format_plan_with_metrics, OperatorCounters, OperatorKind,
+    OperatorMetrics, QueryExecutionMetrics,
 };
 pub use operator::{
     compare_rows_by_sort_keys, compare_values_for_sort, AggregateOperator, AggregateState,

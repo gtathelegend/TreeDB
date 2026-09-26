@@ -1558,7 +1558,18 @@ impl<'db> Transaction<'db> {
                         )))
                     }
                 };
-                let plan_str = plan.to_string();
+                let plan_str = if explain_stmt.analyze {
+                    let start = std::time::Instant::now();
+                    let (res, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                    let metrics = crate::query::QueryExecutionMetrics::new(
+                        start.elapsed(),
+                        res.rows.len(),
+                        Some(root_op),
+                    );
+                    crate::query::metrics::format_plan_with_metrics(&plan, &metrics)
+                } else {
+                    plan.to_string()
+                };
                 let schema = Schema::new_projected(vec![crate::engine::types::Column::new(
                     "plan",
                     DataType::String,
@@ -1601,6 +1612,109 @@ impl<'db> Transaction<'db> {
         self.ensure_active()?;
         let res = self.execute_statement(sql)?;
         res.into_query()
+    }
+
+    /// Parses, binds, optimizes, and executes an SQL statement, returning both the query result
+    /// and fine-grained runtime execution metrics.
+    pub fn execute_sql_with_metrics(
+        &mut self,
+        sql: &str,
+    ) -> Result<(
+        crate::query::QueryResult,
+        crate::query::QueryExecutionMetrics,
+    )> {
+        self.ensure_active()?;
+        let start = std::time::Instant::now();
+        let stmt = crate::sql::parse_statement(sql)?;
+        match stmt {
+            crate::sql::Statement::Select(select_stmt) => {
+                let plan = self.plan_select(&select_stmt)?;
+                let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                let metrics = crate::query::QueryExecutionMetrics::new(
+                    start.elapsed(),
+                    qr.rows.len(),
+                    Some(root_op),
+                );
+                Ok((qr, metrics))
+            }
+            crate::sql::Statement::SetQuery(set_stmt) => {
+                let plan = self.plan_set_query(&set_stmt)?;
+                let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                let metrics = crate::query::QueryExecutionMetrics::new(
+                    start.elapsed(),
+                    qr.rows.len(),
+                    Some(root_op),
+                );
+                Ok((qr, metrics))
+            }
+            other => {
+                let res = match other {
+                    crate::sql::Statement::Explain(explain_stmt) => {
+                        let plan = match explain_stmt.query.as_ref() {
+                            crate::sql::Statement::Select(select_stmt) => {
+                                self.plan_select(select_stmt)?
+                            }
+                            crate::sql::Statement::SetQuery(set_stmt) => {
+                                self.plan_set_query(set_stmt)?
+                            }
+                            _ => {
+                                return Err(Error::UnsupportedExplainTarget(format!(
+                                    "{}",
+                                    explain_stmt.query
+                                )))
+                            }
+                        };
+                        let plan_str = if explain_stmt.analyze {
+                            let (res, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                            let metrics = crate::query::QueryExecutionMetrics::new(
+                                start.elapsed(),
+                                res.rows.len(),
+                                Some(root_op),
+                            );
+                            crate::query::metrics::format_plan_with_metrics(&plan, &metrics)
+                        } else {
+                            plan.to_string()
+                        };
+                        let schema =
+                            Schema::new_projected(vec![crate::engine::types::Column::new(
+                                "plan",
+                                DataType::String,
+                                false,
+                            )]);
+                        let rows = vec![Row::new(vec![Value::String(plan_str)])];
+                        crate::query::QueryResult::new(schema, rows)
+                    }
+                    crate::sql::Statement::CreateTable(create_stmt) => {
+                        self.execute_create_table(&create_stmt)?.into_query()?
+                    }
+                    crate::sql::Statement::DropTable(drop_stmt) => {
+                        self.execute_drop_table(&drop_stmt)?.into_query()?
+                    }
+                    crate::sql::Statement::CreateIndex(create_stmt) => {
+                        self.execute_create_index(&create_stmt)?.into_query()?
+                    }
+                    crate::sql::Statement::DropIndex(drop_stmt) => {
+                        self.execute_drop_index(&drop_stmt)?.into_query()?
+                    }
+                    crate::sql::Statement::Insert(insert_stmt) => {
+                        self.execute_insert(&insert_stmt)?.into_query()?
+                    }
+                    crate::sql::Statement::Update(update_stmt) => {
+                        self.execute_update(&update_stmt)?.into_query()?
+                    }
+                    crate::sql::Statement::Delete(delete_stmt) => {
+                        self.execute_delete(&delete_stmt)?.into_query()?
+                    }
+                    crate::sql::Statement::Analyze(analyze_stmt) => {
+                        self.execute_analyze(&analyze_stmt)?.into_query()?
+                    }
+                    _ => unreachable!(),
+                };
+                let metrics =
+                    crate::query::QueryExecutionMetrics::new(start.elapsed(), res.rows.len(), None);
+                Ok((res, metrics))
+            }
+        }
     }
 
     fn execute_create_table(
@@ -2081,7 +2195,19 @@ impl<'db> Transaction<'db> {
         outer_contexts: &[(&Row, &Schema)],
     ) -> Result<crate::query::QueryResult> {
         let mut cte_store = std::collections::HashMap::new();
-        self.execute_physical_plan_internal(plan, outer_contexts, &mut cte_store)
+        let (qr, _metrics) =
+            self.execute_physical_plan_internal_with_metrics(plan, outer_contexts, &mut cte_store)?;
+        Ok(qr)
+    }
+
+    /// Executes a fully optimized `PhysicalPlan` against this transaction, returning both the query result
+    /// and the full operator execution metrics tree.
+    pub fn execute_physical_plan_with_metrics(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+    ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
+        let mut cte_store = std::collections::HashMap::new();
+        self.execute_physical_plan_internal_with_metrics(plan, &[], &mut cte_store)
     }
 
     fn execute_physical_plan_internal(
@@ -2090,15 +2216,42 @@ impl<'db> Transaction<'db> {
         outer_contexts: &[(&Row, &Schema)],
         cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
     ) -> Result<crate::query::QueryResult> {
+        let (res, _metrics) =
+            self.execute_physical_plan_internal_with_metrics(plan, outer_contexts, cte_store)?;
+        Ok(res)
+    }
+
+    fn execute_physical_plan_internal_with_metrics(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
+    ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
         self.ensure_active()?;
+        let op_start = std::time::Instant::now();
 
         // 0. Materialize any CTEs defined on this plan (in declaration order)
+        let mut cte_metrics = Vec::new();
         for cte in &plan.ctes {
             if !cte_store.contains_key(&cte.name) {
                 match &cte.kind {
-                    crate::sql::BoundCteKind::NonRecursive { plan } => {
-                        let res =
-                            self.execute_physical_plan_internal(plan, outer_contexts, cte_store)?;
+                    crate::sql::BoundCteKind::NonRecursive { plan: cte_plan } => {
+                        let (res, cte_op) = self.execute_physical_plan_internal_with_metrics(
+                            cte_plan,
+                            outer_contexts,
+                            cte_store,
+                        )?;
+                        let mut cte_metric = crate::query::OperatorMetrics::new(
+                            crate::query::OperatorKind::Cte {
+                                name: cte.name.clone(),
+                            },
+                            Some(cte_plan.estimated_rows),
+                            Some(cte_plan.total_cost),
+                        );
+                        cte_metric.actual_rows = res.rows.len();
+                        cte_metric.input_rows = res.rows.len();
+                        cte_metric.add_child(cte_op);
+                        cte_metrics.push(cte_metric);
                         cte_store.insert(cte.name.clone(), (cte.output_schema.clone(), res.rows));
                     }
                     crate::sql::BoundCteKind::Recursive {
@@ -2107,11 +2260,12 @@ impl<'db> Transaction<'db> {
                         max_iterations,
                         max_rows,
                     } => {
-                        let anchor_res = self.execute_physical_plan_internal(
-                            anchor_plan,
-                            outer_contexts,
-                            cte_store,
-                        )?;
+                        let (anchor_res, anchor_op) = self
+                            .execute_physical_plan_internal_with_metrics(
+                                anchor_plan,
+                                outer_contexts,
+                                cte_store,
+                            )?;
                         let mut accumulated_rows = anchor_res.rows;
                         if accumulated_rows.len() > *max_rows {
                             return Err(Error::RecursiveCteRowLimit {
@@ -2138,11 +2292,12 @@ impl<'db> Transaction<'db> {
                                 (cte.output_schema.clone(), working_rows),
                             );
 
-                            let next_res = self.execute_physical_plan_internal(
-                                recursive_plan,
-                                outer_contexts,
-                                cte_store,
-                            )?;
+                            let (next_res, _next_op) = self
+                                .execute_physical_plan_internal_with_metrics(
+                                    recursive_plan,
+                                    outer_contexts,
+                                    cte_store,
+                                )?;
                             let next_working_rows = next_res.rows;
 
                             if next_working_rows.is_empty() {
@@ -2163,8 +2318,21 @@ impl<'db> Transaction<'db> {
 
                         cte_store.insert(
                             cte.name.clone(),
-                            (cte.output_schema.clone(), accumulated_rows),
+                            (cte.output_schema.clone(), accumulated_rows.clone()),
                         );
+
+                        let mut rec_metric = crate::query::OperatorMetrics::new(
+                            crate::query::OperatorKind::RecursiveCte {
+                                name: cte.name.clone(),
+                                iterations,
+                            },
+                            Some(anchor_plan.estimated_rows),
+                            Some(anchor_plan.total_cost),
+                        );
+                        rec_metric.actual_rows = accumulated_rows.len();
+                        rec_metric.input_rows = accumulated_rows.len();
+                        rec_metric.add_child(anchor_op);
+                        cte_metrics.push(rec_metric);
                     }
                 }
             }
@@ -2174,40 +2342,121 @@ impl<'db> Transaction<'db> {
         self.pre_evaluate_uncorrelated_subqueries_internal(&mut plan, outer_contexts, cte_store)?;
 
         if let Some(set_op) = &plan.set_op {
-            let left_res =
-                self.execute_physical_plan_internal(&set_op.left, outer_contexts, cte_store)?;
-            let right_res =
-                self.execute_physical_plan_internal(&set_op.right, outer_contexts, cte_store)?;
+            let (left_res, left_op) = self.execute_physical_plan_internal_with_metrics(
+                &set_op.left,
+                outer_contexts,
+                cte_store,
+            )?;
+            let (right_res, right_op) = self.execute_physical_plan_internal_with_metrics(
+                &set_op.right,
+                outer_contexts,
+                cte_store,
+            )?;
+            let left_count = left_res.rows.len();
+            let right_count = right_res.rows.len();
             let set_rows = crate::query::SetOperationOperator::apply(
                 left_res.rows,
                 right_res.rows,
                 &set_op.schema,
                 &set_op.op,
             )?;
-            let sorted_rows =
-                crate::query::SortOperator::apply(set_rows, &set_op.schema, &plan.order_by)?;
-            let paginated_rows =
-                crate::query::OffsetLimitOperator::apply(sorted_rows, plan.offset, plan.limit);
-            return Ok(crate::query::QueryResult::new(
-                set_op.schema.clone(),
-                paginated_rows,
+            let mut set_metric = crate::query::OperatorMetrics::new(
+                crate::query::OperatorKind::SetOperation {
+                    op: set_op.op.to_string(),
+                },
+                Some(plan.estimated_rows),
+                Some(plan.total_cost),
+            );
+            set_metric.input_rows = left_count + right_count;
+            set_metric.actual_rows = set_rows.len();
+            set_metric.add_child(left_op);
+            set_metric.add_child(right_op);
+
+            let mut current_op = set_metric;
+            let mut current_rows = set_rows;
+
+            if !plan.order_by.is_empty() {
+                let sorted_rows = crate::query::SortOperator::apply(
+                    current_rows,
+                    &set_op.schema,
+                    &plan.order_by,
+                )?;
+                let mut sort_metric = crate::query::OperatorMetrics::new(
+                    crate::query::OperatorKind::Sort,
+                    Some(plan.estimated_rows),
+                    Some(plan.total_cost),
+                );
+                sort_metric.input_rows = sorted_rows.len();
+                sort_metric.actual_rows = sorted_rows.len();
+                sort_metric.add_child(current_op);
+                current_op = sort_metric;
+                current_rows = sorted_rows;
+            }
+
+            if plan.offset.is_some() || plan.limit.is_some() {
+                let paginated_rows =
+                    crate::query::OffsetLimitOperator::apply(current_rows, plan.offset, plan.limit);
+                let mut limit_metric = crate::query::OperatorMetrics::new(
+                    crate::query::OperatorKind::LimitOffset,
+                    Some(plan.estimated_rows),
+                    Some(plan.total_cost),
+                );
+                limit_metric.input_rows = current_op.actual_rows;
+                limit_metric.actual_rows = paginated_rows.len();
+                limit_metric.add_child(current_op);
+                current_op = limit_metric;
+                current_rows = paginated_rows;
+            }
+
+            current_op.execution_time = op_start.elapsed();
+            return Ok((
+                crate::query::QueryResult::new(set_op.schema.clone(), current_rows),
+                current_op,
             ));
         }
 
         // 1. Execute base table scan
-        let (mut current_schema, mut current_rows) = {
+        let (mut current_schema, mut current_rows, mut current_op) = {
             if let Some((cte_schema, cte_rows)) = cte_store.get(&plan.base_table.table_name) {
                 let raw_schema = cte_schema.clone();
                 let initial_rows = cte_rows.clone();
-                let filtered_rows = match &plan.base_table.residual_filter {
-                    Some(filter) => self.filter_rows_with_outer_internal(
-                        initial_rows,
-                        &raw_schema,
-                        filter,
-                        outer_contexts,
-                        cte_store,
-                    )?,
-                    None => initial_rows,
+                let mut scan_metric = crate::query::OperatorMetrics::new(
+                    crate::query::OperatorKind::TableScan {
+                        table_name: plan.base_table.table_name.clone(),
+                        access_path: "CTE Scan".to_string(),
+                    },
+                    Some(plan.base_table.estimated_rows),
+                    Some(plan.base_table.cost),
+                );
+                scan_metric.input_rows = initial_rows.len();
+                scan_metric.actual_rows = initial_rows.len();
+                scan_metric.counters.tuples_fetched = initial_rows.len();
+                scan_metric.counters.rows_evaluated = initial_rows.len();
+
+                let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
+                    Some(filter) => {
+                        let filtered = self.filter_rows_with_outer_internal(
+                            initial_rows.clone(),
+                            &raw_schema,
+                            filter,
+                            outer_contexts,
+                            cte_store,
+                        )?;
+                        let mut filter_metric = crate::query::OperatorMetrics::new(
+                            crate::query::OperatorKind::Filter,
+                            Some(plan.base_table.estimated_rows),
+                            Some(plan.base_table.cost),
+                        );
+                        filter_metric.input_rows = initial_rows.len();
+                        filter_metric.actual_rows = filtered.len();
+                        filter_metric.counters.rows_evaluated = initial_rows.len();
+                        filter_metric.counters.rows_passed = filtered.len();
+                        filter_metric.counters.rows_rejected =
+                            initial_rows.len().saturating_sub(filtered.len());
+                        filter_metric.add_child(scan_metric);
+                        (filtered, filter_metric)
+                    }
+                    None => (initial_rows, scan_metric),
                 };
 
                 let schema = if plan.joins.is_empty() {
@@ -2228,119 +2477,30 @@ impl<'db> Transaction<'db> {
                     crate::engine::types::Schema::new_projected(cols)
                 };
 
-                (schema, filtered_rows)
+                (schema, filtered_rows, table_op)
             } else {
                 let mut table = self.open_table(&plan.base_table.table_name)?;
                 let raw_schema = table.schema().clone();
+                let mut index_lookups = 0;
                 let initial_rows = match &plan.base_table.access_path {
                     crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
+                        index_lookups = 1;
                         match table.get(key)? {
                             Some(row) => vec![row],
                             None => Vec::new(),
                         }
                     }
                     crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
+                        index_lookups = 1;
                         table.scan(start.as_ref(), end.as_ref())?
                     }
                     crate::query::optimizer::AccessPath::SecondaryIndexScan {
                         index_name,
                         scan_type,
                         ..
-                    } => match scan_type {
-                        crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
-                            table.index_lookup(index_name, val)?
-                        }
-                        crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
-                            table.index_scan(index_name, start.as_ref(), end.as_ref())?
-                        }
-                    },
-                    crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
-                };
-
-                let filtered_rows = match &plan.base_table.residual_filter {
-                    Some(filter) => self.filter_rows_with_outer_internal(
-                        initial_rows,
-                        &raw_schema,
-                        filter,
-                        outer_contexts,
-                        cte_store,
-                    )?,
-                    None => initial_rows,
-                };
-
-                let schema = if plan.joins.is_empty() {
-                    raw_schema
-                } else {
-                    let q = plan.base_table.qualifier();
-                    let cols: Vec<crate::engine::types::Column> = raw_schema
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            crate::engine::types::Column::new(
-                                format!("{q}.{}", c.name),
-                                c.data_type,
-                                c.nullable,
-                            )
-                        })
-                        .collect();
-                    crate::engine::types::Schema::new_projected(cols)
-                };
-
-                (schema, filtered_rows)
-            }
-        };
-
-        // 2. Execute Joins sequentially
-        for join in &plan.joins {
-            let (right_schema, right_rows) = {
-                if let Some((cte_schema, cte_rows)) = cte_store.get(&join.right.table_name) {
-                    let raw_schema = cte_schema.clone();
-                    let initial_rows = cte_rows.clone();
-                    let filtered_rows = match &join.right.residual_filter {
-                        Some(filter) => self.filter_rows_with_outer_internal(
-                            initial_rows,
-                            &raw_schema,
-                            filter,
-                            outer_contexts,
-                            cte_store,
-                        )?,
-                        None => initial_rows,
-                    };
-
-                    let q = join.right.qualifier();
-                    let cols: Vec<crate::engine::types::Column> = raw_schema
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            crate::engine::types::Column::new(
-                                format!("{q}.{}", c.name),
-                                c.data_type,
-                                c.nullable,
-                            )
-                        })
-                        .collect();
-                    (
-                        crate::engine::types::Schema::new_projected(cols),
-                        filtered_rows,
-                    )
-                } else {
-                    let mut table = self.open_table(&join.right.table_name)?;
-                    let raw_schema = table.schema().clone();
-                    let initial_rows = match &join.right.access_path {
-                        crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
-                            match table.get(key)? {
-                                Some(row) => vec![row],
-                                None => Vec::new(),
-                            }
-                        }
-                        crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
-                            table.scan(start.as_ref(), end.as_ref())?
-                        }
-                        crate::query::optimizer::AccessPath::SecondaryIndexScan {
-                            index_name,
-                            scan_type,
-                            ..
-                        } => match scan_type {
+                    } => {
+                        index_lookups = 1;
+                        match scan_type {
                             crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
                                 table.index_lookup(index_name, val)?
                             }
@@ -2348,21 +2508,116 @@ impl<'db> Transaction<'db> {
                                 start,
                                 end,
                             } => table.index_scan(index_name, start.as_ref(), end.as_ref())?,
-                        },
-                        crate::query::optimizer::AccessPath::FullTableScan => {
-                            table.scan(None, None)?
                         }
-                    };
+                    }
+                    crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
+                };
 
-                    let filtered_rows = match &join.right.residual_filter {
-                        Some(filter) => self.filter_rows_with_outer_internal(
-                            initial_rows,
+                let mut scan_metric = crate::query::OperatorMetrics::new(
+                    crate::query::OperatorKind::TableScan {
+                        table_name: plan.base_table.table_name.clone(),
+                        access_path: plan.base_table.access_path.to_string(),
+                    },
+                    Some(plan.base_table.estimated_rows),
+                    Some(plan.base_table.cost),
+                );
+                scan_metric.input_rows = initial_rows.len();
+                scan_metric.actual_rows = initial_rows.len();
+                scan_metric.counters.tuples_fetched = initial_rows.len();
+                scan_metric.counters.index_lookups = index_lookups;
+                scan_metric.counters.rows_evaluated = initial_rows.len();
+
+                let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
+                    Some(filter) => {
+                        let filtered = self.filter_rows_with_outer_internal(
+                            initial_rows.clone(),
                             &raw_schema,
                             filter,
                             outer_contexts,
                             cte_store,
-                        )?,
-                        None => initial_rows,
+                        )?;
+                        let mut filter_metric = crate::query::OperatorMetrics::new(
+                            crate::query::OperatorKind::Filter,
+                            Some(plan.base_table.estimated_rows),
+                            Some(plan.base_table.cost),
+                        );
+                        filter_metric.input_rows = initial_rows.len();
+                        filter_metric.actual_rows = filtered.len();
+                        filter_metric.counters.rows_evaluated = initial_rows.len();
+                        filter_metric.counters.rows_passed = filtered.len();
+                        filter_metric.counters.rows_rejected =
+                            initial_rows.len().saturating_sub(filtered.len());
+                        filter_metric.add_child(scan_metric);
+                        (filtered, filter_metric)
+                    }
+                    None => (initial_rows, scan_metric),
+                };
+
+                let schema = if plan.joins.is_empty() {
+                    raw_schema
+                } else {
+                    let q = plan.base_table.qualifier();
+                    let cols: Vec<crate::engine::types::Column> = raw_schema
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            crate::engine::types::Column::new(
+                                format!("{q}.{}", c.name),
+                                c.data_type,
+                                c.nullable,
+                            )
+                        })
+                        .collect();
+                    crate::engine::types::Schema::new_projected(cols)
+                };
+
+                (schema, filtered_rows, table_op)
+            }
+        };
+
+        // 2. Execute Joins sequentially
+        for join in &plan.joins {
+            let (right_schema, right_rows, right_op) = {
+                if let Some((cte_schema, cte_rows)) = cte_store.get(&join.right.table_name) {
+                    let raw_schema = cte_schema.clone();
+                    let initial_rows = cte_rows.clone();
+                    let mut scan_metric = crate::query::OperatorMetrics::new(
+                        crate::query::OperatorKind::TableScan {
+                            table_name: join.right.table_name.clone(),
+                            access_path: "CTE Scan".to_string(),
+                        },
+                        Some(join.right.estimated_rows),
+                        Some(join.right.cost),
+                    );
+                    scan_metric.input_rows = initial_rows.len();
+                    scan_metric.actual_rows = initial_rows.len();
+                    scan_metric.counters.tuples_fetched = initial_rows.len();
+                    scan_metric.counters.rows_evaluated = initial_rows.len();
+
+                    let (filtered_rows, table_op) = match &join.right.residual_filter {
+                        Some(filter) => {
+                            let filtered = self.filter_rows_with_outer_internal(
+                                initial_rows.clone(),
+                                &raw_schema,
+                                filter,
+                                outer_contexts,
+                                cte_store,
+                            )?;
+                            let mut filter_metric = crate::query::OperatorMetrics::new(
+                                crate::query::OperatorKind::Filter,
+                                Some(join.right.estimated_rows),
+                                Some(join.right.cost),
+                            );
+                            filter_metric.input_rows = initial_rows.len();
+                            filter_metric.actual_rows = filtered.len();
+                            filter_metric.counters.rows_evaluated = initial_rows.len();
+                            filter_metric.counters.rows_passed = filtered.len();
+                            filter_metric.counters.rows_rejected =
+                                initial_rows.len().saturating_sub(filtered.len());
+                            filter_metric.add_child(scan_metric);
+                            (filtered, filter_metric)
+                        }
+                        None => (initial_rows, scan_metric),
                     };
 
                     let q = join.right.qualifier();
@@ -2380,9 +2635,108 @@ impl<'db> Transaction<'db> {
                     (
                         crate::engine::types::Schema::new_projected(cols),
                         filtered_rows,
+                        table_op,
+                    )
+                } else {
+                    let mut table = self.open_table(&join.right.table_name)?;
+                    let raw_schema = table.schema().clone();
+                    let mut index_lookups = 0;
+                    let initial_rows = match &join.right.access_path {
+                        crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
+                            index_lookups = 1;
+                            match table.get(key)? {
+                                Some(row) => vec![row],
+                                None => Vec::new(),
+                            }
+                        }
+                        crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
+                            index_lookups = 1;
+                            table.scan(start.as_ref(), end.as_ref())?
+                        }
+                        crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                            index_name,
+                            scan_type,
+                            ..
+                        } => {
+                            index_lookups = 1;
+                            match scan_type {
+                                crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                                    table.index_lookup(index_name, val)?
+                                }
+                                crate::query::optimizer::SecondaryScanType::RangeScan {
+                                    start,
+                                    end,
+                                } => table.index_scan(index_name, start.as_ref(), end.as_ref())?,
+                            }
+                        }
+                        crate::query::optimizer::AccessPath::FullTableScan => {
+                            table.scan(None, None)?
+                        }
+                    };
+
+                    let mut scan_metric = crate::query::OperatorMetrics::new(
+                        crate::query::OperatorKind::TableScan {
+                            table_name: join.right.table_name.clone(),
+                            access_path: join.right.access_path.to_string(),
+                        },
+                        Some(join.right.estimated_rows),
+                        Some(join.right.cost),
+                    );
+                    scan_metric.input_rows = initial_rows.len();
+                    scan_metric.actual_rows = initial_rows.len();
+                    scan_metric.counters.tuples_fetched = initial_rows.len();
+                    scan_metric.counters.index_lookups = index_lookups;
+                    scan_metric.counters.rows_evaluated = initial_rows.len();
+
+                    let (filtered_rows, table_op) = match &join.right.residual_filter {
+                        Some(filter) => {
+                            let filtered = self.filter_rows_with_outer_internal(
+                                initial_rows.clone(),
+                                &raw_schema,
+                                filter,
+                                outer_contexts,
+                                cte_store,
+                            )?;
+                            let mut filter_metric = crate::query::OperatorMetrics::new(
+                                crate::query::OperatorKind::Filter,
+                                Some(join.right.estimated_rows),
+                                Some(join.right.cost),
+                            );
+                            filter_metric.input_rows = initial_rows.len();
+                            filter_metric.actual_rows = filtered.len();
+                            filter_metric.counters.rows_evaluated = initial_rows.len();
+                            filter_metric.counters.rows_passed = filtered.len();
+                            filter_metric.counters.rows_rejected =
+                                initial_rows.len().saturating_sub(filtered.len());
+                            filter_metric.add_child(scan_metric);
+                            (filtered, filter_metric)
+                        }
+                        None => (initial_rows, scan_metric),
+                    };
+
+                    let q = join.right.qualifier();
+                    let cols: Vec<crate::engine::types::Column> = raw_schema
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            crate::engine::types::Column::new(
+                                format!("{q}.{}", c.name),
+                                c.data_type,
+                                c.nullable,
+                            )
+                        })
+                        .collect();
+                    (
+                        crate::engine::types::Schema::new_projected(cols),
+                        filtered_rows,
+                        table_op,
                     )
                 }
             };
+
+            let left_count = current_rows.len();
+            let right_count = right_rows.len();
+            let candidate_pairs = left_count * right_count;
 
             let (next_schema, next_rows) = self.join_rows_with_outer_internal(
                 current_rows,
@@ -2394,74 +2748,197 @@ impl<'db> Transaction<'db> {
                 outer_contexts,
                 cte_store,
             )?;
+
+            let mut join_metric = crate::query::OperatorMetrics::new(
+                crate::query::OperatorKind::NestedLoopJoin {
+                    join_type: format!("{:?}", join.join_type),
+                },
+                Some(join.estimated_rows),
+                Some(join.cost),
+            );
+            join_metric.input_rows = left_count + right_count;
+            join_metric.actual_rows = next_rows.len();
+            join_metric.counters.candidate_pairs = candidate_pairs;
+            join_metric.counters.matched_rows = next_rows.len();
+            join_metric.add_child(current_op);
+            join_metric.add_child(right_op);
+
             current_schema = next_schema;
             current_rows = next_rows;
+            current_op = join_metric;
         }
 
         // 3. Post-Join Filter
         if let Some(post_filter) = &plan.post_join_filter {
-            current_rows = self.filter_rows_with_outer_internal(
+            let pre_count = current_rows.len();
+            let filtered_rows = self.filter_rows_with_outer_internal(
                 current_rows,
                 &current_schema,
                 post_filter,
                 outer_contexts,
                 cte_store,
             )?;
+            let mut filter_metric = crate::query::OperatorMetrics::new(
+                crate::query::OperatorKind::Filter,
+                Some(plan.estimated_rows),
+                Some(plan.total_cost),
+            );
+            filter_metric.input_rows = pre_count;
+            filter_metric.actual_rows = filtered_rows.len();
+            filter_metric.counters.rows_evaluated = pre_count;
+            filter_metric.counters.rows_passed = filtered_rows.len();
+            filter_metric.counters.rows_rejected = pre_count.saturating_sub(filtered_rows.len());
+            filter_metric.add_child(current_op);
+            current_op = filter_metric;
+            current_rows = filtered_rows;
         }
 
         // 4. Aggregation / Group By / Having
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
         let (mut working_schema, mut working_rows) = if is_aggregate {
+            let pre_agg_count = current_rows.len();
             let (grouped_schema, grouped_rows) = crate::query::AggregateOperator::apply(
                 current_rows,
                 &current_schema,
                 &plan.group_by,
                 &plan.aggregates,
             )?;
+            let num_groups = grouped_rows.len();
 
-            let having_rows = match &plan.having {
-                Some(predicate) => self.filter_rows_with_outer_internal(
-                    grouped_rows,
-                    &grouped_schema,
-                    predicate,
-                    outer_contexts,
-                    cte_store,
-                )?,
-                None => grouped_rows,
+            let (having_rows, final_rows) = match &plan.having {
+                Some(predicate) => {
+                    let filtered = self.filter_rows_with_outer_internal(
+                        grouped_rows.clone(),
+                        &grouped_schema,
+                        predicate,
+                        outer_contexts,
+                        cte_store,
+                    )?;
+                    (Some(filtered.clone()), filtered)
+                }
+                None => (None, grouped_rows),
             };
-            (grouped_schema, having_rows)
+
+            let mut agg_metric = crate::query::OperatorMetrics::new(
+                crate::query::OperatorKind::Aggregate,
+                Some(plan.estimated_rows),
+                Some(plan.total_cost),
+            );
+            agg_metric.input_rows = pre_agg_count;
+            agg_metric.actual_rows = final_rows.len();
+            agg_metric.counters.group_count = num_groups;
+            agg_metric.counters.rows_evaluated = pre_agg_count;
+            agg_metric.add_child(current_op);
+
+            if let Some(having_filtered) = having_rows {
+                let mut having_metric = crate::query::OperatorMetrics::new(
+                    crate::query::OperatorKind::Filter,
+                    Some(plan.estimated_rows),
+                    Some(plan.total_cost),
+                );
+                having_metric.input_rows = num_groups;
+                having_metric.actual_rows = having_filtered.len();
+                having_metric.counters.rows_evaluated = num_groups;
+                having_metric.counters.rows_passed = having_filtered.len();
+                having_metric.counters.rows_rejected =
+                    num_groups.saturating_sub(having_filtered.len());
+                having_metric.add_child(agg_metric);
+                current_op = having_metric;
+            } else {
+                current_op = agg_metric;
+            }
+
+            (grouped_schema, final_rows)
         } else {
             (current_schema, current_rows)
         };
 
         // 5. Window Operator
         if !plan.window_exprs.is_empty() {
+            let pre_win_count = working_rows.len();
             let (win_schema, win_rows) = crate::query::WindowOperator::apply(
                 working_rows,
                 &working_schema,
                 &plan.window_exprs,
             )?;
+            let mut win_metric = crate::query::OperatorMetrics::new(
+                crate::query::OperatorKind::Window,
+                Some(plan.estimated_rows),
+                Some(plan.total_cost),
+            );
+            win_metric.input_rows = pre_win_count;
+            win_metric.actual_rows = win_rows.len();
+            win_metric.add_child(current_op);
+            current_op = win_metric;
             working_schema = win_schema;
             working_rows = win_rows;
         }
 
         // 6. Sort Operator (ORDER BY)
-        let sorted_rows =
-            crate::query::SortOperator::apply(working_rows, &working_schema, &plan.order_by)?;
+        let sorted_rows = if !plan.order_by.is_empty() {
+            let pre_sort_count = working_rows.len();
+            let sorted =
+                crate::query::SortOperator::apply(working_rows, &working_schema, &plan.order_by)?;
+            let mut sort_metric = crate::query::OperatorMetrics::new(
+                crate::query::OperatorKind::Sort,
+                Some(plan.estimated_rows),
+                Some(plan.total_cost),
+            );
+            sort_metric.input_rows = pre_sort_count;
+            sort_metric.actual_rows = sorted.len();
+            sort_metric.add_child(current_op);
+            current_op = sort_metric;
+            sorted
+        } else {
+            working_rows
+        };
 
         // 7. Projection
+        let pre_proj_count = sorted_rows.len();
         let (projected_schema, projected_rows) = crate::query::ProjectOperator::apply_named(
             sorted_rows,
             &working_schema,
             &plan.projections,
         )?;
+        let mut proj_metric = crate::query::OperatorMetrics::new(
+            crate::query::OperatorKind::Project,
+            Some(plan.estimated_rows),
+            Some(plan.total_cost),
+        );
+        proj_metric.input_rows = pre_proj_count;
+        proj_metric.actual_rows = projected_rows.len();
+        proj_metric.add_child(current_op);
+        current_op = proj_metric;
 
         // 8. Pagination (OFFSET / LIMIT)
-        let paginated_rows =
-            crate::query::OffsetLimitOperator::apply(projected_rows, plan.offset, plan.limit);
-        Ok(crate::query::QueryResult::new(
-            projected_schema,
-            paginated_rows,
+        let paginated_rows = if plan.offset.is_some() || plan.limit.is_some() {
+            let pre_limit_count = projected_rows.len();
+            let paginated =
+                crate::query::OffsetLimitOperator::apply(projected_rows, plan.offset, plan.limit);
+            let mut limit_metric = crate::query::OperatorMetrics::new(
+                crate::query::OperatorKind::LimitOffset,
+                Some(plan.estimated_rows),
+                Some(plan.total_cost),
+            );
+            limit_metric.input_rows = pre_limit_count;
+            limit_metric.actual_rows = paginated.len();
+            limit_metric.add_child(current_op);
+            current_op = limit_metric;
+            paginated
+        } else {
+            projected_rows
+        };
+
+        current_op.execution_time = op_start.elapsed();
+
+        // If CTEs were materialized in this plan, attach them to the top operator
+        for cte_metric in cte_metrics {
+            current_op.add_child(cte_metric);
+        }
+
+        Ok((
+            crate::query::QueryResult::new(projected_schema, paginated_rows),
+            current_op,
         ))
     }
 

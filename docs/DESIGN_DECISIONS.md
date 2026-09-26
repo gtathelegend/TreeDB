@@ -721,8 +721,35 @@ This document records key architectural and design choices, their rationale, and
      * Diagnostics remain strictly zero-execution and zero-persistence.
   8. **Deferred Features:**
      * HyperLogLog/histograms, randomized sampling during analyze, adaptive query execution feedback, and parallel query optimization are deferred to future phases.
+## Decision 45: Query Execution Metrics, Runtime Operator Instrumentation, and EXPLAIN ANALYZE
+
+* **Decision:** Introduce a dedicated runtime execution metrics abstraction (`OperatorMetrics`, `OperatorCounters`, `QueryExecutionMetrics`) and `EXPLAIN ANALYZE <query>;` SQL diagnostic capability without modifying query results or performing adaptive runtime optimization:
+  1. **Metrics Abstraction & Model:**
+     * `OperatorMetrics`: Per-operator execution telemetry organized hierarchically as a tree matching the physical plan. Records `OperatorKind`, optimizer estimated rows/cost, actual output/input rows, execution invocation count, elapsed wall-clock duration (`std::time::Duration`), domain-specific counters (`OperatorCounters`), and child operator nodes.
+     * `OperatorCounters`: Fine-grained execution details including pages read, index lookups performed, tuples fetched from storage, filter rows evaluated/passed/rejected, join candidate pairs examined/matched, and distinct aggregation group counts.
+     * `QueryExecutionMetrics`: Aggregate query-level summary containing total query elapsed time, total rows returned, root operator metrics tree, and aggregated totals for rows scanned, index lookups, and tuples fetched.
+  2. **Operator Instrumentation & Zero Result Mutation:**
+     * Physical execution operators (`TableScan`, `Filter`, `Project`, `Sort`, `LimitOffset`, `NestedLoopJoin`, `Aggregate`, `Window`, `Subquery`, `Cte`, `RecursiveCte`, `SetOperation`) are instrumented at runtime.
+     * Instrumentation observes execution progress without altering result sets, query semantics, or data structures.
+     * Read queries remain strictly non-mutating: zero WAL writes, zero page allocations, and zero freelist mutations.
+  3. **Diagnostic Cardinality Comparisons & Error Ratios:**
+     * Diagnostic comparison: compares `estimated_rows` against `actual_rows` for every operator.
+     * `estimate_error_ratio(actual, estimated)` computes `actual / estimated` with explicit handling for missing/zero estimates.
+  4. **EXPLAIN ANALYZE Grammar & Execution:**
+     * `EXPLAIN ANALYZE <query>;` is parsed as `Statement::Explain(ExplainStatement { query, analyze: true })`.
+     * Unlike normal `EXPLAIN` (which binds, optimizes, formats, and never executes), `EXPLAIN ANALYZE` executes the plan within the active transaction, collects runtime metrics, and formats a combined diagnostic report exposing `cost`, `estimated_rows`, `actual_rows`, and operator details alongside the plan structure.
+     * Unsupported DML targets (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `ANALYZE`) are rejected with `Error::UnsupportedExplainTarget`.
+  5. **Explicit Query Execution API:**
+     * Programmatic API: `txn.execute_sql_with_metrics(sql)` and `db.execute_sql_with_metrics(sql)` return `Result<(QueryResult, QueryExecutionMetrics)>`.
+     * Existing `execute_sql` continues to return `QueryResult` without overhead or metric extraction requirements for general callers.
+  6. **Timing Discipline:**
+     * Wall-clock execution duration uses `std::time::Instant` and is strictly diagnostic.
+     * Tests never assert on exact elapsed durations or threshold timings.
+  7. **Explicit Non-Goal: Adaptive Query Optimization Deferred:**
+     * Measurement and feedback are intentionally decoupled: Phase 30 is strictly about **measurement and diagnostics**.
+     * Runtime cardinality errors and execution metrics are NOT fed back into the optimizer to modify physical plans on the fly.
 * **Rationale:**
-  * Centralizing cost calculations and grounding plan choices in explicit statistics gives predictable, verifiable access path and join selection while ensuring that existing databases without statistics retain identical baseline execution semantics.
+     * **Observability Precedes Adaptation:** Establishing a reliable, deterministic metrics and measurement layer before introducing adaptive optimization prevents compounding optimizer feedback loops, keeps query optimization deterministic and verifiable, and provides transparency into cost-model accuracy.
 
 
 

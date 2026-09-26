@@ -55,7 +55,7 @@ fn test_parser_explain_statements() {
     let stmt =
         treedb::sql::parse_statement("EXPLAIN SELECT id, name FROM users WHERE id = 1;").unwrap();
     match &stmt {
-        Statement::Explain(ExplainStatement { query }) => match query.as_ref() {
+        Statement::Explain(ExplainStatement { query, .. }) => match query.as_ref() {
             Statement::Select(s) => {
                 assert_eq!(s.from.name, "users");
                 assert_eq!(s.projection.len(), 2);

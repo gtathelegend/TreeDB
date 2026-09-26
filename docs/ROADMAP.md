@@ -508,14 +508,29 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 30: Advanced Query Processing & Optimizer Enhancements (Future)
+## Phase 30: Query Execution Metrics & Runtime Plan Diagnostics (Completed)
+* [x] Dedicated metrics abstraction: `OperatorMetrics`, `OperatorCounters`, `QueryExecutionMetrics`
+* [x] Operator runtime instrumentation across all physical operators (`TableScan`, `Filter`, `Project`, `Sort`, `LimitOffset`, `NestedLoopJoin`, `Aggregate`, `Window`, `Subquery`, `Cte`, `RecursiveCte`, `SetOperation`)
+* [x] Domain-specific counters: input rows, output rows, tuples fetched, pages read, index lookups, filter rows evaluated/passed/rejected, join candidate pairs/matches, aggregation group counts
+* [x] Cardinality comparison: estimated vs. actual output rows, `estimate_error_ratio` calculation
+* [x] Diagnostic wall-clock execution timing (`std::time::Instant` / `std::time::Duration`)
+* [x] SQL `EXPLAIN ANALYZE <query>;` grammar, AST (`ExplainStatement { query, analyze: true }`), parser, execution, and diagnostic plan formatting
+* [x] Explicit API: `txn.execute_sql_with_metrics(sql)` and `db.execute_sql_with_metrics(sql)` returning `(QueryResult, QueryExecutionMetrics)`
+* [x] Transaction semantics & visibility: `EXPLAIN ANALYZE` executes inside the active transaction, observing uncommitted mutations and respecting rollback
+* [x] Read-only safety: zero persistent page allocations, zero WAL record generation for read queries
+* [x] Unsupported DML policy: structured rejection of non-query statements in `EXPLAIN ANALYZE` via `Error::UnsupportedExplainTarget`
+* [x] 17 dedicated integration tests in `tests/explain_analyze.rs` including randomized differential query oracle (556 total test suite)
+
+---
+
+## Phase 31: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
 * [ ] Expression indexes & partial indexes
 * [ ] Derived tables (`FROM (SELECT ...)`)
+* [ ] Subquery flattening and decorrelation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
-* [ ] Runtime execution profiling (`EXPLAIN ANALYZE`)
 
 
 

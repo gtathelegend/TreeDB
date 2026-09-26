@@ -680,6 +680,12 @@ impl<'a> Parser<'a> {
         }
         self.advance(); // consume EXPLAIN
 
+        let mut analyze = false;
+        if self.peek().kind == TokenKind::Analyze {
+            analyze = true;
+            self.advance(); // consume ANALYZE
+        }
+
         let next_tok = self.peek().clone();
         match next_tok.kind {
             TokenKind::Insert => Err(Error::UnsupportedExplainTarget("INSERT".to_string())),
@@ -704,21 +710,36 @@ impl<'a> Parser<'a> {
                 let query_stmt = self.parse_query_statement()?;
                 Ok(ExplainStatement {
                     query: Box::new(query_stmt),
+                    analyze,
                 })
             }
-            TokenKind::Eof => Err(Error::SqlParseError {
-                message: "expected query statement after EXPLAIN, found EOF".to_string(),
-                start: start_span.start,
-                end: next_tok.span.end,
-            }),
-            _ => Err(Error::SqlParseError {
-                message: format!(
-                    "expected query statement after EXPLAIN, found {}",
-                    next_tok.kind
-                ),
-                start: next_tok.span.start,
-                end: next_tok.span.end,
-            }),
+            TokenKind::Eof => {
+                let prefix = if analyze {
+                    "EXPLAIN ANALYZE"
+                } else {
+                    "EXPLAIN"
+                };
+                Err(Error::SqlParseError {
+                    message: format!("expected query statement after {prefix}, found EOF"),
+                    start: start_span.start,
+                    end: next_tok.span.end,
+                })
+            }
+            _ => {
+                let prefix = if analyze {
+                    "EXPLAIN ANALYZE"
+                } else {
+                    "EXPLAIN"
+                };
+                Err(Error::SqlParseError {
+                    message: format!(
+                        "expected query statement after {prefix}, found {}",
+                        next_tok.kind
+                    ),
+                    start: next_tok.span.start,
+                    end: next_tok.span.end,
+                })
+            }
         }
     }
 

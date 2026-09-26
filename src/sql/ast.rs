@@ -290,16 +290,22 @@ impl fmt::Display for DeleteStatement {
     }
 }
 
-/// AST node representing an `EXPLAIN` query introspection statement.
+/// AST node representing an `EXPLAIN` or `EXPLAIN ANALYZE` query introspection statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStatement {
     /// Inner query statement to explain.
     pub query: Box<Statement>,
+    /// Whether runtime execution metrics should be gathered (`EXPLAIN ANALYZE`).
+    pub analyze: bool,
 }
 
 impl fmt::Display for ExplainStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "EXPLAIN {}", self.query)
+        if self.analyze {
+            write!(f, "EXPLAIN ANALYZE {}", self.query)
+        } else {
+            write!(f, "EXPLAIN {}", self.query)
+        }
     }
 }
 

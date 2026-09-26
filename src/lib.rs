@@ -23,8 +23,9 @@ pub use index::{
     SEC_INTERNAL_HEADER_SIZE, SEC_LEAF_HEADER_SIZE,
 };
 pub use query::{
-    BinaryOp, CardinalityEstimator, ColumnStatistics, CostModel, Expr, FilterOperator,
-    IndexStatistics, OffsetLimitOperator, PlanCost, ProjectOperator, Query, QueryResult,
+    estimate_error_ratio, BinaryOp, CardinalityEstimator, ColumnStatistics, CostModel, Expr,
+    FilterOperator, IndexStatistics, OffsetLimitOperator, OperatorCounters, OperatorKind,
+    OperatorMetrics, PlanCost, ProjectOperator, Query, QueryExecutionMetrics, QueryResult,
     SortDirection, SortKey, SortOperator, StatisticsProvider, StatsRegistry, TableStatistics,
     UnaryOp,
 };
