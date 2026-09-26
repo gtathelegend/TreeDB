@@ -448,4 +448,8 @@ pub enum Error {
     /// Invalid set operation syntax or usage.
     #[error("Invalid set operation: {0}")]
     InvalidSetOperation(String),
+
+    /// Attempted to EXPLAIN an unsupported statement target (e.g. DML or DDL).
+    #[error("EXPLAIN does not support {0} statements (only queries are supported)")]
+    UnsupportedExplainTarget(String),
 }

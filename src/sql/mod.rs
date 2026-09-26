@@ -7,10 +7,11 @@ pub mod token;
 
 pub use ast::{
     AggregateFunction, ColumnDef, CreateIndexStatement, CreateTableStatement, Cte, CteQuery,
-    DeleteStatement, DropIndexStatement, DropTableStatement, InsertStatement, JoinClause, JoinType,
-    OrderByExpr, OrderDirection, SelectItem, SelectStatement, SetOperator, SetQuery, SetQueryBody,
-    SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment,
-    UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction, WindowSpec, WithClause,
+    DeleteStatement, DropIndexStatement, DropTableStatement, ExplainStatement, InsertStatement,
+    JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SetOperator,
+    SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
+    UpdateAssignment, UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction, WindowSpec,
+    WithClause,
 };
 pub use binder::{
     bind_create_index, bind_drop_index, bind_expr, bind_grouped_expr, bind_select,

@@ -472,7 +472,22 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 28: Advanced Query Processing & Optimizer Enhancements (Future)
+## Phase 28: SQL EXPLAIN & Query Plan Introspection (Completed)
+* [x] Lexer & Parser support for `EXPLAIN <query>;` with case-insensitive `EXPLAIN` keyword
+* [x] Structured AST representation: `ExplainStatement { query: Box<Statement> }` integrated into `Statement::Explain`
+* [x] Statement target restriction: structured rejection of non-query statements (`EXPLAIN INSERT`, `EXPLAIN UPDATE`, `EXPLAIN DELETE`, `EXPLAIN CREATE TABLE`, `EXPLAIN CREATE INDEX`, `EXPLAIN DROP TABLE`, `EXPLAIN DROP INDEX`) via `Error::UnsupportedExplainTarget`
+* [x] Binder & Optimizer integration: binds target query through identical semantic compilation pipeline and generates optimized `PhysicalPlan`
+* [x] Comprehensive physical plan coverage: deterministic formatting for `TableScan` (FullTableScan, PrimaryPointLookup, PrimaryRangeScan, SecondaryIndexScan), `Filter`, `Project`, `Sort`, `LimitOffset`, `NestedLoopJoin` (Inner, Left), `Aggregate`, `Having`, `Window`, `Subquery` (Scalar, In, Exists, Correlated), `CTE`, `Recursive CTE`, and `Set Operation` (all 6 operations)
+* [x] Strict no-execution invariant: plans queries without evaluating row expressions or scanning tables
+* [x] Strict no-persistence mutation: zero disk page allocations, zero WAL record generation, and zero transaction state changes
+* [x] Standard `QueryResult` format: returns single textual column `plan` with DataType::String containing the plan representation
+* [x] Transaction & catalog visibility: reflects active uncommitted transactional metadata and reverts upon rollback
+* [x] CLI integration: execution supported via `treedb query <path> "EXPLAIN <query>"`
+* [x] 18 dedicated integration tests in `tests/explain.rs` covering parser, access paths, joins, aggregates, windows, subqueries, CTEs, recursive CTEs, set operations, index lifecycle, rollback, determinism, and non-mutation (528 total test suite)
+
+---
+
+## Phase 29: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
@@ -480,6 +495,8 @@ This roadmap outlines the planned development phases for TreeDB.
 * [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Cost-based join optimization and cardinality estimation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+* [ ] Runtime execution profiling (`EXPLAIN ANALYZE`)
+
 
 
 

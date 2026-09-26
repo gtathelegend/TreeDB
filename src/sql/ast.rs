@@ -24,6 +24,8 @@ pub enum Statement {
     Update(UpdateStatement),
     /// SQL `DELETE FROM` DML statement.
     Delete(DeleteStatement),
+    /// SQL `EXPLAIN` query introspection statement.
+    Explain(ExplainStatement),
 }
 
 impl fmt::Display for Statement {
@@ -38,6 +40,7 @@ impl fmt::Display for Statement {
             Statement::Insert(s) => write!(f, "{s}"),
             Statement::Update(s) => write!(f, "{s}"),
             Statement::Delete(s) => write!(f, "{s}"),
+            Statement::Explain(s) => write!(f, "{s}"),
         }
     }
 }
@@ -281,6 +284,19 @@ impl fmt::Display for DeleteStatement {
             write!(f, " WHERE {sel}")?;
         }
         Ok(())
+    }
+}
+
+/// AST node representing an `EXPLAIN` query introspection statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainStatement {
+    /// Inner query statement to explain.
+    pub query: Box<Statement>,
+}
+
+impl fmt::Display for ExplainStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "EXPLAIN {}", self.query)
     }
 }
 

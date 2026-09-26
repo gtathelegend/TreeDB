@@ -659,6 +659,36 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * Reusing the existing persistent secondary B+ Tree implementation guarantees that storage formats, WAL records, crash recovery, page recycling, and table mutation hooks remain unified and battle-tested without code or engine duplication.
 
+## Decision 43: SQL EXPLAIN and Deterministic Physical Plan Introspection
+
+* **Decision:** Expose TreeDB's existing physical optimizer plans to users via the `EXPLAIN <query>;` SQL statement without creating a separate planner or duplicating execution logic:
+  1. **Syntax, AST & Target Statement Restriction:**
+     * `EXPLAIN <query>;` wraps any valid query expression (`SELECT`, `WITH ... SELECT`, `WITH RECURSIVE ... SELECT`, `UNION`, `INTERSECT`, `EXCEPT`, parenthesized queries).
+     * Represented explicitly as `Statement::Explain(ExplainStatement { query: Box<Statement> })`.
+     * Non-query statements (`EXPLAIN INSERT`, `EXPLAIN UPDATE`, `EXPLAIN DELETE`, `EXPLAIN CREATE TABLE`, `EXPLAIN CREATE INDEX`, `EXPLAIN DROP TABLE`, `EXPLAIN DROP INDEX`) are rejected with structured errors (`Error::UnsupportedExplainTarget`).
+     * `EXPLAIN` keyword is case-insensitive (`EXPLAIN`, `explain`, `ExPlAiN`).
+  2. **Binder & Optimizer Integration:**
+     * Compiles the inner query through the exact same semantic binding and physical optimizer pipelines as standard query execution.
+     * All semantic errors (unknown tables, unknown columns, ambiguous identifiers, type mismatches, grouping violations) are detected and surfaced identically.
+     * Invokes `Optimizer::optimize` / `plan_select` / `plan_set_query` to construct the canonical `PhysicalPlan` tree.
+  3. **Strict No-Execution & No-Persistence Invariants:**
+     * `EXPLAIN` is strictly diagnostic: it parses, binds, optimizes, formats the physical plan, and halts.
+     * Never evaluates row expressions, never executes table/index scans, never iterates loops, never writes WAL records, never allocates disk pages, never mutates catalog metadata, and never changes transaction state.
+  4. **Deterministic Textual Representation:**
+     * Formatted via `PhysicalPlan::fmt` using structured two-space indentation.
+     * Covers: `TableScan` (FullTableScan, PrimaryPointLookup, PrimaryRangeScan, SecondaryIndexScan), `Filter`, `Project`, `Sort`, `LimitOffset`, `NestedLoopJoin` (Inner, Left), `Aggregate` (group_by, aggs), `Having`, `Window` (functions, partition by, order by, frame), `Subquery` (Scalar, In, Exists, Correlated with outer references), `CTE` (with dependency ordering), `Recursive CTE` (anchor, recursive member, max iterations, max rows), and `Set Operation` (all six operations).
+     * Output is strictly deterministic and free from memory addresses, timestamps, or unstable identifiers.
+  5. **Standard SQL Result Representation:**
+     * Returns a standard `QueryResult` with a single column `plan` of type `DataType::String` and one row containing the complete plan text.
+     * Executes seamlessly via `txn.execute_sql("EXPLAIN ...")`, `db.execute_sql("EXPLAIN ...")`, and the CLI `treedb query <path> "<SQL>"`.
+  6. **Transaction & Catalog Visibility:**
+     * Respects active transaction metadata: observes uncommitted tables and indexes created in the active transaction, and reverts immediately on transaction rollback.
+  7. **Deferred Features:**
+     * Runtime execution statistics (`EXPLAIN ANALYZE`), cost-based cardinality estimates, timing instrumentation, and buffer-pool cache hit statistics are deferred to future profiling phases.
+* **Rationale:**
+  * Exposing the physical plan directly through SQL guarantees transparency into index selection, join ordering, and pushdown optimizations while ensuring that the physical optimizer remains the single source of truth for query planning.
+
+
 
 
 

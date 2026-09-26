@@ -2,10 +2,11 @@ use crate::engine::types::DataType;
 use crate::error::{Error, Result};
 use crate::sql::ast::{
     ColumnDef, CreateIndexStatement, CreateTableStatement, Cte, CteQuery, DeleteStatement,
-    DropIndexStatement, DropTableStatement, InsertStatement, JoinClause, JoinType, OrderByExpr,
-    OrderDirection, SelectItem, SelectStatement, SetOperator, SetQuery, SetQueryBody, SqlBinaryOp,
-    SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement,
-    WindowFrame, WindowFrameBound, WindowFunction, WindowSpec, WithClause,
+    DropIndexStatement, DropTableStatement, ExplainStatement, InsertStatement, JoinClause,
+    JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SetOperator, SetQuery,
+    SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
+    UpdateAssignment, UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction, WindowSpec,
+    WithClause,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};
@@ -36,10 +37,11 @@ impl<'a> Parser<'a> {
         Self { tokens, cursor: 0 }
     }
 
-    /// Parses an arbitrary top-level SQL statement (`SELECT`, set-operation query, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`).
+    /// Parses an arbitrary top-level SQL statement (`SELECT`, set-operation query, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN`).
     pub fn parse_statement(&mut self) -> Result<Statement> {
         let token = self.peek();
         match token.kind {
+            TokenKind::Explain => Ok(Statement::Explain(self.parse_explain()?)),
             TokenKind::Select | TokenKind::With | TokenKind::LParen => {
                 self.parse_query_statement()
             }
@@ -80,7 +82,7 @@ impl<'a> Parser<'a> {
             TokenKind::Delete => Ok(Statement::Delete(self.parse_delete()?)),
             _ => Err(Error::SqlParseError {
                 message: format!(
-                    "unexpected token {}, expected SQL statement (SELECT, CREATE, DROP, INSERT, UPDATE, DELETE)",
+                    "unexpected token {}, expected SQL statement (SELECT, CREATE, DROP, INSERT, UPDATE, DELETE, EXPLAIN)",
                     token.kind
                 ),
                 start: token.span.start,
@@ -659,6 +661,63 @@ impl<'a> Parser<'a> {
         }
 
         Ok(DropIndexStatement { name })
+    }
+
+    /// Parses a complete SQL `EXPLAIN` statement.
+    ///
+    /// # Syntax
+    /// `EXPLAIN <query> [;]`
+    pub fn parse_explain(&mut self) -> Result<ExplainStatement> {
+        let start_span = self.peek().span;
+        if self.peek().kind != TokenKind::Explain {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected EXPLAIN statement, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume EXPLAIN
+
+        let next_tok = self.peek().clone();
+        match next_tok.kind {
+            TokenKind::Insert => Err(Error::UnsupportedExplainTarget("INSERT".to_string())),
+            TokenKind::Update => Err(Error::UnsupportedExplainTarget("UPDATE".to_string())),
+            TokenKind::Delete => Err(Error::UnsupportedExplainTarget("DELETE".to_string())),
+            TokenKind::Create => match self.peek_ahead(1).kind {
+                TokenKind::Table => {
+                    Err(Error::UnsupportedExplainTarget("CREATE TABLE".to_string()))
+                }
+                TokenKind::Index | TokenKind::Unique => {
+                    Err(Error::UnsupportedExplainTarget("CREATE INDEX".to_string()))
+                }
+                _ => Err(Error::UnsupportedExplainTarget("CREATE".to_string())),
+            },
+            TokenKind::Drop => match self.peek_ahead(1).kind {
+                TokenKind::Table => Err(Error::UnsupportedExplainTarget("DROP TABLE".to_string())),
+                TokenKind::Index => Err(Error::UnsupportedExplainTarget("DROP INDEX".to_string())),
+                _ => Err(Error::UnsupportedExplainTarget("DROP".to_string())),
+            },
+            TokenKind::Select | TokenKind::With | TokenKind::LParen => {
+                let query_stmt = self.parse_query_statement()?;
+                Ok(ExplainStatement {
+                    query: Box::new(query_stmt),
+                })
+            }
+            TokenKind::Eof => Err(Error::SqlParseError {
+                message: "expected query statement after EXPLAIN, found EOF".to_string(),
+                start: start_span.start,
+                end: next_tok.span.end,
+            }),
+            _ => Err(Error::SqlParseError {
+                message: format!(
+                    "expected query statement after EXPLAIN, found {}",
+                    next_tok.kind
+                ),
+                start: next_tok.span.start,
+                end: next_tok.span.end,
+            }),
+        }
     }
 
     /// Parses a complete SQL `INSERT INTO` statement.

@@ -101,14 +101,16 @@ v                                                             v
   * **Standalone Boundary:** Operates completely decoupled from runtime storage, schemas, or buffer pools via `treedb::sql::parse_sql(sql)` and `treedb::sql::parse_statement_sql(sql)`.
 
 ### `StatementResult` & Transactional Execution Engine (`src/engine/transaction.rs`)
-* **Role:** Transactional execution coordinator for DDL and DML statements (`txn.execute_statement(sql)`).
+* **Role:** Transactional execution coordinator for DDL, DML, and diagnostic introspection statements (`txn.execute_statement(sql)`).
 * **Responsibilities:**
-  * **Statement Routing:** Dispatches parsed `Statement` AST nodes to dedicated transactional execution routines (`execute_create_table`, `execute_drop_table`, `execute_create_index`, `execute_drop_index`, `execute_insert`, `execute_update`, `execute_delete`, and `execute_select`).
+  * **Statement Routing:** Dispatches parsed `Statement` AST nodes to dedicated transactional execution routines (`execute_create_table`, `execute_drop_table`, `execute_create_index`, `execute_drop_index`, `execute_insert`, `execute_update`, `execute_delete`, `execute_select`, and `Statement::Explain`).
   * **Secondary-Index DDL:** Handles `CREATE [UNIQUE] INDEX` and `DROP INDEX` by delegating directly to `Transaction::create_secondary_index` and `Transaction::drop_secondary_index`. Scans and indexes all existing table rows on creation, enforces uniqueness (including strict single-`NULL` uniqueness), unlinks catalog metadata, and recycles all index pages via freelist on drop.
+  * **Query Plan Introspection (`EXPLAIN`):** Binds and optimizes target query statements through the existing physical optimizer, returning a `StatementResult::Query` with a single `plan` string column containing the deterministic formatted physical plan without executing underlying operations or mutating persistent storage.
   * **Optimizer Reuse:** UPDATE and DELETE statements with WHERE clauses reuse the Phase 20 rule-based optimizer (`TableOptInfo`, `Optimizer::optimize`) to pick primary key lookups, primary range scans, or secondary index scans before executing table mutations.
   * **Constraint & Schema Validation:** Validates schema column types, converts numeric literals contextually (`Int64` -> `UInt64`/`Float64`), enforces `NOT NULL` constraints, rejects primary key updates, and validates unique index constraints.
   * **Result Typing:** Returns structured `StatementResult` variants (`Query`, `Inserted`, `Updated`, `Deleted`, `CreatedTable`, `DroppedTable`, `CreatedIndex`, `DroppedIndex`).
   * **WAL & Durability:** All mutations execute through existing `Table`, `Catalog`, and secondary B+ Tree APIs, ensuring complete WAL generation, ARIES recovery compatibility, and rollback on abort.
+
 
 
 ### `BindingContext`, `BoundSelect`, `TableBinding` & SQL Binder (`src/sql/binder.rs`)

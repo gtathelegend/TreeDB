@@ -1471,6 +1471,14 @@ impl<'db> Transaction<'db> {
         match stmt {
             crate::sql::Statement::Select(select_stmt) => self.plan_select(&select_stmt),
             crate::sql::Statement::SetQuery(set_stmt) => self.plan_set_query(&set_stmt),
+            crate::sql::Statement::Explain(explain_stmt) => match explain_stmt.query.as_ref() {
+                crate::sql::Statement::Select(select_stmt) => self.plan_select(select_stmt),
+                crate::sql::Statement::SetQuery(set_stmt) => self.plan_set_query(set_stmt),
+                _ => Err(Error::UnsupportedExplainTarget(format!(
+                    "{}",
+                    explain_stmt.query
+                ))),
+            },
             crate::sql::Statement::Update(update_stmt) => {
                 let select_ast = crate::sql::SelectStatement {
                     with: None,
@@ -1513,7 +1521,7 @@ impl<'db> Transaction<'db> {
         Ok(plan.to_string())
     }
 
-    /// Executes an arbitrary top-level SQL statement (`SELECT`, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`)
+    /// Executes an arbitrary top-level SQL statement (`SELECT`, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN`)
     /// within this transaction.
     ///
     /// Observes prior uncommitted mutations made within the same transaction.
@@ -1521,6 +1529,28 @@ impl<'db> Transaction<'db> {
         self.ensure_active()?;
         let stmt = crate::sql::parse_statement(sql)?;
         match stmt {
+            crate::sql::Statement::Explain(explain_stmt) => {
+                let plan = match explain_stmt.query.as_ref() {
+                    crate::sql::Statement::Select(select_stmt) => self.plan_select(select_stmt)?,
+                    crate::sql::Statement::SetQuery(set_stmt) => self.plan_set_query(set_stmt)?,
+                    _ => {
+                        return Err(Error::UnsupportedExplainTarget(format!(
+                            "{}",
+                            explain_stmt.query
+                        )))
+                    }
+                };
+                let plan_str = plan.to_string();
+                let schema = Schema::new_projected(vec![crate::engine::types::Column::new(
+                    "plan",
+                    DataType::String,
+                    false,
+                )]);
+                let rows = vec![Row::new(vec![Value::String(plan_str)])];
+                Ok(StatementResult::Query(crate::query::QueryResult::new(
+                    schema, rows,
+                )))
+            }
             crate::sql::Statement::Select(select_stmt) => {
                 let plan = self.plan_select(&select_stmt)?;
                 let query_result = self.execute_physical_plan(&plan)?;
