@@ -29,12 +29,17 @@ enum Precedence {
 pub struct Parser<'a> {
     tokens: &'a [Token],
     cursor: usize,
+    param_counter: usize,
 }
 
 impl<'a> Parser<'a> {
     /// Creates a new `Parser` over the provided slice of tokens.
     pub fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, cursor: 0 }
+        Self {
+            tokens,
+            cursor: 0,
+            param_counter: 0,
+        }
     }
 
     /// Parses an arbitrary top-level SQL statement (`SELECT`, set-operation query, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN`, `ANALYZE`).
@@ -2058,6 +2063,11 @@ impl<'a> Parser<'a> {
             TokenKind::Null => {
                 self.advance();
                 Ok(SqlExpr::Literal(SqlLiteral::Null))
+            }
+            TokenKind::QuestionMark => {
+                self.advance();
+                self.param_counter += 1;
+                Ok(SqlExpr::Parameter(self.param_counter))
             }
             TokenKind::Ident(name) => {
                 let val = name.clone();

@@ -412,6 +412,77 @@ impl TreeDb {
         Ok(result)
     }
 
+    /// Prepares an SQL query string into a reusable `PreparedStatement` with inferred parameter metadata.
+    pub fn prepare_sql(&mut self, sql: &str) -> Result<crate::sql::PreparedStatement> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.prepare_sql(sql)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
+    /// Executes a reusable `PreparedStatement` with parameter values directly on the database engine within an auto-committed transaction.
+    pub fn execute_prepared(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<StatementResult> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.execute_prepared(stmt, params)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
+    /// Executes a prepared query statement directly on the database engine within an auto-committed transaction.
+    pub fn execute_prepared_query(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<crate::query::QueryResult> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.execute_prepared_query(stmt, params)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
+    /// Executes a prepared statement returning both the query result and runtime metrics within an auto-committed transaction.
+    pub fn execute_prepared_with_metrics(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<(
+        crate::query::QueryResult,
+        crate::query::QueryExecutionMetrics,
+    )> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.execute_prepared_with_metrics(stmt, params)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
+    /// Explains the physical execution plan for a prepared statement with concrete parameters within an auto-committed transaction.
+    pub fn explain_prepared(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<String> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.explain_prepared(stmt, params)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
+    /// Explains and analyzes the physical execution plan for a prepared statement with concrete parameters within an auto-committed transaction.
+    pub fn explain_prepared_with_metrics(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<String> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.explain_prepared_with_metrics(stmt, params)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
     /// Creates a persistent secondary index.
     pub fn create_index(
         &mut self,

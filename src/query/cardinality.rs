@@ -27,7 +27,11 @@ impl CardinalityEstimator {
         _schema: &Schema,
     ) -> f64 {
         let sel = match expr {
-            Expr::Literal(Value::Boolean(b)) => {
+            Expr::Literal(Value::Boolean(b))
+            | Expr::Parameter {
+                value: Value::Boolean(b),
+                ..
+            } => {
                 if *b {
                     1.0
                 } else {
@@ -289,8 +293,14 @@ impl CardinalityEstimator {
 
 fn extract_col_and_val(left: &Expr, right: &Expr) -> (Option<String>, Option<Value>) {
     match (left, right) {
-        (Expr::Column(col), Expr::Literal(val)) => (Some(col.clone()), Some(val.clone())),
-        (Expr::Literal(val), Expr::Column(col)) => (Some(col.clone()), Some(val.clone())),
+        (Expr::Column(col), Expr::Literal(val))
+        | (Expr::Column(col), Expr::Parameter { value: val, .. }) => {
+            (Some(col.clone()), Some(val.clone()))
+        }
+        (Expr::Literal(val), Expr::Column(col))
+        | (Expr::Parameter { value: val, .. }, Expr::Column(col)) => {
+            (Some(col.clone()), Some(val.clone()))
+        }
         _ => (None, None),
     }
 }

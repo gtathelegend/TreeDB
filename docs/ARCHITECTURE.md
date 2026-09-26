@@ -378,6 +378,13 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Operator Instrumentation:** Physical operators (`TableScan`, `Filter`, `Project`, `Sort`, `LimitOffset`, `NestedLoopJoin`, `Aggregate`, `Window`, `Subquery`, `Cte`, `RecursiveCte`, `SetOperation`) are instrumented at runtime without modifying query results or altering storage engine state.
   * **EXPLAIN ANALYZE Grammar & Execution:** `EXPLAIN ANALYZE <query>` compiles the physical plan, executes the query within the active transaction, collects fine-grained operator metrics, and formats a diagnostic plan report comparing estimated vs. actual cardinalities and execution costs.
   * **API & Diagnostic Discipline:** Explicit `txn.execute_sql_with_metrics(sql)` and `db.execute_sql_with_metrics(sql)` APIs return `(QueryResult, QueryExecutionMetrics)`. Normal `execute_sql` execution remains unaffected. Metrics are strictly diagnostic; runtime observations are not fed back into the optimizer (non-adaptive in Phase 30). Unsupported DML targets in `EXPLAIN ANALYZE` return structured error `Error::UnsupportedExplainTarget`.
+* **Prepared Statements & Parameter Binding (`PreparedStatement`, `ParameterMetadata`):**
+  * **Positional Parameter Tokenization & AST:** Positional `?` tokens are mapped to 1-indexed `SqlExpr::Parameter(usize)` in deterministic left-to-right lexical appearance order. Parameters in table/column identifiers or DDL are rejected at parse time.
+  * **Contextual Type Inference (`infer_statement_parameters`):** Evaluates parameter sites against catalog table schemas and nested scope contexts (`InferScope`) during `prepare_sql` to infer expected data types (e.g. `col = ?` or `INSERT VALUES (?)`). Ambiguous sites (such as `SELECT ? FROM t`) yield `inferred_type: None`.
+  * **Strict Execution Validation:** `execute_prepared` validates parameter count (`Error::ParameterCountMismatch`) and type compatibility against inferred types (`Error::ParameterTypeMismatch`), permitting `Value::Null` across all types.
+  * **SQL 3-Valued Logic (3VL):** Parameter values evaluate strictly according to SQL 3VL rules (`WHERE col = ?` with `NULL` produces `Null`/`False`, not `IS NULL`).
+  * **Value-Sensitive Optimization:** Parameter values are bound into `Expr::Parameter { index, value }` prior to query planning, allowing the cost-based optimizer to select optimal index access paths (PK point lookup, PK range scan, secondary index scan) based on concrete values rather than generic fallback plans.
+  * **Diagnostics & Plan Cache Separation:** Includes `explain_prepared`, `explain_prepared_with_metrics`, and `execute_prepared_with_metrics`. Physical plan caching across executions is intentionally separated to prevent plan invalidation overhead and parameter sniffing skew.
 
 ---
 
@@ -396,6 +403,8 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **Set Operation Invariant:** Executing set operations is purely in-memory, deterministic, and preserves the left operand's column names and unified types without persistent side effects.
 * **Recursive Boundedness Invariant:** Recursive CTE execution never uses unbounded call stacks and deterministically terminates when the working set is empty or upon reaching configured iteration/row safety thresholds.
 * **Window Cardinality Invariant:** Window function evaluation never collapses or filters rows; the output row cardinality of `WindowOperator` strictly equals input row cardinality.
+* **Parameter Invariant & 3VL:** Bound parameter expressions evaluate consistently with SQL 3VL semantics (`WHERE col = ?` with `Value::Null` evaluates to False/Unknown, not `IS NULL`). Parameters in DDL or table/column identifiers are strictly prohibited.
+* **Prepared Statement Non-Persistence Invariant:** Preparing statements and parameter binding are strictly memory-resident, generating zero WAL records and zero page allocations.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -406,6 +415,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 ## 8. Intentionally Deferred Items
 
 The following capabilities are intentionally deferred to subsequent phases:
+* Physical plan caching and cached plan invalidation across prepared statement executions.
 * Multi-column composite secondary indexes.
 * Index-only covering scans.
 * Full cost-based optimizer and cardinality statistics.
@@ -414,6 +424,7 @@ The following capabilities are intentionally deferred to subsequent phases:
 * Derived tables (`FROM (SELECT ...)`).
 * Subquery flattening and cost-based decorrelation.
 * Multi-threading, concurrency control, and MVCC.
+
 
 
 

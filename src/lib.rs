@@ -34,8 +34,9 @@ pub use sql::{
     tokenize as tokenize_sql, AnalyzeStatement, BindingContext, BoundSelect, ColumnDef,
     CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement,
     DropTableStatement, ExplainStatement, InsertStatement, Lexer, OrderByExpr, OrderDirection,
-    Parser, SelectItem, SelectStatement, SourceSpan, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp,
-    Statement, TableRef, Token, TokenKind, UpdateAssignment, UpdateStatement, MAX_IDENTIFIER_LEN,
+    ParameterMetadata, Parser, PreparedStatement, SelectItem, SelectStatement, SourceSpan,
+    SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef, Token, TokenKind,
+    UpdateAssignment, UpdateStatement, MAX_IDENTIFIER_LEN,
 };
 
 pub use storage::{

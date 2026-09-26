@@ -131,6 +131,7 @@ fn ast_expr_references_table(expr: &crate::sql::SqlExpr, target_table: &str) -> 
         crate::sql::SqlExpr::QualifiedIdentifier { qualifier, .. } => qualifier == target_table,
         crate::sql::SqlExpr::Identifier(_)
         | crate::sql::SqlExpr::Literal(_)
+        | crate::sql::SqlExpr::Parameter(_)
         | crate::sql::SqlExpr::CountAll => false,
         crate::sql::SqlExpr::Subquery(sub) => ast_references_table(sub, target_table),
         crate::sql::SqlExpr::SetSubquery(sub) => ast_set_query_references_table(sub, target_table),
@@ -738,13 +739,24 @@ impl<'db> Transaction<'db> {
         ast: &crate::sql::SelectStatement,
     ) -> Result<crate::query::optimizer::PhysicalPlan> {
         self.ensure_active()?;
-        self.plan_select_with_outer_ctes(ast, &[])
+        self.plan_select_with_outer_ctes_and_params(ast, &[], None)
     }
 
-    fn bind_and_validate_ctes(
+    /// Plans a parsed `SelectStatement` AST with supplied parameter values.
+    pub fn plan_select_with_params(
+        &mut self,
+        ast: &crate::sql::SelectStatement,
+        params: Option<&[Value]>,
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
+        self.ensure_active()?;
+        self.plan_select_with_outer_ctes_and_params(ast, &[], params)
+    }
+
+    fn bind_and_validate_ctes_with_params(
         &mut self,
         ctes: &[crate::sql::Cte],
         visible_ctes: &mut Vec<crate::sql::BoundCte>,
+        params: Option<&[Value]>,
     ) -> Result<()> {
         validate_ast_cte_acyclicity(ctes)?;
         let mut declared_names = std::collections::HashSet::new();
@@ -756,7 +768,11 @@ impl<'db> Transaction<'db> {
             match &cte.query {
                 crate::sql::CteQuery::NonRecursive(select_stmt) => {
                     // Bind and plan the CTE query using currently visible CTEs
-                    let cte_plan = self.plan_select_with_outer_ctes(select_stmt, visible_ctes)?;
+                    let cte_plan = self.plan_select_with_outer_ctes_and_params(
+                        select_stmt,
+                        visible_ctes,
+                        params,
+                    )?;
 
                     // Derive the CTE output schema from cte_plan projections
                     let projected_schema =
@@ -816,7 +832,11 @@ impl<'db> Transaction<'db> {
                     });
                 }
                 crate::sql::CteQuery::SetOperation(set_query) => {
-                    let cte_plan = self.plan_set_query_with_outer_ctes(set_query, visible_ctes)?;
+                    let cte_plan = self.plan_set_query_with_outer_ctes_and_params(
+                        set_query,
+                        visible_ctes,
+                        params,
+                    )?;
                     let projected_schema =
                         self.derive_cte_output_schema(&cte_plan, visible_ctes)?;
 
@@ -877,7 +897,8 @@ impl<'db> Transaction<'db> {
                     }
 
                     // 2. Bind and plan anchor
-                    let anchor_plan = self.plan_select_with_outer_ctes(anchor, visible_ctes)?;
+                    let anchor_plan =
+                        self.plan_select_with_outer_ctes_and_params(anchor, visible_ctes, params)?;
                     let projected_schema =
                         self.derive_cte_output_schema(&anchor_plan, visible_ctes)?;
 
@@ -923,8 +944,11 @@ impl<'db> Transaction<'db> {
                     });
 
                     // 5. Plan recursive member
-                    let rec_plan =
-                        self.plan_select_with_outer_ctes(recursive, &rec_visible_ctes)?;
+                    let rec_plan = self.plan_select_with_outer_ctes_and_params(
+                        recursive,
+                        &rec_visible_ctes,
+                        params,
+                    )?;
 
                     // 6. Check unsupported recursive aggregation or window functions
                     let self_ref_in_rec = plan_references_table(&rec_plan, &cte.name);
@@ -1007,11 +1031,21 @@ impl<'db> Transaction<'db> {
         ast: &crate::sql::SelectStatement,
         outer_ctes: &[crate::sql::BoundCte],
     ) -> Result<crate::query::optimizer::PhysicalPlan> {
+        self.plan_select_with_outer_ctes_and_params(ast, outer_ctes, None)
+    }
+
+    /// Plans a parsed `SelectStatement` AST with in-scope outer CTE definitions and positional parameters.
+    pub fn plan_select_with_outer_ctes_and_params(
+        &mut self,
+        ast: &crate::sql::SelectStatement,
+        outer_ctes: &[crate::sql::BoundCte],
+        params: Option<&[Value]>,
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
         self.ensure_active()?;
         let mut visible_ctes: Vec<crate::sql::BoundCte> = outer_ctes.to_vec();
 
         if let Some(with_clause) = &ast.with {
-            self.bind_and_validate_ctes(&with_clause.ctes, &mut visible_ctes)?;
+            self.bind_and_validate_ctes_with_params(&with_clause.ctes, &mut visible_ctes, params)?;
         }
 
         // Now plan the main query body with visible_ctes
@@ -1073,7 +1107,12 @@ impl<'db> Transaction<'db> {
             bp: &bp_cell,
             ctes: Some(&visible_ctes),
         };
-        let mut bound = crate::sql::bind_select_multi_with_catalog(ast, &bindings, Some(&catalog))?;
+        let mut bound = crate::sql::binder::bind_select_multi_with_catalog_and_params(
+            ast,
+            &bindings,
+            Some(&catalog),
+            params,
+        )?;
         bound.ctes = visible_ctes;
         crate::query::optimizer::Optimizer::optimize(&bound, &table_infos)
     }
@@ -1084,7 +1123,17 @@ impl<'db> Transaction<'db> {
         ast: &crate::sql::SetQuery,
     ) -> Result<crate::query::optimizer::PhysicalPlan> {
         self.ensure_active()?;
-        self.plan_set_query_with_outer_ctes(ast, &[])
+        self.plan_set_query_with_outer_ctes_and_params(ast, &[], None)
+    }
+
+    /// Plans a parsed `SetQuery` AST with supplied parameter values.
+    pub fn plan_set_query_with_params(
+        &mut self,
+        ast: &crate::sql::SetQuery,
+        params: Option<&[Value]>,
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
+        self.ensure_active()?;
+        self.plan_set_query_with_outer_ctes_and_params(ast, &[], params)
     }
 
     /// Plans a parsed `SetQuery` AST with in-scope outer CTE definitions.
@@ -1093,14 +1142,24 @@ impl<'db> Transaction<'db> {
         ast: &crate::sql::SetQuery,
         outer_ctes: &[crate::sql::BoundCte],
     ) -> Result<crate::query::optimizer::PhysicalPlan> {
+        self.plan_set_query_with_outer_ctes_and_params(ast, outer_ctes, None)
+    }
+
+    /// Plans a parsed `SetQuery` AST with in-scope outer CTE definitions and positional parameters.
+    pub fn plan_set_query_with_outer_ctes_and_params(
+        &mut self,
+        ast: &crate::sql::SetQuery,
+        outer_ctes: &[crate::sql::BoundCte],
+        params: Option<&[Value]>,
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
         self.ensure_active()?;
         let mut visible_ctes: Vec<crate::sql::BoundCte> = outer_ctes.to_vec();
 
         if let Some(with_clause) = &ast.with {
-            self.bind_and_validate_ctes(&with_clause.ctes, &mut visible_ctes)?;
+            self.bind_and_validate_ctes_with_params(&with_clause.ctes, &mut visible_ctes, params)?;
         }
 
-        let mut plan = self.plan_set_query_body(&ast.body, &visible_ctes)?;
+        let mut plan = self.plan_set_query_body_with_params(&ast.body, &visible_ctes, params)?;
 
         if !ast.order_by.is_empty() {
             let schema = self.derive_cte_output_schema(&plan, &visible_ctes)?;
@@ -1121,11 +1180,12 @@ impl<'db> Transaction<'db> {
                             bp: &bp_cell,
                             ctes: Some(&visible_ctes),
                         };
-                        let ctx = crate::sql::binder::BindingContext::with_parent_and_catalog(
+                        let mut ctx = crate::sql::binder::BindingContext::with_parent_and_catalog(
                             vec![binding],
                             None,
                             Some(&catalog),
                         );
+                        ctx.params = params;
                         crate::sql::binder::bind_expr(&order_item.expr, &ctx)?
                     }
                 };
@@ -1149,21 +1209,23 @@ impl<'db> Transaction<'db> {
         Ok(plan)
     }
 
-    fn plan_set_query_body(
+    fn plan_set_query_body_with_params(
         &mut self,
         body: &crate::sql::SetQueryBody,
         visible_ctes: &[crate::sql::BoundCte],
+        params: Option<&[Value]>,
     ) -> Result<crate::query::optimizer::PhysicalPlan> {
         match body {
             crate::sql::SetQueryBody::Select(statement) => {
-                self.plan_select_with_outer_ctes(statement, visible_ctes)
+                self.plan_select_with_outer_ctes_and_params(statement, visible_ctes, params)
             }
             crate::sql::SetQueryBody::Parenthesized(inner) => {
-                self.plan_set_query_with_outer_ctes(inner, visible_ctes)
+                self.plan_set_query_with_outer_ctes_and_params(inner, visible_ctes, params)
             }
             crate::sql::SetQueryBody::SetOperation { op, left, right } => {
-                let left_plan = self.plan_set_query_body(left, visible_ctes)?;
-                let right_plan = self.plan_set_query_body(right, visible_ctes)?;
+                let left_plan = self.plan_set_query_body_with_params(left, visible_ctes, params)?;
+                let right_plan =
+                    self.plan_set_query_body_with_params(right, visible_ctes, params)?;
                 let left_schema = self.derive_cte_output_schema(&left_plan, visible_ctes)?;
                 let right_schema = self.derive_cte_output_schema(&right_plan, visible_ctes)?;
 
@@ -1412,7 +1474,8 @@ fn collect_cte_deps_from_expr(
         }
         crate::query::expr::Expr::Literal(_)
         | crate::query::expr::Expr::Column(_)
-        | crate::query::expr::Expr::OuterColumn { .. } => {}
+        | crate::query::expr::Expr::OuterColumn { .. }
+        | crate::query::expr::Expr::Parameter { .. } => {}
     }
 }
 
@@ -1796,7 +1859,263 @@ impl<'db> Transaction<'db> {
         })
     }
 
+    /// Prepares an SQL query string into a reusable `PreparedStatement` with inferred parameter metadata.
+    pub fn prepare_sql(&mut self, sql: &str) -> Result<crate::sql::PreparedStatement> {
+        self.ensure_active()?;
+        let statement = crate::sql::parse_statement(sql)?;
+        let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
+        let catalog = TxnBufferPoolCatalog {
+            bp: &bp_cell,
+            ctes: None,
+        };
+        let parameters = crate::sql::infer_statement_parameters(&statement, &catalog)?;
+        Ok(crate::sql::PreparedStatement::new(
+            sql, statement, parameters,
+        ))
+    }
+
+    fn validate_prepared_params(
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<()> {
+        if params.len() != stmt.parameter_count() {
+            return Err(Error::ParameterCountMismatch {
+                expected: stmt.parameter_count(),
+                received: params.len(),
+            });
+        }
+        for param_meta in stmt.parameters() {
+            if let Some(expected_type) = param_meta.inferred_type {
+                let val = &params[param_meta.index - 1];
+                if !val.is_null() {
+                    let val_type = val.data_type();
+                    if val_type != expected_type {
+                        let can_coerce = matches!(
+                            (val, expected_type),
+                            (Value::Int64(i), DataType::UInt64) if *i >= 0
+                        ) || matches!(
+                            (val, expected_type),
+                            (Value::Int64(_), DataType::Float64)
+                        ) || matches!(
+                            (val, expected_type),
+                            (Value::UInt64(u), DataType::Int64) if *u <= i64::MAX as u64
+                        ) || matches!(
+                            (val, expected_type),
+                            (Value::UInt64(_), DataType::Float64)
+                        );
+                        if !can_coerce {
+                            return Err(Error::ParameterTypeMismatch {
+                                param_index: param_meta.index,
+                                expected: expected_type.to_string(),
+                                found: val_type.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Executes a reusable `PreparedStatement` with the provided parameter values within this transaction.
+    pub fn execute_prepared(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<StatementResult> {
+        self.ensure_active()?;
+        Self::validate_prepared_params(stmt, params)?;
+
+        match &stmt.statement {
+            crate::sql::Statement::Select(select_stmt) => {
+                let plan = self.plan_select_with_params(select_stmt, Some(params))?;
+                let query_result = self.execute_physical_plan(&plan)?;
+                Ok(StatementResult::Query(query_result))
+            }
+            crate::sql::Statement::SetQuery(set_stmt) => {
+                let plan = self.plan_set_query_with_params(set_stmt, Some(params))?;
+                let query_result = self.execute_physical_plan(&plan)?;
+                Ok(StatementResult::Query(query_result))
+            }
+            crate::sql::Statement::Insert(insert_stmt) => {
+                self.execute_insert_with_params(insert_stmt, Some(params))
+            }
+            crate::sql::Statement::Update(update_stmt) => {
+                self.execute_update_with_params(update_stmt, Some(params))
+            }
+            crate::sql::Statement::Delete(delete_stmt) => {
+                self.execute_delete_with_params(delete_stmt, Some(params))
+            }
+            crate::sql::Statement::Explain(explain_stmt) => {
+                let plan = match explain_stmt.query.as_ref() {
+                    crate::sql::Statement::Select(select_stmt) => {
+                        self.plan_select_with_params(select_stmt, Some(params))?
+                    }
+                    crate::sql::Statement::SetQuery(set_stmt) => {
+                        self.plan_set_query_with_params(set_stmt, Some(params))?
+                    }
+                    _ => {
+                        return Err(Error::UnsupportedExplainTarget(format!(
+                            "{}",
+                            explain_stmt.query
+                        )))
+                    }
+                };
+                let plan_str = if explain_stmt.analyze {
+                    let start = std::time::Instant::now();
+                    let (res, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                    let metrics = crate::query::QueryExecutionMetrics::new(
+                        start.elapsed(),
+                        res.rows.len(),
+                        Some(root_op),
+                    );
+                    crate::query::metrics::format_plan_with_metrics(&plan, &metrics)
+                } else {
+                    plan.to_string()
+                };
+                let schema = Schema::new_projected(vec![crate::engine::types::Column::new(
+                    "plan",
+                    DataType::String,
+                    false,
+                )]);
+                let rows = vec![Row::new(vec![Value::String(plan_str)])];
+                Ok(StatementResult::Query(crate::query::QueryResult::new(
+                    schema, rows,
+                )))
+            }
+            crate::sql::Statement::CreateTable(create_stmt) => {
+                self.execute_create_table(create_stmt)
+            }
+            crate::sql::Statement::DropTable(drop_stmt) => self.execute_drop_table(drop_stmt),
+            crate::sql::Statement::CreateIndex(create_stmt) => {
+                self.execute_create_index(create_stmt)
+            }
+            crate::sql::Statement::DropIndex(drop_stmt) => self.execute_drop_index(drop_stmt),
+            crate::sql::Statement::Analyze(analyze_stmt) => self.execute_analyze(analyze_stmt),
+        }
+    }
+
+    /// Executes a prepared query statement returning a `QueryResult`.
+    pub fn execute_prepared_query(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<crate::query::QueryResult> {
+        let res = self.execute_prepared(stmt, params)?;
+        res.into_query()
+    }
+
+    /// Executes a prepared query statement returning both the query result and runtime metrics.
+    pub fn execute_prepared_with_metrics(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<(
+        crate::query::QueryResult,
+        crate::query::QueryExecutionMetrics,
+    )> {
+        self.ensure_active()?;
+        Self::validate_prepared_params(stmt, params)?;
+        let start = std::time::Instant::now();
+
+        match &stmt.statement {
+            crate::sql::Statement::Select(select_stmt) => {
+                let plan = self.plan_select_with_params(select_stmt, Some(params))?;
+                let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                let metrics = crate::query::QueryExecutionMetrics::new(
+                    start.elapsed(),
+                    qr.rows.len(),
+                    Some(root_op),
+                );
+                Ok((qr, metrics))
+            }
+            crate::sql::Statement::SetQuery(set_stmt) => {
+                let plan = self.plan_set_query_with_params(set_stmt, Some(params))?;
+                let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                let metrics = crate::query::QueryExecutionMetrics::new(
+                    start.elapsed(),
+                    qr.rows.len(),
+                    Some(root_op),
+                );
+                Ok((qr, metrics))
+            }
+            _ => {
+                let res = self.execute_prepared(stmt, params)?.into_query()?;
+                let metrics =
+                    crate::query::QueryExecutionMetrics::new(start.elapsed(), res.rows.len(), None);
+                Ok((res, metrics))
+            }
+        }
+    }
+
+    /// Explains the physical execution plan for a prepared statement with concrete parameters.
+    pub fn explain_prepared(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<String> {
+        self.ensure_active()?;
+        Self::validate_prepared_params(stmt, params)?;
+        let plan = match &stmt.statement {
+            crate::sql::Statement::Select(select_stmt) => {
+                self.plan_select_with_params(select_stmt, Some(params))?
+            }
+            crate::sql::Statement::SetQuery(set_stmt) => {
+                self.plan_set_query_with_params(set_stmt, Some(params))?
+            }
+            _ => {
+                return Err(Error::UnsupportedExplainTarget(format!(
+                    "{}",
+                    stmt.statement
+                )))
+            }
+        };
+        Ok(plan.to_string())
+    }
+
+    /// Explains and analyzes the physical execution plan for a prepared statement with concrete parameters.
+    pub fn explain_prepared_with_metrics(
+        &mut self,
+        stmt: &crate::sql::PreparedStatement,
+        params: &[Value],
+    ) -> Result<String> {
+        self.ensure_active()?;
+        Self::validate_prepared_params(stmt, params)?;
+        let start = std::time::Instant::now();
+        let plan = match &stmt.statement {
+            crate::sql::Statement::Select(select_stmt) => {
+                self.plan_select_with_params(select_stmt, Some(params))?
+            }
+            crate::sql::Statement::SetQuery(set_stmt) => {
+                self.plan_set_query_with_params(set_stmt, Some(params))?
+            }
+            _ => {
+                return Err(Error::UnsupportedExplainTarget(format!(
+                    "{}",
+                    stmt.statement
+                )))
+            }
+        };
+        let (res, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+        let metrics = crate::query::QueryExecutionMetrics::new(
+            start.elapsed(),
+            res.rows.len(),
+            Some(root_op),
+        );
+        Ok(crate::query::metrics::format_plan_with_metrics(
+            &plan, &metrics,
+        ))
+    }
+
     fn execute_insert(&mut self, stmt: &crate::sql::InsertStatement) -> Result<StatementResult> {
+        self.execute_insert_with_params(stmt, None)
+    }
+
+    fn execute_insert_with_params(
+        &mut self,
+        stmt: &crate::sql::InsertStatement,
+        params: Option<&[Value]>,
+    ) -> Result<StatementResult> {
         self.ensure_active()?;
         let mut table = self.open_table(&stmt.table_name)?;
         let schema = table.schema().clone();
@@ -1840,10 +2159,10 @@ impl<'db> Transaction<'db> {
 
             for (expr, &target_idx) in value_tuple.iter().zip(col_indices.iter()) {
                 let target_col = &schema.columns[target_idx];
-                let bound_expr = crate::sql::bind_expr(
-                    expr,
-                    &crate::sql::BindingContext::new_single(&stmt.table_name, None, &schema),
-                )?;
+                let mut ctx =
+                    crate::sql::BindingContext::new_single(&stmt.table_name, None, &schema);
+                ctx.params = params;
+                let bound_expr = crate::sql::bind_expr(expr, &ctx)?;
                 let mut evaluated_val = bound_expr.evaluate(&empty_row, &schema)?;
 
                 // Type coercion for numeric literals
@@ -1905,6 +2224,14 @@ impl<'db> Transaction<'db> {
     }
 
     fn execute_update(&mut self, stmt: &crate::sql::UpdateStatement) -> Result<StatementResult> {
+        self.execute_update_with_params(stmt, None)
+    }
+
+    fn execute_update_with_params(
+        &mut self,
+        stmt: &crate::sql::UpdateStatement,
+        params: Option<&[Value]>,
+    ) -> Result<StatementResult> {
         self.ensure_active()?;
         let schema = {
             let table = self.open_table(&stmt.table_name)?;
@@ -1938,10 +2265,9 @@ impl<'db> Transaction<'db> {
                 )));
             }
 
-            let bound_expr = crate::sql::bind_expr(
-                &assign.expr,
-                &crate::sql::BindingContext::new_single(&stmt.table_name, None, &schema),
-            )?;
+            let mut ctx = crate::sql::BindingContext::new_single(&stmt.table_name, None, &schema);
+            ctx.params = params;
+            let bound_expr = crate::sql::bind_expr(&assign.expr, &ctx)?;
             let expr_type = bound_expr.infer_type(&schema)?;
             let target_col = &schema.columns[col_idx];
 
@@ -1953,6 +2279,18 @@ impl<'db> Transaction<'db> {
                     (&bound_expr, target_col.data_type),
                     (
                         crate::query::expr::Expr::Literal(Value::Int64(_)),
+                        DataType::Float64
+                    )
+                ) || matches!(
+                    (&bound_expr, target_col.data_type),
+                    (crate::query::expr::Expr::Parameter { value: Value::Int64(i), .. }, DataType::UInt64) if *i >= 0
+                ) || matches!(
+                    (&bound_expr, target_col.data_type),
+                    (
+                        crate::query::expr::Expr::Parameter {
+                            value: Value::Int64(_),
+                            ..
+                        },
                         DataType::Float64
                     )
                 );
@@ -1981,7 +2319,7 @@ impl<'db> Transaction<'db> {
             limit: None,
             offset: None,
         };
-        let mut plan = self.plan_select(&select_ast)?;
+        let mut plan = self.plan_select_with_params(&select_ast, params)?;
 
         // 3. Fetch candidate rows
         self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
@@ -2070,6 +2408,14 @@ impl<'db> Transaction<'db> {
     }
 
     fn execute_delete(&mut self, stmt: &crate::sql::DeleteStatement) -> Result<StatementResult> {
+        self.execute_delete_with_params(stmt, None)
+    }
+
+    fn execute_delete_with_params(
+        &mut self,
+        stmt: &crate::sql::DeleteStatement,
+        params: Option<&[Value]>,
+    ) -> Result<StatementResult> {
         self.ensure_active()?;
         let schema = {
             let table = self.open_table(&stmt.table_name)?;
@@ -2089,7 +2435,7 @@ impl<'db> Transaction<'db> {
             limit: None,
             offset: None,
         };
-        let mut plan = self.plan_select(&select_ast)?;
+        let mut plan = self.plan_select_with_params(&select_ast, params)?;
 
         // 2. Fetch candidate rows
         self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
@@ -3049,7 +3395,8 @@ impl<'db> Transaction<'db> {
             }
             crate::query::expr::Expr::Literal(_)
             | crate::query::expr::Expr::Column(_)
-            | crate::query::expr::Expr::OuterColumn { .. } => {}
+            | crate::query::expr::Expr::OuterColumn { .. }
+            | crate::query::expr::Expr::Parameter { .. } => {}
         }
         Ok(())
     }
@@ -3378,7 +3725,8 @@ impl<'db> Transaction<'db> {
             }
             crate::query::expr::Expr::Literal(_)
             | crate::query::expr::Expr::Column(_)
-            | crate::query::expr::Expr::OuterColumn { .. } => {
+            | crate::query::expr::Expr::OuterColumn { .. }
+            | crate::query::expr::Expr::Parameter { .. } => {
                 expr.evaluate_with_outer(row, schema, outer_contexts)
             }
         }

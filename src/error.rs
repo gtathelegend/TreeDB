@@ -452,4 +452,26 @@ pub enum Error {
     /// Attempted to EXPLAIN an unsupported statement target (e.g. DML or DDL).
     #[error("EXPLAIN does not support {0} statements (only queries are supported)")]
     UnsupportedExplainTarget(String),
+
+    /// Prepared statement parameter count mismatch.
+    #[error("Parameter count mismatch: expected {expected} parameters, received {received}")]
+    ParameterCountMismatch { expected: usize, received: usize },
+
+    /// Prepared statement parameter type mismatch at runtime.
+    #[error(
+        "Parameter type mismatch at parameter {param_index}: expected {expected}, found {found}"
+    )]
+    ParameterTypeMismatch {
+        param_index: usize,
+        expected: String,
+        found: String,
+    },
+
+    /// Prepared statement execution requires parameters that were not provided.
+    #[error("Parameter required for positional parameter {0}")]
+    ParameterRequired(usize),
+
+    /// Invalid parameter usage or definition.
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
 }

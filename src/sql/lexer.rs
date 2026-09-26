@@ -90,6 +90,13 @@ impl<'a> Lexer<'a> {
                     SourceSpan::new(start, start + 1),
                 ))
             }
+            '?' => {
+                self.advance();
+                Ok(Token::new(
+                    TokenKind::QuestionMark,
+                    SourceSpan::new(start, start + 1),
+                ))
+            }
 
             // Operators
             '=' => {

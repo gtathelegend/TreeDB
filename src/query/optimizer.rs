@@ -571,7 +571,9 @@ fn format_subqueries_in_expr(
             }
             Ok(())
         }
-        Expr::Literal(_) | Expr::Column(_) | Expr::OuterColumn { .. } => Ok(()),
+        Expr::Literal(_) | Expr::Parameter { .. } | Expr::Column(_) | Expr::OuterColumn { .. } => {
+            Ok(())
+        }
     }
 }
 
@@ -1305,7 +1307,7 @@ fn collect_qualifiers(expr: &Expr, set: &mut HashSet<String>) {
                 collect_qualifiers(item, set);
             }
         }
-        Expr::Subquery(_) | Expr::Literal(_) => {}
+        Expr::Subquery(_) | Expr::Literal(_) | Expr::Parameter { .. } => {}
     }
 }
 
@@ -1354,6 +1356,10 @@ pub fn unqualify_expr(expr: &Expr, qualifier: &str) -> Expr {
         },
         Expr::Subquery(sub) => Expr::Subquery(sub.clone()),
         Expr::Literal(val) => Expr::Literal(val.clone()),
+        Expr::Parameter { index, value } => Expr::Parameter {
+            index: *index,
+            value: value.clone(),
+        },
     }
 }
 
@@ -1365,14 +1371,20 @@ fn extract_col_equality(expr: &Expr, target_col: &str, target_type: DataType) ->
             op: BinaryOp::Eq,
             right,
         } => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(name), Expr::Literal(val)) if name == target_col => {
+            (Expr::Column(name), Expr::Literal(val))
+            | (Expr::Column(name), Expr::Parameter { value: val, .. })
+                if name == target_col =>
+            {
                 if val.data_type() == target_type || val.is_null() {
                     Some(val.clone())
                 } else {
                     None
                 }
             }
-            (Expr::Literal(val), Expr::Column(name)) if name == target_col => {
+            (Expr::Literal(val), Expr::Column(name))
+            | (Expr::Parameter { value: val, .. }, Expr::Column(name))
+                if name == target_col =>
+            {
                 if val.data_type() == target_type || val.is_null() {
                     Some(val.clone())
                 } else {
@@ -1403,6 +1415,7 @@ fn extract_col_range_bounds(
                 right,
             } => match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(name), Expr::Literal(val))
+                | (Expr::Column(name), Expr::Parameter { value: val, .. })
                     if name == target_col && val.data_type() == target_type && !val.is_null() =>
                 {
                     if start.is_none() {
@@ -1411,6 +1424,7 @@ fn extract_col_range_bounds(
                     }
                 }
                 (Expr::Literal(val), Expr::Column(name))
+                | (Expr::Parameter { value: val, .. }, Expr::Column(name))
                     if name == target_col && val.data_type() == target_type && !val.is_null() =>
                 {
                     // val >= col -> col <= val
@@ -1424,6 +1438,7 @@ fn extract_col_range_bounds(
                 right,
             } => match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(name), Expr::Literal(val))
+                | (Expr::Column(name), Expr::Parameter { value: val, .. })
                     if name == target_col
                         && val.data_type() == target_type
                         && !val.is_null()
@@ -1440,6 +1455,7 @@ fn extract_col_range_bounds(
                 right,
             } => match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(name), Expr::Literal(val))
+                | (Expr::Column(name), Expr::Parameter { value: val, .. })
                     if name == target_col
                         && val.data_type() == target_type
                         && !val.is_null()
@@ -1449,6 +1465,7 @@ fn extract_col_range_bounds(
                     used.insert(idx);
                 }
                 (Expr::Literal(val), Expr::Column(name))
+                | (Expr::Parameter { value: val, .. }, Expr::Column(name))
                     if name == target_col
                         && val.data_type() == target_type
                         && !val.is_null()
@@ -1466,6 +1483,7 @@ fn extract_col_range_bounds(
                 right,
             } => match (left.as_ref(), right.as_ref()) {
                 (Expr::Literal(val), Expr::Column(name))
+                | (Expr::Parameter { value: val, .. }, Expr::Column(name))
                     if name == target_col
                         && val.data_type() == target_type
                         && !val.is_null()
@@ -1475,7 +1493,10 @@ fn extract_col_range_bounds(
                     start = Some(val.clone());
                     used.insert(idx);
                 }
-                (Expr::Column(name), Expr::Literal(_)) if name == target_col => {
+                (Expr::Column(name), Expr::Literal(_))
+                | (Expr::Column(name), Expr::Parameter { .. })
+                    if name == target_col =>
+                {
                     // col <= val: B+ Tree scan is exclusive on end, so keep in residual filter
                 }
                 _ => {}

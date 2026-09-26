@@ -751,6 +751,37 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
      * **Observability Precedes Adaptation:** Establishing a reliable, deterministic metrics and measurement layer before introducing adaptive optimization prevents compounding optimizer feedback loops, keeps query optimization deterministic and verifiable, and provides transparency into cost-model accuracy.
 
+---
+
+## Decision 46: Prepared Statements, Parameter Binding, and Deliberate Physical Plan Cache Separation
+
+* **Decision:** Introduce a formal `PreparedStatement` and `ParameterMetadata` abstraction with positional `?` syntax, AST-level parameter representations, contextual type inference, strict runtime validation, and value-sensitive query planning while deliberately separating prepared statements from physical plan caching in Phase 31:
+  1. **Positional Parameter Syntax & AST Representation:**
+     * The SQL lexer tokenizes `?` as `TokenKind::QuestionMark`.
+     * The parser assigns 1-indexed parameter positions in deterministic left-to-right lexical order, producing `SqlExpr::Parameter(usize)`.
+     * Parameters in DDL statements (`CREATE TABLE ?`) or identifier positions (`SELECT * FROM ?`) are rejected at parse time.
+  2. **Contextual Parameter Type Inference:**
+     * During the prepare phase (`prepare_sql`), `infer_statement_parameters` analyzes the AST in conjunction with catalog schemas across nested scopes (`InferScope`).
+     * Infers expected parameter types from context (e.g., `WHERE col = ?`, `INSERT INTO t VALUES (?)`, `UPDATE t SET col = ?`).
+     * Ambiguous contexts (e.g., `SELECT ? FROM t`) safely record `inferred_type: None`, allowing any valid value type at execution time.
+  3. **Strict Parameter Validation & 3VL Semantics:**
+     * `execute_prepared` validates that the supplied parameter count exactly matches `parameter_count` (`Error::ParameterCountMismatch`).
+     * If an inferred type is present, runtime values are validated against the expected `DataType` (`Error::ParameterTypeMismatch`), with `Value::Null` permitted for any type.
+     * Expression evaluation strictly adheres to SQL 3-Valued Logic (3VL): binding `Value::Null` to `WHERE col = ?` evaluates to `Null`/`False`, NOT `col IS NULL`.
+  4. **Value-Sensitive Query Optimization:**
+     * Bound parameter values are resolved into `Expr::Parameter { index, value }` prior to optimizer plan generation.
+     * The cost-based optimizer, cardinality estimator, and access path selector have access to concrete parameter values for point lookups, range bounds, and join selectivities.
+     * Full access path selection (PK Point Lookup, PK Range Scan, Secondary Index Point/Range Scan, Full Table Scan) operates on concrete bound values per execution.
+  5. **Deliberate Physical Plan Cache Separation:**
+     * Prepared statements store parsed ASTs and metadata rather than cached physical execution plans.
+     * This avoids complex plan invalidation logic, schema evolution hazards, and suboptimal parameter-sniffing plans when data distributions are skewed.
+  6. **Prepared Statement Diagnostics & Runtime Metrics:**
+     * Provides `explain_prepared`, `explain_prepared_with_metrics`, and `execute_prepared_with_metrics` APIs on both `Transaction` and `TreeDb`.
+* **Rationale:**
+  * **Safety & Security:** Parameterization eliminates SQL injection risks and provides clean separation between query structure and user data.
+  * **Optimal Access Paths:** Re-optimizing at execution time with concrete parameter values ensures the cost-based optimizer selects optimal index access paths without generic plan degradation or cache invalidation overhead.
+
+
 
 
 

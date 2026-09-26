@@ -85,6 +85,8 @@ pub struct BindingContext<'a> {
     pub parent: Option<&'a BindingContext<'a>>,
     /// Optional catalog lookup provider for finding referenced tables.
     pub catalog: Option<&'a dyn TableCatalog>,
+    /// Optional parameter values for prepared statement execution.
+    pub params: Option<&'a [Value]>,
 }
 
 impl<'a> BindingContext<'a> {
@@ -115,12 +117,37 @@ impl<'a> BindingContext<'a> {
             }
             Schema::new_projected(cols)
         };
+        let params = parent.and_then(|p| p.params);
         Self {
             tables,
             combined_schema,
             parent,
             catalog,
+            params,
         }
+    }
+
+    /// Attaches parameter values to this binding context.
+    pub fn with_params(mut self, params: Option<&'a [Value]>) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Retrieves a parameter value by 1-indexed identifier.
+    pub fn get_param(&self, index: usize) -> Result<&Value> {
+        if let Some(params) = self.params {
+            if index == 0 || index > params.len() {
+                return Err(Error::ParameterCountMismatch {
+                    expected: index,
+                    received: params.len(),
+                });
+            }
+            return Ok(&params[index - 1]);
+        }
+        if let Some(parent) = self.parent {
+            return parent.get_param(index);
+        }
+        Err(Error::ParameterRequired(index))
     }
 
     /// Creates a single-table root `BindingContext`.
@@ -516,6 +543,7 @@ pub fn contains_window(expr: &SqlExpr) -> bool {
         | SqlExpr::SetExists { .. } => false,
         SqlExpr::CountAll
         | SqlExpr::Literal(_)
+        | SqlExpr::Parameter(_)
         | SqlExpr::Identifier(_)
         | SqlExpr::QualifiedIdentifier { .. } => false,
     }
@@ -551,7 +579,10 @@ pub fn contains_aggregate(expr: &SqlExpr) -> bool {
         | SqlExpr::SetSubquery(_)
         | SqlExpr::Exists { .. }
         | SqlExpr::SetExists { .. } => false,
-        SqlExpr::Literal(_) | SqlExpr::Identifier(_) | SqlExpr::QualifiedIdentifier { .. } => false,
+        SqlExpr::Literal(_)
+        | SqlExpr::Parameter(_)
+        | SqlExpr::Identifier(_)
+        | SqlExpr::QualifiedIdentifier { .. } => false,
     }
 }
 
@@ -629,9 +660,10 @@ fn collect_aggregates(
         | SqlExpr::SetSubquery(_)
         | SqlExpr::Exists { .. }
         | SqlExpr::SetExists { .. } => Ok(()),
-        SqlExpr::Literal(_) | SqlExpr::Identifier(_) | SqlExpr::QualifiedIdentifier { .. } => {
-            Ok(())
-        }
+        SqlExpr::Literal(_)
+        | SqlExpr::Identifier(_)
+        | SqlExpr::QualifiedIdentifier { .. }
+        | SqlExpr::Parameter(_) => Ok(()),
     }
 }
 
@@ -660,7 +692,18 @@ pub fn bind_select_multi_with_catalog<'a>(
     tables: &[TableBinding<'a>],
     catalog: Option<&'a dyn TableCatalog>,
 ) -> Result<BoundSelect> {
-    let ctx = BindingContext::with_parent_and_catalog(tables.to_vec(), None, catalog);
+    bind_select_multi_with_catalog_and_params(statement, tables, catalog, None)
+}
+
+/// Binds a parsed `SelectStatement` AST against multiple tables' schemas, optional catalog, and positional parameters.
+pub fn bind_select_multi_with_catalog_and_params<'a>(
+    statement: &SelectStatement,
+    tables: &[TableBinding<'a>],
+    catalog: Option<&'a dyn TableCatalog>,
+    params: Option<&'a [Value]>,
+) -> Result<BoundSelect> {
+    let mut ctx = BindingContext::with_parent_and_catalog(tables.to_vec(), None, catalog);
+    ctx.params = params;
     bind_select_with_context(statement, &ctx)
 }
 
@@ -1578,6 +1621,13 @@ pub fn bind_grouped_expr(
             SqlLiteral::Float(f) => Ok(Expr::Literal(Value::Float64(*f))),
             SqlLiteral::String(s) => Ok(Expr::Literal(Value::String(s.clone()))),
         },
+        SqlExpr::Parameter(p_idx) => {
+            let val = ctx.get_param(*p_idx)?;
+            Ok(Expr::Parameter {
+                index: *p_idx,
+                value: val.clone(),
+            })
+        }
         SqlExpr::Identifier(col_name) => {
             if group_by.contains(&Expr::Column(col_name.clone())) {
                 Ok(Expr::Column(col_name.clone()))
@@ -1614,7 +1664,7 @@ pub fn bind_grouped_expr(
             let mut left_bound = bind_grouped_expr(left, ctx, group_by, grouped_schema)?;
             let mut right_bound = bind_grouped_expr(right, ctx, group_by, grouped_schema)?;
 
-            // Contextual literal type coercion
+            // Contextual literal/parameter type coercion
             if let Ok(left_type) = left_bound.infer_type(grouped_schema) {
                 if let Ok(right_type) = right_bound.infer_type(grouped_schema) {
                     if left_type == DataType::UInt64 && right_type == DataType::Int64 {
@@ -1622,20 +1672,60 @@ pub fn bind_grouped_expr(
                             if i >= 0 {
                                 right_bound = Expr::Literal(Value::UInt64(i as u64));
                             }
+                        } else if let Expr::Parameter {
+                            index,
+                            value: Value::Int64(i),
+                        } = right_bound
+                        {
+                            if i >= 0 {
+                                right_bound = Expr::Parameter {
+                                    index,
+                                    value: Value::UInt64(i as u64),
+                                };
+                            }
                         }
                     } else if left_type == DataType::Int64 && right_type == DataType::UInt64 {
                         if let Expr::Literal(Value::Int64(i)) = left_bound {
                             if i >= 0 {
                                 left_bound = Expr::Literal(Value::UInt64(i as u64));
                             }
+                        } else if let Expr::Parameter {
+                            index,
+                            value: Value::Int64(i),
+                        } = left_bound
+                        {
+                            if i >= 0 {
+                                left_bound = Expr::Parameter {
+                                    index,
+                                    value: Value::UInt64(i as u64),
+                                };
+                            }
                         }
                     } else if left_type == DataType::Float64 && right_type == DataType::Int64 {
                         if let Expr::Literal(Value::Int64(i)) = right_bound {
                             right_bound = Expr::Literal(Value::Float64(i as f64));
+                        } else if let Expr::Parameter {
+                            index,
+                            value: Value::Int64(i),
+                        } = right_bound
+                        {
+                            right_bound = Expr::Parameter {
+                                index,
+                                value: Value::Float64(i as f64),
+                            };
                         }
                     } else if left_type == DataType::Int64 && right_type == DataType::Float64 {
                         if let Expr::Literal(Value::Int64(i)) = left_bound {
                             left_bound = Expr::Literal(Value::Float64(i as f64));
+                        } else if let Expr::Parameter {
+                            index,
+                            value: Value::Int64(i),
+                        } = left_bound
+                        {
+                            left_bound = Expr::Parameter {
+                                index,
+                                value: Value::Float64(i as f64),
+                            };
                         }
                     }
                 }
@@ -1748,6 +1838,13 @@ pub fn bind_expr(expr: &SqlExpr, ctx: &BindingContext<'_>) -> Result<Expr> {
             SqlLiteral::Float(f) => Ok(Expr::Literal(Value::Float64(*f))),
             SqlLiteral::String(s) => Ok(Expr::Literal(Value::String(s.clone()))),
         },
+        SqlExpr::Parameter(p_idx) => {
+            let val = ctx.get_param(*p_idx)?;
+            Ok(Expr::Parameter {
+                index: *p_idx,
+                value: val.clone(),
+            })
+        }
         SqlExpr::Identifier(col_name) => ctx.resolve_column(col_name),
         SqlExpr::QualifiedIdentifier { qualifier, name } => {
             ctx.resolve_qualified_column(qualifier, name)
@@ -1768,7 +1865,7 @@ pub fn bind_expr(expr: &SqlExpr, ctx: &BindingContext<'_>) -> Result<Expr> {
             let mut left_bound = bind_expr(left, ctx)?;
             let mut right_bound = bind_expr(right, ctx)?;
 
-            // Contextual literal type coercion (e.g. integer literal 42 compared to UInt64 or Float64 column)
+            // Contextual literal/parameter type coercion (e.g. integer literal/parameter 42 compared to UInt64 or Float64 column)
             if let Ok(left_type) = left_bound.infer_type(&ctx.combined_schema) {
                 if let Ok(right_type) = right_bound.infer_type(&ctx.combined_schema) {
                     if left_type == DataType::UInt64 && right_type == DataType::Int64 {
@@ -1776,20 +1873,60 @@ pub fn bind_expr(expr: &SqlExpr, ctx: &BindingContext<'_>) -> Result<Expr> {
                             if i >= 0 {
                                 right_bound = Expr::Literal(Value::UInt64(i as u64));
                             }
+                        } else if let Expr::Parameter {
+                            index,
+                            value: Value::Int64(i),
+                        } = right_bound
+                        {
+                            if i >= 0 {
+                                right_bound = Expr::Parameter {
+                                    index,
+                                    value: Value::UInt64(i as u64),
+                                };
+                            }
                         }
                     } else if left_type == DataType::Int64 && right_type == DataType::UInt64 {
                         if let Expr::Literal(Value::Int64(i)) = left_bound {
                             if i >= 0 {
                                 left_bound = Expr::Literal(Value::UInt64(i as u64));
                             }
+                        } else if let Expr::Parameter {
+                            index,
+                            value: Value::Int64(i),
+                        } = left_bound
+                        {
+                            if i >= 0 {
+                                left_bound = Expr::Parameter {
+                                    index,
+                                    value: Value::UInt64(i as u64),
+                                };
+                            }
                         }
                     } else if left_type == DataType::Float64 && right_type == DataType::Int64 {
                         if let Expr::Literal(Value::Int64(i)) = right_bound {
                             right_bound = Expr::Literal(Value::Float64(i as f64));
+                        } else if let Expr::Parameter {
+                            index,
+                            value: Value::Int64(i),
+                        } = right_bound
+                        {
+                            right_bound = Expr::Parameter {
+                                index,
+                                value: Value::Float64(i as f64),
+                            };
                         }
                     } else if left_type == DataType::Int64 && right_type == DataType::Float64 {
                         if let Expr::Literal(Value::Int64(i)) = left_bound {
                             left_bound = Expr::Literal(Value::Float64(i as f64));
+                        } else if let Expr::Parameter {
+                            index,
+                            value: Value::Int64(i),
+                        } = left_bound
+                        {
+                            left_bound = Expr::Parameter {
+                                index,
+                                value: Value::Float64(i as f64),
+                            };
                         }
                     }
                 }
@@ -2389,6 +2526,6 @@ fn collect_outer_refs_from_expr(expr: &Expr, refs: &mut Vec<String>) {
                 }
             }
         }
-        Expr::Literal(_) | Expr::Column(_) => {}
+        Expr::Literal(_) | Expr::Column(_) | Expr::Parameter { .. } => {}
     }
 }

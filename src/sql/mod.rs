@@ -2,6 +2,7 @@ pub mod ast;
 pub mod binder;
 pub mod lexer;
 pub mod parser;
+pub mod prepared;
 pub mod span;
 pub mod token;
 
@@ -21,6 +22,7 @@ pub use binder::{
 };
 pub use lexer::{Lexer, MAX_IDENTIFIER_LEN};
 pub use parser::Parser;
+pub use prepared::{infer_statement_parameters, ParameterMetadata, PreparedStatement};
 pub use span::SourceSpan;
 pub use token::{Token, TokenKind};
 

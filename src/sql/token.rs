@@ -97,6 +97,7 @@ pub enum TokenKind {
 
     LParen,
     RParen,
+    QuestionMark,
     Semicolon,
 
     // Control
@@ -188,6 +189,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Dot => write!(f, "'.'"),
             TokenKind::LParen => write!(f, "'('"),
             TokenKind::RParen => write!(f, "')'"),
+            TokenKind::QuestionMark => write!(f, "'?'"),
             TokenKind::Semicolon => write!(f, "';'"),
             TokenKind::Eof => write!(f, "end of input"),
         }

@@ -523,7 +523,22 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 31: Advanced Query Processing & Optimizer Enhancements (Future)
+## Phase 31: Prepared Statements & Parameter Binding (Completed)
+* [x] Positional SQL parameter syntax `?` (1-indexed, deterministic left-to-right lexical order)
+* [x] AST & Bound representations: `SqlExpr::Parameter(usize)` and `Expr::Parameter { index, value }`
+* [x] `PreparedStatement` abstraction and `ParameterMetadata` (`index`, `inferred_type: Option<DataType>`)
+* [x] Contextual parameter type inference (`infer_statement_parameters`) during prepare with ambiguous type fallback
+* [x] Strict validation: parameter count matching (`Error::ParameterCountMismatch`) and runtime type validation (`Error::ParameterTypeMismatch`)
+* [x] SQL 3-Valued Logic (3VL) semantics for NULL parameters (`WHERE col = ?` with NULL evaluates to False)
+* [x] Parameterized value-sensitive cost-based optimization: access-path extraction (PK point/range, secondary index scans) and selectivity estimation
+* [x] Full statement coverage: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, JOINs, Aggregates/HAVING, Window functions, Set operations, Subqueries, CTEs, and Recursive CTEs
+* [x] Parameter rejection in DDL and identifier positions (`CREATE TABLE ?`, `SELECT * FROM ?`)
+* [x] Prepared diagnostics: `explain_prepared`, `explain_prepared_with_metrics`, `execute_prepared_with_metrics`
+* [x] 12 dedicated integration tests in `tests/prepared_statements.rs` (568 total passing test suite)
+
+---
+
+## Phase 32: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes

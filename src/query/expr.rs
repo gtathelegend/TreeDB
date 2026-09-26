@@ -358,6 +358,13 @@ pub struct SubqueryExpr {
 pub enum Expr {
     /// Constant literal scalar value.
     Literal(Value),
+    /// Bound positional parameter placeholder with 1-indexed identifier and concrete bound value.
+    Parameter {
+        /// 1-indexed parameter identifier.
+        index: usize,
+        /// Bound parameter value.
+        value: Value,
+    },
     /// Column reference by name in the current scope.
     Column(String),
     /// Correlated column reference from an enclosing outer scope.
@@ -430,6 +437,14 @@ impl Expr {
     /// Creates a literal expression from a `Value`.
     pub fn literal(value: impl Into<Value>) -> Self {
         Expr::Literal(value.into())
+    }
+
+    /// Creates a bound parameter expression.
+    pub fn parameter(index: usize, value: impl Into<Value>) -> Self {
+        Expr::Parameter {
+            index,
+            value: value.into(),
+        }
     }
 
     /// Creates a column reference expression.
@@ -573,7 +588,7 @@ impl Expr {
     /// Validates type compatibility statically before execution.
     pub fn infer_type(&self, schema: &Schema) -> Result<DataType> {
         match self {
-            Expr::Literal(v) => Ok(v.data_type()),
+            Expr::Literal(v) | Expr::Parameter { value: v, .. } => Ok(v.data_type()),
             Expr::Column(name) => resolve_column_in_schema(schema, name)
                 .map(|(_, c)| c.data_type)
                 .ok_or_else(|| Error::ColumnNotFound(name.clone())),
@@ -701,7 +716,7 @@ impl Expr {
         outer_contexts: &[(&Row, &Schema)],
     ) -> Result<Value> {
         match self {
-            Expr::Literal(v) => Ok(v.clone()),
+            Expr::Literal(v) | Expr::Parameter { value: v, .. } => Ok(v.clone()),
             Expr::Column(name) => {
                 let (idx, _) = resolve_column_in_schema(schema, name)
                     .ok_or_else(|| Error::ColumnNotFound(name.clone()))?;
@@ -1054,6 +1069,7 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::Literal(v) => write!(f, "{v}"),
+            Expr::Parameter { index, .. } => write!(f, "?{index}"),
             Expr::Column(name) => write!(f, "{name}"),
             Expr::OuterColumn { name, .. } => write!(f, "{name}"),
             Expr::Binary { left, op, right } => write!(f, "({left} {op} {right})"),

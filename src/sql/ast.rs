@@ -902,6 +902,8 @@ impl fmt::Display for WindowSpec {
 pub enum SqlExpr {
     /// Constant literal value.
     Literal(SqlLiteral),
+    /// Positional statement parameter placeholder (`?` with 1-indexed identifier).
+    Parameter(usize),
     /// Unqualified column or identifier reference (`column`).
     Identifier(String),
     /// Qualified column reference (`table.column` or `alias.column`).
@@ -1000,6 +1002,7 @@ impl fmt::Display for SqlExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SqlExpr::Literal(lit) => write!(f, "{lit}"),
+            SqlExpr::Parameter(_) => write!(f, "?"),
             SqlExpr::Identifier(name) => write!(f, "{name}"),
             SqlExpr::QualifiedIdentifier { qualifier, name } => write!(f, "{qualifier}.{name}"),
             SqlExpr::Binary { left, op, right } => write!(f, "({left} {op} {right})"),
