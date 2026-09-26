@@ -432,4 +432,20 @@ pub enum Error {
     /// Unsupported SQL statement or clause.
     #[error("Unsupported statement: {0}")]
     UnsupportedStatement(String),
+
+    /// Set operation operand column count mismatch.
+    #[error("Set operation column count mismatch: left query produced {left_cols} columns, right query produced {right_cols} columns")]
+    SetOperationColumnCountMismatch { left_cols: usize, right_cols: usize },
+
+    /// Set operation operand data type mismatch.
+    #[error("Set operation data type mismatch at column {col_idx}: left type '{left_type}' is incompatible with right type '{right_type}'")]
+    SetOperationTypeMismatch {
+        col_idx: usize,
+        left_type: String,
+        right_type: String,
+    },
+
+    /// Invalid set operation syntax or usage.
+    #[error("Invalid set operation: {0}")]
+    InvalidSetOperation(String),
 }

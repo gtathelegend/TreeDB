@@ -11,9 +11,9 @@ pub use expr::{
 pub use operator::{
     compare_rows_by_sort_keys, compare_values_for_sort, AggregateOperator, AggregateState,
     CanonicalValue, FilterOperator, GroupKey, JoinOperator, OffsetLimitOperator, ProjectOperator,
-    QueryResult, SortDirection, SortKey, SortOperator, WindowOperator,
+    QueryResult, SetOperationOperator, SortDirection, SortKey, SortOperator, WindowOperator,
 };
 pub use optimizer::{
-    AccessPath, Optimizer, PhysicalJoin, PhysicalPlan, PhysicalTableScan, SecondaryScanType,
-    TableOptInfo,
+    AccessPath, Optimizer, PhysicalJoin, PhysicalPlan, PhysicalSetOp, PhysicalTableScan,
+    SecondaryScanType, TableOptInfo,
 };

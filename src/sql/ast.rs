@@ -8,6 +8,8 @@ use crate::engine::types::DataType;
 pub enum Statement {
     /// SQL `SELECT` query statement.
     Select(SelectStatement),
+    /// SQL set-operation query statement (e.g. `UNION`, `INTERSECT`, `EXCEPT`).
+    SetQuery(SetQuery),
     /// SQL `CREATE TABLE` DDL statement.
     CreateTable(CreateTableStatement),
     /// SQL `DROP TABLE` DDL statement.
@@ -24,6 +26,7 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Statement::Select(s) => write!(f, "{s}"),
+            Statement::SetQuery(s) => write!(f, "{s}"),
             Statement::CreateTable(s) => write!(f, "{s}"),
             Statement::DropTable(s) => write!(f, "{s}"),
             Statement::Insert(s) => write!(f, "{s}"),
@@ -207,11 +210,13 @@ impl fmt::Display for DeleteStatement {
     }
 }
 
-/// Query definition of a CTE (non-recursive query or recursive anchor/member pair).
+/// Query definition of a CTE (non-recursive query, set-operation query, or recursive anchor/member pair).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CteQuery {
     /// Non-recursive single SELECT query.
     NonRecursive(Box<SelectStatement>),
+    /// Non-recursive set-operation query.
+    SetOperation(Box<SetQuery>),
     /// Recursive query with anchor and recursive member connected by `UNION ALL`.
     Recursive {
         /// Initial anchor relation query.
@@ -225,10 +230,111 @@ impl fmt::Display for CteQuery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CteQuery::NonRecursive(q) => write!(f, "{q}"),
+            CteQuery::SetOperation(q) => write!(f, "{q}"),
             CteQuery::Recursive { anchor, recursive } => {
                 write!(f, "{anchor} UNION ALL {recursive}")
             }
         }
+    }
+}
+
+/// Supported SQL relational set operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetOperator {
+    /// `UNION` (duplicate-eliminating union).
+    Union,
+    /// `UNION ALL` (duplicate-preserving concatenation).
+    UnionAll,
+    /// `INTERSECT` (duplicate-eliminating intersection).
+    Intersect,
+    /// `INTERSECT ALL` (multiset intersection).
+    IntersectAll,
+    /// `EXCEPT` (duplicate-eliminating difference).
+    Except,
+    /// `EXCEPT ALL` (multiset difference).
+    ExceptAll,
+}
+
+impl fmt::Display for SetOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SetOperator::Union => write!(f, "UNION"),
+            SetOperator::UnionAll => write!(f, "UNION ALL"),
+            SetOperator::Intersect => write!(f, "INTERSECT"),
+            SetOperator::IntersectAll => write!(f, "INTERSECT ALL"),
+            SetOperator::Except => write!(f, "EXCEPT"),
+            SetOperator::ExceptAll => write!(f, "EXCEPT ALL"),
+        }
+    }
+}
+
+/// Recursive set-operation query body representation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetQueryBody {
+    /// Single `SELECT` query operand.
+    Select(Box<SelectStatement>),
+    /// Binary set operation combining left and right query operands.
+    SetOperation {
+        /// Set operator kind.
+        op: SetOperator,
+        /// Left-hand query operand.
+        left: Box<SetQueryBody>,
+        /// Right-hand query operand.
+        right: Box<SetQueryBody>,
+    },
+    /// Parenthesized query operand (preserves explicit grouping and inner modifiers).
+    Parenthesized(Box<SetQuery>),
+}
+
+impl fmt::Display for SetQueryBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SetQueryBody::Select(s) => write!(f, "{s}"),
+            SetQueryBody::SetOperation { op, left, right } => {
+                write!(f, "{left} {op} {right}")
+            }
+            SetQueryBody::Parenthesized(q) => write!(f, "({q})"),
+        }
+    }
+}
+
+/// Complete SQL set-operation query statement with optional CTEs, sort, and pagination.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetQuery {
+    /// Optional Common Table Expression (CTE) `WITH` clause.
+    pub with: Option<WithClause>,
+    /// Inner set-operation query body.
+    pub body: SetQueryBody,
+    /// Ordered list of sort expressions in the final `ORDER BY` clause.
+    pub order_by: Vec<OrderByExpr>,
+    /// Optional non-negative maximum row count in the final `LIMIT` clause.
+    pub limit: Option<u64>,
+    /// Optional non-negative row skip count in the final `OFFSET` clause.
+    pub offset: Option<u64>,
+}
+
+impl fmt::Display for SetQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(with) = &self.with {
+            write!(f, "{with} ")?;
+        }
+        write!(f, "{}", self.body)?;
+        if !self.order_by.is_empty() {
+            write!(f, " ORDER BY ")?;
+            for (i, item) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{item}")?;
+            }
+        }
+        if let Some(limit) = self.limit {
+            write!(f, " LIMIT {limit}")?;
+        }
+        if let Some(offset) = self.offset {
+            write!(f, " OFFSET {offset}")?;
+        }
+        Ok(())
     }
 }
 
@@ -733,10 +839,19 @@ pub enum SqlExpr {
     },
     /// Scalar subquery: `(SELECT ...)`.
     Subquery(Box<SelectStatement>),
+    /// Scalar set-operation subquery: `(SELECT ... UNION SELECT ...)`.
+    SetSubquery(Box<SetQuery>),
     /// `EXISTS (SELECT ...)` or `NOT EXISTS (SELECT ...)`.
     Exists {
         /// Inner select statement.
         subquery: Box<SelectStatement>,
+        /// Whether the predicate is negated (`NOT EXISTS`).
+        negated: bool,
+    },
+    /// `EXISTS (SELECT ... UNION ...)` or `NOT EXISTS (...)`.
+    SetExists {
+        /// Inner set query.
+        subquery: Box<SetQuery>,
         /// Whether the predicate is negated (`NOT EXISTS`).
         negated: bool,
     },
@@ -746,6 +861,15 @@ pub enum SqlExpr {
         expr: Box<SqlExpr>,
         /// Subquery producing set of candidate values.
         subquery: Box<SelectStatement>,
+        /// Whether the condition is negated (`NOT IN`).
+        negated: bool,
+    },
+    /// `expr [NOT] IN (SELECT ... UNION ...)`.
+    InSetSubquery {
+        /// Evaluated scalar expression.
+        expr: Box<SqlExpr>,
+        /// Subquery producing set of candidate values.
+        subquery: Box<SetQuery>,
         /// Whether the condition is negated (`NOT IN`).
         negated: bool,
     },
@@ -781,6 +905,7 @@ impl fmt::Display for SqlExpr {
                 write!(f, "{function}({}) {window_spec}", args_str.join(", "))
             }
             SqlExpr::Subquery(sub) => write!(f, "({sub})"),
+            SqlExpr::SetSubquery(sub) => write!(f, "({sub})"),
             SqlExpr::Exists { subquery, negated } => {
                 if *negated {
                     write!(f, "NOT EXISTS ({subquery})")
@@ -788,7 +913,25 @@ impl fmt::Display for SqlExpr {
                     write!(f, "EXISTS ({subquery})")
                 }
             }
+            SqlExpr::SetExists { subquery, negated } => {
+                if *negated {
+                    write!(f, "NOT EXISTS ({subquery})")
+                } else {
+                    write!(f, "EXISTS ({subquery})")
+                }
+            }
             SqlExpr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                if *negated {
+                    write!(f, "({expr} NOT IN ({subquery}))")
+                } else {
+                    write!(f, "({expr} IN ({subquery}))")
+                }
+            }
+            SqlExpr::InSetSubquery {
                 expr,
                 subquery,
                 negated,

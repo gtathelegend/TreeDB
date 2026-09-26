@@ -1027,3 +1027,139 @@ impl WindowOperator {
         Ok((output_schema, out_rows))
     }
 }
+
+fn coerce_row(row: Row, target_schema: &Schema) -> Result<Row> {
+    let mut values = Vec::with_capacity(target_schema.columns.len());
+    for (val, col) in row.values.into_iter().zip(&target_schema.columns) {
+        let coerced = match (val, col.data_type) {
+            (Value::Null, _) => Value::Null,
+            (Value::Int64(i), DataType::UInt64) if i >= 0 => Value::UInt64(i as u64),
+            (Value::Int64(i), DataType::Float64) => Value::Float64(i as f64),
+            (Value::UInt64(u), DataType::Int64) if u <= i64::MAX as u64 => Value::Int64(u as i64),
+            (Value::UInt64(u), DataType::Float64) => Value::Float64(u as f64),
+            (v, _) => v,
+        };
+        values.push(coerced);
+    }
+    Ok(Row::new(values))
+}
+
+fn row_key(row: &Row) -> Vec<CanonicalValue> {
+    row.values.iter().map(CanonicalValue::from_value).collect()
+}
+
+/// Physical in-memory execution operator for relational set operations.
+pub struct SetOperationOperator;
+
+impl SetOperationOperator {
+    /// Applies a relational set operation on left and right input rows.
+    pub fn apply(
+        left_rows: Vec<Row>,
+        right_rows: Vec<Row>,
+        target_schema: &Schema,
+        op: &crate::sql::SetOperator,
+    ) -> Result<Vec<Row>> {
+        let left_coerced: Vec<Row> = left_rows
+            .into_iter()
+            .map(|r| coerce_row(r, target_schema))
+            .collect::<Result<Vec<_>>>()?;
+        let right_coerced: Vec<Row> = right_rows
+            .into_iter()
+            .map(|r| coerce_row(r, target_schema))
+            .collect::<Result<Vec<_>>>()?;
+
+        match op {
+            crate::sql::SetOperator::Union => {
+                let mut seen = std::collections::HashSet::new();
+                let mut result = Vec::new();
+                for row in left_coerced {
+                    let key = row_key(&row);
+                    if seen.insert(key) {
+                        result.push(row);
+                    }
+                }
+                for row in right_coerced {
+                    let key = row_key(&row);
+                    if seen.insert(key) {
+                        result.push(row);
+                    }
+                }
+                Ok(result)
+            }
+            crate::sql::SetOperator::UnionAll => {
+                let mut result = left_coerced;
+                result.extend(right_coerced);
+                Ok(result)
+            }
+            crate::sql::SetOperator::Intersect => {
+                let mut right_set = std::collections::HashSet::new();
+                for row in &right_coerced {
+                    right_set.insert(row_key(row));
+                }
+                let mut emitted = std::collections::HashSet::new();
+                let mut result = Vec::new();
+                for row in left_coerced {
+                    let key = row_key(&row);
+                    if right_set.contains(&key) && emitted.insert(key) {
+                        result.push(row);
+                    }
+                }
+                Ok(result)
+            }
+            crate::sql::SetOperator::IntersectAll => {
+                let mut right_counts: std::collections::HashMap<Vec<CanonicalValue>, usize> =
+                    std::collections::HashMap::new();
+                for row in &right_coerced {
+                    let key = row_key(row);
+                    *right_counts.entry(key).or_insert(0) += 1;
+                }
+                let mut result = Vec::new();
+                for row in left_coerced {
+                    let key = row_key(&row);
+                    if let Some(cnt) = right_counts.get_mut(&key) {
+                        if *cnt > 0 {
+                            *cnt -= 1;
+                            result.push(row);
+                        }
+                    }
+                }
+                Ok(result)
+            }
+            crate::sql::SetOperator::Except => {
+                let mut right_set = std::collections::HashSet::new();
+                for row in &right_coerced {
+                    right_set.insert(row_key(row));
+                }
+                let mut emitted = std::collections::HashSet::new();
+                let mut result = Vec::new();
+                for row in left_coerced {
+                    let key = row_key(&row);
+                    if !right_set.contains(&key) && emitted.insert(key) {
+                        result.push(row);
+                    }
+                }
+                Ok(result)
+            }
+            crate::sql::SetOperator::ExceptAll => {
+                let mut right_counts: std::collections::HashMap<Vec<CanonicalValue>, usize> =
+                    std::collections::HashMap::new();
+                for row in &right_coerced {
+                    let key = row_key(row);
+                    *right_counts.entry(key).or_insert(0) += 1;
+                }
+                let mut result = Vec::new();
+                for row in left_coerced {
+                    let key = row_key(&row);
+                    if let Some(cnt) = right_counts.get_mut(&key) {
+                        if *cnt > 0 {
+                            *cnt -= 1;
+                            continue;
+                        }
+                    }
+                    result.push(row);
+                }
+                Ok(result)
+            }
+        }
+    }
+}

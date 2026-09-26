@@ -354,6 +354,13 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Scope & Shadowing Rules:** Recursive CTE name is visible only within the recursive member query, shadowing catalog tables of the same name. Self-reference in anchor is rejected (`Error::RecursiveCteAnchorSelfReference`). Mutual recursion (`a -> b -> a`) is statically rejected (`Error::MutualRecursion`).
   * **Schema Validation:** Enforces exact column count matching and data type compatibility between anchor and recursive member projections.
   * **Relational Integration:** Seamlessly composes with joins (`INNER`/`LEFT`), filters, aliases, preceding CTEs, subqueries, and outer query `ORDER BY`, `LIMIT`, and window functions.
+* **SQL Set Operations:**
+  * **AST & Precedence:** `SetOperator` (`Union`, `UnionAll`, `Intersect`, `IntersectAll`, `Except`, `ExceptAll`), `SetQueryBody` (recursive enum), `SetQuery` (with top-level WITH, ORDER BY, LIMIT, OFFSET). `INTERSECT` binds tighter (precedence 2) than `UNION`/`EXCEPT` (precedence 1). Parentheses explicitly override precedence.
+  * **Physical Set Operator (`PhysicalSetOp`):** Recursive evaluation of left and right physical plan operands applying set and multiset algebra in memory.
+  * **Distinctness & Equivalence:** Evaluates row identity using `CanonicalValue` comparison where `NULL = NULL`.
+  * **Multiset Semantics:** `UNION ALL` preserves duplicates; `INTERSECT ALL` takes multiset minimum $\min(L, R)$; `EXCEPT ALL` subtracts multiplicities $\max(0, L - R)$.
+  * **Schema Coercion & Derivation:** Output schema column names and primary attributes are determined by the left operand; column counts must match (`Error::SetOperationColumnCountMismatch`) and incompatible types are rejected (`Error::SetOperationTypeMismatch`).
+  * **Full Engine Composition:** Integrated with CTEs (non-recursive and recursive), joins, aggregations, window functions, scalar/IN/EXISTS subqueries, and deterministic `explain_sql` formatting.
 
 ---
 
@@ -369,6 +376,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **Secondary Index Invariant:** Every committed table row must have exactly the corresponding secondary-index entries required by its indexed columns, and every secondary-index entry must resolve to a valid current `RecordId`.
 * **Subquery Cardinality Invariant:** Scalar subqueries must return $\le 1$ row (0 rows -> `NULL`, 1 row -> value, $>1$ rows -> `Error::ScalarSubqueryMultipleRows`) and exactly 1 column.
 * **CTE Non-Persistence Invariant:** Executing CTE and recursive CTE queries never modifies persistent database pages, freelist state, catalog metadata, or WAL logs.
+* **Set Operation Invariant:** Executing set operations is purely in-memory, deterministic, and preserves the left operand's column names and unified types without persistent side effects.
 * **Recursive Boundedness Invariant:** Recursive CTE execution never uses unbounded call stacks and deterministically terminates when the working set is empty or upon reaching configured iteration/row safety thresholds.
 * **Window Cardinality Invariant:** Window function evaluation never collapses or filters rows; the output row cardinality of `WindowOperator` strictly equals input row cardinality.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.

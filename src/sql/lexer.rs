@@ -333,6 +333,8 @@ impl<'a> Lexer<'a> {
             "RECURSIVE" => TokenKind::Recursive,
             "UNION" => TokenKind::Union,
             "ALL" => TokenKind::All,
+            "INTERSECT" => TokenKind::Intersect,
+            "EXCEPT" => TokenKind::Except,
             "OVER" => TokenKind::Over,
             "PARTITION" => TokenKind::Partition,
             "ROWS" => TokenKind::Rows,

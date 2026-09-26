@@ -11,6 +11,25 @@ pub const DEFAULT_MAX_RECURSION_ITERATIONS: usize = 1000;
 pub const DEFAULT_MAX_RECURSION_ROWS: usize = 1_000_000;
 
 fn ast_references_table(stmt: &crate::sql::SelectStatement, target_table: &str) -> bool {
+    if let Some(with_clause) = &stmt.with {
+        for cte in &with_clause.ctes {
+            let refs = match &cte.query {
+                crate::sql::CteQuery::NonRecursive(select) => {
+                    ast_references_table(select, target_table)
+                }
+                crate::sql::CteQuery::SetOperation(set_q) => {
+                    ast_set_query_references_table(set_q, target_table)
+                }
+                crate::sql::CteQuery::Recursive { anchor, recursive } => {
+                    ast_references_table(anchor, target_table)
+                        || ast_references_table(recursive, target_table)
+                }
+            };
+            if refs {
+                return true;
+            }
+        }
+    }
     if stmt.from.name == target_table || stmt.from.alias.as_deref() == Some(target_table) {
         return true;
     }
@@ -60,6 +79,53 @@ fn ast_references_table(stmt: &crate::sql::SelectStatement, target_table: &str) 
     false
 }
 
+fn ast_set_query_references_table(query: &crate::sql::SetQuery, target_table: &str) -> bool {
+    if let Some(with_clause) = &query.with {
+        for cte in &with_clause.ctes {
+            let refs = match &cte.query {
+                crate::sql::CteQuery::NonRecursive(select) => {
+                    ast_references_table(select, target_table)
+                }
+                crate::sql::CteQuery::SetOperation(set_q) => {
+                    ast_set_query_references_table(set_q, target_table)
+                }
+                crate::sql::CteQuery::Recursive { anchor, recursive } => {
+                    ast_references_table(anchor, target_table)
+                        || ast_references_table(recursive, target_table)
+                }
+            };
+            if refs {
+                return true;
+            }
+        }
+    }
+    if ast_set_query_body_references_table(&query.body, target_table) {
+        return true;
+    }
+    for item in &query.order_by {
+        if ast_expr_references_table(&item.expr, target_table) {
+            return true;
+        }
+    }
+    false
+}
+
+fn ast_set_query_body_references_table(
+    body: &crate::sql::SetQueryBody,
+    target_table: &str,
+) -> bool {
+    match body {
+        crate::sql::SetQueryBody::Select(s) => ast_references_table(s, target_table),
+        crate::sql::SetQueryBody::Parenthesized(q) => {
+            ast_set_query_references_table(q, target_table)
+        }
+        crate::sql::SetQueryBody::SetOperation { left, right, .. } => {
+            ast_set_query_body_references_table(left, target_table)
+                || ast_set_query_body_references_table(right, target_table)
+        }
+    }
+}
+
 fn ast_expr_references_table(expr: &crate::sql::SqlExpr, target_table: &str) -> bool {
     match expr {
         crate::sql::SqlExpr::QualifiedIdentifier { qualifier, .. } => qualifier == target_table,
@@ -67,6 +133,7 @@ fn ast_expr_references_table(expr: &crate::sql::SqlExpr, target_table: &str) -> 
         | crate::sql::SqlExpr::Literal(_)
         | crate::sql::SqlExpr::CountAll => false,
         crate::sql::SqlExpr::Subquery(sub) => ast_references_table(sub, target_table),
+        crate::sql::SqlExpr::SetSubquery(sub) => ast_set_query_references_table(sub, target_table),
         crate::sql::SqlExpr::Binary { left, right, .. } => {
             ast_expr_references_table(left, target_table)
                 || ast_expr_references_table(right, target_table)
@@ -84,8 +151,15 @@ fn ast_expr_references_table(expr: &crate::sql::SqlExpr, target_table: &str) -> 
             ast_expr_references_table(expr, target_table)
                 || ast_references_table(subquery, target_table)
         }
+        crate::sql::SqlExpr::InSetSubquery { expr, subquery, .. } => {
+            ast_expr_references_table(expr, target_table)
+                || ast_set_query_references_table(subquery, target_table)
+        }
         crate::sql::SqlExpr::Exists { subquery, .. } => {
             ast_references_table(subquery, target_table)
+        }
+        crate::sql::SqlExpr::SetExists { subquery, .. } => {
+            ast_set_query_references_table(subquery, target_table)
         }
         crate::sql::SqlExpr::Aggregate { arg, .. } => ast_expr_references_table(arg, target_table),
         crate::sql::SqlExpr::Window {
@@ -106,6 +180,10 @@ fn ast_expr_references_table(expr: &crate::sql::SqlExpr, target_table: &str) -> 
 }
 
 fn plan_references_table(plan: &crate::query::optimizer::PhysicalPlan, target_table: &str) -> bool {
+    if let Some(set_op) = &plan.set_op {
+        return plan_references_table(&set_op.left, target_table)
+            || plan_references_table(&set_op.right, target_table);
+    }
     if plan.base_table.table_name == target_table
         || plan.base_table.table_alias.as_deref() == Some(target_table)
     {
@@ -134,6 +212,9 @@ fn validate_ast_cte_acyclicity(ctes: &[crate::sql::Cte]) -> Result<()> {
             let refs = match &cte.query {
                 crate::sql::CteQuery::NonRecursive(select) => {
                     ast_references_table(select, &other.name)
+                }
+                crate::sql::CteQuery::SetOperation(set_q) => {
+                    ast_set_query_references_table(set_q, &other.name)
                 }
                 crate::sql::CteQuery::Recursive { anchor, recursive } => {
                     ast_references_table(anchor, &other.name)
@@ -636,6 +717,266 @@ impl<'db> Transaction<'db> {
         self.plan_select_with_outer_ctes(ast, &[])
     }
 
+    fn bind_and_validate_ctes(
+        &mut self,
+        ctes: &[crate::sql::Cte],
+        visible_ctes: &mut Vec<crate::sql::BoundCte>,
+    ) -> Result<()> {
+        validate_ast_cte_acyclicity(ctes)?;
+        let mut declared_names = std::collections::HashSet::new();
+        for cte in ctes {
+            if !declared_names.insert(&cte.name) {
+                return Err(Error::DuplicateCteName(cte.name.clone()));
+            }
+
+            match &cte.query {
+                crate::sql::CteQuery::NonRecursive(select_stmt) => {
+                    // Bind and plan the CTE query using currently visible CTEs
+                    let cte_plan = self.plan_select_with_outer_ctes(select_stmt, visible_ctes)?;
+
+                    // Derive the CTE output schema from cte_plan projections
+                    let projected_schema =
+                        self.derive_cte_output_schema(&cte_plan, visible_ctes)?;
+
+                    // If explicit column list was provided, validate and rename columns
+                    let final_schema = if let Some(cols) = &cte.columns {
+                        if cols.len() != projected_schema.columns.len() {
+                            return Err(Error::CteColumnCountMismatch {
+                                cte: cte.name.clone(),
+                                expected: cols.len(),
+                                found: projected_schema.columns.len(),
+                            });
+                        }
+                        let mut seen = std::collections::HashSet::new();
+                        let mut renamed_cols = Vec::with_capacity(cols.len());
+                        for (col_name, orig_col) in cols.iter().zip(projected_schema.columns.iter())
+                        {
+                            if !seen.insert(col_name) {
+                                return Err(Error::DuplicateCteColumnName {
+                                    cte: cte.name.clone(),
+                                    column: col_name.clone(),
+                                });
+                            }
+                            renamed_cols.push(crate::engine::types::Column::new(
+                                col_name,
+                                orig_col.data_type,
+                                orig_col.nullable,
+                            ));
+                        }
+                        crate::engine::types::Schema::new_projected(renamed_cols)
+                    } else {
+                        projected_schema
+                    };
+
+                    // Track dependencies
+                    let mut dependencies = Vec::new();
+                    collect_cte_dependencies(&cte_plan, visible_ctes, &mut dependencies);
+
+                    // Check for cyclic dependencies in visible_ctes + this CTE
+                    let mut temp_ctes = visible_ctes.clone();
+                    temp_ctes.push(crate::sql::BoundCte {
+                        name: cte.name.clone(),
+                        output_schema: final_schema.clone(),
+                        kind: crate::sql::BoundCteKind::NonRecursive {
+                            plan: cte_plan.clone(),
+                        },
+                        dependencies: dependencies.clone(),
+                    });
+                    validate_cte_acyclicity(&temp_ctes)?;
+
+                    visible_ctes.push(crate::sql::BoundCte {
+                        name: cte.name.clone(),
+                        output_schema: final_schema,
+                        kind: crate::sql::BoundCteKind::NonRecursive { plan: cte_plan },
+                        dependencies,
+                    });
+                }
+                crate::sql::CteQuery::SetOperation(set_query) => {
+                    let cte_plan = self.plan_set_query_with_outer_ctes(set_query, visible_ctes)?;
+                    let projected_schema =
+                        self.derive_cte_output_schema(&cte_plan, visible_ctes)?;
+
+                    let final_schema = if let Some(cols) = &cte.columns {
+                        if cols.len() != projected_schema.columns.len() {
+                            return Err(Error::CteColumnCountMismatch {
+                                cte: cte.name.clone(),
+                                expected: cols.len(),
+                                found: projected_schema.columns.len(),
+                            });
+                        }
+                        let mut seen = std::collections::HashSet::new();
+                        let mut renamed_cols = Vec::with_capacity(cols.len());
+                        for (col_name, orig_col) in cols.iter().zip(projected_schema.columns.iter())
+                        {
+                            if !seen.insert(col_name) {
+                                return Err(Error::DuplicateCteColumnName {
+                                    cte: cte.name.clone(),
+                                    column: col_name.clone(),
+                                });
+                            }
+                            renamed_cols.push(crate::engine::types::Column::new(
+                                col_name,
+                                orig_col.data_type,
+                                orig_col.nullable,
+                            ));
+                        }
+                        crate::engine::types::Schema::new_projected(renamed_cols)
+                    } else {
+                        projected_schema
+                    };
+
+                    let mut dependencies = Vec::new();
+                    collect_cte_dependencies(&cte_plan, visible_ctes, &mut dependencies);
+
+                    let mut temp_ctes = visible_ctes.clone();
+                    temp_ctes.push(crate::sql::BoundCte {
+                        name: cte.name.clone(),
+                        output_schema: final_schema.clone(),
+                        kind: crate::sql::BoundCteKind::NonRecursive {
+                            plan: cte_plan.clone(),
+                        },
+                        dependencies: dependencies.clone(),
+                    });
+                    validate_cte_acyclicity(&temp_ctes)?;
+
+                    visible_ctes.push(crate::sql::BoundCte {
+                        name: cte.name.clone(),
+                        output_schema: final_schema,
+                        kind: crate::sql::BoundCteKind::NonRecursive { plan: cte_plan },
+                        dependencies,
+                    });
+                }
+                crate::sql::CteQuery::Recursive { anchor, recursive } => {
+                    // 1. Check anchor does not reference cte.name
+                    if ast_references_table(anchor, &cte.name) {
+                        return Err(Error::RecursiveCteAnchorSelfReference(cte.name.clone()));
+                    }
+
+                    // 2. Bind and plan anchor
+                    let anchor_plan = self.plan_select_with_outer_ctes(anchor, visible_ctes)?;
+                    let projected_schema =
+                        self.derive_cte_output_schema(&anchor_plan, visible_ctes)?;
+
+                    // 3. Rename columns if explicit columns given
+                    let final_schema = if let Some(cols) = &cte.columns {
+                        if cols.len() != projected_schema.columns.len() {
+                            return Err(Error::CteColumnCountMismatch {
+                                cte: cte.name.clone(),
+                                expected: cols.len(),
+                                found: projected_schema.columns.len(),
+                            });
+                        }
+                        let mut seen = std::collections::HashSet::new();
+                        let mut renamed_cols = Vec::with_capacity(cols.len());
+                        for (col_name, orig_col) in cols.iter().zip(projected_schema.columns.iter())
+                        {
+                            if !seen.insert(col_name) {
+                                return Err(Error::DuplicateCteColumnName {
+                                    cte: cte.name.clone(),
+                                    column: col_name.clone(),
+                                });
+                            }
+                            renamed_cols.push(crate::engine::types::Column::new(
+                                col_name,
+                                orig_col.data_type,
+                                orig_col.nullable,
+                            ));
+                        }
+                        crate::engine::types::Schema::new_projected(renamed_cols)
+                    } else {
+                        projected_schema
+                    };
+
+                    // 4. Create scope where cte.name is available with final_schema
+                    let mut rec_visible_ctes = visible_ctes.clone();
+                    rec_visible_ctes.push(crate::sql::BoundCte {
+                        name: cte.name.clone(),
+                        output_schema: final_schema.clone(),
+                        kind: crate::sql::BoundCteKind::NonRecursive {
+                            plan: anchor_plan.clone(),
+                        },
+                        dependencies: Vec::new(),
+                    });
+
+                    // 5. Plan recursive member
+                    let rec_plan =
+                        self.plan_select_with_outer_ctes(recursive, &rec_visible_ctes)?;
+
+                    // 6. Check unsupported recursive aggregation or window functions
+                    let self_ref_in_rec = plan_references_table(&rec_plan, &cte.name);
+                    if self_ref_in_rec {
+                        if !rec_plan.group_by.is_empty() || !rec_plan.aggregates.is_empty() {
+                            return Err(Error::UnsupportedRecursiveAggregation(cte.name.clone()));
+                        }
+                        if !rec_plan.window_exprs.is_empty() {
+                            return Err(Error::UnsupportedRecursiveWindow(cte.name.clone()));
+                        }
+                    }
+
+                    // 7. Derive recursive member output schema
+                    let rec_projected_schema =
+                        self.derive_cte_output_schema(&rec_plan, &rec_visible_ctes)?;
+
+                    // 8. Validate schema compatibility between anchor and recursive member
+                    if final_schema.columns.len() != rec_projected_schema.columns.len() {
+                        return Err(Error::RecursiveCteColumnCountMismatch {
+                            cte: cte.name.clone(),
+                            anchor_cols: final_schema.columns.len(),
+                            rec_cols: rec_projected_schema.columns.len(),
+                        });
+                    }
+                    for (a_col, r_col) in final_schema
+                        .columns
+                        .iter()
+                        .zip(rec_projected_schema.columns.iter())
+                    {
+                        if a_col.data_type != r_col.data_type {
+                            return Err(Error::RecursiveCteSchemaMismatch {
+                                cte: cte.name.clone(),
+                                anchor_col: a_col.name.clone(),
+                                anchor_type: format!("{:?}", a_col.data_type),
+                                rec_col: r_col.name.clone(),
+                                rec_type: format!("{:?}", r_col.data_type),
+                            });
+                        }
+                    }
+
+                    // 9. Collect dependencies on earlier CTEs (from both anchor and rec member, excluding cte.name)
+                    let mut dependencies = Vec::new();
+                    collect_cte_dependencies(&anchor_plan, visible_ctes, &mut dependencies);
+                    collect_cte_dependencies(&rec_plan, visible_ctes, &mut dependencies);
+
+                    let mut temp_ctes = visible_ctes.clone();
+                    temp_ctes.push(crate::sql::BoundCte {
+                        name: cte.name.clone(),
+                        output_schema: final_schema.clone(),
+                        kind: crate::sql::BoundCteKind::Recursive {
+                            anchor_plan: anchor_plan.clone(),
+                            recursive_plan: rec_plan.clone(),
+                            max_iterations: DEFAULT_MAX_RECURSION_ITERATIONS,
+                            max_rows: DEFAULT_MAX_RECURSION_ROWS,
+                        },
+                        dependencies: dependencies.clone(),
+                    });
+                    validate_cte_acyclicity(&temp_ctes)?;
+
+                    visible_ctes.push(crate::sql::BoundCte {
+                        name: cte.name.clone(),
+                        output_schema: final_schema,
+                        kind: crate::sql::BoundCteKind::Recursive {
+                            anchor_plan,
+                            recursive_plan: rec_plan,
+                            max_iterations: DEFAULT_MAX_RECURSION_ITERATIONS,
+                            max_rows: DEFAULT_MAX_RECURSION_ROWS,
+                        },
+                        dependencies,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Plans a parsed `SelectStatement` AST with in-scope outer CTE definitions.
     pub fn plan_select_with_outer_ctes(
         &mut self,
@@ -646,209 +987,7 @@ impl<'db> Transaction<'db> {
         let mut visible_ctes: Vec<crate::sql::BoundCte> = outer_ctes.to_vec();
 
         if let Some(with_clause) = &ast.with {
-            validate_ast_cte_acyclicity(&with_clause.ctes)?;
-            let mut declared_names = std::collections::HashSet::new();
-            for cte in &with_clause.ctes {
-                if !declared_names.insert(&cte.name) {
-                    return Err(Error::DuplicateCteName(cte.name.clone()));
-                }
-
-                match &cte.query {
-                    crate::sql::CteQuery::NonRecursive(select_stmt) => {
-                        // Bind and plan the CTE query using currently visible CTEs
-                        let cte_plan =
-                            self.plan_select_with_outer_ctes(select_stmt, &visible_ctes)?;
-
-                        // Derive the CTE output schema from cte_plan projections
-                        let projected_schema =
-                            self.derive_cte_output_schema(&cte_plan, &visible_ctes)?;
-
-                        // If explicit column list was provided, validate and rename columns
-                        let final_schema = if let Some(cols) = &cte.columns {
-                            if cols.len() != projected_schema.columns.len() {
-                                return Err(Error::CteColumnCountMismatch {
-                                    cte: cte.name.clone(),
-                                    expected: cols.len(),
-                                    found: projected_schema.columns.len(),
-                                });
-                            }
-                            let mut seen = std::collections::HashSet::new();
-                            let mut renamed_cols = Vec::with_capacity(cols.len());
-                            for (col_name, orig_col) in
-                                cols.iter().zip(projected_schema.columns.iter())
-                            {
-                                if !seen.insert(col_name) {
-                                    return Err(Error::DuplicateCteColumnName {
-                                        cte: cte.name.clone(),
-                                        column: col_name.clone(),
-                                    });
-                                }
-                                renamed_cols.push(crate::engine::types::Column::new(
-                                    col_name,
-                                    orig_col.data_type,
-                                    orig_col.nullable,
-                                ));
-                            }
-                            crate::engine::types::Schema::new_projected(renamed_cols)
-                        } else {
-                            projected_schema
-                        };
-
-                        // Track dependencies
-                        let mut dependencies = Vec::new();
-                        collect_cte_dependencies(&cte_plan, &visible_ctes, &mut dependencies);
-
-                        // Check for cyclic dependencies in visible_ctes + this CTE
-                        let mut temp_ctes = visible_ctes.clone();
-                        temp_ctes.push(crate::sql::BoundCte {
-                            name: cte.name.clone(),
-                            output_schema: final_schema.clone(),
-                            kind: crate::sql::BoundCteKind::NonRecursive {
-                                plan: cte_plan.clone(),
-                            },
-                            dependencies: dependencies.clone(),
-                        });
-                        validate_cte_acyclicity(&temp_ctes)?;
-
-                        visible_ctes.push(crate::sql::BoundCte {
-                            name: cte.name.clone(),
-                            output_schema: final_schema,
-                            kind: crate::sql::BoundCteKind::NonRecursive { plan: cte_plan },
-                            dependencies,
-                        });
-                    }
-                    crate::sql::CteQuery::Recursive { anchor, recursive } => {
-                        // 1. Check anchor does not reference cte.name
-                        if ast_references_table(anchor, &cte.name) {
-                            return Err(Error::RecursiveCteAnchorSelfReference(cte.name.clone()));
-                        }
-
-                        // 2. Bind and plan anchor
-                        let anchor_plan =
-                            self.plan_select_with_outer_ctes(anchor, &visible_ctes)?;
-                        let projected_schema =
-                            self.derive_cte_output_schema(&anchor_plan, &visible_ctes)?;
-
-                        // 3. Rename columns if explicit columns given
-                        let final_schema = if let Some(cols) = &cte.columns {
-                            if cols.len() != projected_schema.columns.len() {
-                                return Err(Error::CteColumnCountMismatch {
-                                    cte: cte.name.clone(),
-                                    expected: cols.len(),
-                                    found: projected_schema.columns.len(),
-                                });
-                            }
-                            let mut seen = std::collections::HashSet::new();
-                            let mut renamed_cols = Vec::with_capacity(cols.len());
-                            for (col_name, orig_col) in
-                                cols.iter().zip(projected_schema.columns.iter())
-                            {
-                                if !seen.insert(col_name) {
-                                    return Err(Error::DuplicateCteColumnName {
-                                        cte: cte.name.clone(),
-                                        column: col_name.clone(),
-                                    });
-                                }
-                                renamed_cols.push(crate::engine::types::Column::new(
-                                    col_name,
-                                    orig_col.data_type,
-                                    orig_col.nullable,
-                                ));
-                            }
-                            crate::engine::types::Schema::new_projected(renamed_cols)
-                        } else {
-                            projected_schema
-                        };
-
-                        // 4. Create scope where cte.name is available with final_schema
-                        let mut rec_visible_ctes = visible_ctes.clone();
-                        rec_visible_ctes.push(crate::sql::BoundCte {
-                            name: cte.name.clone(),
-                            output_schema: final_schema.clone(),
-                            kind: crate::sql::BoundCteKind::NonRecursive {
-                                plan: anchor_plan.clone(),
-                            },
-                            dependencies: Vec::new(),
-                        });
-
-                        // 5. Plan recursive member
-                        let rec_plan =
-                            self.plan_select_with_outer_ctes(recursive, &rec_visible_ctes)?;
-
-                        // 6. Check unsupported recursive aggregation or window functions
-                        let self_ref_in_rec = plan_references_table(&rec_plan, &cte.name);
-                        if self_ref_in_rec {
-                            if !rec_plan.group_by.is_empty() || !rec_plan.aggregates.is_empty() {
-                                return Err(Error::UnsupportedRecursiveAggregation(
-                                    cte.name.clone(),
-                                ));
-                            }
-                            if !rec_plan.window_exprs.is_empty() {
-                                return Err(Error::UnsupportedRecursiveWindow(cte.name.clone()));
-                            }
-                        }
-
-                        // 7. Derive recursive member output schema
-                        let rec_projected_schema =
-                            self.derive_cte_output_schema(&rec_plan, &rec_visible_ctes)?;
-
-                        // 8. Validate schema compatibility between anchor and recursive member
-                        if final_schema.columns.len() != rec_projected_schema.columns.len() {
-                            return Err(Error::RecursiveCteColumnCountMismatch {
-                                cte: cte.name.clone(),
-                                anchor_cols: final_schema.columns.len(),
-                                rec_cols: rec_projected_schema.columns.len(),
-                            });
-                        }
-                        for (a_col, r_col) in final_schema
-                            .columns
-                            .iter()
-                            .zip(rec_projected_schema.columns.iter())
-                        {
-                            if a_col.data_type != r_col.data_type {
-                                return Err(Error::RecursiveCteSchemaMismatch {
-                                    cte: cte.name.clone(),
-                                    anchor_col: a_col.name.clone(),
-                                    anchor_type: format!("{:?}", a_col.data_type),
-                                    rec_col: r_col.name.clone(),
-                                    rec_type: format!("{:?}", r_col.data_type),
-                                });
-                            }
-                        }
-
-                        // 9. Collect dependencies on earlier CTEs (from both anchor and rec member, excluding cte.name)
-                        let mut dependencies = Vec::new();
-                        collect_cte_dependencies(&anchor_plan, &visible_ctes, &mut dependencies);
-                        collect_cte_dependencies(&rec_plan, &visible_ctes, &mut dependencies);
-
-                        let mut temp_ctes = visible_ctes.clone();
-                        temp_ctes.push(crate::sql::BoundCte {
-                            name: cte.name.clone(),
-                            output_schema: final_schema.clone(),
-                            kind: crate::sql::BoundCteKind::Recursive {
-                                anchor_plan: anchor_plan.clone(),
-                                recursive_plan: rec_plan.clone(),
-                                max_iterations: DEFAULT_MAX_RECURSION_ITERATIONS,
-                                max_rows: DEFAULT_MAX_RECURSION_ROWS,
-                            },
-                            dependencies: dependencies.clone(),
-                        });
-                        validate_cte_acyclicity(&temp_ctes)?;
-
-                        visible_ctes.push(crate::sql::BoundCte {
-                            name: cte.name.clone(),
-                            output_schema: final_schema,
-                            kind: crate::sql::BoundCteKind::Recursive {
-                                anchor_plan,
-                                recursive_plan: rec_plan,
-                                max_iterations: DEFAULT_MAX_RECURSION_ITERATIONS,
-                                max_rows: DEFAULT_MAX_RECURSION_ROWS,
-                            },
-                            dependencies,
-                        });
-                    }
-                }
-            }
+            self.bind_and_validate_ctes(&with_clause.ctes, &mut visible_ctes)?;
         }
 
         // Now plan the main query body with visible_ctes
@@ -903,6 +1042,136 @@ impl<'db> Transaction<'db> {
         crate::query::optimizer::Optimizer::optimize(&bound, &table_infos)
     }
 
+    /// Plans a parsed `SetQuery` AST into an optimized physical execution plan (`PhysicalPlan`).
+    pub fn plan_set_query(
+        &mut self,
+        ast: &crate::sql::SetQuery,
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
+        self.ensure_active()?;
+        self.plan_set_query_with_outer_ctes(ast, &[])
+    }
+
+    /// Plans a parsed `SetQuery` AST with in-scope outer CTE definitions.
+    pub fn plan_set_query_with_outer_ctes(
+        &mut self,
+        ast: &crate::sql::SetQuery,
+        outer_ctes: &[crate::sql::BoundCte],
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
+        self.ensure_active()?;
+        let mut visible_ctes: Vec<crate::sql::BoundCte> = outer_ctes.to_vec();
+
+        if let Some(with_clause) = &ast.with {
+            self.bind_and_validate_ctes(&with_clause.ctes, &mut visible_ctes)?;
+        }
+
+        let mut plan = self.plan_set_query_body(&ast.body, &visible_ctes)?;
+
+        if !ast.order_by.is_empty() {
+            let schema = self.derive_cte_output_schema(&plan, &visible_ctes)?;
+            let mut bound_order_by = Vec::with_capacity(ast.order_by.len());
+            for order_item in &ast.order_by {
+                let bound_expr = match &order_item.expr {
+                    crate::sql::SqlExpr::Identifier(ident) => {
+                        if schema.columns.iter().any(|c| &c.name == ident) {
+                            crate::query::expr::Expr::Column(ident.clone())
+                        } else {
+                            return Err(Error::ColumnNotFound(ident.clone()));
+                        }
+                    }
+                    _ => {
+                        let binding = crate::sql::TableBinding::new("", None, &schema);
+                        let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
+                        let catalog = TxnBufferPoolCatalog {
+                            bp: &bp_cell,
+                            ctes: Some(&visible_ctes),
+                        };
+                        let ctx = crate::sql::binder::BindingContext::with_parent_and_catalog(
+                            vec![binding],
+                            None,
+                            Some(&catalog),
+                        );
+                        crate::sql::binder::bind_expr(&order_item.expr, &ctx)?
+                    }
+                };
+                let direction = match order_item.direction {
+                    crate::sql::OrderDirection::Asc => crate::query::SortDirection::Ascending,
+                    crate::sql::OrderDirection::Desc => crate::query::SortDirection::Descending,
+                };
+                bound_order_by.push(crate::query::SortKey::new(bound_expr, direction));
+            }
+            plan.order_by = bound_order_by;
+        }
+
+        if let Some(limit) = ast.limit {
+            plan.limit = Some(limit as usize);
+        }
+        if let Some(offset) = ast.offset {
+            plan.offset = Some(offset as usize);
+        }
+        plan.ctes = visible_ctes;
+
+        Ok(plan)
+    }
+
+    fn plan_set_query_body(
+        &mut self,
+        body: &crate::sql::SetQueryBody,
+        visible_ctes: &[crate::sql::BoundCte],
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
+        match body {
+            crate::sql::SetQueryBody::Select(statement) => {
+                self.plan_select_with_outer_ctes(statement, visible_ctes)
+            }
+            crate::sql::SetQueryBody::Parenthesized(inner) => {
+                self.plan_set_query_with_outer_ctes(inner, visible_ctes)
+            }
+            crate::sql::SetQueryBody::SetOperation { op, left, right } => {
+                let left_plan = self.plan_set_query_body(left, visible_ctes)?;
+                let right_plan = self.plan_set_query_body(right, visible_ctes)?;
+                let left_schema = self.derive_cte_output_schema(&left_plan, visible_ctes)?;
+                let right_schema = self.derive_cte_output_schema(&right_plan, visible_ctes)?;
+
+                if left_schema.columns.len() != right_schema.columns.len() {
+                    return Err(Error::SetOperationColumnCountMismatch {
+                        left_cols: left_schema.columns.len(),
+                        right_cols: right_schema.columns.len(),
+                    });
+                }
+
+                let mut unified_cols = Vec::with_capacity(left_schema.columns.len());
+                for (idx, (l_col, r_col)) in left_schema
+                    .columns
+                    .iter()
+                    .zip(right_schema.columns.iter())
+                    .enumerate()
+                {
+                    let unified_type =
+                        crate::sql::binder::unify_set_types(l_col.data_type, r_col.data_type)
+                            .ok_or_else(|| Error::SetOperationTypeMismatch {
+                                col_idx: idx + 1,
+                                left_type: format!("{:?}", l_col.data_type),
+                                right_type: format!("{:?}", r_col.data_type),
+                            })?;
+                    unified_cols.push(crate::engine::types::Column::new(
+                        l_col.name.clone(),
+                        unified_type,
+                        l_col.nullable || r_col.nullable,
+                    ));
+                }
+                let unified_schema = crate::engine::types::Schema::new_projected(unified_cols);
+
+                Ok(crate::query::optimizer::PhysicalPlan::new_set_op(
+                    crate::query::optimizer::PhysicalSetOp {
+                        op: *op,
+                        left: Box::new(left_plan),
+                        right: Box::new(right_plan),
+                        schema: unified_schema,
+                    },
+                ))
+            }
+        }
+    }
+
     fn resolve_table_for_planning(
         &mut self,
         table_name: &str,
@@ -929,6 +1198,9 @@ impl<'db> Transaction<'db> {
         plan: &crate::query::optimizer::PhysicalPlan,
         visible_ctes: &[crate::sql::BoundCte],
     ) -> Result<crate::engine::types::Schema> {
+        if let Some(set_op) = &plan.set_op {
+            return Ok(set_op.schema.clone());
+        }
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
 
         let (base_schema, _, _) =
@@ -1038,6 +1310,11 @@ fn collect_cte_dependencies(
     visible_ctes: &[crate::sql::BoundCte],
     deps: &mut Vec<String>,
 ) {
+    if let Some(set_op) = &plan.set_op {
+        collect_cte_dependencies(&set_op.left, visible_ctes, deps);
+        collect_cte_dependencies(&set_op.right, visible_ctes, deps);
+        return;
+    }
     let mut check_table = |t_name: &str| {
         for v in visible_ctes {
             if v.name == t_name && !deps.contains(&v.name) {
@@ -1175,6 +1452,7 @@ impl<'db> Transaction<'db> {
         let stmt = crate::sql::parse_statement(sql)?;
         match stmt {
             crate::sql::Statement::Select(select_stmt) => self.plan_select(&select_stmt),
+            crate::sql::Statement::SetQuery(set_stmt) => self.plan_set_query(&set_stmt),
             crate::sql::Statement::Update(update_stmt) => {
                 let select_ast = crate::sql::SelectStatement {
                     with: None,
@@ -1227,6 +1505,11 @@ impl<'db> Transaction<'db> {
         match stmt {
             crate::sql::Statement::Select(select_stmt) => {
                 let plan = self.plan_select(&select_stmt)?;
+                let query_result = self.execute_physical_plan(&plan)?;
+                Ok(StatementResult::Query(query_result))
+            }
+            crate::sql::Statement::SetQuery(set_stmt) => {
+                let plan = self.plan_set_query(&set_stmt)?;
                 let query_result = self.execute_physical_plan(&plan)?;
                 Ok(StatementResult::Query(query_result))
             }
@@ -1743,6 +2026,27 @@ impl<'db> Transaction<'db> {
         let mut plan = plan.clone();
         self.pre_evaluate_uncorrelated_subqueries_internal(&mut plan, outer_contexts, cte_store)?;
 
+        if let Some(set_op) = &plan.set_op {
+            let left_res =
+                self.execute_physical_plan_internal(&set_op.left, outer_contexts, cte_store)?;
+            let right_res =
+                self.execute_physical_plan_internal(&set_op.right, outer_contexts, cte_store)?;
+            let set_rows = crate::query::SetOperationOperator::apply(
+                left_res.rows,
+                right_res.rows,
+                &set_op.schema,
+                &set_op.op,
+            )?;
+            let sorted_rows =
+                crate::query::SortOperator::apply(set_rows, &set_op.schema, &plan.order_by)?;
+            let paginated_rows =
+                crate::query::OffsetLimitOperator::apply(sorted_rows, plan.offset, plan.limit);
+            return Ok(crate::query::QueryResult::new(
+                set_op.schema.clone(),
+                paginated_rows,
+            ));
+        }
+
         // 1. Execute base table scan
         let (mut current_schema, mut current_rows) = {
             if let Some((cte_schema, cte_rows)) = cte_store.get(&plan.base_table.table_name) {
@@ -2030,6 +2334,19 @@ impl<'db> Transaction<'db> {
         outer_contexts: &[(&Row, &Schema)],
         cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
     ) -> Result<()> {
+        if let Some(set_op) = &mut plan.set_op {
+            self.pre_evaluate_uncorrelated_subqueries_internal(
+                &mut set_op.left,
+                outer_contexts,
+                cte_store,
+            )?;
+            self.pre_evaluate_uncorrelated_subqueries_internal(
+                &mut set_op.right,
+                outer_contexts,
+                cte_store,
+            )?;
+            return Ok(());
+        }
         if let Some(rf) = &mut plan.base_table.residual_filter {
             self.pre_evaluate_uncorrelated_subqueries_in_expr(rf, outer_contexts, cte_store)?;
         }

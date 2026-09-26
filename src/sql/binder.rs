@@ -411,9 +411,14 @@ pub fn contains_window(expr: &SqlExpr) -> bool {
         SqlExpr::InList { expr, list, .. } => {
             contains_window(expr) || list.iter().any(contains_window)
         }
-        SqlExpr::InSubquery { expr, .. } => contains_window(expr),
+        SqlExpr::InSubquery { expr, .. } | SqlExpr::InSetSubquery { expr, .. } => {
+            contains_window(expr)
+        }
         SqlExpr::Aggregate { arg, .. } => contains_window(arg),
-        SqlExpr::Subquery(_) | SqlExpr::Exists { .. } => false,
+        SqlExpr::Subquery(_)
+        | SqlExpr::SetSubquery(_)
+        | SqlExpr::Exists { .. }
+        | SqlExpr::SetExists { .. } => false,
         SqlExpr::CountAll
         | SqlExpr::Literal(_)
         | SqlExpr::Identifier(_)
@@ -434,7 +439,9 @@ pub fn contains_aggregate(expr: &SqlExpr) -> bool {
         SqlExpr::InList { expr, list, .. } => {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
         }
-        SqlExpr::InSubquery { expr, .. } => contains_aggregate(expr),
+        SqlExpr::InSubquery { expr, .. } | SqlExpr::InSetSubquery { expr, .. } => {
+            contains_aggregate(expr)
+        }
         SqlExpr::Window {
             args, window_spec, ..
         } => {
@@ -445,7 +452,10 @@ pub fn contains_aggregate(expr: &SqlExpr) -> bool {
                     .iter()
                     .any(|o| contains_aggregate(&o.expr))
         }
-        SqlExpr::Subquery(_) | SqlExpr::Exists { .. } => false,
+        SqlExpr::Subquery(_)
+        | SqlExpr::SetSubquery(_)
+        | SqlExpr::Exists { .. }
+        | SqlExpr::SetExists { .. } => false,
         SqlExpr::Literal(_) | SqlExpr::Identifier(_) | SqlExpr::QualifiedIdentifier { .. } => false,
     }
 }
@@ -517,8 +527,13 @@ fn collect_aggregates(
             }
             Ok(())
         }
-        SqlExpr::InSubquery { expr, .. } => collect_aggregates(expr, ctx, aggs),
-        SqlExpr::Subquery(_) | SqlExpr::Exists { .. } => Ok(()),
+        SqlExpr::InSubquery { expr, .. } | SqlExpr::InSetSubquery { expr, .. } => {
+            collect_aggregates(expr, ctx, aggs)
+        }
+        SqlExpr::Subquery(_)
+        | SqlExpr::SetSubquery(_)
+        | SqlExpr::Exists { .. }
+        | SqlExpr::SetExists { .. } => Ok(()),
         SqlExpr::Literal(_) | SqlExpr::Identifier(_) | SqlExpr::QualifiedIdentifier { .. } => {
             Ok(())
         }
@@ -1580,6 +1595,9 @@ pub fn bind_grouped_expr(
         SqlExpr::Subquery(subquery) => {
             bind_subquery_internal(SubqueryKindTag::Scalar, subquery, ctx)
         }
+        SqlExpr::SetSubquery(subquery) => {
+            bind_set_subquery_internal(SubqueryKindTag::Scalar, subquery, ctx)
+        }
         SqlExpr::InSubquery {
             expr,
             subquery,
@@ -1595,8 +1613,26 @@ pub fn bind_grouped_expr(
                 ctx,
             )
         }
+        SqlExpr::InSetSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let bound_expr = bind_grouped_expr(expr, ctx, group_by, grouped_schema)?;
+            bind_set_subquery_internal(
+                SubqueryKindTag::In {
+                    expr: Box::new(bound_expr),
+                    negated: *negated,
+                },
+                subquery,
+                ctx,
+            )
+        }
         SqlExpr::Exists { subquery, negated } => {
             bind_subquery_internal(SubqueryKindTag::Exists { negated: *negated }, subquery, ctx)
+        }
+        SqlExpr::SetExists { subquery, negated } => {
+            bind_set_subquery_internal(SubqueryKindTag::Exists { negated: *negated }, subquery, ctx)
         }
         SqlExpr::Window { .. } => Err(Error::SqlBindingError(
             "window expressions cannot be bound as scalar expressions directly".to_string(),
@@ -1713,6 +1749,9 @@ pub fn bind_expr(expr: &SqlExpr, ctx: &BindingContext<'_>) -> Result<Expr> {
         SqlExpr::Subquery(subquery) => {
             bind_subquery_internal(SubqueryKindTag::Scalar, subquery, ctx)
         }
+        SqlExpr::SetSubquery(subquery) => {
+            bind_set_subquery_internal(SubqueryKindTag::Scalar, subquery, ctx)
+        }
         SqlExpr::InSubquery {
             expr,
             subquery,
@@ -1728,8 +1767,26 @@ pub fn bind_expr(expr: &SqlExpr, ctx: &BindingContext<'_>) -> Result<Expr> {
                 ctx,
             )
         }
+        SqlExpr::InSetSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let bound_expr = bind_expr(expr, ctx)?;
+            bind_set_subquery_internal(
+                SubqueryKindTag::In {
+                    expr: Box::new(bound_expr),
+                    negated: *negated,
+                },
+                subquery,
+                ctx,
+            )
+        }
         SqlExpr::Exists { subquery, negated } => {
             bind_subquery_internal(SubqueryKindTag::Exists { negated: *negated }, subquery, ctx)
+        }
+        SqlExpr::SetExists { subquery, negated } => {
+            bind_set_subquery_internal(SubqueryKindTag::Exists { negated: *negated }, subquery, ctx)
         }
         SqlExpr::Window { .. } => Err(Error::SqlBindingError(
             "window expressions cannot be bound as scalar table expressions".to_string(),
@@ -1875,6 +1932,313 @@ fn bind_subquery_internal(
         outer_references,
         materialized: None,
     })))
+}
+
+pub(crate) fn unify_set_types(left: DataType, right: DataType) -> Option<DataType> {
+    if left == right {
+        Some(left)
+    } else if left == DataType::Null {
+        Some(right)
+    } else if right == DataType::Null {
+        Some(left)
+    } else {
+        match (left, right) {
+            (DataType::Int64, DataType::UInt64) | (DataType::UInt64, DataType::Int64) => {
+                Some(DataType::Int64)
+            }
+            (DataType::Int64, DataType::Float64)
+            | (DataType::Float64, DataType::Int64)
+            | (DataType::UInt64, DataType::Float64)
+            | (DataType::Float64, DataType::UInt64) => Some(DataType::Float64),
+            _ => None,
+        }
+    }
+}
+
+fn derive_plan_schema_in_binder(
+    plan: &crate::query::optimizer::PhysicalPlan,
+    table_schemas: &[(
+        String,
+        Option<String>,
+        Schema,
+        Vec<crate::engine::catalog::IndexMetadata>,
+    )],
+) -> Result<Schema> {
+    if let Some(set_op) = &plan.set_op {
+        return Ok(set_op.schema.clone());
+    }
+
+    let mut bindings = Vec::new();
+    for (name, alias, schema, _) in table_schemas {
+        bindings.push(TableBinding::new(name, alias.as_deref(), schema));
+    }
+    let ctx = BindingContext::new(bindings);
+
+    let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
+    let schema_for_proj = if is_aggregate {
+        let mut grouped_columns = Vec::new();
+        for expr in &plan.group_by {
+            let dt = expr.infer_type(&ctx.combined_schema)?;
+            let col_name = match expr {
+                Expr::Column(name) => name.clone(),
+                _ => format!("{expr}"),
+            };
+            grouped_columns.push(Column::new(col_name, dt, true));
+        }
+        for agg in &plan.aggregates {
+            let dt = agg.infer_type(&ctx.combined_schema)?;
+            grouped_columns.push(Column::new(agg.display_name(), dt, true));
+        }
+        for we in &plan.window_exprs {
+            grouped_columns.push(Column::new(we.display_name.clone(), we.output_type, true));
+        }
+        Schema::new_projected(grouped_columns)
+    } else if !plan.window_exprs.is_empty() {
+        let mut cols = ctx.combined_schema.columns.clone();
+        for we in &plan.window_exprs {
+            cols.push(Column::new(we.display_name.clone(), we.output_type, true));
+        }
+        Schema::new_projected(cols)
+    } else {
+        ctx.combined_schema.clone()
+    };
+
+    let mut out_cols = Vec::with_capacity(plan.projections.len());
+    for (expr, alias) in &plan.projections {
+        let dt = expr.infer_type(&schema_for_proj)?;
+        let name = match alias {
+            Some(a) => a.clone(),
+            None => match expr {
+                Expr::Column(col) => col.clone(),
+                _ => format!("{expr}"),
+            },
+        };
+        out_cols.push(Column::new(name, dt, true));
+    }
+    Ok(Schema::new_projected(out_cols))
+}
+
+fn plan_set_query_body_in_binder(
+    body: &crate::sql::ast::SetQueryBody,
+    outer_ctx: &BindingContext<'_>,
+) -> Result<(crate::query::optimizer::PhysicalPlan, Schema)> {
+    match body {
+        crate::sql::ast::SetQueryBody::Select(statement) => {
+            let mut table_schemas: Vec<(
+                String,
+                Option<String>,
+                Schema,
+                Vec<crate::engine::catalog::IndexMetadata>,
+            )> = Vec::new();
+
+            let base_schema = outer_ctx.get_table_schema(&statement.from.name)?;
+            let base_indexes = outer_ctx.get_table_indexes(&statement.from.name)?;
+            table_schemas.push((
+                statement.from.name.clone(),
+                statement.from.alias.clone(),
+                base_schema,
+                base_indexes,
+            ));
+
+            for join in &statement.joins {
+                let schema = outer_ctx.get_table_schema(&join.table.name)?;
+                let indexes = outer_ctx.get_table_indexes(&join.table.name)?;
+                table_schemas.push((
+                    join.table.name.clone(),
+                    join.table.alias.clone(),
+                    schema,
+                    indexes,
+                ));
+            }
+
+            let mut inner_bindings = Vec::new();
+            let mut inner_opt_infos = Vec::new();
+            for (name, alias, schema, indexes) in &table_schemas {
+                inner_bindings.push(TableBinding::new(name, alias.as_deref(), schema));
+                inner_opt_infos.push(crate::query::optimizer::TableOptInfo::new(
+                    name,
+                    alias.as_deref(),
+                    schema.clone(),
+                    indexes.clone(),
+                ));
+            }
+
+            let inner_ctx = BindingContext::with_parent_and_catalog(
+                inner_bindings,
+                Some(outer_ctx),
+                outer_ctx.catalog,
+            );
+
+            let bound_select = bind_select_with_context(statement, &inner_ctx)?;
+            let inner_plan =
+                crate::query::optimizer::Optimizer::optimize(&bound_select, &inner_opt_infos)?;
+            let output_schema = derive_plan_schema_in_binder(&inner_plan, &table_schemas)?;
+            Ok((inner_plan, output_schema))
+        }
+        crate::sql::ast::SetQueryBody::Parenthesized(inner) => {
+            let (mut plan, schema) = plan_set_query_body_in_binder(&inner.body, outer_ctx)?;
+            if let Some(limit) = inner.limit {
+                plan.limit = Some(limit as usize);
+            }
+            if let Some(offset) = inner.offset {
+                plan.offset = Some(offset as usize);
+            }
+            Ok((plan, schema))
+        }
+        crate::sql::ast::SetQueryBody::SetOperation { op, left, right } => {
+            let (left_plan, left_schema) = plan_set_query_body_in_binder(left, outer_ctx)?;
+            let (right_plan, right_schema) = plan_set_query_body_in_binder(right, outer_ctx)?;
+
+            if left_schema.columns.len() != right_schema.columns.len() {
+                return Err(Error::SetOperationColumnCountMismatch {
+                    left_cols: left_schema.columns.len(),
+                    right_cols: right_schema.columns.len(),
+                });
+            }
+
+            let mut unified_cols = Vec::with_capacity(left_schema.columns.len());
+            for (idx, (l_col, r_col)) in left_schema
+                .columns
+                .iter()
+                .zip(right_schema.columns.iter())
+                .enumerate()
+            {
+                let unified_type =
+                    unify_set_types(l_col.data_type, r_col.data_type).ok_or_else(|| {
+                        Error::SetOperationTypeMismatch {
+                            col_idx: idx + 1,
+                            left_type: format!("{:?}", l_col.data_type),
+                            right_type: format!("{:?}", r_col.data_type),
+                        }
+                    })?;
+                unified_cols.push(Column::new(
+                    l_col.name.clone(),
+                    unified_type,
+                    l_col.nullable || r_col.nullable,
+                ));
+            }
+            let unified_schema = Schema::new_projected(unified_cols);
+
+            let plan = crate::query::optimizer::PhysicalPlan::new_set_op(
+                crate::query::optimizer::PhysicalSetOp {
+                    op: *op,
+                    left: Box::new(left_plan),
+                    right: Box::new(right_plan),
+                    schema: unified_schema.clone(),
+                },
+            );
+
+            Ok((plan, unified_schema))
+        }
+    }
+}
+
+fn bind_set_subquery_internal(
+    kind_tag: SubqueryKindTag,
+    set_query: &crate::sql::ast::SetQuery,
+    outer_ctx: &BindingContext<'_>,
+) -> Result<Expr> {
+    let (mut plan, output_schema) = plan_set_query_body_in_binder(&set_query.body, outer_ctx)?;
+    if let Some(limit) = set_query.limit {
+        plan.limit = Some(limit as usize);
+    }
+    if let Some(offset) = set_query.offset {
+        plan.offset = Some(offset as usize);
+    }
+
+    let subquery_kind = match kind_tag {
+        SubqueryKindTag::Scalar => {
+            if output_schema.columns.len() != 1 {
+                return Err(Error::SubqueryColumnCountMismatch {
+                    expected: 1,
+                    found: output_schema.columns.len(),
+                });
+            }
+            let data_type = output_schema.columns[0].data_type;
+            crate::query::expr::SubqueryKind::Scalar { data_type }
+        }
+        SubqueryKindTag::In { expr, negated } => {
+            if output_schema.columns.len() != 1 {
+                return Err(Error::SubqueryColumnCountMismatch {
+                    expected: 1,
+                    found: output_schema.columns.len(),
+                });
+            }
+            let left_type = expr.infer_type(&outer_ctx.combined_schema)?;
+            let right_type = output_schema.columns[0].data_type;
+            if left_type != DataType::Null
+                && right_type != DataType::Null
+                && left_type != right_type
+            {
+                return Err(Error::InvalidComparison {
+                    left: left_type.to_string(),
+                    right: right_type.to_string(),
+                    op: "IN".to_string(),
+                });
+            }
+            crate::query::expr::SubqueryKind::In { expr, negated }
+        }
+        SubqueryKindTag::Exists { negated } => crate::query::expr::SubqueryKind::Exists { negated },
+    };
+
+    let mut outer_references = Vec::new();
+    collect_outer_refs_from_plan(&plan, &mut outer_references);
+    let is_correlated = !outer_references.is_empty();
+
+    Ok(Expr::Subquery(Box::new(crate::query::expr::SubqueryExpr {
+        kind: subquery_kind,
+        statement: Box::new(SelectStatement {
+            with: None,
+            projection: vec![],
+            from: crate::sql::ast::TableRef {
+                name: String::new(),
+                alias: None,
+            },
+            joins: vec![],
+            selection: None,
+            group_by: vec![],
+            having: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        }),
+        plan,
+        is_correlated,
+        outer_references,
+        materialized: None,
+    })))
+}
+
+fn collect_outer_refs_from_plan(
+    plan: &crate::query::optimizer::PhysicalPlan,
+    refs: &mut Vec<String>,
+) {
+    if let Some(set_op) = &plan.set_op {
+        collect_outer_refs_from_plan(&set_op.left, refs);
+        collect_outer_refs_from_plan(&set_op.right, refs);
+        return;
+    }
+    if let Some(rf) = &plan.base_table.residual_filter {
+        collect_outer_refs_from_expr(rf, refs);
+    }
+    for j in &plan.joins {
+        collect_outer_refs_from_expr(&j.on, refs);
+        if let Some(rf) = &j.right.residual_filter {
+            collect_outer_refs_from_expr(rf, refs);
+        }
+    }
+    if let Some(post) = &plan.post_join_filter {
+        collect_outer_refs_from_expr(post, refs);
+    }
+    if let Some(h) = &plan.having {
+        collect_outer_refs_from_expr(h, refs);
+    }
+    for (p, _) in &plan.projections {
+        collect_outer_refs_from_expr(p, refs);
+    }
+    for o in &plan.order_by {
+        collect_outer_refs_from_expr(&o.expression, refs);
+    }
 }
 
 fn collect_outer_refs_from_select(select: &BoundSelect, refs: &mut Vec<String>) {

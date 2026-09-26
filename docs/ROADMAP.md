@@ -435,7 +435,24 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 26: Advanced Query Processing & Secondary Index DDL (Future)
+## Phase 26: SQL Set Operations (Completed)
+* [x] Lexer & Parser support for `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, and `EXCEPT ALL`
+* [x] Operator precedence (`INTERSECT` > `UNION`/`EXCEPT`), left-associativity, and explicit parentheses nesting
+* [x] Structured AST representation: `SetOperator`, `SetQueryBody`, `SetQuery`, `Statement::SetQuery`, `CteQuery::SetOperation`, and subquery variants (`SqlExpr::SetSubquery`, `SqlExpr::SetExists`, `SqlExpr::InSetSubquery`)
+* [x] Semantic binding & validation: column count checking (`Error::SetOperationColumnCountMismatch`), numeric type coercion, incompatible type rejection (`Error::SetOperationTypeMismatch`), and left-operand output schema derivation
+* [x] Row identity equality semantics with distinct `NULL = NULL` representation (`CanonicalValue`)
+* [x] Multiset arithmetic and deduplication algorithms: `UNION` (distinct), `UNION ALL` (multiset sum), `INTERSECT` (distinct), `INTERSECT ALL` ($\min$), `EXCEPT` (distinct), `EXCEPT ALL` ($\max(0, count_L - count_R)$)
+* [x] Composable physical execution operator (`PhysicalSetOp`) evaluated recursively
+* [x] Seamless composition with non-recursive CTEs, recursive CTEs (preserving Phase 25 recursive engine invariants), joins, aggregations, window functions, and subqueries
+* [x] Top-level `ORDER BY`, `LIMIT`, and `OFFSET` execution over set operation result sets
+* [x] Optimizer integration with deterministic `explain_sql` output formatting
+* [x] Statement-local in-memory evaluation model: read-only, zero persistent page allocation, zero catalog mutation, zero WAL writes
+* [x] Transaction visibility: set operations observe uncommitted mutations in active transactions and respect transaction rollback
+* [x] 24 dedicated integration tests in `tests/set_operations.rs` including randomized reference evaluator oracle (491 total test suite)
+
+---
+
+## Phase 27: Advanced Query Processing & Secondary Index DDL (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] SQL `CREATE INDEX` and `DROP INDEX` DDL statements
 * [ ] Index-only covering scans
@@ -443,6 +460,7 @@ This roadmap outlines the planned development phases for TreeDB.
 * [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Cost-based join optimization and cardinality estimation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

@@ -8,9 +8,9 @@ pub mod token;
 pub use ast::{
     AggregateFunction, ColumnDef, CreateTableStatement, Cte, CteQuery, DeleteStatement,
     DropTableStatement, InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection,
-    SelectItem, SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
-    UpdateAssignment, UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction, WindowSpec,
-    WithClause,
+    SelectItem, SelectStatement, SetOperator, SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr,
+    SqlLiteral, SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement, WindowFrame,
+    WindowFrameBound, WindowFunction, WindowSpec, WithClause,
 };
 pub use binder::{
     bind_expr, bind_grouped_expr, bind_select, bind_select_multi, bind_select_multi_with_catalog,

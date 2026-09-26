@@ -1248,7 +1248,7 @@ fn test_parser_invalid_with_ctes() {
         "WITH a(id,) AS (SELECT 1) SELECT * FROM a;",
         "WITH a() AS (SELECT 1) SELECT * FROM a;",
         // Recursive specific errors
-        "WITH a AS (SELECT 1 FROM t UNION ALL SELECT 2 FROM a) SELECT * FROM a;", // UNION ALL without WITH RECURSIVE
+        "WITH a AS (SELECT 1 FROM t UNION ALL) SELECT * FROM a;", // Malformed set operation in CTE
         "WITH RECURSIVE a AS (SELECT 1 FROM t UNION SELECT 2 FROM a) SELECT * FROM a;", // UNION without ALL
         "WITH RECURSIVE a AS (SELECT 1 FROM t UNION ALL SELECT 2 FROM a UNION ALL SELECT 3 FROM a) SELECT * FROM a;", // 3 branches
         "WITH RECURSIVE a AS (SELECT 1 FROM t UNION ALL) SELECT * FROM a;",

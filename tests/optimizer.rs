@@ -968,6 +968,7 @@ fn baseline_execute(
 
     let unoptimized_plan = treedb::query::optimizer::PhysicalPlan {
         ctes: Vec::new(),
+        set_op: None,
         base_table: base_scan,
         joins,
         post_join_filter: bound.filter.clone(),

@@ -3,9 +3,9 @@ use crate::error::{Error, Result};
 use crate::sql::ast::{
     ColumnDef, CreateTableStatement, Cte, CteQuery, DeleteStatement, DropTableStatement,
     InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem,
-    SelectStatement, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
-    UpdateAssignment, UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction, WindowSpec,
-    WithClause,
+    SelectStatement, SetOperator, SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral,
+    SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement, WindowFrame,
+    WindowFrameBound, WindowFunction, WindowSpec, WithClause,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};
@@ -36,11 +36,13 @@ impl<'a> Parser<'a> {
         Self { tokens, cursor: 0 }
     }
 
-    /// Parses an arbitrary top-level SQL statement (`SELECT`, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`).
+    /// Parses an arbitrary top-level SQL statement (`SELECT`, set-operation query, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`).
     pub fn parse_statement(&mut self) -> Result<Statement> {
         let token = self.peek();
         match token.kind {
-            TokenKind::Select | TokenKind::With => Ok(Statement::Select(self.parse_select()?)),
+            TokenKind::Select | TokenKind::With | TokenKind::LParen => {
+                self.parse_query_statement()
+            }
             TokenKind::Create => Ok(Statement::CreateTable(self.parse_create_table()?)),
             TokenKind::Drop => Ok(Statement::DropTable(self.parse_drop_table()?)),
             TokenKind::Insert => Ok(Statement::Insert(self.parse_insert()?)),
@@ -793,8 +795,8 @@ impl<'a> Parser<'a> {
         Ok(stmt)
     }
 
-    /// Parses the core clauses of a SQL `SELECT` statement without consuming trailing statement delimiters.
-    pub fn parse_select_clauses(&mut self) -> Result<SelectStatement> {
+    /// Parses the core clauses of a SQL `SELECT` statement without trailing ORDER BY, LIMIT, OFFSET or statement delimiters.
+    pub fn parse_select_core_clauses(&mut self) -> Result<SelectStatement> {
         let with_clause = if self.peek().kind == TokenKind::With {
             Some(self.parse_with_clause()?)
         } else {
@@ -937,8 +939,26 @@ impl<'a> Parser<'a> {
             None
         };
 
+        Ok(SelectStatement {
+            with: with_clause,
+            projection,
+            from,
+            joins,
+            selection,
+            group_by,
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        })
+    }
+
+    /// Parses the clauses of a SQL `SELECT` statement including trailing ORDER BY, LIMIT, and OFFSET.
+    pub fn parse_select_clauses(&mut self) -> Result<SelectStatement> {
+        let mut stmt = self.parse_select_core_clauses()?;
+
         // 7. Optional ORDER BY clause
-        let order_by = if self.peek().kind == TokenKind::Order {
+        if self.peek().kind == TokenKind::Order {
             self.advance(); // consume ORDER
             let by_token = self.peek();
             if by_token.kind != TokenKind::By {
@@ -949,12 +969,160 @@ impl<'a> Parser<'a> {
                 });
             }
             self.advance(); // consume BY
-            self.parse_order_by_list()?
-        } else {
-            Vec::new()
-        };
+            stmt.order_by = self.parse_order_by_list()?;
+        }
 
         // 8. Optional LIMIT clause
+        if self.peek().kind == TokenKind::Limit {
+            self.advance(); // consume LIMIT
+            stmt.limit = Some(self.parse_non_negative_integer("LIMIT")?);
+        }
+
+        // 9. Optional OFFSET clause
+        if self.peek().kind == TokenKind::Offset {
+            self.advance(); // consume OFFSET
+            stmt.offset = Some(self.parse_non_negative_integer("OFFSET")?);
+        }
+
+        Ok(stmt)
+    }
+
+    /// Checks if the next tokens form a set operator without consuming them.
+    fn peek_set_operator(&self) -> Option<(SetOperator, usize)> {
+        match self.peek().kind {
+            TokenKind::Union => {
+                if self.peek_ahead(1).kind == TokenKind::All {
+                    Some((SetOperator::UnionAll, 2))
+                } else {
+                    Some((SetOperator::Union, 1))
+                }
+            }
+            TokenKind::Intersect => {
+                if self.peek_ahead(1).kind == TokenKind::All {
+                    Some((SetOperator::IntersectAll, 2))
+                } else {
+                    Some((SetOperator::Intersect, 1))
+                }
+            }
+            TokenKind::Except => {
+                if self.peek_ahead(1).kind == TokenKind::All {
+                    Some((SetOperator::ExceptAll, 2))
+                } else {
+                    Some((SetOperator::Except, 1))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Consumes a set operator that was previously peeked.
+    fn consume_set_operator(&mut self, token_count: usize) {
+        for _ in 0..token_count {
+            self.advance();
+        }
+    }
+
+    fn set_operator_precedence(op: SetOperator) -> u8 {
+        match op {
+            SetOperator::Intersect | SetOperator::IntersectAll => 2,
+            SetOperator::Union
+            | SetOperator::UnionAll
+            | SetOperator::Except
+            | SetOperator::ExceptAll => 1,
+        }
+    }
+
+    fn parse_set_query_primary(&mut self) -> Result<SetQueryBody> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::LParen => {
+                self.advance(); // consume '('
+                let inner = self.parse_query_expression()?;
+                let close = self.peek();
+                if close.kind != TokenKind::RParen {
+                    return Err(Error::SqlParseError {
+                        message: format!("expected ')' to close query, found {}", close.kind),
+                        start: close.span.start,
+                        end: close.span.end,
+                    });
+                }
+                self.advance(); // consume ')'
+                Ok(SetQueryBody::Parenthesized(Box::new(inner)))
+            }
+            TokenKind::Select => {
+                let stmt = self.parse_select_core_clauses()?;
+                Ok(SetQueryBody::Select(Box::new(stmt)))
+            }
+            _ => Err(Error::SqlParseError {
+                message: format!("expected SELECT or '(' in query, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            }),
+        }
+    }
+
+    fn parse_set_query_body_precedence(&mut self, min_prec: u8) -> Result<SetQueryBody> {
+        let mut left = self.parse_set_query_primary()?;
+
+        while let Some((op, count)) = self.peek_set_operator() {
+            let prec = Self::set_operator_precedence(op);
+            if prec < min_prec {
+                break;
+            }
+
+            self.consume_set_operator(count);
+
+            let next_tok = self.peek().clone();
+            if next_tok.kind != TokenKind::Select
+                && next_tok.kind != TokenKind::LParen
+                && next_tok.kind != TokenKind::With
+            {
+                return Err(Error::SqlParseError {
+                    message: format!(
+                        "expected query operand after {}, found {}",
+                        op, next_tok.kind
+                    ),
+                    start: next_tok.span.start,
+                    end: next_tok.span.end,
+                });
+            }
+
+            let right = self.parse_set_query_body_precedence(prec + 1)?;
+            left = SetQueryBody::SetOperation {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    /// Parses a complete SQL query expression including optional WITH, set operations, ORDER BY, LIMIT, and OFFSET.
+    pub fn parse_query_expression(&mut self) -> Result<SetQuery> {
+        let with = if self.peek().kind == TokenKind::With {
+            Some(self.parse_with_clause()?)
+        } else {
+            None
+        };
+
+        let body = self.parse_set_query_body_precedence(0)?;
+
+        let mut order_by = Vec::new();
+        if self.peek().kind == TokenKind::Order {
+            self.advance(); // consume ORDER
+            let by_token = self.peek();
+            if by_token.kind != TokenKind::By {
+                return Err(Error::SqlParseError {
+                    message: format!("expected BY after ORDER, found {}", by_token.kind),
+                    start: by_token.span.start,
+                    end: by_token.span.end,
+                });
+            }
+            self.advance(); // consume BY
+            order_by = self.parse_order_by_list()?;
+        }
+
         let limit = if self.peek().kind == TokenKind::Limit {
             self.advance(); // consume LIMIT
             Some(self.parse_non_negative_integer("LIMIT")?)
@@ -962,7 +1130,6 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // 9. Optional OFFSET clause
         let offset = if self.peek().kind == TokenKind::Offset {
             self.advance(); // consume OFFSET
             Some(self.parse_non_negative_integer("OFFSET")?)
@@ -970,18 +1137,55 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(SelectStatement {
-            with: with_clause,
-            projection,
-            from,
-            joins,
-            selection,
-            group_by,
-            having,
+        Ok(SetQuery {
+            with,
+            body,
             order_by,
             limit,
             offset,
         })
+    }
+
+    /// Parses an arbitrary query statement (SELECT or SetQuery) ending with an optional semicolon and EOF.
+    pub fn parse_query_statement(&mut self) -> Result<Statement> {
+        let query = self.parse_query_expression()?;
+
+        // Optional trailing semicolon
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        // Enforce EOF
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        match query.body {
+            SetQueryBody::Select(mut select_stmt) => {
+                if !query.order_by.is_empty() {
+                    select_stmt.order_by = query.order_by;
+                }
+                if query.limit.is_some() {
+                    select_stmt.limit = query.limit;
+                }
+                if query.offset.is_some() {
+                    select_stmt.offset = query.offset;
+                }
+                if query.with.is_some() {
+                    select_stmt.with = query.with;
+                }
+                Ok(Statement::Select(*select_stmt))
+            }
+            _ => Ok(Statement::SetQuery(query)),
+        }
     }
 
     /// Parses a SQL `WITH` clause containing one or more CTE definitions.
@@ -1117,57 +1321,57 @@ impl<'a> Parser<'a> {
                 });
             }
 
-            // Check if starts with SELECT (or WITH)
-            let body_tok = self.peek().clone();
-            if body_tok.kind != TokenKind::Select && body_tok.kind != TokenKind::With {
-                return Err(Error::SqlParseError {
-                    message: format!("expected SELECT in CTE body, found {}", body_tok.kind),
-                    start: body_tok.span.start,
-                    end: body_tok.span.end,
-                });
-            }
-
-            // Parse first query inside CTE
-            let first_query = self.parse_select_clauses()?;
-
-            let query = if self.peek().kind == TokenKind::Union {
-                self.advance(); // consume UNION
-                if self.peek().kind == TokenKind::All {
-                    self.advance(); // consume ALL
-                } else {
-                    return Err(Error::UnsupportedSetOperation(
-                        "UNION without ALL is not supported".to_string(),
-                    ));
-                }
-
-                if !recursive {
-                    return Err(Error::RecursiveWithoutWithRecursive(cte_name.clone()));
-                }
-
-                let body_tok = self.peek().clone();
-                if body_tok.kind != TokenKind::Select && body_tok.kind != TokenKind::With {
-                    return Err(Error::SqlParseError {
-                        message: format!(
-                            "expected SELECT after UNION ALL in CTE body, found {}",
-                            body_tok.kind
-                        ),
-                        start: body_tok.span.start,
-                        end: body_tok.span.end,
-                    });
-                }
-
-                let second_query = self.parse_select_clauses()?;
-
+            // Parse CTE query body
+            let query = if recursive {
+                let first_query = self.parse_select_clauses()?;
                 if self.peek().kind == TokenKind::Union {
-                    return Err(Error::InvalidRecursiveCteShape(cte_name.clone()));
-                }
+                    self.advance(); // consume UNION
+                    if self.peek().kind == TokenKind::All {
+                        self.advance(); // consume ALL
+                    } else {
+                        return Err(Error::UnsupportedSetOperation(
+                            "UNION without ALL is not supported".to_string(),
+                        ));
+                    }
 
-                CteQuery::Recursive {
-                    anchor: Box::new(first_query),
-                    recursive: Box::new(second_query),
+                    let body_tok = self.peek().clone();
+                    if body_tok.kind != TokenKind::Select && body_tok.kind != TokenKind::With {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected SELECT after UNION ALL in CTE body, found {}",
+                                body_tok.kind
+                            ),
+                            start: body_tok.span.start,
+                            end: body_tok.span.end,
+                        });
+                    }
+
+                    let second_query = self.parse_select_clauses()?;
+
+                    if self.peek().kind == TokenKind::Union {
+                        return Err(Error::InvalidRecursiveCteShape(cte_name.clone()));
+                    }
+
+                    CteQuery::Recursive {
+                        anchor: Box::new(first_query),
+                        recursive: Box::new(second_query),
+                    }
+                } else {
+                    CteQuery::NonRecursive(Box::new(first_query))
                 }
             } else {
-                CteQuery::NonRecursive(Box::new(first_query))
+                let query_expr = self.parse_query_expression()?;
+                match query_expr.body {
+                    SetQueryBody::Select(select_stmt)
+                        if query_expr.with.is_none()
+                            && query_expr.order_by.is_empty()
+                            && query_expr.limit.is_none()
+                            && query_expr.offset.is_none() =>
+                    {
+                        CteQuery::NonRecursive(select_stmt)
+                    }
+                    _ => CteQuery::SetOperation(Box::new(query_expr)),
+                }
             };
 
             // Expect `)`
@@ -1620,8 +1824,8 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.advance(); // consume '('
-                if self.peek().kind == TokenKind::Select {
-                    let subquery = self.parse_select_clauses()?;
+                if self.peek().kind == TokenKind::Select || self.peek().kind == TokenKind::With {
+                    let subquery = self.parse_query_expression()?;
                     let close = self.peek();
                     if close.kind != TokenKind::RParen {
                         return Err(Error::SqlParseError {
@@ -1634,7 +1838,21 @@ impl<'a> Parser<'a> {
                         });
                     }
                     self.advance(); // consume ')'
-                    Ok(SqlExpr::Subquery(Box::new(subquery)))
+                    match subquery.body {
+                        SetQueryBody::Select(mut select_stmt) if subquery.with.is_none() => {
+                            if !subquery.order_by.is_empty() {
+                                select_stmt.order_by = subquery.order_by;
+                            }
+                            if subquery.limit.is_some() {
+                                select_stmt.limit = subquery.limit;
+                            }
+                            if subquery.offset.is_some() {
+                                select_stmt.offset = subquery.offset;
+                            }
+                            Ok(SqlExpr::Subquery(select_stmt))
+                        }
+                        _ => Ok(SqlExpr::SetSubquery(Box::new(subquery))),
+                    }
                 } else {
                     let inner = self.parse_expr()?;
                     let close = self.peek();
@@ -1663,7 +1881,7 @@ impl<'a> Parser<'a> {
                     });
                 }
                 self.advance(); // consume '('
-                let subquery = self.parse_select_clauses()?;
+                let subquery = self.parse_query_expression()?;
                 let close = self.peek();
                 if close.kind != TokenKind::RParen {
                     return Err(Error::SqlParseError {
@@ -1676,10 +1894,27 @@ impl<'a> Parser<'a> {
                     });
                 }
                 self.advance(); // consume ')'
-                Ok(SqlExpr::Exists {
-                    subquery: Box::new(subquery),
-                    negated: false,
-                })
+                match subquery.body {
+                    SetQueryBody::Select(mut select_stmt) if subquery.with.is_none() => {
+                        if !subquery.order_by.is_empty() {
+                            select_stmt.order_by = subquery.order_by;
+                        }
+                        if subquery.limit.is_some() {
+                            select_stmt.limit = subquery.limit;
+                        }
+                        if subquery.offset.is_some() {
+                            select_stmt.offset = subquery.offset;
+                        }
+                        Ok(SqlExpr::Exists {
+                            subquery: select_stmt,
+                            negated: false,
+                        })
+                    }
+                    _ => Ok(SqlExpr::SetExists {
+                        subquery: Box::new(subquery),
+                        negated: false,
+                    }),
+                }
             }
             TokenKind::Not => {
                 self.advance(); // consume NOT
@@ -1694,7 +1929,7 @@ impl<'a> Parser<'a> {
                         });
                     }
                     self.advance(); // consume '('
-                    let subquery = self.parse_select_clauses()?;
+                    let subquery = self.parse_query_expression()?;
                     let close = self.peek();
                     if close.kind != TokenKind::RParen {
                         return Err(Error::SqlParseError {
@@ -1707,10 +1942,27 @@ impl<'a> Parser<'a> {
                         });
                     }
                     self.advance(); // consume ')'
-                    Ok(SqlExpr::Exists {
-                        subquery: Box::new(subquery),
-                        negated: true,
-                    })
+                    match subquery.body {
+                        SetQueryBody::Select(mut select_stmt) if subquery.with.is_none() => {
+                            if !subquery.order_by.is_empty() {
+                                select_stmt.order_by = subquery.order_by;
+                            }
+                            if subquery.limit.is_some() {
+                                select_stmt.limit = subquery.limit;
+                            }
+                            if subquery.offset.is_some() {
+                                select_stmt.offset = subquery.offset;
+                            }
+                            Ok(SqlExpr::Exists {
+                                subquery: select_stmt,
+                                negated: true,
+                            })
+                        }
+                        _ => Ok(SqlExpr::SetExists {
+                            subquery: Box::new(subquery),
+                            negated: true,
+                        }),
+                    }
                 } else {
                     let expr = self.parse_precedence(Precedence::Not)?;
                     Ok(SqlExpr::Unary {
@@ -1780,8 +2032,8 @@ impl<'a> Parser<'a> {
                     });
                 }
                 self.advance(); // consume '('
-                if self.peek().kind == TokenKind::Select {
-                    let subquery = self.parse_select_clauses()?;
+                if self.peek().kind == TokenKind::Select || self.peek().kind == TokenKind::With {
+                    let subquery = self.parse_query_expression()?;
                     let close = self.peek();
                     if close.kind != TokenKind::RParen {
                         return Err(Error::SqlParseError {
@@ -1794,11 +2046,29 @@ impl<'a> Parser<'a> {
                         });
                     }
                     self.advance(); // consume ')'
-                    Ok(SqlExpr::InSubquery {
-                        expr: Box::new(left),
-                        subquery: Box::new(subquery),
-                        negated: false,
-                    })
+                    match subquery.body {
+                        SetQueryBody::Select(mut select_stmt) if subquery.with.is_none() => {
+                            if !subquery.order_by.is_empty() {
+                                select_stmt.order_by = subquery.order_by;
+                            }
+                            if subquery.limit.is_some() {
+                                select_stmt.limit = subquery.limit;
+                            }
+                            if subquery.offset.is_some() {
+                                select_stmt.offset = subquery.offset;
+                            }
+                            Ok(SqlExpr::InSubquery {
+                                expr: Box::new(left),
+                                subquery: select_stmt,
+                                negated: false,
+                            })
+                        }
+                        _ => Ok(SqlExpr::InSetSubquery {
+                            expr: Box::new(left),
+                            subquery: Box::new(subquery),
+                            negated: false,
+                        }),
+                    }
                 } else if self.peek().kind == TokenKind::RParen {
                     let tok = self.peek();
                     Err(Error::SqlParseError {
@@ -1845,8 +2115,8 @@ impl<'a> Parser<'a> {
                     });
                 }
                 self.advance(); // consume '('
-                if self.peek().kind == TokenKind::Select {
-                    let subquery = self.parse_select_clauses()?;
+                if self.peek().kind == TokenKind::Select || self.peek().kind == TokenKind::With {
+                    let subquery = self.parse_query_expression()?;
                     let close = self.peek();
                     if close.kind != TokenKind::RParen {
                         return Err(Error::SqlParseError {
@@ -1859,11 +2129,29 @@ impl<'a> Parser<'a> {
                         });
                     }
                     self.advance(); // consume ')'
-                    Ok(SqlExpr::InSubquery {
-                        expr: Box::new(left),
-                        subquery: Box::new(subquery),
-                        negated: true,
-                    })
+                    match subquery.body {
+                        SetQueryBody::Select(mut select_stmt) if subquery.with.is_none() => {
+                            if !subquery.order_by.is_empty() {
+                                select_stmt.order_by = subquery.order_by;
+                            }
+                            if subquery.limit.is_some() {
+                                select_stmt.limit = subquery.limit;
+                            }
+                            if subquery.offset.is_some() {
+                                select_stmt.offset = subquery.offset;
+                            }
+                            Ok(SqlExpr::InSubquery {
+                                expr: Box::new(left),
+                                subquery: select_stmt,
+                                negated: true,
+                            })
+                        }
+                        _ => Ok(SqlExpr::InSetSubquery {
+                            expr: Box::new(left),
+                            subquery: Box::new(subquery),
+                            negated: true,
+                        }),
+                    }
                 } else if self.peek().kind == TokenKind::RParen {
                     let tok = self.peek();
                     Err(Error::SqlParseError {

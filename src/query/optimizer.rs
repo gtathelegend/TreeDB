@@ -118,6 +118,19 @@ pub struct PhysicalJoin {
     pub on: Expr,
 }
 
+/// Physical relational set operation node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalSetOp {
+    /// Set operator kind.
+    pub op: crate::sql::SetOperator,
+    /// Left input physical plan.
+    pub left: Box<PhysicalPlan>,
+    /// Right input physical plan.
+    pub right: Box<PhysicalPlan>,
+    /// Target unified schema for the set operation.
+    pub schema: Schema,
+}
+
 /// Complete physical execution plan produced by the rule-based optimizer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalPlan {
@@ -145,6 +158,34 @@ pub struct PhysicalPlan {
     pub offset: Option<usize>,
     /// Limit pagination.
     pub limit: Option<usize>,
+    /// Optional physical set operation.
+    pub set_op: Option<PhysicalSetOp>,
+}
+
+impl PhysicalPlan {
+    /// Creates a new physical plan for a relational set operation.
+    pub fn new_set_op(set_op: PhysicalSetOp) -> Self {
+        Self {
+            ctes: Vec::new(),
+            base_table: PhysicalTableScan {
+                table_name: String::new(),
+                table_alias: None,
+                access_path: AccessPath::FullTableScan,
+                residual_filter: None,
+            },
+            joins: Vec::new(),
+            post_join_filter: None,
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
+            having: None,
+            window_exprs: Vec::new(),
+            projections: Vec::new(),
+            order_by: Vec::new(),
+            offset: None,
+            limit: None,
+            set_op: Some(set_op),
+        }
+    }
 }
 
 impl fmt::Display for PhysicalPlan {
@@ -243,6 +284,26 @@ impl fmt::Display for PhysicalPlan {
                 .collect();
             writeln!(f, "Sort [{}]", keys.join(", "))?;
             indent += 1;
+        }
+
+        if let Some(set_op) = &self.set_op {
+            write_indent(f, indent)?;
+            writeln!(f, "Set Operation: {}", set_op.op)?;
+            write_indent(f, indent + 1)?;
+            writeln!(f, "Left")?;
+            let left_str = format!("{}", set_op.left);
+            for line in left_str.lines() {
+                write_indent(f, indent + 2)?;
+                writeln!(f, "{line}")?;
+            }
+            write_indent(f, indent + 1)?;
+            writeln!(f, "Right")?;
+            let right_str = format!("{}", set_op.right);
+            for line in right_str.lines() {
+                write_indent(f, indent + 2)?;
+                writeln!(f, "{line}")?;
+            }
+            return Ok(());
         }
 
         if !self.window_exprs.is_empty() {
@@ -650,6 +711,7 @@ impl Optimizer {
             order_by: bound.order_by.clone(),
             offset: bound.offset,
             limit: bound.limit,
+            set_op: None,
         })
     }
 }

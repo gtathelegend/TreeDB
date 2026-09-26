@@ -593,6 +593,38 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * Modeling recursion as an explicit delta iteration loop over in-memory working sets prevents unbounded call stacks, provides deterministic memory consumption, and ensures mathematical fixpoint correctness without persistent side effects.
 
+## Decision 41: SQL Set Operations Semantics, Multiset Arithmetic, and In-Memory Execution
+
+* **Decision:** Implement a complete SQL set-operation layer for `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, and `EXCEPT ALL` integrated into TreeDB's SQL lexer/parser, AST, semantic binder, physical optimizer, and transaction execution engine:
+  1. **Grammar, AST & Precedence Hierarchy:**
+     * `SetOperator`: Enumerates `Union`, `UnionAll`, `Intersect`, `IntersectAll`, `Except`, `ExceptAll`.
+     * `SetQueryBody`: Recursive AST structure representing `Select(Box<SelectStatement>)`, `SetOperation { op, left, right }`, or `Parenthesized(Box<SetQueryBody>)`.
+     * `SetQuery`: Wraps `WithClause`, `SetQueryBody`, and top-level `OrderByClause`, `LimitClause`, `OffsetClause`.
+     * **Standard SQL Precedence:** `INTERSECT` and `INTERSECT ALL` bind with higher precedence (level 2) than `UNION`, `UNION ALL`, `EXCEPT`, and `EXCEPT ALL` (level 1). Left-associativity is enforced at equal precedence. Parentheses explicitly override precedence.
+  2. **Schema Compatibility, Coercion, and Output Column Naming:**
+     * **Column Arity:** Enforces identical column counts between left and right operands (`Error::SetOperationColumnCountMismatch`).
+     * **Type Compatibility & Coercion:** Numeric types coerce according to TreeDB promotion rules (e.g., `Int64` + `UInt64` -> `Int64`, integer + `Float64` -> `Float64`). Incompatible types are rejected with `Error::SetOperationTypeMismatch`.
+     * **Output Column Naming:** Output column names, aliases, and primary metadata are derived strictly from the left operand of the set operation.
+  3. **Row Identity & NULL Equivalence Semantics:**
+     * In SQL set operations, row equality uses distinctness semantics where `NULL` is treated as equal to `NULL` (`CanonicalValue` representation). Two rows are identical if and only if each corresponding column value is equal, with `(NULL, NULL)` comparing equal.
+  4. **Multiset Counting & In-Memory Evaluation:**
+     * **UNION:** Produces the distinct union of left and right operand rows (deduplicated).
+     * **UNION ALL:** Appends right operand rows to left operand rows, strictly preserving duplicates.
+     * **INTERSECT:** Produces distinct rows present in both left and right operands.
+     * **INTERSECT ALL:** Produces rows present in both operands with multiset cardinality equal to $\min(count_{left}(r), count_{right}(r))$.
+     * **EXCEPT:** Produces distinct rows present in the left operand that are absent from the right operand.
+     * **EXCEPT ALL:** Produces rows present in the left operand with multiset cardinality $\max(0, count_{left}(r) - count_{right}(r))$.
+  5. **Composition & Execution Architecture:**
+     * **Relational Composition:** Composes seamlessly with joins, filters, `GROUP BY`, `HAVING`, aggregations, window functions, non-recursive CTEs, and recursive CTEs.
+     * **Subquery Integration:** Supported in scalar subqueries (`SqlExpr::SetSubquery`), `EXISTS` subqueries (`SqlExpr::SetExists`), and `IN` subqueries (`SqlExpr::InSetSubquery`).
+     * **Top-Level Modifiers:** `ORDER BY`, `LIMIT`, and `OFFSET` apply over the final output set of the complete set-operation expression tree.
+     * **Optimizer & Explain:** `PhysicalPlan::new_set_op` and `PhysicalSetOp` integrate into the rule-based optimizer with deterministic `explain_sql` output detailing operator names and child plans.
+  6. **Statement-Local Memory Model & Transaction Visibility:**
+     * Pure in-memory execution: zero WAL logging, zero persistent disk page allocation, zero catalog mutations.
+     * Observes uncommitted transaction mutations and honors transaction rollbacks.
+* **Rationale:**
+  * Implementing set operations as a single composable physical operator (`PhysicalSetOp`) preserves the existing query engine as the single source of truth for expression evaluation, 3VL, schema coercion, and row representations without duplicating relational execution mechanics.
+
 
 
 
