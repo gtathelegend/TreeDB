@@ -570,7 +570,23 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 34: Advanced Query Processing & Optimizer Enhancements (Future)
+## Phase 34: External Aggregation & Spill-to-Disk GROUP BY (Completed)
+* [x] Dedicated external aggregation subsystem (`ExternalAggregator`, `AggregateConfig`, `TempAggregateFile`, `AggregateExecutionMetrics`)
+* [x] Dual-path execution: in-memory fast path for sub-budget inputs, partitioned spill-to-disk for super-budget inputs
+* [x] Deterministic partition file binary format (`TEMP_AGG_MAGIC = b"TAGR"`, little-endian encoded group values and typed `AggregateState` records)
+* [x] Complete SQL aggregation semantics preservation: `COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX`, NULL keys, Float64 NaN canonicalization
+* [x] Algebraic intermediate state merging via `AggregateState::merge_from` with checked overflow detection
+* [x] Multi-pass recursive partitioning with salted hash function (`hash(key, pass)`) when partition reloads exceed budget
+* [x] Atomic single-group handling avoiding infinite recursion on high-multiplicity keys
+* [x] RAII-managed temporary partition file lifecycle with guaranteed automatic cleanup on `Drop`
+* [x] Complete isolation from WAL, transaction commit/rollback, and `.treedb` persistent database pages
+* [x] Resource safeguards: `max_temp_bytes` (`Error::ExternalAggregateQuotaExceeded`) and `max_merge_passes` (`Error::ExternalAggregateMaxPassesExceeded`)
+* [x] Execution metrics & `EXPLAIN ANALYZE` integration reporting `group_count`, `spill_partitions`, `runs_created`, `bytes_spilled`, `merge_passes`, `peak_memory_bytes`
+* [x] 12 dedicated integration tests in `tests/external_aggregation.rs` including randomized differential reference oracle (604 total passing test suite)
+
+---
+
+## Phase 35: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes

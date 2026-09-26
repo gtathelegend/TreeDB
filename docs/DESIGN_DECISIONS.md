@@ -844,6 +844,41 @@ This document records key architectural and design choices, their rationale, and
   * **Memory Boundedness & Resilience:** Large intermediate query results (e.g. sorting large joins, aggregations, or full tables) should not exhaust available process memory or cause out-of-memory crashes.
   * **Exclusion from WAL and Persistent Storage:** Temporary sort data is strictly transient and query-scoped. Keeping it outside the WAL and database page allocation engine eliminates lock contention, avoids freelist churn, and ensures zero crash-recovery overhead.
 
+## Decision 49: External Aggregation and Spill-to-Disk GROUP BY Execution
+
+* **Decision:** Implement a deterministic partition-and-merge external hash aggregation subsystem (`ExternalAggregator`, `AggregateConfig`, `TempAggregateFile`, `AggregateExecutionMetrics`) capable of spilling intermediate aggregation state to disk when memory budgets are exceeded:
+  1. **Dual-Path Aggregation Architecture (In-Memory Fast Path & Spill Path):**
+     * Queries whose aggregate state fits within the configured budget (`AggregateConfig.memory_budget_bytes`, default 64 KB) execute entirely in memory with zero disk overhead.
+     * When memory usage reaches the budget, in-memory partial states are hashed by `GroupKey` and flushed into up to `max_temp_files` partition files, clearing in-memory state and continuing input processing.
+  2. **Authoritative SQL Aggregation & Grouping Semantics:**
+     * Reuses existing `AggregateState` and `CanonicalValue` grouping representations across all supported types (`Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`, `Null`).
+     * Preserves NULL group grouping (all NULL keys group together), Float64 NaN canonicalization, and empty-input rules (global aggregation on empty input returns 1 row with COUNT=0, SUM/AVG/MIN/MAX=NULL; GROUP BY on empty input returns 0 rows).
+     * Output rows and aggregate values are 100% mathematically and semantically identical between in-memory and spilled execution.
+  3. **Algebraic State Merging:**
+     * Intermediate aggregate states are mergeable via `AggregateState::merge_from`:
+       * `COUNT(*)`, `COUNT(expr)`: $c_1 + c_2$
+       * `SUM`: $s_1 + s_2$ with checked numeric overflow detection
+       * `AVG`: maintains exact sufficient statistics $(s_1 + s_2, c_1 + c_2)$ to compute $(s_1 + s_2) / (c_1 + c_2)$
+       * `MIN`: $\min(v_1, v_2)$ using canonical value comparison
+       * `MAX`: $\max(v_1, v_2)$ using canonical value comparison
+  4. **Recursive Multi-Pass Partitioning:**
+     * If reloading a partition exceeds the memory budget (due to large numbers of distinct groups hashing to the same partition), the partition is recursively re-partitioned into sub-partitions using a salted hash function (`hash(key, pass)`).
+     * Partitions with only a single distinct group are merged in-place in $O(1)$ memory without infinite recursion.
+  5. **External Runtime Artifacts & RAII Cleanup:**
+     * Spill partition files (`TempAggregateFile`) are external temporary files with unique filenames outside the `.treedb` database pages, freelist, and WAL.
+     * `TempAggregateFile` guarantees deletion on `Drop`. Aborted transactions, failed queries, or panics clean up all temporary files immediately upon unwinding.
+  6. **Deterministic Binary Format (`TEMP_AGG_MAGIC = b"TAGR"`):**
+     * Partition run files use an explicit little-endian format with a 14-byte header (`magic`, `version`, `record_count`) followed by serialized group values and typed `AggregateState` records with truncation/corruption detection (`Error::ExternalAggregateRunCorrupted`).
+  7. **Resource Limits & Structured Errors:**
+     * Enforces configurable limits: `max_temp_bytes` (`Error::ExternalAggregateQuotaExceeded`) and `max_merge_passes` (`Error::ExternalAggregateMaxPassesExceeded`).
+  8. **Metrics & EXPLAIN ANALYZE Integration:**
+     * `AggregateExecutionMetrics` tracks `rows_input`, `rows_output`, `groups_created`, `spill_partitions`, `runs_created`, `bytes_spilled`, `merge_passes`, and `peak_memory_bytes`.
+     * `EXPLAIN ANALYZE` reports spill metrics when spilling occurs, while normal `EXPLAIN` remains purely logical.
+* **Rationale:**
+  * **Memory Boundedness:** Enables queries with massive group cardinality or large input streams to complete reliably within bounded memory without out-of-memory crashes.
+  * **Exclusion from WAL/Storage:** Intermediate aggregation states are statement-local execution artifacts. Excluding them from database pages and WAL prevents lock contention, avoids freelist churn, and adds zero overhead to crash recovery.
+
+
 
 
 

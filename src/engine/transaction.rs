@@ -2696,6 +2696,26 @@ impl<'db> Transaction<'db> {
         self.db.set_sort_config(config);
     }
 
+    /// Returns a reference to the active external aggregation configuration.
+    pub fn aggregate_config(&self) -> &crate::query::external_aggregate::AggregateConfig {
+        self.db.aggregate_config()
+    }
+
+    /// Returns a mutable reference to the active external aggregation configuration.
+    pub fn aggregate_config_mut(
+        &mut self,
+    ) -> &mut crate::query::external_aggregate::AggregateConfig {
+        self.db.aggregate_config_mut()
+    }
+
+    /// Sets the active external aggregation configuration.
+    pub fn set_aggregate_config(
+        &mut self,
+        config: crate::query::external_aggregate::AggregateConfig,
+    ) {
+        self.db.set_aggregate_config(config);
+    }
+
     /// Executes a fully optimized `PhysicalPlan` against this transaction.
     pub fn execute_physical_plan(
         &mut self,
@@ -3318,12 +3338,14 @@ impl<'db> Transaction<'db> {
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
         let (mut working_schema, mut working_rows) = if is_aggregate {
             let pre_agg_count = current_rows.len();
-            let (grouped_schema, grouped_rows) = crate::query::AggregateOperator::apply(
-                current_rows,
-                &current_schema,
-                &plan.group_by,
-                &plan.aggregates,
-            )?;
+            let (grouped_schema, grouped_rows, agg_metrics) =
+                crate::query::AggregateOperator::apply_with_config(
+                    current_rows,
+                    &current_schema,
+                    &plan.group_by,
+                    &plan.aggregates,
+                    &self.db.aggregate_config,
+                )?;
             let num_groups = grouped_rows.len();
 
             let (having_rows, final_rows) = match &plan.having {
@@ -3347,7 +3369,12 @@ impl<'db> Transaction<'db> {
             );
             agg_metric.input_rows = pre_agg_count;
             agg_metric.actual_rows = final_rows.len();
-            agg_metric.counters.group_count = num_groups;
+            agg_metric.counters.group_count = agg_metrics.groups_created;
+            agg_metric.counters.spill_partitions = agg_metrics.spill_partitions;
+            agg_metric.counters.runs_created = agg_metrics.runs_created;
+            agg_metric.counters.bytes_spilled = agg_metrics.bytes_spilled;
+            agg_metric.counters.merge_passes = agg_metrics.merge_passes;
+            agg_metric.counters.peak_memory_bytes = agg_metrics.peak_memory_bytes;
             agg_metric.counters.rows_evaluated = pre_agg_count;
             agg_metric.add_child(current_op);
 

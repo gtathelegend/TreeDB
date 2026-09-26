@@ -78,13 +78,15 @@ pub struct OperatorCounters {
     pub matched_rows: usize,
     /// Distinct group keys produced during aggregation.
     pub group_count: usize,
-    /// Number of temporary runs created during external sort spilling.
+    /// Number of distinct spill partitions used during external aggregation.
+    pub spill_partitions: usize,
+    /// Number of temporary runs created during external sort or aggregation spilling.
     pub runs_created: usize,
-    /// Total bytes written/spilled to temporary files during external sort.
+    /// Total bytes written/spilled to temporary files during external sort or aggregation.
     pub bytes_spilled: usize,
-    /// Number of merge passes executed during external sorting.
+    /// Number of merge passes executed during external sorting or aggregation.
     pub merge_passes: usize,
-    /// Peak in-memory bytes used during sort operations.
+    /// Peak in-memory bytes used during sort or aggregation operations.
     pub peak_memory_bytes: usize,
 }
 
@@ -441,6 +443,30 @@ pub fn format_plan_with_metrics(
             groups.join(", "),
             proper_aggs = aggs.join(", ")
         ));
+        if let Some(root) = &metrics.root_operator {
+            if let Some(agg_op) =
+                find_operator_metrics(root, &|k| matches!(k, OperatorKind::Aggregate))
+            {
+                write_indent(&mut out, indent + 1);
+                if agg_op.counters.runs_created > 0 || agg_op.counters.bytes_spilled > 0 {
+                    out.push_str(&format!(
+                        "actual_rows: {}, group_count: {}, spill_partitions: {}, runs_created: {}, bytes_spilled: {}, merge_passes: {}, peak_memory_bytes: {}\n",
+                        agg_op.actual_rows,
+                        agg_op.counters.group_count,
+                        agg_op.counters.spill_partitions,
+                        agg_op.counters.runs_created,
+                        agg_op.counters.bytes_spilled,
+                        agg_op.counters.merge_passes,
+                        agg_op.counters.peak_memory_bytes
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "actual_rows: {}, group_count: {}\n",
+                        agg_op.actual_rows, agg_op.counters.group_count
+                    ));
+                }
+            }
+        }
         indent += 1;
     }
 

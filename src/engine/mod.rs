@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
+use crate::query::external_aggregate::AggregateConfig;
 use crate::query::external_sort::SortConfig;
 use crate::query::plan_cache::{PlanCache, PlanCacheStats};
 use crate::query::stats::{StatsRegistry, TableStatistics};
@@ -40,6 +41,7 @@ pub struct TreeDb {
     pub(crate) statistics_generation: u64,
     pub(crate) plan_cache: PlanCache,
     pub(crate) sort_config: SortConfig,
+    pub(crate) aggregate_config: AggregateConfig,
 }
 
 impl TreeDb {
@@ -74,6 +76,7 @@ impl TreeDb {
             statistics_generation: 1,
             plan_cache: PlanCache::new(),
             sort_config: SortConfig::default(),
+            aggregate_config: AggregateConfig::default(),
         })
     }
 
@@ -100,6 +103,7 @@ impl TreeDb {
             statistics_generation: 1,
             plan_cache: PlanCache::new(),
             sort_config: SortConfig::default(),
+            aggregate_config: AggregateConfig::default(),
         })
     }
 
@@ -120,6 +124,7 @@ impl TreeDb {
             statistics_generation: 1,
             plan_cache: PlanCache::new(),
             sort_config: SortConfig::default(),
+            aggregate_config: AggregateConfig::default(),
         }
     }
 
@@ -727,5 +732,20 @@ impl TreeDb {
     /// Sets the active external sort configuration.
     pub fn set_sort_config(&mut self, config: SortConfig) {
         self.sort_config = config;
+    }
+
+    /// Returns a reference to the active external aggregation configuration.
+    pub fn aggregate_config(&self) -> &AggregateConfig {
+        &self.aggregate_config
+    }
+
+    /// Returns a mutable reference to the active external aggregation configuration.
+    pub fn aggregate_config_mut(&mut self) -> &mut AggregateConfig {
+        &mut self.aggregate_config
+    }
+
+    /// Sets the active external aggregation configuration.
+    pub fn set_aggregate_config(&mut self, config: AggregateConfig) {
+        self.aggregate_config = config;
     }
 }

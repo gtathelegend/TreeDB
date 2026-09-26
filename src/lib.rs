@@ -23,14 +23,16 @@ pub use index::{
     SEC_INTERNAL_HEADER_SIZE, SEC_LEAF_HEADER_SIZE,
 };
 pub use query::{
-    estimate_error_ratio, BinaryOp, CardinalityEstimator, ColumnStatistics, CostModel, Expr,
-    ExternalSorter, FilterOperator, IndexStatistics, OffsetLimitOperator, OperatorCounters,
-    OperatorKind, OperatorMetrics, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,
-    PlanCacheStats, PlanCost, PlanValidity, ProjectOperator, Query, QueryExecutionMetrics,
-    QueryResult, RunReader, SortConfig, SortDirection, SortExecutionMetrics, SortKey, SortOperator,
-    StatisticsProvider, StatsRegistry, TableStatistics, TempRunFile, UnaryOp,
-    DEFAULT_MAX_MERGE_PASSES, DEFAULT_MAX_TEMP_BYTES, DEFAULT_MAX_TEMP_FILES,
-    DEFAULT_PLAN_CACHE_CAPACITY, DEFAULT_SORT_MEMORY_BUDGET_BYTES,
+    estimate_error_ratio, AggregateConfig, AggregateExecutionMetrics, AggregateOperator,
+    AggregateState, BinaryOp, CardinalityEstimator, ColumnStatistics, CostModel, Expr,
+    ExternalAggregator, ExternalSorter, FilterOperator, IndexStatistics, OffsetLimitOperator,
+    OperatorCounters, OperatorKind, OperatorMetrics, ParamPlanningSignature, PlanCache,
+    PlanCacheEntry, PlanCacheKey, PlanCacheStats, PlanCost, PlanValidity, ProjectOperator, Query,
+    QueryExecutionMetrics, QueryResult, RunReader, SortConfig, SortDirection, SortExecutionMetrics,
+    SortKey, SortOperator, StatisticsProvider, StatsRegistry, TableStatistics, TempAggregateFile,
+    TempRunFile, UnaryOp, DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES, DEFAULT_MAX_MERGE_PASSES,
+    DEFAULT_MAX_TEMP_BYTES, DEFAULT_MAX_TEMP_FILES, DEFAULT_PLAN_CACHE_CAPACITY,
+    DEFAULT_SORT_MEMORY_BUDGET_BYTES,
 };
 
 pub use sql::{

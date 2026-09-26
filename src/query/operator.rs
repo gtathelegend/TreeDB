@@ -641,6 +641,147 @@ impl AggregateState {
         }
     }
 
+    /// Merges another accumulator state for the same aggregate expression into `self`.
+    pub fn merge_from(&mut self, other: AggregateState) -> Result<()> {
+        match (self, other) {
+            (AggregateState::CountAll { count: c1 }, AggregateState::CountAll { count: c2 }) => {
+                *c1 += c2;
+                Ok(())
+            }
+            (AggregateState::Count { count: c1, .. }, AggregateState::Count { count: c2, .. }) => {
+                *c1 += c2;
+                Ok(())
+            }
+            (
+                AggregateState::SumInt64 {
+                    sum: s1,
+                    seen: seen1,
+                    ..
+                },
+                AggregateState::SumInt64 {
+                    sum: s2,
+                    seen: seen2,
+                    ..
+                },
+            ) => {
+                if seen2 {
+                    if *seen1 {
+                        *s1 = s1.checked_add(s2).ok_or_else(|| {
+                            Error::AggregateOverflow(format!(
+                                "integer overflow adding {s2} to current sum {s1}"
+                            ))
+                        })?;
+                    } else {
+                        *s1 = s2;
+                        *seen1 = true;
+                    }
+                }
+                Ok(())
+            }
+            (
+                AggregateState::SumUInt64 {
+                    sum: s1,
+                    seen: seen1,
+                    ..
+                },
+                AggregateState::SumUInt64 {
+                    sum: s2,
+                    seen: seen2,
+                    ..
+                },
+            ) => {
+                if seen2 {
+                    if *seen1 {
+                        *s1 = s1.checked_add(s2).ok_or_else(|| {
+                            Error::AggregateOverflow(format!(
+                                "unsigned integer overflow adding {s2} to current sum {s1}"
+                            ))
+                        })?;
+                    } else {
+                        *s1 = s2;
+                        *seen1 = true;
+                    }
+                }
+                Ok(())
+            }
+            (
+                AggregateState::SumFloat64 {
+                    sum: s1,
+                    seen: seen1,
+                    ..
+                },
+                AggregateState::SumFloat64 {
+                    sum: s2,
+                    seen: seen2,
+                    ..
+                },
+            ) => {
+                if seen2 {
+                    if *seen1 {
+                        *s1 += s2;
+                    } else {
+                        *s1 = s2;
+                        *seen1 = true;
+                    }
+                }
+                Ok(())
+            }
+            (
+                AggregateState::Avg {
+                    sum: s1, count: c1, ..
+                },
+                AggregateState::Avg {
+                    sum: s2, count: c2, ..
+                },
+            ) => {
+                *s1 += s2;
+                *c1 += c2;
+                Ok(())
+            }
+            (AggregateState::Min { value: v1, .. }, AggregateState::Min { value: v2, .. }) => {
+                if let Some(val2) = v2 {
+                    match v1 {
+                        None => *v1 = Some(val2),
+                        Some(val1) => {
+                            let ord = compare_values_for_sort(
+                                &val2,
+                                val1,
+                                SortDirection::Ascending,
+                                None,
+                            )?;
+                            if ord == Ordering::Less {
+                                *v1 = Some(val2);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            (AggregateState::Max { value: v1, .. }, AggregateState::Max { value: v2, .. }) => {
+                if let Some(val2) = v2 {
+                    match v1 {
+                        None => *v1 = Some(val2),
+                        Some(val1) => {
+                            let ord = compare_values_for_sort(
+                                &val2,
+                                val1,
+                                SortDirection::Ascending,
+                                None,
+                            )?;
+                            if ord == Ordering::Greater {
+                                *v1 = Some(val2);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(Error::QueryExecutionError(
+                "mismatched aggregate states during merge".to_string(),
+            )),
+        }
+    }
+
     /// Finalizes accumulator state into a scalar `Value`.
     pub fn finish(self) -> Value {
         match self {
@@ -684,7 +825,7 @@ impl AggregateState {
 pub struct AggregateOperator;
 
 impl AggregateOperator {
-    /// Executes grouping and aggregation over input rows.
+    /// Executes grouping and aggregation over input rows using the default aggregation configuration.
     ///
     /// Produces an intermediate Schema and Row set containing:
     /// - Grouping columns first: columns corresponding to each `group_by` expression.
@@ -695,91 +836,36 @@ impl AggregateOperator {
         group_by: &[Expr],
         aggregates: &[AggregateExpr],
     ) -> Result<(Schema, Vec<Row>)> {
-        // Build intermediate output schema
-        let mut out_cols = Vec::new();
-        for (idx, grp_expr) in group_by.iter().enumerate() {
-            let dt = grp_expr.infer_type(input_schema)?;
-            let name = match grp_expr {
-                Expr::Column(col_name) => col_name.clone(),
-                _ => format!("_group_{idx}"),
-            };
-            out_cols.push(Column::new(name, dt, true));
-        }
+        Self::apply_with_config(
+            rows,
+            input_schema,
+            group_by,
+            aggregates,
+            &crate::query::external_aggregate::AggregateConfig::default(),
+        )
+        .map(|(s, r, _)| (s, r))
+    }
 
-        for agg_expr in aggregates {
-            let dt = agg_expr.infer_type(input_schema)?;
-            let name = agg_expr.display_name();
-            out_cols.push(Column::new(name, dt, true));
-        }
-
-        let out_schema = Schema::new_projected(out_cols);
-
-        // Case 1: Global aggregation (no GROUP BY)
-        if group_by.is_empty() {
-            let mut accumulators = Vec::with_capacity(aggregates.len());
-            for agg in aggregates {
-                accumulators.push(AggregateState::new(agg, input_schema)?);
-            }
-
-            for row in &rows {
-                for acc in &mut accumulators {
-                    acc.accumulate(row, input_schema)?;
-                }
-            }
-
-            let agg_values: Vec<Value> = accumulators.into_iter().map(|acc| acc.finish()).collect();
-            return Ok((out_schema, vec![Row::new(agg_values)]));
-        }
-
-        // Case 2: Grouped aggregation (group_by is non-empty)
-        if rows.is_empty() {
-            return Ok((out_schema, Vec::new()));
-        }
-
-        let mut groups: HashMap<GroupKey, (Vec<Value>, Vec<AggregateState>)> = HashMap::new();
-        let mut group_order: Vec<GroupKey> = Vec::new();
-
-        for row in rows {
-            let mut key_values = Vec::with_capacity(group_by.len());
-            let mut canonical_keys = Vec::with_capacity(group_by.len());
-
-            for grp_expr in group_by {
-                let val = grp_expr.evaluate(&row, input_schema)?;
-                canonical_keys.push(CanonicalValue::from_value(&val));
-                key_values.push(val);
-            }
-
-            let key = GroupKey(canonical_keys);
-
-            if let Some(entry) = groups.get_mut(&key) {
-                for acc in &mut entry.1 {
-                    acc.accumulate(&row, input_schema)?;
-                }
-            } else {
-                group_order.push(key.clone());
-                let mut initial_states = Vec::with_capacity(aggregates.len());
-                for agg in aggregates {
-                    initial_states.push(AggregateState::new(agg, input_schema)?);
-                }
-                for acc in &mut initial_states {
-                    acc.accumulate(&row, input_schema)?;
-                }
-                groups.insert(key, (key_values, initial_states));
-            }
-        }
-
-        let mut out_rows = Vec::with_capacity(group_order.len());
-        for key in group_order {
-            if let Some((grp_vals, accs)) = groups.remove(&key) {
-                let mut row_values = grp_vals;
-                for acc in accs {
-                    row_values.push(acc.finish());
-                }
-                out_rows.push(Row::new(row_values));
-            }
-        }
-
-        Ok((out_schema, out_rows))
+    /// Executes grouping and aggregation over input rows using the provided `AggregateConfig`,
+    /// returning the schema, result rows, and execution telemetry metrics.
+    pub fn apply_with_config(
+        rows: Vec<Row>,
+        input_schema: &Schema,
+        group_by: &[Expr],
+        aggregates: &[AggregateExpr],
+        config: &crate::query::external_aggregate::AggregateConfig,
+    ) -> Result<(
+        Schema,
+        Vec<Row>,
+        crate::query::external_aggregate::AggregateExecutionMetrics,
+    )> {
+        let aggregator = crate::query::external_aggregate::ExternalAggregator::new(
+            input_schema,
+            group_by,
+            aggregates,
+            config.clone(),
+        );
+        aggregator.aggregate(rows)
     }
 }
 

@@ -492,4 +492,22 @@ pub enum Error {
     /// Corrupted or truncated temporary sort run file.
     #[error("External sort run corruption detected: {0}")]
     ExternalSortRunCorrupted(String),
+
+    /// External aggregation temporary file I/O or directory error.
+    #[error("External aggregation I/O error: {0}")]
+    ExternalAggregateIo(String),
+
+    /// External aggregation temporary disk quota exceeded.
+    #[error(
+        "External aggregation disk quota exceeded: spilled {bytes_spilled} bytes, limit is {limit} bytes"
+    )]
+    ExternalAggregateQuotaExceeded { bytes_spilled: usize, limit: usize },
+
+    /// External aggregation maximum merge/partition passes exceeded.
+    #[error("External aggregation max passes exceeded: reached {passes}, limit is {limit}")]
+    ExternalAggregateMaxPassesExceeded { passes: usize, limit: usize },
+
+    /// Corrupted or truncated temporary aggregation partition/run file.
+    #[error("External aggregation run corruption detected: {0}")]
+    ExternalAggregateRunCorrupted(String),
 }

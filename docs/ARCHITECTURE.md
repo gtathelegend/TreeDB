@@ -396,6 +396,11 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Authoritative Ordering:** Reuses canonical comparison engine (`compare_rows_by_sort_keys`) preserving `ASC`/`DESC`, `NULLS FIRST`/`LAST`, IEEE NaN float semantics (`f64::total_cmp`), and stable tie-breaking via monotonic sequence numbers.
   * **External Runtime Lifecycle:** Spilled runs are written to dedicated temporary files outside `.treedb` pages, freelist, and WAL logs. Automatic cleanup on `Drop` via RAII wrappers guarantees zero orphaned temporary files across queries, errors, and transaction rollbacks.
   * **Bounded K-Way & Multi-Pass Merge:** Merges runs concurrently in chunks bounded by `max_temp_files` (default 32) using a min-heap (`BinaryHeap<MergeItem>`), bounding merge memory to $O(\text{number\_of\_runs})$.
+* **External Aggregation & Spill-to-Disk GROUP BY (`ExternalAggregator`, `AggregateConfig`, `TempAggregateFile`, `AggregateExecutionMetrics`):**
+  * **Partition-and-Merge Hash Aggregation:** Evaluates in-memory aggregate state against `AggregateConfig.memory_budget_bytes` (default 64 KB). If memory exceeds the budget, in-memory states are hashed by `GroupKey` into temporary partition files (`TempAggregateFile`), freeing memory to continue consuming input.
+  * **Authoritative Semantics & Merging:** Preserves exact SQL grouping and aggregation semantics (`COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, NULL keys, Float64 NaN). Accumulators merge algebraically via `AggregateState::merge_from`.
+  * **Multi-Pass Recursive Partitioning:** If reloading a partition exceeds the memory budget, it is recursively sub-partitioned using a salted hash function (`hash(key, pass)`).
+  * **Temporary Runtime Lifecycle:** Spill files are strictly runtime artifacts cleaned up automatically on `Drop`. They never participate in WAL, catalog, or persistent database pages.
 
 ---
 
@@ -418,6 +423,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **Prepared Statement Non-Persistence Invariant:** Preparing statements and parameter binding are strictly memory-resident, generating zero WAL records and zero page allocations.
 * **Plan Cache Invariant:** A cached physical plan is never reused when schema, index state, statistics assumptions, transaction visibility, or parameter-dependent planning conditions are no longer valid. Cache hits and misses produce semantically identical query results.
 * **External Sort Non-Persistence & Equivalence Invariant:** Temporary sort runs are strictly runtime external artifacts excluded from WAL and persistent database pages. Spilling decisions never alter query results, row ordering, duplicates, or column structures compared to in-memory execution.
+* **External Aggregation Non-Persistence & Equivalence Invariant:** Temporary aggregation partition runs are strictly runtime external artifacts excluded from WAL and persistent database pages. Spilling decisions produce results 100% mathematically and semantically identical to in-memory aggregation.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -431,12 +437,13 @@ The following capabilities are intentionally deferred to subsequent phases:
 * Multi-column composite secondary indexes.
 * Index-only covering scans.
 * Hash join and merge join physical operators.
-* External aggregation and external hash join spilling.
+* External hash join spilling.
 * DDL statements (`ALTER TABLE`) in SQL grammar.
 * Recursive CTE `UNION DISTINCT`, `SEARCH`, `CYCLE` clauses, and mutual recursion.
 * Derived tables (`FROM (SELECT ...)`).
 * Subquery flattening and cost-based decorrelation.
 * Multi-threading, concurrency control, and MVCC.
+
 
 
 
