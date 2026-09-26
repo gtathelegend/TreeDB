@@ -26,6 +26,8 @@ pub enum Statement {
     Delete(DeleteStatement),
     /// SQL `EXPLAIN` query introspection statement.
     Explain(ExplainStatement),
+    /// SQL `ANALYZE` statistics collection statement.
+    Analyze(AnalyzeStatement),
 }
 
 impl fmt::Display for Statement {
@@ -41,6 +43,7 @@ impl fmt::Display for Statement {
             Statement::Update(s) => write!(f, "{s}"),
             Statement::Delete(s) => write!(f, "{s}"),
             Statement::Explain(s) => write!(f, "{s}"),
+            Statement::Analyze(s) => write!(f, "{s}"),
         }
     }
 }
@@ -297,6 +300,19 @@ pub struct ExplainStatement {
 impl fmt::Display for ExplainStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "EXPLAIN {}", self.query)
+    }
+}
+
+/// AST node representing an `ANALYZE` statistics collection statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalyzeStatement {
+    /// Target table name to analyze and collect statistics for.
+    pub table_name: String,
+}
+
+impl fmt::Display for AnalyzeStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ANALYZE {}", self.table_name)
     }
 }
 

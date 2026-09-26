@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
+use crate::query::stats::{StatsRegistry, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::{Key, PageId};
 use crate::storage::page_manager::PageManager;
@@ -31,6 +32,7 @@ pub struct TreeDb {
     record_store: RecordStore,
     buffer_pool: BufferPool,
     active_txn: Option<TxnId>,
+    stats: StatsRegistry,
 }
 
 impl TreeDb {
@@ -59,6 +61,7 @@ impl TreeDb {
             record_store,
             buffer_pool,
             active_txn: None,
+            stats: StatsRegistry::new(),
         })
     }
 
@@ -79,6 +82,7 @@ impl TreeDb {
             record_store,
             buffer_pool,
             active_txn: None,
+            stats: StatsRegistry::new(),
         })
     }
 
@@ -93,6 +97,7 @@ impl TreeDb {
             record_store,
             buffer_pool,
             active_txn: None,
+            stats: StatsRegistry::new(),
         }
     }
 
@@ -497,5 +502,38 @@ impl TreeDb {
     /// Validates the structural and referential integrity of the catalog.
     pub fn validate_catalog(&mut self) -> Result<()> {
         Catalog::validate_catalog(&mut self.buffer_pool)
+    }
+
+    /// Derives and registers runtime statistics for the named table.
+    pub fn collect_statistics(&mut self, table_name: &str) -> Result<TableStatistics> {
+        let mut table = self.open_table(table_name)?;
+        let stats = table.collect_statistics()?;
+        self.stats.set_table_stats(stats.clone());
+        Ok(stats)
+    }
+
+    /// Retrieves registered statistics for a table if available.
+    pub fn get_statistics(&self, table_name: &str) -> Option<&TableStatistics> {
+        self.stats.get_table_stats(table_name)
+    }
+
+    /// Sets or overrides statistics for a table.
+    pub fn set_statistics(&mut self, stats: TableStatistics) {
+        self.stats.set_table_stats(stats);
+    }
+
+    /// Removes registered statistics for a table.
+    pub fn clear_statistics(&mut self, table_name: &str) {
+        self.stats.remove_table_stats(table_name);
+    }
+
+    /// Returns a reference to the database statistics registry.
+    pub fn statistics_registry(&self) -> &StatsRegistry {
+        &self.stats
+    }
+
+    /// Returns a mutable reference to the database statistics registry.
+    pub fn statistics_registry_mut(&mut self) -> &mut StatsRegistry {
+        &mut self.stats
     }
 }

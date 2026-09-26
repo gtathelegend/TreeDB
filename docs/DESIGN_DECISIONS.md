@@ -659,7 +659,7 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * Reusing the existing persistent secondary B+ Tree implementation guarantees that storage formats, WAL records, crash recovery, page recycling, and table mutation hooks remain unified and battle-tested without code or engine duplication.
 
-## Decision 43: SQL EXPLAIN and Deterministic Physical Plan Introspection
+### Decision 43: SQL EXPLAIN and Deterministic Physical Plan Introspection
 
 * **Decision:** Expose TreeDB's existing physical optimizer plans to users via the `EXPLAIN <query>;` SQL statement without creating a separate planner or duplicating execution logic:
   1. **Syntax, AST & Target Statement Restriction:**
@@ -687,6 +687,43 @@ This document records key architectural and design choices, their rationale, and
      * Runtime execution statistics (`EXPLAIN ANALYZE`), cost-based cardinality estimates, timing instrumentation, and buffer-pool cache hit statistics are deferred to future profiling phases.
 * **Rationale:**
   * Exposing the physical plan directly through SQL guarantees transparency into index selection, join ordering, and pushdown optimizations while ensuring that the physical optimizer remains the single source of truth for query planning.
+
+## Decision 44: Query Statistics and Cost-Based Query Optimization
+
+* **Decision:** Introduce a deterministic, statistics-aware cost-based query optimizer and cardinality estimator while maintaining full backward compatibility, safe missing-statistics fallbacks, and zero-execution EXPLAIN invariants:
+  1. **Statistics Abstraction & Data Model:**
+     * `TableStatistics`: Encapsulates relation-level row count, per-column `ColumnStatistics`, and per-index `IndexStatistics`.
+     * `ColumnStatistics`: Tracks row count, null count, distinct non-null count (NDV), min value, and max value.
+     * `IndexStatistics`: Tracks indexed entry count, distinct key count, and null count.
+     * `StatsRegistry`: In-memory thread-safe advisory statistics store managing cached statistics for tables across transactions.
+  2. **Non-Destructive Statistics Collection:**
+     * `Table::collect_statistics(&mut self)` performs an in-order scan across the table's primary and secondary B+ Trees to compute column/index statistics.
+     * Accessible programmatically via `db.collect_statistics("table")` and `txn.collect_statistics("table")`.
+     * Accessible via SQL statement `ANALYZE <table>;` (`StatementResult::AnalyzedTable { table }`).
+     * Guaranteed non-destructive: does not modify data, allocates no user data pages, respects transaction isolation, and generates no WAL overhead.
+  3. **Statistics Freshness & Advisory Lifecycle:**
+     * Statistics are explicitly advisory and maintained in a runtime cache (`StatsRegistry`).
+     * When statistics are absent or tables are unanalyzed, the optimizer seamlessly falls back to deterministic rule-based default parameters (`DEFAULT_TABLE_ROWS = 1000.0`, `DEFAULT_EQ_SELECTIVITY = 0.1`, `DEFAULT_RANGE_SELECTIVITY = 1/3`, `DEFAULT_NULL_FRACTION = 0.05`).
+  4. **Centralized Deterministic Cost Model (`CostModel`):**
+     * Centralizes all physical execution cost formulas in `src/query/cost.rs` using explicit constants (`PAGE_READ_COST`, `ROW_CPU_COST`, `FILTER_CPU_COST`, `BPLUS_TREE_HEIGHT_COST`, `SEC_INDEX_LOOKUP_COST`, `SEC_INDEX_FETCH_COST`, `PK_LOOKUP_COST`, `TUPLE_FETCH_COST`, `SORT_CPU_COST`, `JOIN_CPU_COST`, `AGG_CPU_COST`, `WINDOW_CPU_COST`).
+     * Provides monotonic cost formulas for table scans, PK point lookups, PK range scans, secondary index point lookups, secondary index range scans, nested-loop joins, sorting, aggregation, and window function evaluation.
+  5. **Access-Path Candidate Generation & Deterministic Tie-Breaking:**
+     * For any single-table predicate, generates all eligible candidate access paths (`FullTableScan`, `PrimaryPointLookup`, `PrimaryRangeScan`, `SecondaryIndexScan`).
+     * Calculates estimated output rows and execution costs for each candidate.
+     * Sorts candidates using deterministic tie-breaking: `lowest cost -> lowest estimated rows -> priority (PK point > PK range > secondary index > full scan) -> index ID -> index name`.
+  6. **Bounded Cost-Based Inner-Join Ordering:**
+     * For queries joining 2 to 5 relations where all joins are `INNER JOIN`s and table statistics are present, evaluates all $N!$ join permutations.
+     * Computes cumulative nested-loop join cost and intermediate cardinality for each permutation.
+     * On cost ties, strictly preserves the user's original syntactic join order (identity permutation `[0..N]`).
+     * Non-inner joins (`LEFT JOIN`) are strictly preserved in their original syntactic order to prevent invalid outer join reordering.
+  7. **EXPLAIN Integration:**
+     * Formats `cost: {:.2}, estimated_rows: {:.0}` in `PhysicalPlan::fmt` for base table scans and joins.
+     * Diagnostics remain strictly zero-execution and zero-persistence.
+  8. **Deferred Features:**
+     * HyperLogLog/histograms, randomized sampling during analyze, adaptive query execution feedback, and parallel query optimization are deferred to future phases.
+* **Rationale:**
+  * Centralizing cost calculations and grounding plan choices in explicit statistics gives predictable, verifiable access path and join selection while ensuring that existing databases without statistics retain identical baseline execution semantics.
+
 
 
 

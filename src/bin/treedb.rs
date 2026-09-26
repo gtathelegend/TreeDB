@@ -73,6 +73,9 @@ fn main() -> Result<()> {
                 treedb::StatementResult::Deleted { rows } => {
                     println!("Deleted {rows} row(s)");
                 }
+                treedb::StatementResult::AnalyzedTable { table } => {
+                    println!("Analyzed table '{table}'");
+                }
             }
         }
         "init" => {

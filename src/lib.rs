@@ -23,16 +23,18 @@ pub use index::{
     SEC_INTERNAL_HEADER_SIZE, SEC_LEAF_HEADER_SIZE,
 };
 pub use query::{
-    BinaryOp, Expr, FilterOperator, OffsetLimitOperator, ProjectOperator, Query, QueryResult,
-    SortDirection, SortKey, SortOperator, UnaryOp,
+    BinaryOp, CardinalityEstimator, ColumnStatistics, CostModel, Expr, FilterOperator,
+    IndexStatistics, OffsetLimitOperator, PlanCost, ProjectOperator, Query, QueryResult,
+    SortDirection, SortKey, SortOperator, StatisticsProvider, StatsRegistry, TableStatistics,
+    UnaryOp,
 };
 pub use sql::{
     bind_select, parse as parse_sql, parse_statement as parse_statement_sql,
-    tokenize as tokenize_sql, BindingContext, BoundSelect, ColumnDef, CreateIndexStatement,
-    CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement,
-    ExplainStatement, InsertStatement, Lexer, OrderByExpr, OrderDirection, Parser, SelectItem,
-    SelectStatement, SourceSpan, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
-    Token, TokenKind, UpdateAssignment, UpdateStatement, MAX_IDENTIFIER_LEN,
+    tokenize as tokenize_sql, AnalyzeStatement, BindingContext, BoundSelect, ColumnDef,
+    CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement,
+    DropTableStatement, ExplainStatement, InsertStatement, Lexer, OrderByExpr, OrderDirection,
+    Parser, SelectItem, SelectStatement, SourceSpan, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp,
+    Statement, TableRef, Token, TokenKind, UpdateAssignment, UpdateStatement, MAX_IDENTIFIER_LEN,
 };
 
 pub use storage::{

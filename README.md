@@ -72,6 +72,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **SQL Set Operations** | **Implemented** | `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`, precedence (`INTERSECT` > `UNION`/`EXCEPT`), parenthesized query expressions, `NULL = NULL` row identity equality, type coercion & output schema derivation from left operand, multiset arithmetic, subquery/CTE/JOIN/window/order-by integration |
 | **SQL Secondary-Index DDL** | **Implemented** | `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, single-column index specification, canonical `IndexKey` types, strict single-`NULL` uniqueness, persistent B+ Tree integration, existing row indexing, optimizer access-path visibility, transactional rollback & ARIES recovery |
 | **SQL EXPLAIN Query Introspection** | **Implemented** | `EXPLAIN <query>`, query plan introspection, deterministic physical plan formatting, scans, access paths, joins, filters, projections, sorts, window functions, CTEs, recursive CTEs, set operations, subqueries, no execution side-effects, transaction visibility |
+| **Query Statistics & Cost-Based Optimization** | **Implemented** | Table/column/index statistics collection (`collect_statistics`, `ANALYZE <table>;`), `StatsRegistry`, deterministic `CostModel`, `CardinalityEstimator` (equality, ranges, nulls, 3VL logic, equi-joins), cost-based access-path selection (PK lookup/range, secondary index lookup/range, full scan), bounded inner-join ordering (2–5 relations), EXPLAIN cost/row estimation, missing-stats fallback |
 
 
 ---

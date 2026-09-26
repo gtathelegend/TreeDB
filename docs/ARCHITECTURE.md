@@ -154,16 +154,19 @@ v                                                             v
     8. **Pagination (`OffsetLimitOperator`):** In-memory offset skipping and limit truncation.
   * **Programmatic API:** Fluent builder via `TreeDb::query(name)` and `Transaction::query(name)` supporting `.filter()`, `.group_by()`, `.aggregate()`, `.having()`, `.project()`, `.sort_by()`, `.sort()`, `.offset()`, `.limit()`, and `.execute()`.
 
-### `Optimizer`, `AccessPath`, & `PhysicalPlan` (`src/query/optimizer.rs`)
-* **Role:** Deterministic rule-based query optimizer and physical execution planner producing executable `PhysicalPlan` trees from `BoundSelect`.
+### `Optimizer`, `AccessPath`, `CostModel`, `CardinalityEstimator`, & `PhysicalPlan` (`src/query/optimizer.rs`, `src/query/cost.rs`, `src/query/cardinality.rs`, `src/query/stats.rs`)
+* **Role:** Deterministic statistics-aware and cost-based query optimizer and physical execution planner producing executable `PhysicalPlan` trees from `BoundSelect`.
 * **Responsibilities:**
-  * **Access Path Selection:** Identifies primary-key point lookups, primary-key range scans, secondary-index point/range scans, or full table scans using catalog and index metadata.
-  * **Deterministic Priority:** Follows strict precedence: `PrimaryPointLookup > PrimaryRangeScan > SecondaryIndexScan (sorted by IndexId asc) > FullTableScan`.
+  * **Table & Index Statistics (`src/query/stats.rs`):** `TableStatistics`, `ColumnStatistics` (row count, null count, distinct count, min/max), and `IndexStatistics` (indexed row count, distinct key count, null count). In-memory `StatsRegistry` manages advisory statistics populated via `Table::collect_statistics(&mut self)`, `db.collect_statistics()`, or SQL `ANALYZE <table>;`.
+  * **Cardinality Estimation (`CardinalityEstimator`, `src/query/cardinality.rs`):** Computes estimated output row counts for full scans, equality predicates ($1/\text{NDV}$), `IS NULL` / `IS NOT NULL`, ranges via domain bounds $\frac{\text{val} - \text{min}}{\text{max} - \text{min}}$, boolean combinations (`AND`, `OR`, `NOT`), and inner equi-joins $\frac{|A| \times |B|}{\max(\text{ndv}_A, \text{ndv}_B)}$.
+  * **Centralized Cost Model (`CostModel`, `src/query/cost.rs`):** Centralizes all execution cost weights (`PAGE_READ_COST`, `ROW_CPU_COST`, `FILTER_CPU_COST`, `BPLUS_TREE_HEIGHT_COST`, `SEC_INDEX_LOOKUP_COST`, `SEC_INDEX_FETCH_COST`, `PK_LOOKUP_COST`, `TUPLE_FETCH_COST`, `SORT_CPU_COST`, `JOIN_CPU_COST`, `AGG_CPU_COST`, `WINDOW_CPU_COST`) with monotonic cost formulas for scans, lookups, joins, sorting, and aggregations.
+  * **Access Path Candidate Generation & Selection:** Identifies all candidate access paths (`FullTableScan`, `PrimaryPointLookup`, `PrimaryRangeScan`, `SecondaryIndexScan`), computing estimated rows and cost for each candidate.
+  * **Deterministic Tie-Breaking:** Selects lowest estimated cost candidate, tie-breaking by `lowest cost -> lowest estimated rows -> priority (PK point > PK range > secondary index > full scan) -> index ID -> index name`.
+  * **Bounded Inner-Join Ordering:** Evaluates all $N!$ join permutations for 2–5 inner-joined relations with statistics, choosing the permutation with the lowest cumulative cost, tie-breaking to the original syntactic order. Preserves `LEFT JOIN` outer ordering strictly.
   * **Predicate Decomposition & Pushdown:** Splits `AND` conjunctions into individual conjuncts. Pushes table-local predicates down into individual `PhysicalTableScan` access paths and residual filters before executing joins.
   * **LEFT JOIN Outer Safety:** Restricts pushdown across `LEFT JOIN` boundaries; filters on the right side in `WHERE` are retained post-join to ensure unmatched rows are correctly filtered out.
   * **Residual Filter Preservation:** Always retains unconsumed predicate components in `PhysicalTableScan.residual_filter` to ensure full semantic equivalence.
-  * **SQL 3VL Preservation:** Treats `col = NULL` and `IS NULL` correctly without converting them to invalid matching index lookups.
-  * **Deterministic Plan Inspection:** Provides formatted, indented tree representations via `PhysicalPlan::Display` and `Transaction::explain_sql` / `TreeDb::explain_sql`.
+  * **Deterministic Plan Inspection:** Exposes `cost: {:.2}, estimated_rows: {:.0}` in `PhysicalPlan::Display` and `EXPLAIN <query>;` with strict zero-execution and zero-persistence guarantees.
 
 ---
 

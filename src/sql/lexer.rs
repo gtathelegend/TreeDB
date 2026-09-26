@@ -349,6 +349,7 @@ impl<'a> Lexer<'a> {
             "INDEX" => TokenKind::Index,
             "UNIQUE" => TokenKind::Unique,
             "EXPLAIN" => TokenKind::Explain,
+            "ANALYZE" => TokenKind::Analyze,
             "BOOLEAN" | "BOOL" => TokenKind::BooleanType,
             "BIGINT" | "INT64" | "INTEGER" | "INT" => TokenKind::BigIntType,
             "UBIGINT" | "UINT64" | "UINT" => TokenKind::UBigIntType,

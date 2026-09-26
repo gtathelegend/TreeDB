@@ -1,10 +1,10 @@
 use crate::engine::types::DataType;
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    ColumnDef, CreateIndexStatement, CreateTableStatement, Cte, CteQuery, DeleteStatement,
-    DropIndexStatement, DropTableStatement, ExplainStatement, InsertStatement, JoinClause,
-    JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SetOperator, SetQuery,
-    SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
+    AnalyzeStatement, ColumnDef, CreateIndexStatement, CreateTableStatement, Cte, CteQuery,
+    DeleteStatement, DropIndexStatement, DropTableStatement, ExplainStatement, InsertStatement,
+    JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SetOperator,
+    SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
     UpdateAssignment, UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction, WindowSpec,
     WithClause,
 };
@@ -37,11 +37,12 @@ impl<'a> Parser<'a> {
         Self { tokens, cursor: 0 }
     }
 
-    /// Parses an arbitrary top-level SQL statement (`SELECT`, set-operation query, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN`).
+    /// Parses an arbitrary top-level SQL statement (`SELECT`, set-operation query, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN`, `ANALYZE`).
     pub fn parse_statement(&mut self) -> Result<Statement> {
         let token = self.peek();
         match token.kind {
             TokenKind::Explain => Ok(Statement::Explain(self.parse_explain()?)),
+            TokenKind::Analyze => Ok(Statement::Analyze(self.parse_analyze()?)),
             TokenKind::Select | TokenKind::With | TokenKind::LParen => {
                 self.parse_query_statement()
             }
@@ -82,7 +83,7 @@ impl<'a> Parser<'a> {
             TokenKind::Delete => Ok(Statement::Delete(self.parse_delete()?)),
             _ => Err(Error::SqlParseError {
                 message: format!(
-                    "unexpected token {}, expected SQL statement (SELECT, CREATE, DROP, INSERT, UPDATE, DELETE, EXPLAIN)",
+                    "unexpected token {}, expected SQL statement (SELECT, CREATE, DROP, INSERT, UPDATE, DELETE, EXPLAIN, ANALYZE)",
                     token.kind
                 ),
                 start: token.span.start,
@@ -684,6 +685,7 @@ impl<'a> Parser<'a> {
             TokenKind::Insert => Err(Error::UnsupportedExplainTarget("INSERT".to_string())),
             TokenKind::Update => Err(Error::UnsupportedExplainTarget("UPDATE".to_string())),
             TokenKind::Delete => Err(Error::UnsupportedExplainTarget("DELETE".to_string())),
+            TokenKind::Analyze => Err(Error::UnsupportedExplainTarget("ANALYZE".to_string())),
             TokenKind::Create => match self.peek_ahead(1).kind {
                 TokenKind::Table => {
                     Err(Error::UnsupportedExplainTarget("CREATE TABLE".to_string()))
@@ -718,6 +720,53 @@ impl<'a> Parser<'a> {
                 end: next_tok.span.end,
             }),
         }
+    }
+
+    /// Parses a complete SQL `ANALYZE` statement.
+    ///
+    /// # Syntax
+    /// `ANALYZE <table_name> [;]`
+    pub fn parse_analyze(&mut self) -> Result<AnalyzeStatement> {
+        if self.peek().kind != TokenKind::Analyze {
+            let tok = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!("expected ANALYZE statement, found {}", tok.kind),
+                start: tok.span.start,
+                end: tok.span.end,
+            });
+        }
+        self.advance(); // consume ANALYZE
+
+        let table_name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected table name in ANALYZE, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+        };
+        self.advance(); // consume table name
+
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+
+        if self.peek().kind != TokenKind::Eof {
+            let trailing = self.peek().clone();
+            return Err(Error::SqlParseError {
+                message: format!(
+                    "unexpected trailing token after ANALYZE statement: {}",
+                    trailing.kind
+                ),
+                start: trailing.span.start,
+                end: trailing.span.end,
+            });
+        }
+
+        Ok(AnalyzeStatement { table_name })
     }
 
     /// Parses a complete SQL `INSERT INTO` statement.

@@ -376,6 +376,11 @@ pub enum StatementResult {
         /// Name of the dropped index.
         index: String,
     },
+    /// Result of an SQL `ANALYZE` statement.
+    AnalyzedTable {
+        /// Name of the analyzed table.
+        table: String,
+    },
 }
 
 impl StatementResult {
@@ -400,7 +405,8 @@ impl StatementResult {
             StatementResult::CreatedTable { .. }
             | StatementResult::DroppedTable { .. }
             | StatementResult::CreatedIndex { .. }
-            | StatementResult::DroppedIndex { .. } => 0,
+            | StatementResult::DroppedIndex { .. }
+            | StatementResult::AnalyzedTable { .. } => 0,
         }
     }
 }
@@ -1016,6 +1022,11 @@ impl<'db> Transaction<'db> {
         {
             let (schema, indexes, is_cte) =
                 self.resolve_table_for_planning(&ast.from.name, &visible_ctes)?;
+            let stats = if is_cte {
+                None
+            } else {
+                self.db.get_statistics(&ast.from.name).cloned()
+            };
             table_infos.push(
                 crate::query::optimizer::TableOptInfo::new(
                     &ast.from.name,
@@ -1023,7 +1034,8 @@ impl<'db> Transaction<'db> {
                     schema,
                     indexes,
                 )
-                .with_cte(is_cte),
+                .with_cte(is_cte)
+                .with_stats(stats),
             );
         }
 
@@ -1031,6 +1043,11 @@ impl<'db> Transaction<'db> {
         for j in &ast.joins {
             let (schema, indexes, is_cte) =
                 self.resolve_table_for_planning(&j.table.name, &visible_ctes)?;
+            let stats = if is_cte {
+                None
+            } else {
+                self.db.get_statistics(&j.table.name).cloned()
+            };
             table_infos.push(
                 crate::query::optimizer::TableOptInfo::new(
                     &j.table.name,
@@ -1038,7 +1055,8 @@ impl<'db> Transaction<'db> {
                     schema,
                     indexes,
                 )
-                .with_cte(is_cte),
+                .with_cte(is_cte)
+                .with_stats(stats),
             );
         }
 
@@ -1572,6 +1590,7 @@ impl<'db> Transaction<'db> {
             crate::sql::Statement::Insert(insert_stmt) => self.execute_insert(&insert_stmt),
             crate::sql::Statement::Update(update_stmt) => self.execute_update(&update_stmt),
             crate::sql::Statement::Delete(delete_stmt) => self.execute_delete(&delete_stmt),
+            crate::sql::Statement::Analyze(analyze_stmt) => self.execute_analyze(&analyze_stmt),
         }
     }
 
@@ -2007,6 +2026,44 @@ impl<'db> Transaction<'db> {
         Ok(StatementResult::Deleted {
             rows: deleted_count,
         })
+    }
+
+    fn execute_analyze(&mut self, stmt: &crate::sql::AnalyzeStatement) -> Result<StatementResult> {
+        self.ensure_active()?;
+        self.collect_statistics(&stmt.table_name)?;
+        Ok(StatementResult::AnalyzedTable {
+            table: stmt.table_name.clone(),
+        })
+    }
+
+    /// Derives and registers runtime statistics for the named table within this transaction.
+    pub fn collect_statistics(
+        &mut self,
+        table_name: &str,
+    ) -> Result<crate::query::stats::TableStatistics> {
+        self.ensure_active()?;
+        let mut table = self.open_table(table_name)?;
+        let stats = table.collect_statistics()?;
+        self.db.set_statistics(stats.clone());
+        Ok(stats)
+    }
+
+    /// Retrieves registered statistics for a table if available.
+    pub fn get_statistics(
+        &self,
+        table_name: &str,
+    ) -> Option<&crate::query::stats::TableStatistics> {
+        self.db.get_statistics(table_name)
+    }
+
+    /// Sets or overrides statistics for a table.
+    pub fn set_statistics(&mut self, stats: crate::query::stats::TableStatistics) {
+        self.db.set_statistics(stats);
+    }
+
+    /// Removes registered statistics for a table.
+    pub fn clear_statistics(&mut self, table_name: &str) {
+        self.db.clear_statistics(table_name);
     }
 
     /// Executes a fully optimized `PhysicalPlan` against this transaction.

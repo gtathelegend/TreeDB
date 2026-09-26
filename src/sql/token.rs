@@ -63,6 +63,7 @@ pub enum TokenKind {
     Index,
     Unique,
     Explain,
+    Analyze,
 
     // Data Type Keywords
     BooleanType,
@@ -162,6 +163,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Index => write!(f, "INDEX"),
             TokenKind::Unique => write!(f, "UNIQUE"),
             TokenKind::Explain => write!(f, "EXPLAIN"),
+            TokenKind::Analyze => write!(f, "ANALYZE"),
             TokenKind::BooleanType => write!(f, "BOOLEAN"),
             TokenKind::BigIntType => write!(f, "BIGINT"),
             TokenKind::UBigIntType => write!(f, "UBIGINT"),

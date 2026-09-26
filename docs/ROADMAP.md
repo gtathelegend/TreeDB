@@ -487,13 +487,33 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 29: Advanced Query Processing & Optimizer Enhancements (Future)
+## Phase 29: Query Statistics & Cost-Based Optimization (Completed)
+* [x] Statistics abstraction & data models: `TableStatistics`, `ColumnStatistics` (row count, null count, distinct count, min/max), `IndexStatistics` (indexed row count, distinct key count, null count), `StatisticsProvider` trait, `StatsRegistry`
+* [x] Statistics collection mechanism: non-destructive `Table::collect_statistics(&mut self)`, `db.collect_statistics("table")`, `txn.collect_statistics("table")`, and SQL statement `ANALYZE <table>;`
+* [x] Statistics freshness policy: advisory in-memory cache, explicit collection via `collect_statistics` / `ANALYZE`, safe missing-statistics fallback to deterministic defaults
+* [x] Deterministic cardinality estimation (`CardinalityEstimator`):
+  * Full table scan: `stats.row_count` (fallback 1000.0)
+  * Equality predicate: `1 / distinct_count` (fallback 0.1)
+  * IS NULL / IS NOT NULL: `null_count / row_count` and `1 - null_fraction`
+  * Range predicates: value domain fraction `(val - min) / (max - min)` with fallback `1/3`
+  * Logical operators: independent multiplication for `AND`, inclusion-exclusion for `OR`, complement for `NOT`
+  * Inner equi-joins: `|A| * |B| / max(ndv(A.key), ndv(B.key))`
+* [x] Centralized cost model (`CostModel`): canonical weights (`PAGE_READ_COST`, `ROW_CPU_COST`, `FILTER_CPU_COST`, `BPLUS_TREE_HEIGHT_COST`, `SEC_INDEX_LOOKUP_COST`, `SEC_INDEX_FETCH_COST`, `PK_LOOKUP_COST`, `TUPLE_FETCH_COST`, `SORT_CPU_COST`, `JOIN_CPU_COST`, `AGG_CPU_COST`, `WINDOW_CPU_COST`) and deterministic `PlanCost` comparison
+* [x] Access-path candidate generation & selection: evaluates `FullTableScan`, `PrimaryPointLookup`, `PrimaryRangeScan`, `SecondaryIndexScan` (PointLookup, RangeScan); deterministic cost tie-breaking (cost -> estimated rows -> priority -> index ID -> index name -> full scan)
+* [x] Bounded cost-based inner-join ordering: evaluates all $N!$ permutations for 2–5 relations, preserves identity ordering on ties, strictly preserves outer join (LEFT JOIN) ordering
+* [x] EXPLAIN integration: formats `cost: <f64>` and `estimated_rows: <f64>` across table scans and joins while preserving zero-execution and zero-persistence invariants
+* [x] Missing-statistics fallback: unanalyzed tables fall back gracefully to default rule-based priorities without changing query results
+* [x] CLI integration: supports `ANALYZE <table>;` execution in REPL/CLI
+* [x] 11 dedicated integration tests in `tests/statistics_optimizer.rs` including randomized differential query oracle comparing analyzed vs unanalyzed execution (539 total test suite)
+
+---
+
+## Phase 30: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Hash join and merge join physical execution operators
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
 * [ ] Expression indexes & partial indexes
 * [ ] Derived tables (`FROM (SELECT ...)`)
-* [ ] Cost-based join optimization and cardinality estimation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
 * [ ] Runtime execution profiling (`EXPLAIN ANALYZE`)
 

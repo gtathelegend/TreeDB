@@ -4,8 +4,11 @@ use std::fmt;
 use crate::engine::catalog::{IndexId, IndexMetadata};
 use crate::engine::types::{DataType, Schema, Value};
 use crate::error::Result;
+use crate::query::cardinality::CardinalityEstimator;
+use crate::query::cost::CostModel;
 use crate::query::expr::{AggregateExpr, BinaryOp, Expr};
 use crate::query::operator::SortKey;
+use crate::query::stats::TableStatistics;
 use crate::sql::ast::JoinType;
 use crate::sql::binder::BoundSelect;
 
@@ -98,6 +101,10 @@ pub struct PhysicalTableScan {
     pub access_path: AccessPath,
     /// Table-local residual filtering predicate to be evaluated on candidate rows.
     pub residual_filter: Option<Expr>,
+    /// Estimated output row count from this table scan.
+    pub estimated_rows: f64,
+    /// Estimated cost of this table scan.
+    pub cost: f64,
 }
 
 impl PhysicalTableScan {
@@ -116,6 +123,10 @@ pub struct PhysicalJoin {
     pub right: PhysicalTableScan,
     /// Join condition boolean predicate.
     pub on: Expr,
+    /// Estimated output row count after this join step.
+    pub estimated_rows: f64,
+    /// Estimated total cumulative cost through this join step.
+    pub cost: f64,
 }
 
 /// Physical relational set operation node.
@@ -131,14 +142,14 @@ pub struct PhysicalSetOp {
     pub schema: Schema,
 }
 
-/// Complete physical execution plan produced by the rule-based optimizer.
+/// Complete physical execution plan produced by the cost-based optimizer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalPlan {
     /// Statement-local CTE definitions.
     pub ctes: Vec<crate::sql::binder::BoundCte>,
     /// Base relation scan node (FROM table).
     pub base_table: PhysicalTableScan,
-    /// Physical joins in left-to-right evaluation order.
+    /// Physical joins in evaluation order.
     pub joins: Vec<PhysicalJoin>,
     /// Global post-join filter predicate (WHERE condition across multiple tables).
     pub post_join_filter: Option<Expr>,
@@ -160,11 +171,20 @@ pub struct PhysicalPlan {
     pub limit: Option<usize>,
     /// Optional physical set operation.
     pub set_op: Option<PhysicalSetOp>,
+    /// Total estimated execution cost of this physical plan.
+    pub total_cost: f64,
+    /// Total estimated output row count of this physical plan.
+    pub estimated_rows: f64,
 }
 
 impl PhysicalPlan {
     /// Creates a new physical plan for a relational set operation.
     pub fn new_set_op(set_op: PhysicalSetOp) -> Self {
+        let left_cost = set_op.left.total_cost;
+        let right_cost = set_op.right.total_cost;
+        let total_cost = left_cost + right_cost;
+        let estimated_rows = set_op.left.estimated_rows + set_op.right.estimated_rows;
+
         Self {
             ctes: Vec::new(),
             base_table: PhysicalTableScan {
@@ -172,6 +192,8 @@ impl PhysicalPlan {
                 table_alias: None,
                 access_path: AccessPath::FullTableScan,
                 residual_filter: None,
+                estimated_rows: 0.0,
+                cost: 0.0,
             },
             joins: Vec::new(),
             post_join_filter: None,
@@ -184,6 +206,8 @@ impl PhysicalPlan {
             offset: None,
             limit: None,
             set_op: Some(set_op),
+            total_cost,
+            estimated_rows,
         }
     }
 }
@@ -395,6 +419,12 @@ impl fmt::Display for PhysicalPlan {
                     .map(|rf| format!(", filter: [{rf}]"))
                     .unwrap_or_default()
             )?;
+            write_indent(f, indent + 1)?;
+            writeln!(
+                f,
+                "cost: {:.2}, estimated_rows: {:.0}",
+                self.base_table.cost, self.base_table.estimated_rows
+            )?;
             if let Some(rf) = &self.base_table.residual_filter {
                 format_subqueries_in_expr(rf, f, indent + 1)?;
             }
@@ -405,6 +435,12 @@ impl fmt::Display for PhysicalPlan {
                     f,
                     "NestedLoopJoin ({:?}, on: [{}])",
                     join.join_type, join.on
+                )?;
+                write_indent(f, indent + 1)?;
+                writeln!(
+                    f,
+                    "cost: {:.2}, estimated_rows: {:.0}",
+                    join.cost, join.estimated_rows
                 )?;
                 format_subqueries_in_expr(&join.on, f, indent + 1)?;
                 indent += 1;
@@ -426,6 +462,12 @@ impl fmt::Display for PhysicalPlan {
                             .map(|rf| format!(", filter: [{rf}]"))
                             .unwrap_or_default()
                     )?;
+                    write_indent(f, indent + 1)?;
+                    writeln!(
+                        f,
+                        "cost: {:.2}, estimated_rows: {:.0}",
+                        self.base_table.cost, self.base_table.estimated_rows
+                    )?;
                     if let Some(rf) = &self.base_table.residual_filter {
                         format_subqueries_in_expr(rf, f, indent + 1)?;
                     }
@@ -446,6 +488,12 @@ impl fmt::Display for PhysicalPlan {
                         .as_ref()
                         .map(|rf| format!(", filter: [{rf}]"))
                         .unwrap_or_default()
+                )?;
+                write_indent(f, indent + 1)?;
+                writeln!(
+                    f,
+                    "cost: {:.2}, estimated_rows: {:.0}",
+                    join.right.cost, join.right.estimated_rows
                 )?;
                 if let Some(rf) = &join.right.residual_filter {
                     format_subqueries_in_expr(rf, f, indent + 1)?;
@@ -540,6 +588,8 @@ pub struct TableOptInfo {
     pub indexes: Vec<IndexMetadata>,
     /// Whether this table represents an in-memory CTE or derived relation without persistent indexes.
     pub is_cte: bool,
+    /// Advisory statistics for this table if available.
+    pub stats: Option<TableStatistics>,
 }
 
 impl TableOptInfo {
@@ -556,6 +606,7 @@ impl TableOptInfo {
             schema,
             indexes,
             is_cte: false,
+            stats: None,
         }
     }
 
@@ -565,32 +616,23 @@ impl TableOptInfo {
         self
     }
 
+    /// Attaches optional table statistics.
+    pub fn with_stats(mut self, stats: Option<TableStatistics>) -> Self {
+        self.stats = stats;
+        self
+    }
+
     /// Returns the active qualifier (alias if present, otherwise table name).
     pub fn qualifier(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.name)
     }
 }
 
-/// Rule-based query optimizer and physical access-path planner.
+/// Cost-based and statistics-aware query optimizer and physical access-path planner.
 pub struct Optimizer;
 
 impl Optimizer {
-    /// Optimizes a bound SQL query (`BoundSelect`) into a deterministic `PhysicalPlan`.
-    ///
-    /// # Optimization Pipeline
-    /// 1. **Predicate Decomposition**: Decomposes `WHERE` and `ON` clauses into top-level `AND` conjuncts.
-    /// 2. **Relation Affiliation & Pushdown Classification**:
-    ///    - Single-table predicates are identified.
-    ///    - Pushed down to table scans where safe (preserving LEFT JOIN semantics).
-    ///    - Multi-table predicates and unsafe outer-join filters remain in `post_join_filter` or `ON`.
-    /// 3. **Access Path Selection**:
-    ///    - For each table, candidate local predicates are analyzed with deterministic priority:
-    ///      1. `PrimaryPointLookup`
-    ///      2. `PrimaryRangeScan`
-    ///      3. `SecondaryIndexScan` (sorted by `IndexId` ascending)
-    ///      4. `FullTableScan`
-    ///    - Unconsumed candidate predicates are preserved in `residual_filter`.
-    /// 4. **Physical Plan Assembly**: Constructs the `PhysicalPlan` preserving left-to-right join order.
+    /// Optimizes a bound SQL query (`BoundSelect`) into a deterministic cost-based `PhysicalPlan`.
     pub fn optimize(bound: &BoundSelect, tables: &[TableOptInfo]) -> Result<PhysicalPlan> {
         let is_multi_table = !bound.joins.is_empty();
 
@@ -600,6 +642,21 @@ impl Optimizer {
             None => Vec::new(),
         };
 
+        // Check if all joins are INNER JOINs eligible for bounded reordering
+        let has_any_stats = tables.iter().any(|t| t.stats.is_some());
+        let can_reorder_joins =
+            is_multi_table && bound.joins.iter().all(|j| j.join_type == JoinType::Inner);
+
+        if is_multi_table
+            && can_reorder_joins
+            && tables.len() >= 2
+            && tables.len() <= 5
+            && has_any_stats
+        {
+            return optimize_inner_joins_cost_based(bound, tables, &where_conjuncts);
+        }
+
+        // Standard sequential join / single-table planning pipeline
         // 2. Classify WHERE conjuncts per table
         let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); tables.len()];
         let mut post_join_conjuncts: Vec<Expr> = Vec::new();
@@ -611,18 +668,13 @@ impl Optimizer {
                 table_local_conjuncts[0].push(conjunct);
             } else if refs.len() == 1 {
                 let target_qualifier = refs.iter().next().unwrap();
-                // Find table index
                 if let Some(tbl_idx) = tables
                     .iter()
                     .position(|t| t.qualifier() == target_qualifier)
                 {
                     if tbl_idx == 0 {
-                        // Base table: always safe to push down WHERE filter
                         table_local_conjuncts[0].push(conjunct);
                     } else {
-                        // Joined table: check if any join up to tbl_idx is a LEFT JOIN
-                        // If tbl_idx is on the right side of a LEFT JOIN, pushing down WHERE
-                        // is UNSAFE because WHERE must eliminate NULL-padded unmatched rows.
                         let is_right_of_left_join =
                             bound.joins[tbl_idx - 1].join_type == JoinType::Left;
                         if is_right_of_left_join {
@@ -635,7 +687,6 @@ impl Optimizer {
                     post_join_conjuncts.push(conjunct);
                 }
             } else {
-                // Multi-table predicate (or literal constant like 1=1)
                 post_join_conjuncts.push(conjunct);
             }
         }
@@ -652,21 +703,16 @@ impl Optimizer {
                 let refs = expr_referenced_qualifiers(&on_conj);
                 if bound_join.join_type == JoinType::Inner {
                     if refs.len() == 1 && refs.contains(right_qualifier) {
-                        // Right-local predicate in INNER JOIN ON: push to right table
                         table_local_conjuncts[right_table_idx].push(on_conj);
                     } else if refs.len() == 1 && refs.contains(tables[0].qualifier()) {
-                        // Left-local predicate in INNER JOIN ON: push to base table
                         table_local_conjuncts[0].push(on_conj);
                     } else {
                         remaining_on.push(on_conj);
                     }
                 } else if bound_join.join_type == JoinType::Left {
                     if refs.len() == 1 && refs.contains(right_qualifier) {
-                        // Right-local predicate in LEFT JOIN ON: safe to push to right table scan
-                        // (matches only satisfying right rows; unmatched left rows still get NULL padded)
                         table_local_conjuncts[right_table_idx].push(on_conj);
                     } else {
-                        // Multi-table or left-local ON predicate in LEFT JOIN remains in ON
                         remaining_on.push(on_conj);
                     }
                 }
@@ -682,6 +728,9 @@ impl Optimizer {
             plan_table_scan(&tables[0], table_local_conjuncts[0].clone(), is_multi_table);
 
         let mut physical_joins = Vec::new();
+        let mut cur_cost = base_table_scan.cost;
+        let mut cur_rows = base_table_scan.estimated_rows;
+
         for (join_idx, (join_type, on_expr)) in optimized_joins.into_iter().enumerate() {
             let right_table_idx = join_idx + 1;
             let right_table_scan = plan_table_scan(
@@ -689,14 +738,51 @@ impl Optimizer {
                 table_local_conjuncts[right_table_idx].clone(),
                 is_multi_table,
             );
+
+            let join_cost = CostModel::nested_loop_join_cost(
+                cur_cost,
+                cur_rows,
+                right_table_scan.cost,
+                right_table_scan.estimated_rows,
+            );
+            let join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
+                cur_rows,
+                tables[0].stats.as_ref(),
+                right_table_scan.estimated_rows,
+                tables[right_table_idx].stats.as_ref(),
+                &on_expr,
+                &tables[right_table_idx].schema,
+            );
+
+            cur_cost = join_cost;
+            cur_rows = join_rows;
+
             physical_joins.push(PhysicalJoin {
                 join_type,
                 right: right_table_scan,
                 on: on_expr,
+                estimated_rows: join_rows,
+                cost: join_cost,
             });
         }
 
         let post_join_filter = recombine_conjunction(post_join_conjuncts);
+        if let Some(post_f) = &post_join_filter {
+            cur_cost += CostModel::filter_cost(cur_rows);
+            let sel =
+                CardinalityEstimator::estimate_expr_selectivity(post_f, None, &tables[0].schema);
+            cur_rows = (cur_rows * sel).max(if cur_rows > 0.0 { 1.0 } else { 0.0 });
+        }
+
+        if !bound.order_by.is_empty() {
+            cur_cost += CostModel::sort_cost(cur_rows);
+        }
+        if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+            cur_cost += CostModel::aggregate_cost(cur_rows);
+        }
+        if !bound.window_exprs.is_empty() {
+            cur_cost += CostModel::window_cost(cur_rows);
+        }
 
         Ok(PhysicalPlan {
             ctes: bound.ctes.clone(),
@@ -712,11 +798,231 @@ impl Optimizer {
             offset: bound.offset,
             limit: bound.limit,
             set_op: None,
+            total_cost: cur_cost,
+            estimated_rows: cur_rows,
         })
     }
 }
 
-/// Analyzes local predicates for a single table and selects the optimal access path.
+/// Helper for cost-based inner-join ordering across 2 to 5 relations.
+fn optimize_inner_joins_cost_based(
+    bound: &BoundSelect,
+    tables: &[TableOptInfo],
+    where_conjuncts: &[Expr],
+) -> Result<PhysicalPlan> {
+    let num_tables = tables.len();
+    let mut all_conjuncts = where_conjuncts.to_vec();
+    for j in &bound.joins {
+        all_conjuncts.extend(split_conjunction(&j.on));
+    }
+
+    // Collect single-table local conjuncts for each table
+    let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); num_tables];
+    let mut join_multi_conjuncts: Vec<Expr> = Vec::new();
+
+    for conj in all_conjuncts {
+        let refs = expr_referenced_qualifiers(&conj);
+        if refs.len() == 1 {
+            let target_qual = refs.iter().next().unwrap();
+            if let Some(pos) = tables.iter().position(|t| t.qualifier() == target_qual) {
+                table_local_conjuncts[pos].push(conj);
+            } else {
+                join_multi_conjuncts.push(conj);
+            }
+        } else {
+            join_multi_conjuncts.push(conj);
+        }
+    }
+
+    // Generate permutations of 0..num_tables
+    let mut indices: Vec<usize> = (0..num_tables).collect();
+    let mut permutations = Vec::new();
+    generate_permutations(&mut indices, 0, &mut permutations);
+
+    struct PermutationResult {
+        perm: Vec<usize>,
+        base_scan: PhysicalTableScan,
+        joins: Vec<PhysicalJoin>,
+        post_filter: Option<Expr>,
+        total_cost: f64,
+        output_rows: f64,
+    }
+
+    let mut best_result: Option<PermutationResult> = None;
+
+    for perm in permutations {
+        let base_idx = perm[0];
+        let base_scan = plan_table_scan(
+            &tables[base_idx],
+            table_local_conjuncts[base_idx].clone(),
+            true,
+        );
+
+        let mut available_qualifiers: HashSet<String> = HashSet::new();
+        available_qualifiers.insert(tables[base_idx].qualifier().to_string());
+
+        let mut used_multi_conjuncts = vec![false; join_multi_conjuncts.len()];
+        let mut physical_joins = Vec::new();
+
+        let mut cur_cost = base_scan.cost;
+        let mut cur_rows = base_scan.estimated_rows;
+
+        for &right_idx in perm.iter().skip(1) {
+            let right_qual = tables[right_idx].qualifier().to_string();
+            available_qualifiers.insert(right_qual.clone());
+
+            let mut step_on_conjuncts = Vec::new();
+            for (c_idx, conj) in join_multi_conjuncts.iter().enumerate() {
+                if !used_multi_conjuncts[c_idx] {
+                    let refs = expr_referenced_qualifiers(conj);
+                    if refs.is_subset(&available_qualifiers) && refs.contains(&right_qual) {
+                        step_on_conjuncts.push(conj.clone());
+                        used_multi_conjuncts[c_idx] = true;
+                    }
+                }
+            }
+
+            let on_expr = recombine_conjunction(step_on_conjuncts)
+                .unwrap_or(Expr::Literal(Value::Boolean(true)));
+
+            let right_scan = plan_table_scan(
+                &tables[right_idx],
+                table_local_conjuncts[right_idx].clone(),
+                true,
+            );
+
+            let join_cost = CostModel::nested_loop_join_cost(
+                cur_cost,
+                cur_rows,
+                right_scan.cost,
+                right_scan.estimated_rows,
+            );
+            let join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
+                cur_rows,
+                tables[base_idx].stats.as_ref(),
+                right_scan.estimated_rows,
+                tables[right_idx].stats.as_ref(),
+                &on_expr,
+                &tables[right_idx].schema,
+            );
+
+            cur_cost = join_cost;
+            cur_rows = join_rows;
+
+            physical_joins.push(PhysicalJoin {
+                join_type: JoinType::Inner,
+                right: right_scan,
+                on: on_expr,
+                estimated_rows: join_rows,
+                cost: join_cost,
+            });
+        }
+
+        let mut remaining_post = Vec::new();
+        for (c_idx, conj) in join_multi_conjuncts.iter().enumerate() {
+            if !used_multi_conjuncts[c_idx] {
+                remaining_post.push(conj.clone());
+            }
+        }
+        let post_filter = recombine_conjunction(remaining_post);
+        if let Some(pf) = &post_filter {
+            cur_cost += CostModel::filter_cost(cur_rows);
+            let sel = CardinalityEstimator::estimate_expr_selectivity(pf, None, &tables[0].schema);
+            cur_rows = (cur_rows * sel).max(if cur_rows > 0.0 { 1.0 } else { 0.0 });
+        }
+
+        if !bound.order_by.is_empty() {
+            cur_cost += CostModel::sort_cost(cur_rows);
+        }
+        if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+            cur_cost += CostModel::aggregate_cost(cur_rows);
+        }
+        if !bound.window_exprs.is_empty() {
+            cur_cost += CostModel::window_cost(cur_rows);
+        }
+
+        let cand = PermutationResult {
+            perm: perm.clone(),
+            base_scan,
+            joins: physical_joins,
+            post_filter,
+            total_cost: cur_cost,
+            output_rows: cur_rows,
+        };
+
+        best_result = match best_result {
+            None => Some(cand),
+            Some(existing) => {
+                const EPSILON: f64 = 1e-9;
+                let cost_diff = cand.total_cost - existing.total_cost;
+                if cost_diff < -EPSILON {
+                    Some(cand)
+                } else if cost_diff.abs() <= EPSILON {
+                    // Tie-breaker: prefer identity permutation (0..N) or lexicographically earlier
+                    let cand_is_identity = cand.perm.iter().enumerate().all(|(i, &p)| i == p);
+                    let exist_is_identity = existing.perm.iter().enumerate().all(|(i, &p)| i == p);
+                    if cand_is_identity && !exist_is_identity {
+                        Some(cand)
+                    } else if !cand_is_identity && exist_is_identity {
+                        Some(existing)
+                    } else if cand.perm < existing.perm {
+                        Some(cand)
+                    } else {
+                        Some(existing)
+                    }
+                } else {
+                    Some(existing)
+                }
+            }
+        };
+    }
+
+    let chosen = best_result.unwrap();
+
+    Ok(PhysicalPlan {
+        ctes: bound.ctes.clone(),
+        base_table: chosen.base_scan,
+        joins: chosen.joins,
+        post_join_filter: chosen.post_filter,
+        group_by: bound.group_by.clone(),
+        aggregates: bound.aggregates.clone(),
+        having: bound.having.clone(),
+        window_exprs: bound.window_exprs.clone(),
+        projections: bound.projections.clone(),
+        order_by: bound.order_by.clone(),
+        offset: bound.offset,
+        limit: bound.limit,
+        set_op: None,
+        total_cost: chosen.total_cost,
+        estimated_rows: chosen.output_rows,
+    })
+}
+
+fn generate_permutations(indices: &mut [usize], start: usize, out: &mut Vec<Vec<usize>>) {
+    if start == indices.len() {
+        out.push(indices.to_vec());
+        return;
+    }
+    for i in start..indices.len() {
+        indices.swap(start, i);
+        generate_permutations(indices, start + 1, out);
+        indices.swap(start, i);
+    }
+}
+
+/// Candidate access path evaluated during cost-based access-path selection.
+#[derive(Debug, Clone)]
+struct AccessPathCandidate {
+    access_path: AccessPath,
+    residual_filter: Option<Expr>,
+    estimated_rows: f64,
+    cost: f64,
+    priority: u8,
+    index_id: Option<IndexId>,
+    index_name: Option<String>,
+}
+
+/// Analyzes local predicates for a single table and selects the optimal cost-based access path.
 fn plan_table_scan(
     table: &TableOptInfo,
     conjuncts: Vec<Expr>,
@@ -734,12 +1040,24 @@ fn plan_table_scan(
 
     // If this is a CTE / in-memory relation, it does not possess a physical B-Tree index or primary key path.
     if table.is_cte {
-        let residual_filter = recombine_conjunction(unqual_conjuncts);
+        let residual_filter = recombine_conjunction(unqual_conjuncts.clone());
+        let estimated_rows = CardinalityEstimator::estimate_scan_cardinality(
+            table.stats.as_ref(),
+            residual_filter.as_ref(),
+            &table.schema,
+        );
+        let cost = CostModel::table_scan_cost(
+            CardinalityEstimator::estimate_table_rows(table.stats.as_ref()),
+            unqual_conjuncts.len(),
+        );
+
         return PhysicalTableScan {
             table_name: table.name.clone(),
             table_alias: table.alias.clone(),
             access_path: AccessPath::FullTableScan,
             residual_filter,
+            estimated_rows,
+            cost,
         };
     }
 
@@ -748,24 +1066,51 @@ fn plan_table_scan(
     let pk_name = &pk_col.name;
     let pk_type = pk_col.data_type;
 
-    // Check 1: Primary Key Point Lookup
+    let mut candidates: Vec<AccessPathCandidate> = Vec::new();
+
+    // Candidate 1: Full Table Scan
+    let full_residual = recombine_conjunction(unqual_conjuncts.clone());
+    let full_rows = CardinalityEstimator::estimate_scan_cardinality(
+        table.stats.as_ref(),
+        full_residual.as_ref(),
+        schema,
+    );
+    let full_cost = CostModel::table_scan_cost(
+        CardinalityEstimator::estimate_table_rows(table.stats.as_ref()),
+        unqual_conjuncts.len(),
+    );
+    candidates.push(AccessPathCandidate {
+        access_path: AccessPath::FullTableScan,
+        residual_filter: full_residual,
+        estimated_rows: full_rows,
+        cost: full_cost,
+        priority: 3,
+        index_id: None,
+        index_name: None,
+    });
+
+    // Candidate 2: Primary Key Point Lookup
     for (idx, conj) in unqual_conjuncts.iter().enumerate() {
         if let Some(val) = extract_col_equality(conj, pk_name, pk_type) {
             if !val.is_null() {
                 let mut residual = unqual_conjuncts.clone();
                 residual.remove(idx);
                 let residual_filter = recombine_conjunction(residual);
-                return PhysicalTableScan {
-                    table_name: table.name.clone(),
-                    table_alias: table.alias.clone(),
+                let cost = CostModel::primary_point_lookup_cost();
+                candidates.push(AccessPathCandidate {
                     access_path: AccessPath::PrimaryPointLookup { key: val },
                     residual_filter,
-                };
+                    estimated_rows: 1.0,
+                    cost,
+                    priority: 0,
+                    index_id: None,
+                    index_name: None,
+                });
             }
         }
     }
 
-    // Check 2: Primary Key Range Scan
+    // Candidate 3: Primary Key Range Scan
     let (pk_start, pk_end, used_indices) =
         extract_col_range_bounds(&unqual_conjuncts, pk_name, pk_type);
     if pk_start.is_some() || pk_end.is_some() {
@@ -776,52 +1121,62 @@ fn plan_table_scan(
             .map(|(_, c)| c.clone())
             .collect();
         let residual_filter = recombine_conjunction(residual);
-        return PhysicalTableScan {
-            table_name: table.name.clone(),
-            table_alias: table.alias.clone(),
+        let est_rows = CardinalityEstimator::estimate_pk_range_rows(
+            table.stats.as_ref(),
+            pk_start.as_ref(),
+            pk_end.as_ref(),
+        );
+        let cost = CostModel::primary_range_scan_cost(est_rows);
+        candidates.push(AccessPathCandidate {
             access_path: AccessPath::PrimaryRangeScan {
                 start: pk_start,
                 end: pk_end,
             },
             residual_filter,
-        };
+            estimated_rows: est_rows,
+            cost,
+            priority: 1,
+            index_id: None,
+            index_name: None,
+        });
     }
 
-    // Check 3: Secondary Index Scans (sorted deterministically by IndexId ascending)
-    let mut sorted_indexes = table.indexes.clone();
-    sorted_indexes.sort_by(|a, b| {
-        a.index_id
-            .cmp(&b.index_id)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-
-    for sec_meta in &sorted_indexes {
+    // Candidate 4: Secondary Indexes
+    for sec_meta in &table.indexes {
         let sec_col = &schema.columns[sec_meta.column_idx];
         let col_name = &sec_col.name;
         let col_type = sec_col.data_type;
 
-        // 3a. Secondary Point Lookup
+        // 4a. Point Lookups
         for (idx, conj) in unqual_conjuncts.iter().enumerate() {
             if let Some(val) = extract_col_equality(conj, col_name, col_type) {
                 if !val.is_null() {
                     let mut residual = unqual_conjuncts.clone();
                     residual.remove(idx);
                     let residual_filter = recombine_conjunction(residual);
-                    return PhysicalTableScan {
-                        table_name: table.name.clone(),
-                        table_alias: table.alias.clone(),
+                    let est_rows = CardinalityEstimator::estimate_sec_point_rows(
+                        table.stats.as_ref(),
+                        sec_meta,
+                    );
+                    let cost = CostModel::secondary_point_lookup_cost(est_rows);
+                    candidates.push(AccessPathCandidate {
                         access_path: AccessPath::SecondaryIndexScan {
                             index_name: sec_meta.name.clone(),
                             index_id: sec_meta.index_id,
                             scan_type: SecondaryScanType::PointLookup(val),
                         },
                         residual_filter,
-                    };
+                        estimated_rows: est_rows,
+                        cost,
+                        priority: 2,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
                 }
             }
         }
 
-        // 3b. Secondary Range Scan
+        // 4b. Range Scans
         let (sec_start, sec_end, used_indices) =
             extract_col_range_bounds(&unqual_conjuncts, col_name, col_type);
         if sec_start.is_some() || sec_end.is_some() {
@@ -832,9 +1187,14 @@ fn plan_table_scan(
                 .map(|(_, c)| c.clone())
                 .collect();
             let residual_filter = recombine_conjunction(residual);
-            return PhysicalTableScan {
-                table_name: table.name.clone(),
-                table_alias: table.alias.clone(),
+            let est_rows = CardinalityEstimator::estimate_sec_range_rows(
+                table.stats.as_ref(),
+                sec_meta,
+                sec_start.as_ref(),
+                sec_end.as_ref(),
+            );
+            let cost = CostModel::secondary_range_scan_cost(est_rows);
+            candidates.push(AccessPathCandidate {
                 access_path: AccessPath::SecondaryIndexScan {
                     index_name: sec_meta.name.clone(),
                     index_id: sec_meta.index_id,
@@ -844,17 +1204,40 @@ fn plan_table_scan(
                     },
                 },
                 residual_filter,
-            };
+                estimated_rows: est_rows,
+                cost,
+                priority: 2,
+                index_id: Some(sec_meta.index_id),
+                index_name: Some(sec_meta.name.clone()),
+            });
         }
     }
 
-    // Check 4: Full Table Scan fallback
-    let residual_filter = recombine_conjunction(unqual_conjuncts);
+    // Deterministic Candidate Selection
+    candidates.sort_by(|a, b| {
+        const EPSILON: f64 = 1e-9;
+        if (a.cost - b.cost).abs() > EPSILON {
+            a.cost.total_cmp(&b.cost)
+        } else if (a.estimated_rows - b.estimated_rows).abs() > EPSILON {
+            a.estimated_rows.total_cmp(&b.estimated_rows)
+        } else if a.priority != b.priority {
+            a.priority.cmp(&b.priority)
+        } else if a.index_id != b.index_id {
+            a.index_id.cmp(&b.index_id)
+        } else {
+            a.index_name.cmp(&b.index_name)
+        }
+    });
+
+    let best = candidates.remove(0);
+
     PhysicalTableScan {
         table_name: table.name.clone(),
         table_alias: table.alias.clone(),
-        access_path: AccessPath::FullTableScan,
-        residual_filter,
+        access_path: best.access_path,
+        residual_filter: best.residual_filter,
+        estimated_rows: best.estimated_rows,
+        cost: best.cost,
     }
 }
 

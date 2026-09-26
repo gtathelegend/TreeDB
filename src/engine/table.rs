@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+
 use crate::engine::catalog::{Catalog, IndexMetadata, TableId, TableMetadata};
 use crate::engine::types::{Row, Schema, Value};
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
 use crate::index::secondary::{IndexKey, SecondaryIndex};
+use crate::query::stats::{ColumnStatistics, IndexStatistics, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::record_store::RecordStore;
 
@@ -367,5 +370,85 @@ impl<'a> Table<'a> {
         }
 
         Ok(())
+    }
+
+    /// Inspects the table and derives comprehensive relational statistics without mutating persistent storage.
+    pub fn collect_statistics(&mut self) -> Result<TableStatistics> {
+        let schema = self.schema().clone();
+        let num_cols = schema.columns.len();
+        let mut null_counts = vec![0usize; num_cols];
+        let mut distinct_sets: Vec<HashSet<crate::query::CanonicalValue>> =
+            vec![HashSet::new(); num_cols];
+        let mut mins: Vec<Option<Value>> = vec![None; num_cols];
+        let mut maxs: Vec<Option<Value>> = vec![None; num_cols];
+
+        let rows = self.scan(None, None)?;
+        let row_count = rows.len();
+
+        for row in &rows {
+            for (idx, val) in row.values.iter().enumerate() {
+                if idx < num_cols {
+                    if val.is_null() {
+                        null_counts[idx] += 1;
+                    } else {
+                        distinct_sets[idx].insert(crate::query::CanonicalValue::from_value(val));
+                        match &mins[idx] {
+                            Some(cur_min) => {
+                                if let Ok(std::cmp::Ordering::Less) =
+                                    crate::query::compare_values_for_sort(
+                                        val,
+                                        cur_min,
+                                        crate::query::SortDirection::Ascending,
+                                        None,
+                                    )
+                                {
+                                    mins[idx] = Some(val.clone());
+                                }
+                            }
+                            None => mins[idx] = Some(val.clone()),
+                        }
+                        match &maxs[idx] {
+                            Some(cur_max) => {
+                                if let Ok(std::cmp::Ordering::Greater) =
+                                    crate::query::compare_values_for_sort(
+                                        val,
+                                        cur_max,
+                                        crate::query::SortDirection::Ascending,
+                                        None,
+                                    )
+                                {
+                                    maxs[idx] = Some(val.clone());
+                                }
+                            }
+                            None => maxs[idx] = Some(val.clone()),
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut table_stats = TableStatistics::new(self.name(), row_count);
+
+        for (idx, col) in schema.columns.iter().enumerate() {
+            let col_stats = ColumnStatistics::new(
+                row_count,
+                null_counts[idx],
+                distinct_sets[idx].len(),
+                mins[idx].clone(),
+                maxs[idx].clone(),
+            );
+            table_stats = table_stats.with_column(&col.name, col_stats);
+        }
+
+        for (meta, _sec_idx) in &self.indexes {
+            let col_idx = meta.column_idx;
+            let col_nulls = null_counts[col_idx];
+            let col_distinct = distinct_sets[col_idx].len();
+            let idx_stats =
+                IndexStatistics::new(row_count.saturating_sub(col_nulls), col_distinct, col_nulls);
+            table_stats = table_stats.with_index(&meta.name, idx_stats);
+        }
+
+        Ok(table_stats)
     }
 }

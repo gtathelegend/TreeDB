@@ -950,6 +950,8 @@ fn baseline_execute(
         table_alias: bound.table_alias.clone(),
         access_path: AccessPath::FullTableScan,
         residual_filter: None,
+        estimated_rows: 0.0,
+        cost: 0.0,
     };
 
     let mut joins = Vec::new();
@@ -961,8 +963,12 @@ fn baseline_execute(
                 table_alias: j.table_alias.clone(),
                 access_path: AccessPath::FullTableScan,
                 residual_filter: None,
+                estimated_rows: 0.0,
+                cost: 0.0,
             },
             on: j.on.clone(),
+            estimated_rows: 0.0,
+            cost: 0.0,
         });
     }
 
@@ -980,6 +986,8 @@ fn baseline_execute(
         order_by: bound.order_by.clone(),
         offset: bound.offset,
         limit: bound.limit,
+        total_cost: 0.0,
+        estimated_rows: 0.0,
     };
 
     txn.execute_physical_plan(&unoptimized_plan)
