@@ -920,25 +920,25 @@ fn baseline_execute(
     let mut bindings = Vec::new();
 
     {
-        let base_table = txn.open_table(&ast.from.name)?;
+        let base_table = txn.open_table(ast.from.name())?;
         let schema = base_table.schema().clone();
         schemas.push(schema);
     }
     for j in &ast.joins {
-        let t = txn.open_table(&j.table.name)?;
+        let t = txn.open_table(j.table.name())?;
         let schema = t.schema().clone();
         schemas.push(schema);
     }
 
     bindings.push(treedb::sql::TableBinding::new(
-        &ast.from.name,
-        ast.from.alias.as_deref(),
+        ast.from.name(),
+        ast.from.alias(),
         &schemas[0],
     ));
     for (idx, j) in ast.joins.iter().enumerate() {
         bindings.push(treedb::sql::TableBinding::new(
-            &j.table.name,
-            j.table.alias.as_deref(),
+            j.table.name(),
+            j.table.alias(),
             &schemas[idx + 1],
         ));
     }
@@ -988,6 +988,7 @@ fn baseline_execute(
         limit: bound.limit,
         total_cost: 0.0,
         estimated_rows: 0.0,
+        logical_rewrites: Vec::new(),
     };
 
     txn.execute_physical_plan(&unoptimized_plan)

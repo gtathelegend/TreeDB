@@ -535,7 +535,7 @@ fn test_sql_parsing_standalone_boundary() {
     let ast = parse_sql(sql).expect("standalone parse should succeed");
 
     assert_eq!(ast.projection.len(), 2);
-    assert_eq!(ast.from.name, "users");
+    assert_eq!(ast.from.name(), "users");
     assert!(ast.selection.is_some());
     assert_eq!(ast.order_by.len(), 1);
     assert_eq!(ast.limit, Some(10));
@@ -616,7 +616,7 @@ fn test_parser_group_by_and_having() {
     let ast = parse_sql(sql).expect("parsing grouped query should succeed");
 
     assert_eq!(ast.projection.len(), 3);
-    assert_eq!(ast.from.name, "employees");
+    assert_eq!(ast.from.name(), "employees");
     assert!(ast.selection.is_some());
     assert_eq!(
         ast.group_by,
@@ -675,13 +675,13 @@ fn test_parser_joins_and_case_insensitivity() {
     let sql = "SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id LEFT OUTER JOIN products AS p ON o.prod_id = p.id WHERE u.active = true;";
     let ast = parse_sql(sql).unwrap();
 
-    assert_eq!(ast.from.name, "users");
-    assert_eq!(ast.from.alias, Some("u".to_string()));
+    assert_eq!(ast.from.name(), "users");
+    assert_eq!(ast.from.alias(), Some("u"));
     assert_eq!(ast.joins.len(), 2);
 
     assert_eq!(ast.joins[0].join_type, treedb::sql::JoinType::Inner);
-    assert_eq!(ast.joins[0].table.name, "orders");
-    assert_eq!(ast.joins[0].table.alias, Some("o".to_string()));
+    assert_eq!(ast.joins[0].table.name(), "orders");
+    assert_eq!(ast.joins[0].table.alias(), Some("o"));
     assert_eq!(
         ast.joins[0].on,
         SqlExpr::Binary {
@@ -698,8 +698,8 @@ fn test_parser_joins_and_case_insensitivity() {
     );
 
     assert_eq!(ast.joins[1].join_type, treedb::sql::JoinType::Left);
-    assert_eq!(ast.joins[1].table.name, "products");
-    assert_eq!(ast.joins[1].table.alias, Some("p".to_string()));
+    assert_eq!(ast.joins[1].table.name(), "products");
+    assert_eq!(ast.joins[1].table.alias(), Some("p"));
 
     // Case insensitivity: 'join', 'left join', 'inner join'
     let sql2 = "SELECT * FROM a join b on a.id = b.a_id left join c on b.id = c.b_id;";
@@ -1048,7 +1048,7 @@ fn test_parser_subqueries() {
             assert_eq!(*left, SqlExpr::Identifier("id".into()));
             match *right {
                 SqlExpr::Subquery(sub) => {
-                    assert_eq!(sub.from.name, "orders");
+                    assert_eq!(sub.from.name(), "orders");
                 }
                 other => panic!("expected Subquery, found {other:?}"),
             }
@@ -1066,7 +1066,7 @@ fn test_parser_subqueries() {
             negated,
         } => {
             assert_eq!(*expr, SqlExpr::Identifier("id".into()));
-            assert_eq!(subquery.from.name, "orders");
+            assert_eq!(subquery.from.name(), "orders");
             assert!(!negated);
         }
         other => panic!("expected InSubquery, found {other:?}"),
@@ -1082,7 +1082,7 @@ fn test_parser_subqueries() {
             negated,
         } => {
             assert_eq!(*expr, SqlExpr::Identifier("id".into()));
-            assert_eq!(subquery.from.name, "orders");
+            assert_eq!(subquery.from.name(), "orders");
             assert!(negated);
         }
         other => panic!("expected InSubquery negated, found {other:?}"),
@@ -1093,8 +1093,8 @@ fn test_parser_subqueries() {
     let stmt = parse_sql(sql).unwrap();
     match stmt.selection.unwrap() {
         SqlExpr::Exists { subquery, negated } => {
-            assert_eq!(subquery.from.name, "orders");
-            assert_eq!(subquery.from.alias.as_deref(), Some("o"));
+            assert_eq!(subquery.from.name(), "orders");
+            assert_eq!(subquery.from.alias(), Some("o"));
             assert!(!negated);
         }
         other => panic!("expected Exists, found {other:?}"),
@@ -1106,7 +1106,7 @@ fn test_parser_subqueries() {
     let stmt = parse_sql(sql).unwrap();
     match stmt.selection.unwrap() {
         SqlExpr::Exists { subquery, negated } => {
-            assert_eq!(subquery.from.name, "orders");
+            assert_eq!(subquery.from.name(), "orders");
             assert!(negated);
         }
         other => panic!("expected Exists negated, found {other:?}"),
@@ -1160,7 +1160,7 @@ fn test_parser_with_ctes() {
     assert_eq!(with.ctes[0].name, "active_users");
     assert!(with.ctes[0].columns.is_none());
     match &with.ctes[0].query {
-        treedb::sql::CteQuery::NonRecursive(q) => assert_eq!(q.from.name, "users"),
+        treedb::sql::CteQuery::NonRecursive(q) => assert_eq!(q.from.name(), "users"),
         _ => panic!("expected non-recursive CTE query"),
     }
 
@@ -1202,8 +1202,8 @@ fn test_parser_with_recursive_ctes() {
     );
     match &with.ctes[0].query {
         treedb::sql::CteQuery::Recursive { anchor, recursive } => {
-            assert_eq!(anchor.from.name, "numbers");
-            assert_eq!(recursive.from.name, "nums");
+            assert_eq!(anchor.from.name(), "numbers");
+            assert_eq!(recursive.from.name(), "nums");
         }
         _ => panic!("expected recursive CTE query"),
     }

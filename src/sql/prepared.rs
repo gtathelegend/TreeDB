@@ -199,30 +199,30 @@ fn infer_select(
 ) -> Result<()> {
     // 1. Resolve tables and schemas
     let mut columns = Vec::new();
-    if let Ok(from_schema) = catalog.get_table_schema(&stmt.from.name) {
+    if let Ok(from_schema) = catalog.get_table_schema(stmt.from.name()) {
         for col in &from_schema.columns {
             columns.push((
-                Some(stmt.from.name.clone()),
+                Some(stmt.from.name().to_string()),
                 col.name.clone(),
                 col.data_type,
             ));
-            if let Some(alias) = &stmt.from.alias {
-                columns.push((Some(alias.clone()), col.name.clone(), col.data_type));
+            if let Some(alias) = stmt.from.alias() {
+                columns.push((Some(alias.to_string()), col.name.clone(), col.data_type));
             }
             columns.push((None, col.name.clone(), col.data_type));
         }
     }
 
     for join in &stmt.joins {
-        if let Ok(join_schema) = catalog.get_table_schema(&join.table.name) {
+        if let Ok(join_schema) = catalog.get_table_schema(join.table.name()) {
             for col in &join_schema.columns {
                 columns.push((
-                    Some(join.table.name.clone()),
+                    Some(join.table.name().to_string()),
                     col.name.clone(),
                     col.data_type,
                 ));
-                if let Some(alias) = &join.table.alias {
-                    columns.push((Some(alias.clone()), col.name.clone(), col.data_type));
+                if let Some(alias) = join.table.alias() {
+                    columns.push((Some(alias.to_string()), col.name.clone(), col.data_type));
                 }
                 columns.push((None, col.name.clone(), col.data_type));
             }

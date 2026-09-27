@@ -601,38 +601,111 @@ impl fmt::Display for SelectItem {
     }
 }
 
-/// A referenced table in a `FROM` clause.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TableRef {
-    /// Table name.
-    pub name: String,
-    /// Optional table alias.
-    pub alias: Option<String>,
+/// Inner query definition of a derived table in a `FROM` or `JOIN` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DerivedQuery {
+    /// Single `SELECT` query.
+    Select(Box<SelectStatement>),
+    /// Set-operation query (e.g. `UNION`, `INTERSECT`, `EXCEPT`).
+    SetOperation(Box<SetQuery>),
+}
+
+impl fmt::Display for DerivedQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DerivedQuery::Select(s) => write!(f, "{s}"),
+            DerivedQuery::SetOperation(q) => write!(f, "{q}"),
+        }
+    }
+}
+
+/// A referenced relation in a `FROM` or `JOIN` clause (either a base table or a derived table subquery).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableRef {
+    /// Named physical table or CTE reference.
+    Table {
+        /// Table or CTE name.
+        name: String,
+        /// Optional table alias.
+        alias: Option<String>,
+    },
+    /// Derived table subquery with a mandatory alias.
+    Derived {
+        /// Inner query defining the derived relation.
+        query: DerivedQuery,
+        /// Mandatory derived table alias.
+        alias: String,
+    },
 }
 
 impl TableRef {
-    /// Creates a new `TableRef` with the given table name.
+    /// Creates a new `TableRef::Table` with the given table name.
     pub fn new(name: impl Into<String>) -> Self {
-        Self {
+        Self::Table {
             name: name.into(),
             alias: None,
         }
     }
 
-    /// Creates a new `TableRef` with a table name and alias.
+    /// Creates a new `TableRef::Table` with a table name and alias.
     pub fn with_alias(name: impl Into<String>, alias: impl Into<String>) -> Self {
-        Self {
+        Self::Table {
             name: name.into(),
             alias: Some(alias.into()),
+        }
+    }
+
+    /// Creates a new `TableRef::Derived` from a `SelectStatement` AST.
+    pub fn derived_select(subquery: SelectStatement, alias: impl Into<String>) -> Self {
+        Self::Derived {
+            query: DerivedQuery::Select(Box::new(subquery)),
+            alias: alias.into(),
+        }
+    }
+
+    /// Creates a new `TableRef::Derived` from a `SetQuery` AST.
+    pub fn derived_set(query: SetQuery, alias: impl Into<String>) -> Self {
+        Self::Derived {
+            query: DerivedQuery::SetOperation(Box::new(query)),
+            alias: alias.into(),
+        }
+    }
+
+    /// Returns the relation name or derived table alias.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Table { name, .. } => name.as_str(),
+            Self::Derived { alias, .. } => alias.as_str(),
+        }
+    }
+
+    /// Returns the alias if specified.
+    pub fn alias(&self) -> Option<&str> {
+        match self {
+            Self::Table { alias, .. } => alias.as_deref(),
+            Self::Derived { alias, .. } => Some(alias.as_str()),
+        }
+    }
+
+    /// Returns the effective qualifier for column resolution (alias if present, otherwise table name).
+    pub fn qualifier(&self) -> &str {
+        match self {
+            Self::Table { name, alias } => alias.as_deref().unwrap_or(name.as_str()),
+            Self::Derived { alias, .. } => alias.as_str(),
         }
     }
 }
 
 impl fmt::Display for TableRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.alias {
-            Some(alias) => write!(f, "{} AS {}", self.name, alias),
-            None => write!(f, "{}", self.name),
+        match self {
+            TableRef::Table { name, alias } => match alias {
+                Some(alias) => write!(f, "{} AS {}", name, alias),
+                None => write!(f, "{}", name),
+            },
+            TableRef::Derived { query, alias } => {
+                write!(f, "({}) AS {}", query, alias)
+            }
         }
     }
 }
@@ -648,6 +721,10 @@ pub enum JoinType {
     Right,
     /// FULL OUTER JOIN: All left-side and right-side rows are emitted, with NULL-padded opposite side when no match.
     Full,
+    /// SEMI JOIN: Emits left-side rows that have at least one matching right-side row (no row duplication).
+    Semi,
+    /// ANTI JOIN: Emits left-side rows that have no matching right-side row.
+    Anti,
 }
 
 impl fmt::Display for JoinType {
@@ -657,6 +734,8 @@ impl fmt::Display for JoinType {
             JoinType::Left => write!(f, "LEFT JOIN"),
             JoinType::Right => write!(f, "RIGHT JOIN"),
             JoinType::Full => write!(f, "FULL JOIN"),
+            JoinType::Semi => write!(f, "SEMI JOIN"),
+            JoinType::Anti => write!(f, "ANTI JOIN"),
         }
     }
 }

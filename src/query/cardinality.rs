@@ -325,6 +325,8 @@ impl CardinalityEstimator {
             crate::sql::ast::JoinType::Left => inner_est.max(left_rows),
             crate::sql::ast::JoinType::Right => inner_est.max(right_rows),
             crate::sql::ast::JoinType::Full => inner_est.max(left_rows).max(right_rows),
+            crate::sql::ast::JoinType::Semi => inner_est.min(left_rows).max(1.0),
+            crate::sql::ast::JoinType::Anti => (left_rows - inner_est).max(0.0).max(1.0),
         }
     }
 }

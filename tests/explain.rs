@@ -57,7 +57,7 @@ fn test_parser_explain_statements() {
     match &stmt {
         Statement::Explain(ExplainStatement { query, .. }) => match query.as_ref() {
             Statement::Select(s) => {
-                assert_eq!(s.from.name, "users");
+                assert_eq!(s.from.name(), "users");
                 assert_eq!(s.projection.len(), 2);
             }
             _ => panic!("expected Statement::Select inside Explain"),
@@ -326,11 +326,11 @@ fn test_explain_subqueries() {
     assert!(plan_corr.contains("Correlated Subquery"));
     assert!(plan_corr.contains("Outer references: [u.id]"));
 
-    // 2. IN subquery
+    // 2. IN subquery (decorrelated to Semi Join)
     let plan_in = txn
         .explain_sql("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders);")
         .unwrap();
-    assert!(plan_in.contains("Kind: IN"));
+    assert!(plan_in.contains("Semi"));
 
     // 3. NOT IN subquery
     let plan_not_in = txn
@@ -338,13 +338,21 @@ fn test_explain_subqueries() {
         .unwrap();
     assert!(plan_not_in.contains("Kind: NOT IN"));
 
-    // 4. EXISTS subquery
+    // 4. EXISTS subquery (decorrelated to Semi Join)
     let plan_exists = txn
         .explain_sql(
             "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);",
         )
         .unwrap();
-    assert!(plan_exists.contains("Kind: EXISTS"));
+    assert!(plan_exists.contains("Semi"));
+
+    // 5. Non-decorrelatable EXISTS subquery (retains Subquery node)
+    let plan_exists_group = txn
+        .explain_sql(
+            "SELECT * FROM users u WHERE EXISTS (SELECT o.user_id FROM orders o WHERE o.user_id = u.id GROUP BY o.user_id HAVING count(*) > 1);",
+        )
+        .unwrap();
+    assert!(plan_exists_group.contains("Kind: EXISTS"));
 }
 
 #[test]

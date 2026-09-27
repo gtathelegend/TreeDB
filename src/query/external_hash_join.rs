@@ -616,6 +616,9 @@ pub fn create_joined_schema(
     right_schema: &Schema,
     join_type: JoinType,
 ) -> Schema {
+    if join_type == JoinType::Semi || join_type == JoinType::Anti {
+        return left_schema.clone();
+    }
     let mut combined_columns =
         Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
     for col in &left_schema.columns {
@@ -706,7 +709,12 @@ impl<'a> ExternalHashJoiner<'a> {
         }
 
         if right_rows.is_empty() {
-            if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
+            if self.join_type == JoinType::Anti {
+                metrics.rows_output = left_rows.len();
+                return Ok((joined_schema, left_rows, metrics));
+            } else if self.join_type == JoinType::Semi {
+                return Ok((joined_schema, Vec::new(), metrics));
+            } else if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
                 let right_nulls = vec![Value::Null; self.right_schema.columns.len()];
                 let mut out_rows = Vec::with_capacity(left_rows.len());
                 for l_row in left_rows {
@@ -787,7 +795,9 @@ impl<'a> ExternalHashJoiner<'a> {
         for l_row in left_rows {
             let key = JoinKey::from_row(l_row, self.left_schema, &self.left_keys)?;
             if key.has_null() {
-                if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
+                if self.join_type == JoinType::Anti {
+                    out_rows.push(l_row.clone());
+                } else if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
                     let mut combined = Vec::with_capacity(l_row.values.len() + right_nulls.len());
                     combined.extend_from_slice(&l_row.values);
                     combined.extend_from_slice(&right_nulls);
@@ -806,7 +816,19 @@ impl<'a> ExternalHashJoiner<'a> {
                     let candidate = Row::new(combined);
 
                     let passed = if let Some(res_expr) = &self.residual_predicate {
-                        let res_val = res_expr.evaluate(&candidate, joined_schema)?;
+                        let eval_schema = if self.join_type == JoinType::Semi
+                            || self.join_type == JoinType::Anti
+                        {
+                            let mut combined_columns = Vec::with_capacity(
+                                self.left_schema.columns.len() + self.right_schema.columns.len(),
+                            );
+                            combined_columns.extend_from_slice(&self.left_schema.columns);
+                            combined_columns.extend_from_slice(&self.right_schema.columns);
+                            Schema::new_projected(combined_columns)
+                        } else {
+                            joined_schema.clone()
+                        };
+                        let res_val = res_expr.evaluate(&candidate, &eval_schema)?;
                         res_val == Value::Boolean(true)
                     } else {
                         true
@@ -816,12 +838,24 @@ impl<'a> ExternalHashJoiner<'a> {
                         left_matched = true;
                         right_matched[*r_idx] = true;
                         metrics.matched_rows += 1;
-                        out_rows.push(candidate);
+                        if self.join_type != JoinType::Semi && self.join_type != JoinType::Anti {
+                            out_rows.push(candidate);
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
 
-            if !left_matched
+            if self.join_type == JoinType::Semi {
+                if left_matched {
+                    out_rows.push(l_row.clone());
+                }
+            } else if self.join_type == JoinType::Anti {
+                if !left_matched {
+                    out_rows.push(l_row.clone());
+                }
+            } else if !left_matched
                 && (self.join_type == JoinType::Left || self.join_type == JoinType::Full)
             {
                 let mut combined = Vec::with_capacity(l_row.values.len() + right_nulls.len());
@@ -998,7 +1032,9 @@ impl<'a> ExternalHashJoiner<'a> {
             }
 
             if right_part.is_empty() {
-                if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
+                if self.join_type == JoinType::Anti {
+                    out_rows.extend(left_part);
+                } else if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
                     let right_nulls = vec![Value::Null; self.right_schema.columns.len()];
                     for l_row in left_part {
                         let mut combined =

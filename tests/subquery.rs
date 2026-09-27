@@ -691,17 +691,27 @@ fn test_optimizer_and_explain_subquery() {
     setup_ecommerce_db(&mut db);
 
     let mut txn = db.begin().unwrap();
-    let explanation = txn
-        .explain_sql("SELECT u.name FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)")
+    // 1. Scalar correlated subquery (retains Correlated Subquery node)
+    let explanation_scalar = txn
+        .explain_sql("SELECT u.name FROM users u WHERE u.id = (SELECT o.user_id FROM orders o WHERE o.user_id = u.id LIMIT 1)")
         .unwrap();
 
     assert!(
-        explanation.contains("Correlated Subquery"),
-        "Explanation must show Correlated Subquery:\n{explanation}"
+        explanation_scalar.contains("Correlated Subquery"),
+        "Explanation must show Correlated Subquery:\n{explanation_scalar}"
     );
     assert!(
-        explanation.contains("Outer references: [u.id]"),
-        "Explanation must show Outer references: [u.id]:\n{explanation}"
+        explanation_scalar.contains("Outer references: [u.id]"),
+        "Explanation must show Outer references: [u.id]:\n{explanation_scalar}"
+    );
+
+    // 2. EXISTS subquery (decorrelated to Semi Join)
+    let explanation_exists = txn
+        .explain_sql("SELECT u.name FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)")
+        .unwrap();
+    assert!(
+        explanation_exists.contains("Semi"),
+        "Explanation must show Semi Join for decorrelated EXISTS:\n{explanation_exists}"
     );
 }
 

@@ -55,6 +55,8 @@ pub struct TableBinding<'a> {
     pub alias: Option<&'a str>,
     /// Table schema.
     pub schema: &'a Schema,
+    /// Whether this table is joined via SEMI JOIN or ANTI JOIN.
+    pub is_semi_or_anti: bool,
 }
 
 impl<'a> TableBinding<'a> {
@@ -64,7 +66,14 @@ impl<'a> TableBinding<'a> {
             name,
             alias,
             schema,
+            is_semi_or_anti: false,
         }
+    }
+
+    /// Marks this table binding as a SEMI or ANTI join table.
+    pub fn with_semi_or_anti(mut self, is_semi_or_anti: bool) -> Self {
+        self.is_semi_or_anti = is_semi_or_anti;
+        self
     }
 
     /// Returns the primary qualifier for this table (alias if present, otherwise table name).
@@ -87,6 +96,8 @@ pub struct BindingContext<'a> {
     pub catalog: Option<&'a dyn TableCatalog>,
     /// Optional parameter values for prepared statement execution.
     pub params: Option<&'a [Value]>,
+    /// Whether this binding context is for a JOIN ON clause.
+    pub in_join_on: bool,
 }
 
 impl<'a> BindingContext<'a> {
@@ -101,11 +112,16 @@ impl<'a> BindingContext<'a> {
         parent: Option<&'a BindingContext<'a>>,
         catalog: Option<&'a dyn TableCatalog>,
     ) -> Self {
-        let combined_schema = if tables.len() == 1 {
-            tables[0].schema.clone()
+        let non_semi_tables: Vec<&TableBinding<'a>> =
+            tables.iter().filter(|t| !t.is_semi_or_anti).collect();
+        let combined_schema = if non_semi_tables.len() <= 1 {
+            non_semi_tables
+                .first()
+                .map(|t| (*t.schema).clone())
+                .unwrap_or_else(|| tables[0].schema.clone())
         } else {
             let mut cols = Vec::new();
-            for tbl in &tables {
+            for tbl in &non_semi_tables {
                 let q = tbl.qualifier();
                 for col in &tbl.schema.columns {
                     cols.push(Column::new(
@@ -124,6 +140,7 @@ impl<'a> BindingContext<'a> {
             parent,
             catalog,
             params,
+            in_join_on: false,
         }
     }
 
@@ -210,8 +227,14 @@ impl<'a> BindingContext<'a> {
 
     /// Resolves an unqualified column identifier across visible tables and enclosing parent scopes.
     pub fn resolve_column(&self, col_name: &str) -> Result<Expr> {
+        if self.in_join_on {
+            return self.resolve_column_in_join_on(col_name);
+        }
         let mut matches = Vec::new();
         for tbl in &self.tables {
+            if tbl.is_semi_or_anti {
+                continue;
+            }
             if tbl.schema.get_column(col_name).is_some() {
                 matches.push(tbl);
             }
@@ -220,7 +243,8 @@ impl<'a> BindingContext<'a> {
             return Err(Error::AmbiguousColumn(col_name.to_string()));
         }
         if matches.len() == 1 {
-            if self.tables.len() == 1 {
+            let non_semi_count = self.tables.iter().filter(|t| !t.is_semi_or_anti).count();
+            if non_semi_count <= 1 {
                 return Ok(Expr::Column(col_name.to_string()));
             } else {
                 let q = matches[0].qualifier();
@@ -235,10 +259,57 @@ impl<'a> BindingContext<'a> {
         }
     }
 
+    /// Resolves an unqualified column for JOIN ON clauses: checks non-SEMI/ANTI tables first,
+    /// then falls back to SEMI/ANTI tables. This allows the join predicate to reference columns
+    /// on the SEMI/ANTI table (e.g. the right side of a decorrelated IN) without causing
+    /// ambiguity when the same column name exists on the left (non-semi) table.
+    pub fn resolve_column_in_join_on(&self, col_name: &str) -> Result<Expr> {
+        // 1. Try non-semi tables first (preserves original semantics for left-side columns)
+        let non_semi_matches: Vec<&TableBinding<'_>> = self
+            .tables
+            .iter()
+            .filter(|t| !t.is_semi_or_anti && t.schema.get_column(col_name).is_some())
+            .collect();
+        if non_semi_matches.len() > 1 {
+            return Err(Error::AmbiguousColumn(col_name.to_string()));
+        }
+        if non_semi_matches.len() == 1 {
+            let non_semi_count = self.tables.iter().filter(|t| !t.is_semi_or_anti).count();
+            if non_semi_count <= 1 {
+                return Ok(Expr::Column(col_name.to_string()));
+            } else {
+                let q = non_semi_matches[0].qualifier();
+                return Ok(Expr::Column(format!("{q}.{col_name}")));
+            }
+        }
+        // 2. Fall back to semi/anti tables (allows right-side columns like CTE projections)
+        let semi_matches: Vec<&TableBinding<'_>> = self
+            .tables
+            .iter()
+            .filter(|t| t.is_semi_or_anti && t.schema.get_column(col_name).is_some())
+            .collect();
+        if semi_matches.len() > 1 {
+            return Err(Error::AmbiguousColumn(col_name.to_string()));
+        }
+        if semi_matches.len() == 1 {
+            let q = semi_matches[0].qualifier();
+            return Ok(Expr::Column(format!("{q}.{col_name}")));
+        }
+        // Not found in current scope; check enclosing parent scopes
+        if let Some(parent) = self.parent {
+            parent.resolve_outer_column(col_name, 1)
+        } else {
+            Err(Error::ColumnNotFound(col_name.to_string()))
+        }
+    }
+
     /// Helper for resolving outer columns across nested parent scopes.
     pub fn resolve_outer_column(&self, col_name: &str, depth: usize) -> Result<Expr> {
         let mut matches = Vec::new();
         for tbl in &self.tables {
+            if tbl.is_semi_or_anti {
+                continue;
+            }
             if tbl.schema.get_column(col_name).is_some() {
                 matches.push(tbl);
             }
@@ -249,7 +320,8 @@ impl<'a> BindingContext<'a> {
         if matches.len() == 1 {
             let tbl = matches[0];
             let col = tbl.schema.get_column(col_name).unwrap();
-            let name = if self.tables.len() == 1 {
+            let non_semi_count = self.tables.iter().filter(|t| !t.is_semi_or_anti).count();
+            let name = if non_semi_count <= 1 {
                 col_name.to_string()
             } else {
                 format!("{}.{col_name}", tbl.qualifier())
@@ -296,6 +368,17 @@ impl<'a> BindingContext<'a> {
         } else {
             Err(Error::UnknownTableAlias(qualifier.to_string()))
         }
+    }
+
+    /// Resolves a qualified column including SEMI/ANTI-join tables, for JOIN ON clauses.
+    pub fn resolve_qualified_column_in_join_on(
+        &self,
+        qualifier: &str,
+        col_name: &str,
+    ) -> Result<Expr> {
+        // Identical to resolve_qualified_column — qualified lookup already targets a specific
+        // table by name/alias, so SEMI/ANTI filtering is not relevant here.
+        self.resolve_qualified_column(qualifier, col_name)
     }
 
     /// Helper for resolving qualified outer columns across nested parent scopes.
@@ -345,6 +428,40 @@ impl<'a> BindingContext<'a> {
             return parent.validate_qualifier(qualifier);
         }
         Err(Error::UnknownTableAlias(qualifier.to_string()))
+    }
+
+    /// Returns a context clone whose `combined_schema` includes SEMI/ANTI table columns,
+    /// so that JOIN ON type inference can validate predicates referencing those tables.
+    /// The `is_semi_or_anti` flags are preserved; resolution uses `resolve_column_in_join_on`.
+    pub fn for_join_on_binding(&self) -> BindingContext<'a> {
+        let non_semi_tables: Vec<&TableBinding<'a>> =
+            self.tables.iter().filter(|t| !t.is_semi_or_anti).collect();
+        let mut cols = Vec::new();
+        for tbl in &self.tables {
+            let q = tbl.qualifier();
+            for col in &tbl.schema.columns {
+                cols.push(Column::new(
+                    format!("{q}.{}", col.name),
+                    col.data_type,
+                    col.nullable,
+                ));
+                if non_semi_tables.len() <= 1 && !tbl.is_semi_or_anti {
+                    cols.push(Column::new(
+                        col.name.clone(),
+                        col.data_type,
+                        col.nullable,
+                    ));
+                }
+            }
+        }
+        BindingContext {
+            tables: self.tables.clone(),
+            combined_schema: Schema::new_projected(cols),
+            parent: self.parent,
+            catalog: self.catalog,
+            params: self.params,
+            in_join_on: true,
+        }
     }
 }
 
@@ -669,9 +786,10 @@ fn collect_aggregates(
 
 /// Binds a parsed `SelectStatement` AST against a single table's `Schema`.
 pub fn bind_select(statement: &SelectStatement, schema: &Schema) -> Result<BoundSelect> {
+    let name = statement.from.name();
     let binding = TableBinding::new(
-        &statement.from.name,
-        statement.from.alias.as_deref(),
+        name,
+        statement.from.alias(),
         schema,
     );
     bind_select_multi(statement, &[binding])
@@ -743,17 +861,20 @@ pub fn bind_select_with_context(
         if contains_aggregate(&join_clause.on) {
             return Err(Error::AggregateInWhere);
         }
-        let bound_on = bind_expr(&join_clause.on, ctx)?;
-        let dt = bound_on.infer_type(schema)?;
+        let join_on_ctx = ctx.for_join_on_binding();
+        let bound_on = bind_expr(&join_clause.on, &join_on_ctx)?;
+        let dt = bound_on.infer_type(&join_on_ctx.combined_schema)?;
         if dt != DataType::Boolean && dt != DataType::Null {
             return Err(Error::InvalidBooleanExpression {
                 found: dt.to_string(),
             });
         }
+        let table_name = join_clause.table.name().to_string();
+        let table_alias = join_clause.table.alias().map(str::to_string);
         bound_joins.push(BoundJoin {
             join_type: join_clause.join_type,
-            table_name: join_clause.table.name.clone(),
-            table_alias: join_clause.table.alias.clone(),
+            table_name,
+            table_alias,
             on: bound_on,
         });
     }
@@ -798,13 +919,15 @@ pub fn bind_select_with_context(
         for item in &statement.projection {
             match item {
                 SelectItem::Wildcard => {
-                    if tables.len() == 1 {
-                        for col in &tables[0].schema.columns {
+                    let non_semi_tables: Vec<_> =
+                        tables.iter().filter(|t| !t.is_semi_or_anti).collect();
+                    if non_semi_tables.len() == 1 {
+                        for col in &non_semi_tables[0].schema.columns {
                             projections
                                 .push((Expr::Column(col.name.clone()), Some(col.name.clone())));
                         }
                     } else {
-                        for tbl in tables {
+                        for tbl in non_semi_tables {
                             let q = tbl.qualifier();
                             for col in &tbl.schema.columns {
                                 projections.push((
@@ -917,8 +1040,8 @@ pub fn bind_select_with_context(
 
         return Ok(BoundSelect {
             ctes: Vec::new(),
-            table_name: statement.from.name.clone(),
-            table_alias: statement.from.alias.clone(),
+            table_name: statement.from.name().to_string(),
+            table_alias: statement.from.alias().map(str::to_string),
             joins: bound_joins,
             window_exprs,
             projections,
@@ -979,15 +1102,17 @@ pub fn bind_select_with_context(
     for item in &statement.projection {
         match item {
             SelectItem::Wildcard => {
-                if tables.len() == 1 {
-                    for col in &tables[0].schema.columns {
+                let non_semi_tables: Vec<&TableBinding<'_>> =
+                    tables.iter().filter(|t| !t.is_semi_or_anti).collect();
+                if non_semi_tables.len() == 1 {
+                    for col in &non_semi_tables[0].schema.columns {
                         if !bound_group_by.contains(&Expr::Column(col.name.clone())) {
                             return Err(Error::UngroupedColumn(col.name.clone()));
                         }
                         projections.push((Expr::Column(col.name.clone()), Some(col.name.clone())));
                     }
                 } else {
-                    for tbl in tables {
+                    for tbl in non_semi_tables {
                         let q = tbl.qualifier();
                         for col in &tbl.schema.columns {
                             let qual_col = format!("{q}.{}", col.name);
@@ -1121,7 +1246,7 @@ pub fn bind_select_with_context(
         };
 
         let _ = if let Expr::Column(cname) = &bound_expr {
-            if let Some(we) = window_exprs.iter().find(|w| &w.display_name == cname) {
+            if let Some(we) = window_exprs.iter().find(|w| w.display_name == *cname) {
                 we.output_type
             } else {
                 bound_expr.infer_type(&grouped_schema)?
@@ -1139,8 +1264,8 @@ pub fn bind_select_with_context(
 
     Ok(BoundSelect {
         ctes: Vec::new(),
-        table_name: statement.from.name.clone(),
-        table_alias: statement.from.alias.clone(),
+        table_name: statement.from.name().to_string(),
+        table_alias: statement.from.alias().map(str::to_string),
         joins: bound_joins,
         window_exprs,
         projections,
@@ -2046,21 +2171,21 @@ fn bind_subquery_internal(
         Vec<crate::engine::catalog::IndexMetadata>,
     )> = Vec::new();
 
-    let base_schema = outer_ctx.get_table_schema(&statement.from.name)?;
-    let base_indexes = outer_ctx.get_table_indexes(&statement.from.name)?;
+    let base_schema = outer_ctx.get_table_schema(statement.from.name())?;
+    let base_indexes = outer_ctx.get_table_indexes(statement.from.name())?;
     table_schemas.push((
-        statement.from.name.clone(),
-        statement.from.alias.clone(),
+        statement.from.name().to_string(),
+        statement.from.alias().map(str::to_string),
         base_schema,
         base_indexes,
     ));
 
     for join in &statement.joins {
-        let schema = outer_ctx.get_table_schema(&join.table.name)?;
-        let indexes = outer_ctx.get_table_indexes(&join.table.name)?;
+        let schema = outer_ctx.get_table_schema(join.table.name())?;
+        let indexes = outer_ctx.get_table_indexes(join.table.name())?;
         table_schemas.push((
-            join.table.name.clone(),
-            join.table.alias.clone(),
+            join.table.name().to_string(),
+            join.table.alias().map(str::to_string),
             schema,
             indexes,
         ));
@@ -2263,21 +2388,21 @@ fn plan_set_query_body_in_binder(
                 Vec<crate::engine::catalog::IndexMetadata>,
             )> = Vec::new();
 
-            let base_schema = outer_ctx.get_table_schema(&statement.from.name)?;
-            let base_indexes = outer_ctx.get_table_indexes(&statement.from.name)?;
+            let base_schema = outer_ctx.get_table_schema(statement.from.name())?;
+            let base_indexes = outer_ctx.get_table_indexes(statement.from.name())?;
             table_schemas.push((
-                statement.from.name.clone(),
-                statement.from.alias.clone(),
+                statement.from.name().to_string(),
+                statement.from.alias().map(str::to_string),
                 base_schema,
                 base_indexes,
             ));
 
             for join in &statement.joins {
-                let schema = outer_ctx.get_table_schema(&join.table.name)?;
-                let indexes = outer_ctx.get_table_indexes(&join.table.name)?;
+                let schema = outer_ctx.get_table_schema(join.table.name())?;
+                let indexes = outer_ctx.get_table_indexes(join.table.name())?;
                 table_schemas.push((
-                    join.table.name.clone(),
-                    join.table.alias.clone(),
+                    join.table.name().to_string(),
+                    join.table.alias().map(str::to_string),
                     schema,
                     indexes,
                 ));
@@ -2422,10 +2547,7 @@ fn bind_set_subquery_internal(
         statement: Box::new(SelectStatement {
             with: None,
             projection: vec![],
-            from: crate::sql::ast::TableRef {
-                name: String::new(),
-                alias: None,
-            },
+            from: crate::sql::ast::TableRef::new(""),
             joins: vec![],
             selection: None,
             group_by: vec![],

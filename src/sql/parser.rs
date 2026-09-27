@@ -2,11 +2,11 @@ use crate::engine::types::DataType;
 use crate::error::{Error, Result};
 use crate::sql::ast::{
     AnalyzeStatement, ColumnDef, CreateIndexStatement, CreateTableStatement, Cte, CteQuery,
-    DeleteStatement, DropIndexStatement, DropTableStatement, ExplainStatement, InsertStatement,
-    JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement, SetOperator,
-    SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement, TableRef,
-    UpdateAssignment, UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction, WindowSpec,
-    WithClause,
+    DeleteStatement, DerivedQuery, DropIndexStatement, DropTableStatement, ExplainStatement,
+    InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement,
+    SetOperator, SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement,
+    TableRef, UpdateAssignment, UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction,
+    WindowSpec, WithClause,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};
@@ -1923,6 +1923,62 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef> {
+        if self.peek().kind == TokenKind::LParen {
+            let lparen_span = self.peek().span;
+            self.advance(); // consume '('
+
+            let query_expr = self.parse_query_expression()?;
+            let rparen_tok = self.peek().clone();
+            if rparen_tok.kind != TokenKind::RParen {
+                return Err(Error::SqlParseError {
+                    message: format!(
+                        "expected ')' after derived table query, found {}",
+                        rparen_tok.kind
+                    ),
+                    start: rparen_tok.span.start,
+                    end: rparen_tok.span.end,
+                });
+            }
+            self.advance(); // consume ')'
+
+            let alias = self.parse_optional_alias()?;
+            let alias = match alias {
+                Some(a) => a,
+                None => {
+                    let end_span = self.peek().span;
+                    return Err(Error::SqlParseError {
+                        message: "every derived table must have an alias".to_string(),
+                        start: lparen_span.start,
+                        end: end_span.end,
+                    });
+                }
+            };
+
+            let derived_query = match query_expr.body {
+                SetQueryBody::Select(mut select_stmt) => {
+                    if !query_expr.order_by.is_empty() {
+                        select_stmt.order_by = query_expr.order_by;
+                    }
+                    if query_expr.limit.is_some() {
+                        select_stmt.limit = query_expr.limit;
+                    }
+                    if query_expr.offset.is_some() {
+                        select_stmt.offset = query_expr.offset;
+                    }
+                    if query_expr.with.is_some() {
+                        select_stmt.with = query_expr.with;
+                    }
+                    DerivedQuery::Select(select_stmt)
+                }
+                _ => DerivedQuery::SetOperation(Box::new(query_expr)),
+            };
+
+            return Ok(TableRef::Derived {
+                query: derived_query,
+                alias,
+            });
+        }
+
         let table_token = self.peek();
         let name = match &table_token.kind {
             TokenKind::Ident(s) => s.clone(),
@@ -1936,32 +1992,9 @@ impl<'a> Parser<'a> {
         };
         self.advance();
 
-        let alias = if self.peek().kind == TokenKind::As {
-            self.advance(); // consume AS
-            let alias_token = self.peek();
-            match &alias_token.kind {
-                TokenKind::Ident(s) => {
-                    let a = s.clone();
-                    self.advance();
-                    Some(a)
-                }
-                other => {
-                    return Err(Error::SqlParseError {
-                        message: format!("expected table alias after AS, found {other}"),
-                        start: alias_token.span.start,
-                        end: alias_token.span.end,
-                    })
-                }
-            }
-        } else if let TokenKind::Ident(s) = &self.peek().kind {
-            let a = s.clone();
-            self.advance();
-            Some(a)
-        } else {
-            None
-        };
+        let alias = self.parse_optional_alias()?;
 
-        Ok(TableRef { name, alias })
+        Ok(TableRef::Table { name, alias })
     }
 
     fn parse_order_by_list(&mut self) -> Result<Vec<OrderByExpr>> {

@@ -171,6 +171,8 @@ pub struct PhysicalPlan {
     pub limit: Option<usize>,
     /// Optional physical set operation.
     pub set_op: Option<PhysicalSetOp>,
+    /// Logical transformations applied during the query rewrite phase.
+    pub logical_rewrites: Vec<String>,
     /// Total estimated execution cost of this physical plan.
     pub total_cost: f64,
     /// Total estimated output row count of this physical plan.
@@ -206,6 +208,7 @@ impl PhysicalPlan {
             offset: None,
             limit: None,
             set_op: Some(set_op),
+            logical_rewrites: Vec::new(),
             total_cost,
             estimated_rows,
         }
@@ -221,6 +224,15 @@ impl fmt::Display for PhysicalPlan {
             }
             Ok(())
         };
+
+        if !self.logical_rewrites.is_empty() {
+            write_indent(f, indent)?;
+            writeln!(f, "Logical Rewrite")?;
+            for rw in &self.logical_rewrites {
+                write_indent(f, indent + 1)?;
+                writeln!(f, "{rw}")?;
+            }
+        }
 
         if !self.ctes.is_empty() {
             for cte in &self.ctes {
@@ -1188,6 +1200,7 @@ fn optimize_all_inner_joins(
         offset: bound.offset,
         limit: bound.limit,
         set_op: None,
+        logical_rewrites: Vec::new(),
         total_cost: cur_cost,
         estimated_rows: cur_rows,
     })
@@ -1359,6 +1372,7 @@ fn optimize_with_outer_barriers(
         offset: bound.offset,
         limit: bound.limit,
         set_op: None,
+        logical_rewrites: Vec::new(),
         total_cost: cur_cost,
         estimated_rows: cur_rows,
     })
@@ -1406,6 +1420,7 @@ impl Optimizer {
                 offset: bound.offset,
                 limit: bound.limit,
                 set_op: None,
+                logical_rewrites: Vec::new(),
                 total_cost: cur_cost,
                 estimated_rows: cur_rows,
             });

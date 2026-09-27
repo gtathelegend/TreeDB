@@ -257,6 +257,62 @@ impl JoinOperator {
             );
             joiner.execute(left_rows, right_rows.to_vec())
         } else {
+            if join_type == JoinType::Semi || join_type == JoinType::Anti {
+                let mut combined_columns =
+                    Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
+                for col in &left_schema.columns {
+                    combined_columns.push(col.clone());
+                }
+                for col in &right_schema.columns {
+                    combined_columns.push(col.clone());
+                }
+                let eval_schema = Schema::new_projected(combined_columns);
+
+                let mut out_rows = Vec::new();
+                let mut candidate_pairs = 0;
+                let mut matched_rows = 0;
+
+                for left_row in &left_rows {
+                    let mut left_matched = false;
+                    for right_row in right_rows {
+                        candidate_pairs += 1;
+                        let mut combined_values =
+                            Vec::with_capacity(left_row.values.len() + right_row.values.len());
+                        combined_values.extend_from_slice(&left_row.values);
+                        combined_values.extend_from_slice(&right_row.values);
+                        let joined_row = Row::new(combined_values);
+
+                        let on_val = on_predicate.evaluate(&joined_row, &eval_schema)?;
+                        if on_val == Value::Boolean(true) {
+                            left_matched = true;
+                            matched_rows += 1;
+                            break;
+                        }
+                    }
+
+                    if (join_type == JoinType::Semi && left_matched)
+                        || (join_type == JoinType::Anti && !left_matched)
+                    {
+                        out_rows.push(left_row.clone());
+                    }
+                }
+
+                let metrics = crate::query::external_hash_join::JoinExecutionMetrics {
+                    rows_left: left_rows.len(),
+                    rows_right: right_rows.len(),
+                    rows_output: out_rows.len(),
+                    candidate_pairs,
+                    matched_rows,
+                    spill_partitions: 0,
+                    runs_created: 0,
+                    bytes_spilled: 0,
+                    partition_passes: 0,
+                    peak_memory_bytes: 0,
+                };
+
+                return Ok((left_schema.clone(), out_rows, metrics));
+            }
+
             let mut combined_columns =
                 Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
 

@@ -30,11 +30,11 @@ fn ast_references_table(stmt: &crate::sql::SelectStatement, target_table: &str) 
             }
         }
     }
-    if stmt.from.name == target_table || stmt.from.alias.as_deref() == Some(target_table) {
+    if stmt.from.name() == target_table || stmt.from.alias() == Some(target_table) {
         return true;
     }
     for join in &stmt.joins {
-        if join.table.name == target_table || join.table.alias.as_deref() == Some(target_table) {
+        if join.table.name() == target_table || join.table.alias() == Some(target_table) {
             return true;
         }
         if ast_expr_references_table(&join.on, target_table) {
@@ -1071,23 +1071,79 @@ impl<'db> Transaction<'db> {
             self.bind_and_validate_ctes_with_params(&with_clause.ctes, &mut visible_ctes, params)?;
         }
 
+        let rewrite_res = {
+            let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
+            let catalog = TxnBufferPoolCatalog {
+                bp: &bp_cell,
+                ctes: Some(&visible_ctes),
+            };
+            crate::query::QueryRewriter::rewrite_select(ast, Some(&catalog))?
+        };
+        let rewritten_ast = rewrite_res.statement;
+        let rewrite_logs = rewrite_res.rewrites;
+
+        // If the FROM or JOIN relations contain non-flattened derived tables, plan them as statement-local CTEs
+        if let crate::sql::ast::TableRef::Derived { query, alias } = &rewritten_ast.from {
+            let inner_plan = match query {
+                crate::sql::ast::DerivedQuery::Select(select_stmt) => {
+                    self.plan_select_with_outer_ctes_and_params(select_stmt, &visible_ctes, params)?
+                }
+                crate::sql::ast::DerivedQuery::SetOperation(set_stmt) => {
+                    self.plan_set_query_with_outer_ctes_and_params(set_stmt, &visible_ctes, params)?
+                }
+            };
+            let output_schema = self.derive_cte_output_schema(&inner_plan, &visible_ctes)?;
+            visible_ctes.push(crate::sql::binder::BoundCte {
+                name: alias.clone(),
+                output_schema,
+                kind: crate::sql::binder::BoundCteKind::NonRecursive {
+                    plan: inner_plan,
+                },
+                dependencies: Vec::new(),
+            });
+        }
+
+        for j in &rewritten_ast.joins {
+            if let crate::sql::ast::TableRef::Derived { query, alias } = &j.table {
+                let inner_plan = match query {
+                    crate::sql::ast::DerivedQuery::Select(select_stmt) => {
+                        self.plan_select_with_outer_ctes_and_params(select_stmt, &visible_ctes, params)?
+                    }
+                    crate::sql::ast::DerivedQuery::SetOperation(set_stmt) => {
+                        self.plan_set_query_with_outer_ctes_and_params(set_stmt, &visible_ctes, params)?
+                    }
+                };
+                let output_schema = self.derive_cte_output_schema(&inner_plan, &visible_ctes)?;
+                visible_ctes.push(crate::sql::binder::BoundCte {
+                    name: alias.clone(),
+                    output_schema,
+                    kind: crate::sql::binder::BoundCteKind::NonRecursive {
+                        plan: inner_plan,
+                    },
+                    dependencies: Vec::new(),
+                });
+            }
+        }
+
         // Now plan the main query body with visible_ctes
         let mut table_infos = Vec::new();
         let mut bindings = Vec::new();
 
         // 1. Resolve FROM table
         {
+            let from_name = rewritten_ast.from.name();
+            let from_alias = rewritten_ast.from.alias();
             let (schema, indexes, is_cte) =
-                self.resolve_table_for_planning(&ast.from.name, &visible_ctes)?;
+                self.resolve_table_for_planning(from_name, &visible_ctes)?;
             let stats = if is_cte {
                 None
             } else {
-                self.db.get_statistics(&ast.from.name).cloned()
+                self.db.get_statistics(from_name).cloned()
             };
             table_infos.push(
                 crate::query::optimizer::TableOptInfo::new(
-                    &ast.from.name,
-                    ast.from.alias.as_deref(),
+                    from_name,
+                    from_alias,
                     schema,
                     indexes,
                 )
@@ -1097,18 +1153,20 @@ impl<'db> Transaction<'db> {
         }
 
         // 2. Resolve JOIN tables
-        for j in &ast.joins {
+        for j in &rewritten_ast.joins {
+            let join_name = j.table.name();
+            let join_alias = j.table.alias();
             let (schema, indexes, is_cte) =
-                self.resolve_table_for_planning(&j.table.name, &visible_ctes)?;
+                self.resolve_table_for_planning(join_name, &visible_ctes)?;
             let stats = if is_cte {
                 None
             } else {
-                self.db.get_statistics(&j.table.name).cloned()
+                self.db.get_statistics(join_name).cloned()
             };
             table_infos.push(
                 crate::query::optimizer::TableOptInfo::new(
-                    &j.table.name,
-                    j.table.alias.as_deref(),
+                    join_name,
+                    join_alias,
                     schema,
                     indexes,
                 )
@@ -1117,12 +1175,22 @@ impl<'db> Transaction<'db> {
             );
         }
 
-        for t in &table_infos {
-            bindings.push(crate::sql::TableBinding::new(
-                &t.name,
-                t.alias.as_deref(),
-                &t.schema,
-            ));
+        for (idx, t) in table_infos.iter().enumerate() {
+            let is_semi_or_anti = if idx == 0 {
+                false
+            } else {
+                let j = &rewritten_ast.joins[idx - 1];
+                j.join_type == crate::sql::ast::JoinType::Semi
+                    || j.join_type == crate::sql::ast::JoinType::Anti
+            };
+            bindings.push(
+                crate::sql::TableBinding::new(
+                    &t.name,
+                    t.alias.as_deref(),
+                    &t.schema,
+                )
+                .with_semi_or_anti(is_semi_or_anti),
+            );
         }
 
         let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
@@ -1131,13 +1199,15 @@ impl<'db> Transaction<'db> {
             ctes: Some(&visible_ctes),
         };
         let mut bound = crate::sql::binder::bind_select_multi_with_catalog_and_params(
-            ast,
+            &rewritten_ast,
             &bindings,
             Some(&catalog),
             params,
         )?;
         bound.ctes = visible_ctes;
-        crate::query::optimizer::Optimizer::optimize(&bound, &table_infos)
+        let mut plan = crate::query::optimizer::Optimizer::optimize(&bound, &table_infos)?;
+        plan.logical_rewrites = rewrite_logs;
+        Ok(plan)
     }
 
     /// Plans a parsed `SetQuery` AST into an optimized physical execution plan (`PhysicalPlan`).
@@ -1344,6 +1414,11 @@ impl<'db> Transaction<'db> {
                 ));
             }
             for join in &plan.joins {
+                if join.join_type == crate::sql::ast::JoinType::Semi
+                    || join.join_type == crate::sql::ast::JoinType::Anti
+                {
+                    continue;
+                }
                 let (right_schema, _, _) =
                     self.resolve_table_for_planning(&join.right.table_name, visible_ctes)?;
                 let rq = join.right.qualifier();
@@ -2483,8 +2558,11 @@ impl<'db> Transaction<'db> {
         let mut plan = self.plan_select_with_params(&select_ast, params)?;
 
         // 3. Fetch candidate rows
-        self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
-        let candidate_rows = {
+        let candidate_rows = if !plan.joins.is_empty() {
+            let qr = self.execute_physical_plan(&plan)?;
+            qr.rows
+        } else {
+            self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
             let mut table = self.open_table(&stmt.table_name)?;
             let initial_rows = match &plan.base_table.access_path {
                 crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
@@ -2599,8 +2677,11 @@ impl<'db> Transaction<'db> {
         let mut plan = self.plan_select_with_params(&select_ast, params)?;
 
         // 2. Fetch candidate rows
-        self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
-        let candidate_rows = {
+        let candidate_rows = if !plan.joins.is_empty() {
+            let qr = self.execute_physical_plan(&plan)?;
+            qr.rows
+        } else {
+            self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
             let mut table = self.open_table(&stmt.table_name)?;
             let initial_rows = match &plan.base_table.access_path {
                 crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
