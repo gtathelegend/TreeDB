@@ -259,35 +259,47 @@ impl CardinalityEstimator {
             return 0.0;
         }
 
-        // Check if on_expr is an equi-join: Left.col = Right.col
-        if let Expr::Binary {
-            left,
-            op: BinaryOp::Eq,
-            right,
-        } = on_expr
-        {
-            if let (Expr::Column(col_a), Expr::Column(col_b)) = (left.as_ref(), right.as_ref()) {
-                let name_a = col_a.split('.').next_back().unwrap_or(col_a);
-                let name_b = col_b.split('.').next_back().unwrap_or(col_b);
-
-                let ndv_a = left_stats
-                    .and_then(|s| s.column(name_a))
-                    .map(|c| c.distinct_count as f64)
-                    .unwrap_or(left_rows);
-
-                let ndv_b = right_stats
-                    .and_then(|s| s.column(name_b))
-                    .map(|c| c.distinct_count as f64)
-                    .unwrap_or(right_rows);
-
-                let max_ndv = ndv_a.max(ndv_b).max(1.0);
-                let rows = (left_rows * right_rows) / max_ndv;
-                return rows.max(1.0);
-            }
+        let conjuncts = crate::query::optimizer::split_conjunction(on_expr);
+        if conjuncts.is_empty() {
+            return (left_rows * right_rows).max(1.0);
         }
 
-        let sel = Self::estimate_expr_selectivity(on_expr, None, schema);
-        (left_rows * right_rows * sel).max(1.0)
+        let mut total_selectivity = 1.0;
+
+        for conj in &conjuncts {
+            if let Expr::Binary {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            } = conj
+            {
+                if let (Expr::Column(col_a), Expr::Column(col_b)) = (left.as_ref(), right.as_ref())
+                {
+                    let name_a = col_a.split('.').next_back().unwrap_or(col_a);
+                    let name_b = col_b.split('.').next_back().unwrap_or(col_b);
+
+                    let ndv_a = left_stats
+                        .and_then(|s| s.column(name_a))
+                        .map(|c| c.distinct_count as f64)
+                        .unwrap_or(left_rows);
+
+                    let ndv_b = right_stats
+                        .and_then(|s| s.column(name_b))
+                        .map(|c| c.distinct_count as f64)
+                        .unwrap_or(right_rows);
+
+                    let max_ndv = ndv_a.max(ndv_b).max(1.0);
+                    total_selectivity *= 1.0 / max_ndv;
+                    continue;
+                }
+            }
+
+            let sel = Self::estimate_expr_selectivity(conj, None, schema);
+            total_selectivity *= sel;
+        }
+
+        let rows = left_rows * right_rows * total_selectivity;
+        rows.max(1.0)
     }
 
     /// Estimates the output cardinality for a join operation taking `JoinType` into account.

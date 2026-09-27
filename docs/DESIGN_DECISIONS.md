@@ -945,6 +945,41 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * **Complete SQL Outer-Join Conformance:** Preserves standard SQL outer join semantics, duplicate counts, and 3VL without modifying storage pages or WAL logging.
 
+---
+
+### Decision 52: Cost-Based Join Reordering with DP Enumeration & Outer Join Barriers
+* **Context:** Prior to Phase 37, TreeDB evaluated multi-table joins in either naive syntactic order or small exhaustive permutations without explicit join graph connectivity modeling or strict semantic isolation across outer joins. A principled cost-based join-order optimizer was required to find optimal join execution orders while guaranteeing safety across outer joins.
+* **Decision:**
+  > TreeDB performs cost-based join reordering only inside semantically safe INNER JOIN regions. OUTER JOINs are optimization barriers.
+  1. **Join Graph Representation (`JoinGraph`, `JoinGraphRelation`, `JoinGraphPredicate`):**
+     * Relations: Retains physical scan access path, estimated cardinality, scan cost, and column mappings for reconstruction.
+     * Predicates: Extracts multi-relation join conditions, classifying equi-join keys and residual non-equi predicates along with referenced relation bitmasks. Single-table predicates are pushed down to local table scan filters.
+  2. **Bounded Dynamic Programming Join Enumeration (`MAX_ENUMERATED_RELATIONS = 8`):**
+     * For $N \le 8$ relations, optimizes join orders using subset dynamic programming ($O(n \cdot 2^n)$):
+       * $\text{BestPlan}(\{r\}) = \text{Scan}(r)$
+       * $\text{BestPlan}(S) = \min_{S_1 \subset S, S_2 = S \setminus S_1} \text{Join}(\text{BestPlan}(S_1), \text{BestPlan}(S_2))$
+       * Intermediate subplans track estimated cardinality, cumulative cost, relation sequence, and Cartesian join step counts.
+  3. **Deterministic Greedy Fallback ($N > 8$):**
+     * When relation count exceeds 8, falls back to a deterministic $O(n^2)$ greedy search that successively joins the lowest-cost connected relation candidate, preventing factorial explosion.
+  4. **Strict Outer Join Semantic Barriers:**
+     * `LEFT JOIN`, `RIGHT JOIN`, and `FULL JOIN` act as impenetrable optimization barriers.
+     * Join trees are partitioned into independent contiguous `INNER JOIN` sub-regions separated by outer join boundaries. Join reordering is applied exclusively within each inner region; outer join orientations and boundaries are never commuted or reordered.
+  5. **Deterministic 5-Tier Tie-Breaking Policy:**
+     * When comparing alternative candidate join plans:
+       1. Fewer Cartesian join steps (strictly prefer connected join predicates over Cartesian products).
+       2. Lower estimated total plan cost (with floating point $\epsilon = 10^{-9}$).
+       3. Lower estimated output cardinality.
+       4. Original syntactic relation order preference (identity permutation).
+       5. Lexicographical relation index permutation order.
+  6. **Predicate Preservation & Earliest Legal Placement:**
+     * All original equi and residual predicates are attached at the earliest intermediate join node where all referenced relations are present in the joined subplan. Unassigned predicates are placed into post-join filters.
+  7. **Integration with Cost Model, Plan Cache & Diagnostics:**
+     * Reuses Phase 29 `CostModel` and `CardinalityEstimator` (with composite conjunction selectivity).
+     * Reordered plans are cached under `PlanCacheKey` with catalog, index, and statistics generation invalidation.
+     * `EXPLAIN` and `EXPLAIN ANALYZE` reflect the chosen join order and estimated/actual metrics without query execution side effects.
+* **Rationale:**
+  * **Semantic Soundness & Performance:** Guarantees optimal join orders for common multi-table analytical queries while avoiding semantic corruption across outer joins and ensuring predictable, deterministic planning time.
+
 
 
 

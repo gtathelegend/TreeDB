@@ -616,7 +616,21 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 37: Advanced Query Processing & Optimizer Enhancements (Future)
+## Phase 37: Cost-Based Join Reordering & Join Enumeration (Completed)
+* [x] Internal join graph representation (`JoinGraph`, `JoinGraphRelation`, `JoinGraphPredicate`) capturing scan nodes, column projections, and multi-table join predicates
+* [x] Dynamic Programming (DP) subset-based join enumeration ($O(n \cdot 2^n)$) for $N \le 8$ (`MAX_ENUMERATED_RELATIONS = 8`)
+* [x] Bounded deterministic $O(n^2)$ greedy candidate fallback for large join graphs ($N > 8$)
+* [x] Outer join semantic barriers: `LEFT JOIN`, `RIGHT JOIN`, and `FULL JOIN` preserved as strict optimization barriers
+* [x] 5-tier deterministic tie-breaker: 1. Cartesian step minimization, 2. Lower cost, 3. Lower cardinality, 4. Identity permutation, 5. Lexicographical index order
+* [x] Predicate preservation: equi and residual predicates attached at the earliest legal join node or post-join filter
+* [x] Cost model and cardinality estimation reuse with composite conjunction selectivity
+* [x] EXPLAIN and EXPLAIN ANALYZE visibility into chosen join orders and estimated/actual performance
+* [x] Parameter-sensitive plan caching, prepared statements, transaction rollback, and database persistence safety
+* [x] 11 dedicated integration tests in `tests/join_optimizer.rs` including randomized differential reference oracle (639 total passing test suite)
+
+---
+
+## Phase 38: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Merge join physical execution operator
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes

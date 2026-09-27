@@ -630,205 +630,503 @@ impl TableOptInfo {
     }
 }
 
-/// Cost-based and statistics-aware query optimizer and physical access-path planner.
-pub struct Optimizer;
+/// Maximum number of relations enumerated via subset dynamic programming.
+/// If an inner-join region contains more than this limit, a deterministic greedy search is used.
+pub const MAX_ENUMERATED_RELATIONS: usize = 8;
 
-impl Optimizer {
-    /// Optimizes a bound SQL query (`BoundSelect`) into a deterministic cost-based `PhysicalPlan`.
-    pub fn optimize(bound: &BoundSelect, tables: &[TableOptInfo]) -> Result<PhysicalPlan> {
-        let is_multi_table = !bound.joins.is_empty();
+/// A relation node in the join graph.
+#[derive(Debug, Clone)]
+pub struct JoinGraphRelation {
+    /// Local relation ID within the join region (0..M).
+    pub id: usize,
+    /// Global index within the query's `tables` slice.
+    pub global_idx: usize,
+    /// Active table qualifier.
+    pub qualifier: String,
+    /// Metadata information about the table.
+    pub table_info: TableOptInfo,
+    /// Pre-planned base table scan.
+    pub base_scan: PhysicalTableScan,
+}
 
-        // 1. Deconstruct WHERE clause into conjuncts
-        let where_conjuncts = match &bound.filter {
-            Some(f) => split_conjunction(f),
-            None => Vec::new(),
-        };
+/// A join predicate or multi-table filter conjunct in the join graph.
+#[derive(Debug, Clone)]
+pub struct JoinGraphPredicate {
+    /// Boolean expression of the predicate.
+    pub expr: Expr,
+    /// Set of table qualifiers referenced by this expression.
+    pub referenced_qualifiers: HashSet<String>,
+    /// Set of local relation IDs within the join region required to evaluate this predicate.
+    pub referenced_rel_ids: HashSet<usize>,
+    /// Whether this predicate represents a direct equi-join equality between two relations.
+    pub is_equality: bool,
+}
 
-        // Check if all joins are INNER JOINs eligible for bounded reordering
-        let has_any_stats = tables.iter().any(|t| t.stats.is_some());
-        let can_reorder_joins =
-            is_multi_table && bound.joins.iter().all(|j| j.join_type == JoinType::Inner);
+/// Relational join graph representation for an inner-join region.
+#[derive(Debug, Clone)]
+pub struct JoinGraph {
+    /// Participating relations in this join region.
+    pub relations: Vec<JoinGraphRelation>,
+    /// Extracted join and filter predicates applicable to this join region.
+    pub predicates: Vec<JoinGraphPredicate>,
+}
 
-        if is_multi_table
-            && can_reorder_joins
-            && tables.len() >= 2
-            && tables.len() <= 5
-            && has_any_stats
+/// Intermediate plan candidate used in dynamic programming enumeration and greedy fallback.
+#[derive(Debug, Clone)]
+pub struct DPPlan {
+    /// Ordered permutation of local relation IDs: `[base_relation, join_1, join_2, ...]`.
+    pub perm: Vec<usize>,
+    /// Cumulative estimated cost.
+    pub cost: f64,
+    /// Cumulative estimated output row count.
+    pub rows: f64,
+    /// Physical base table scan for the chosen leading relation.
+    pub base_scan: PhysicalTableScan,
+    /// Sequence of physical join operations.
+    pub joins: Vec<PhysicalJoin>,
+    /// Bitset marking which join graph predicates have been attached.
+    pub used_predicates: Vec<bool>,
+    /// Number of Cartesian join steps (joins without direct connecting predicates).
+    pub cartesian_joins: usize,
+}
+
+/// Deterministic comparator for selecting the lowest-cost plan candidate.
+fn is_better_plan(cand: &DPPlan, existing: &DPPlan) -> bool {
+    // 1. Prefer fewer Cartesian products (favor direct connected joins)
+    if cand.cartesian_joins != existing.cartesian_joins {
+        return cand.cartesian_joins < existing.cartesian_joins;
+    }
+
+    const EPSILON: f64 = 1e-9;
+    let cost_diff = cand.cost - existing.cost;
+    if cost_diff < -EPSILON {
+        return true;
+    }
+    if cost_diff > EPSILON {
+        return false;
+    }
+
+    // 2. Deterministic tie-breaker: lower estimated output cardinality
+    let row_diff = cand.rows - existing.rows;
+    if row_diff < -EPSILON {
+        return true;
+    }
+    if row_diff > EPSILON {
+        return false;
+    }
+
+    // 3. Deterministic tie-breaker: prefer identity permutation (original SQL relation order)
+    let cand_is_identity = cand.perm.iter().enumerate().all(|(i, &p)| i == p);
+    let exist_is_identity = existing.perm.iter().enumerate().all(|(i, &p)| i == p);
+    if cand_is_identity && !exist_is_identity {
+        return true;
+    }
+    if !cand_is_identity && exist_is_identity {
+        return false;
+    }
+
+    // 4. Deterministic tie-breaker: lexicographically smaller permutation order
+    cand.perm < existing.perm
+}
+
+/// Optimizes an inner-join region using dynamic programming over subsets ($O(n \cdot 2^n)$).
+fn optimize_inner_join_region_dp(graph: &JoinGraph) -> DPPlan {
+    let num_rels = graph.relations.len();
+    assert!(num_rels > 0 && num_rels <= MAX_ENUMERATED_RELATIONS);
+
+    let num_states = 1 << num_rels;
+    let mut dp: Vec<Option<DPPlan>> = vec![None; num_states];
+
+    // Base cases: single-table scans (subsets of size 1)
+    for i in 0..num_rels {
+        let base_scan = graph.relations[i].base_scan.clone();
+        dp[1 << i] = Some(DPPlan {
+            perm: vec![i],
+            cost: base_scan.cost,
+            rows: base_scan.estimated_rows,
+            base_scan,
+            joins: Vec::new(),
+            used_predicates: vec![false; graph.predicates.len()],
+            cartesian_joins: 0,
+        });
+    }
+
+    // Iterate over subset sizes from 2 to num_rels
+    for size in 2..=num_rels {
+        for mask in 1..num_states {
+            if mask.count_ones() as usize != size {
+                continue;
+            }
+
+            let mut best_for_mask: Option<DPPlan> = None;
+
+            // Try each relation `r` as the right-most (latest joined) relation in subset `mask`
+            for r in 0..num_rels {
+                if (mask & (1 << r)) == 0 {
+                    continue;
+                }
+
+                let left_mask = mask ^ (1 << r);
+                let left_plan = match &dp[left_mask] {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let right_scan = &graph.relations[r].base_scan;
+
+                // Collect relations available in `mask`
+                let mut mask_rel_ids = HashSet::new();
+                for i in 0..num_rels {
+                    if (mask & (1 << i)) != 0 {
+                        mask_rel_ids.insert(i);
+                    }
+                }
+
+                // Identify predicates attached at this join step
+                let mut step_conjuncts = Vec::new();
+                let mut cand_used_preds = left_plan.used_predicates.clone();
+                let mut has_direct_predicate = false;
+
+                for (p_idx, pred) in graph.predicates.iter().enumerate() {
+                    if !cand_used_preds[p_idx]
+                        && pred.referenced_rel_ids.is_subset(&mask_rel_ids)
+                        && pred.referenced_rel_ids.contains(&r)
+                    {
+                        step_conjuncts.push(pred.expr.clone());
+                        cand_used_preds[p_idx] = true;
+                        if pred
+                            .referenced_rel_ids
+                            .iter()
+                            .any(|&id| id != r && (left_mask & (1 << id)) != 0)
+                        {
+                            has_direct_predicate = true;
+                        }
+                    }
+                }
+
+                let on_expr = recombine_conjunction(step_conjuncts)
+                    .unwrap_or(Expr::Literal(Value::Boolean(true)));
+
+                let join_cost = CostModel::nested_loop_join_cost(
+                    left_plan.cost,
+                    left_plan.rows,
+                    right_scan.cost,
+                    right_scan.estimated_rows,
+                );
+
+                let base_idx = left_plan.perm[0];
+                let join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
+                    left_plan.rows,
+                    graph.relations[base_idx].table_info.stats.as_ref(),
+                    right_scan.estimated_rows,
+                    graph.relations[r].table_info.stats.as_ref(),
+                    &on_expr,
+                    &graph.relations[r].table_info.schema,
+                );
+
+                let mut cand_joins = left_plan.joins.clone();
+                cand_joins.push(PhysicalJoin {
+                    join_type: JoinType::Inner,
+                    right: right_scan.clone(),
+                    on: on_expr,
+                    estimated_rows: join_rows,
+                    cost: join_cost,
+                });
+
+                let mut cand_perm = left_plan.perm.clone();
+                cand_perm.push(r);
+
+                let cand_plan = DPPlan {
+                    perm: cand_perm,
+                    cost: join_cost,
+                    rows: join_rows,
+                    base_scan: left_plan.base_scan.clone(),
+                    joins: cand_joins,
+                    used_predicates: cand_used_preds,
+                    cartesian_joins: left_plan.cartesian_joins
+                        + if has_direct_predicate { 0 } else { 1 },
+                };
+
+                best_for_mask = match best_for_mask {
+                    None => Some(cand_plan),
+                    Some(existing) => {
+                        if is_better_plan(&cand_plan, &existing) {
+                            Some(cand_plan)
+                        } else {
+                            Some(existing)
+                        }
+                    }
+                };
+            }
+
+            dp[mask] = best_for_mask;
+        }
+    }
+
+    dp[(1 << num_rels) - 1]
+        .clone()
+        .expect("DP plan must exist for full mask")
+}
+
+/// Optimizes an inner-join region using deterministic greedy search ($O(n^2)$ fallback for large graphs).
+fn optimize_inner_join_region_greedy(graph: &JoinGraph) -> DPPlan {
+    let num_rels = graph.relations.len();
+    assert!(num_rels > 0);
+
+    // Step 1: Pick starting relation with minimum scan cardinality, then minimum scan cost, then lowest index
+    let mut start_idx = 0;
+    let mut min_rows = graph.relations[0].base_scan.estimated_rows;
+    let mut min_cost = graph.relations[0].base_scan.cost;
+
+    for i in 1..num_rels {
+        let r_rows = graph.relations[i].base_scan.estimated_rows;
+        let r_cost = graph.relations[i].base_scan.cost;
+        if r_rows < min_rows - 1e-9
+            || ((r_rows - min_rows).abs() <= 1e-9 && r_cost < min_cost - 1e-9)
         {
-            return optimize_inner_joins_cost_based(bound, tables, &where_conjuncts);
+            start_idx = i;
+            min_rows = r_rows;
+            min_cost = r_cost;
+        }
+    }
+
+    let mut visited = vec![false; num_rels];
+    visited[start_idx] = true;
+    let mut perm = vec![start_idx];
+    let base_scan = graph.relations[start_idx].base_scan.clone();
+
+    let mut used_predicates = vec![false; graph.predicates.len()];
+    let mut joins = Vec::new();
+    let mut cur_cost = base_scan.cost;
+    let mut cur_rows = base_scan.estimated_rows;
+    let mut cartesian_joins = 0;
+
+    let mut available_rel_ids = HashSet::new();
+    available_rel_ids.insert(start_idx);
+
+    for _ in 1..num_rels {
+        struct GreedyCandidate {
+            cand: usize,
+            join_cost: f64,
+            join_rows: f64,
+            has_direct_predicate: bool,
+            step_conjuncts: Vec<Expr>,
+            step_pred_indices: Vec<usize>,
         }
 
-        // Standard sequential join / single-table planning pipeline
-        // 2. Classify WHERE conjuncts per table
-        let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); tables.len()];
-        let mut post_join_conjuncts: Vec<Expr> = Vec::new();
+        let mut best_cand: Option<GreedyCandidate> = None;
 
-        for conjunct in where_conjuncts {
-            let refs = expr_referenced_qualifiers(&conjunct);
-            if !is_multi_table {
-                // Single table query: all conjuncts belong to base table
-                table_local_conjuncts[0].push(conjunct);
-            } else if refs.len() == 1 {
-                let target_qualifier = refs.iter().next().unwrap();
-                if let Some(tbl_idx) = tables
-                    .iter()
-                    .position(|t| t.qualifier() == target_qualifier)
+        for (cand, &is_visited) in visited.iter().enumerate().take(num_rels) {
+            if is_visited {
+                continue;
+            }
+
+            let cand_scan = &graph.relations[cand].base_scan;
+            let mut test_rel_ids = available_rel_ids.clone();
+            test_rel_ids.insert(cand);
+
+            let mut step_conjuncts = Vec::new();
+            let mut step_pred_indices = Vec::new();
+            let mut has_direct_predicate = false;
+
+            for (p_idx, pred) in graph.predicates.iter().enumerate() {
+                if !used_predicates[p_idx]
+                    && pred.referenced_rel_ids.is_subset(&test_rel_ids)
+                    && pred.referenced_rel_ids.contains(&cand)
                 {
-                    if tbl_idx == 0 {
-                        let has_right_or_full = bound.joins.iter().any(|j| {
-                            j.join_type == JoinType::Right || j.join_type == JoinType::Full
-                        });
-                        if has_right_or_full {
-                            post_join_conjuncts.push(conjunct);
-                        } else {
-                            table_local_conjuncts[0].push(conjunct);
-                        }
-                    } else {
-                        let this_join_type = bound.joins[tbl_idx - 1].join_type;
-                        let is_outer_right =
-                            this_join_type == JoinType::Left || this_join_type == JoinType::Full;
-                        let subsequent_outer = bound.joins[tbl_idx..].iter().any(|j| {
-                            j.join_type == JoinType::Right || j.join_type == JoinType::Full
-                        });
-                        if is_outer_right || subsequent_outer {
-                            post_join_conjuncts.push(conjunct);
-                        } else {
-                            table_local_conjuncts[tbl_idx].push(conjunct);
-                        }
+                    step_conjuncts.push(pred.expr.clone());
+                    step_pred_indices.push(p_idx);
+                    if pred
+                        .referenced_rel_ids
+                        .iter()
+                        .any(|&id| id != cand && available_rel_ids.contains(&id))
+                    {
+                        has_direct_predicate = true;
                     }
-                } else {
-                    post_join_conjuncts.push(conjunct);
-                }
-            } else {
-                post_join_conjuncts.push(conjunct);
-            }
-        }
-
-        // 3. Process JOIN ON clauses
-        let mut optimized_joins = Vec::new();
-        for (join_idx, bound_join) in bound.joins.iter().enumerate() {
-            let right_table_idx = join_idx + 1;
-            let right_qualifier = tables[right_table_idx].qualifier();
-            let on_conjuncts = split_conjunction(&bound_join.on);
-            let mut remaining_on = Vec::new();
-
-            for on_conj in on_conjuncts {
-                let refs = expr_referenced_qualifiers(&on_conj);
-                if bound_join.join_type == JoinType::Inner {
-                    if refs.len() == 1 && refs.contains(right_qualifier) {
-                        table_local_conjuncts[right_table_idx].push(on_conj);
-                    } else if refs.len() == 1 && refs.contains(tables[0].qualifier()) {
-                        table_local_conjuncts[0].push(on_conj);
-                    } else {
-                        remaining_on.push(on_conj);
-                    }
-                } else if bound_join.join_type == JoinType::Left {
-                    if refs.len() == 1 && refs.contains(right_qualifier) {
-                        table_local_conjuncts[right_table_idx].push(on_conj);
-                    } else {
-                        remaining_on.push(on_conj);
-                    }
-                } else if bound_join.join_type == JoinType::Right {
-                    if refs.len() == 1 && refs.contains(tables[0].qualifier()) {
-                        table_local_conjuncts[0].push(on_conj);
-                    } else {
-                        remaining_on.push(on_conj);
-                    }
-                } else {
-                    // Full join: cannot push down on predicates to either side
-                    remaining_on.push(on_conj);
                 }
             }
 
-            let on_expr =
-                recombine_conjunction(remaining_on).unwrap_or(Expr::Literal(Value::Boolean(true)));
-            optimized_joins.push((bound_join.join_type, on_expr));
-        }
-
-        // 4. Select Access Paths for Base Table and Joined Tables
-        let base_table_scan =
-            plan_table_scan(&tables[0], table_local_conjuncts[0].clone(), is_multi_table);
-
-        let mut physical_joins = Vec::new();
-        let mut cur_cost = base_table_scan.cost;
-        let mut cur_rows = base_table_scan.estimated_rows;
-
-        for (join_idx, (join_type, on_expr)) in optimized_joins.into_iter().enumerate() {
-            let right_table_idx = join_idx + 1;
-            let right_table_scan = plan_table_scan(
-                &tables[right_table_idx],
-                table_local_conjuncts[right_table_idx].clone(),
-                is_multi_table,
-            );
+            let on_expr = recombine_conjunction(step_conjuncts.clone())
+                .unwrap_or(Expr::Literal(Value::Boolean(true)));
 
             let join_cost = CostModel::nested_loop_join_cost(
                 cur_cost,
                 cur_rows,
-                right_table_scan.cost,
-                right_table_scan.estimated_rows,
+                cand_scan.cost,
+                cand_scan.estimated_rows,
             );
-            let join_rows = CardinalityEstimator::estimate_join_cardinality(
-                join_type,
+            let join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
                 cur_rows,
-                tables[0].stats.as_ref(),
-                right_table_scan.estimated_rows,
-                tables[right_table_idx].stats.as_ref(),
+                graph.relations[start_idx].table_info.stats.as_ref(),
+                cand_scan.estimated_rows,
+                graph.relations[cand].table_info.stats.as_ref(),
                 &on_expr,
-                &tables[right_table_idx].schema,
+                &graph.relations[cand].table_info.schema,
             );
 
-            cur_cost = join_cost;
-            cur_rows = join_rows;
+            let is_better = match &best_cand {
+                None => true,
+                Some(best) => {
+                    if has_direct_predicate != best.has_direct_predicate {
+                        has_direct_predicate
+                    } else if (join_cost - best.join_cost).abs() > 1e-9 {
+                        join_cost < best.join_cost
+                    } else if (join_rows - best.join_rows).abs() > 1e-9 {
+                        join_rows < best.join_rows
+                    } else {
+                        cand < best.cand
+                    }
+                }
+            };
 
-            physical_joins.push(PhysicalJoin {
-                join_type,
-                right: right_table_scan,
-                on: on_expr,
-                estimated_rows: join_rows,
-                cost: join_cost,
-            });
-        }
-
-        let post_join_filter = recombine_conjunction(post_join_conjuncts);
-        if let Some(post_f) = &post_join_filter {
-            cur_cost += CostModel::filter_cost(cur_rows);
-            let sel =
-                CardinalityEstimator::estimate_expr_selectivity(post_f, None, &tables[0].schema);
-            cur_rows = (cur_rows * sel).max(if cur_rows > 0.0 { 1.0 } else { 0.0 });
-        }
-
-        if !bound.order_by.is_empty() {
-            cur_cost += CostModel::sort_cost(cur_rows);
-        }
-        if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
-            cur_cost += CostModel::aggregate_cost(cur_rows);
-        }
-        if !bound.window_exprs.is_empty() {
-            cur_cost += CostModel::window_cost(cur_rows);
+            if is_better {
+                best_cand = Some(GreedyCandidate {
+                    cand,
+                    join_cost,
+                    join_rows,
+                    has_direct_predicate,
+                    step_conjuncts,
+                    step_pred_indices,
+                });
+            }
         }
 
-        Ok(PhysicalPlan {
-            ctes: bound.ctes.clone(),
-            base_table: base_table_scan,
-            joins: physical_joins,
-            post_join_filter,
-            group_by: bound.group_by.clone(),
-            aggregates: bound.aggregates.clone(),
-            having: bound.having.clone(),
-            window_exprs: bound.window_exprs.clone(),
-            projections: bound.projections.clone(),
-            order_by: bound.order_by.clone(),
-            offset: bound.offset,
-            limit: bound.limit,
-            set_op: None,
-            total_cost: cur_cost,
-            estimated_rows: cur_rows,
-        })
+        let chosen = best_cand.unwrap();
+
+        visited[chosen.cand] = true;
+        perm.push(chosen.cand);
+        available_rel_ids.insert(chosen.cand);
+
+        for p_idx in chosen.step_pred_indices {
+            used_predicates[p_idx] = true;
+        }
+        if !chosen.has_direct_predicate {
+            cartesian_joins += 1;
+        }
+
+        let on_expr = recombine_conjunction(chosen.step_conjuncts)
+            .unwrap_or(Expr::Literal(Value::Boolean(true)));
+
+        let right_scan = graph.relations[chosen.cand].base_scan.clone();
+        joins.push(PhysicalJoin {
+            join_type: JoinType::Inner,
+            right: right_scan,
+            on: on_expr,
+            estimated_rows: chosen.join_rows,
+            cost: chosen.join_cost,
+        });
+
+        cur_cost = chosen.join_cost;
+        cur_rows = chosen.join_rows;
+    }
+
+    DPPlan {
+        perm,
+        cost: cur_cost,
+        rows: cur_rows,
+        base_scan,
+        joins,
+        used_predicates,
+        cartesian_joins,
     }
 }
 
-/// Helper for cost-based inner-join ordering across 2 to 5 relations.
-fn optimize_inner_joins_cost_based(
+/// Builds a `JoinGraph` for the given relations and candidate conjuncts.
+fn build_join_graph(
+    region_rel_indices: &[usize],
+    tables: &[TableOptInfo],
+    candidate_conjuncts: &[Expr],
+) -> (JoinGraph, Vec<Vec<Expr>>, Vec<Expr>) {
+    let num_rels = region_rel_indices.len();
+    let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); num_rels];
+    let mut multi_conjuncts: Vec<Expr> = Vec::new();
+    let mut unhandled_conjuncts: Vec<Expr> = Vec::new();
+
+    let region_qualifiers: HashSet<String> = region_rel_indices
+        .iter()
+        .map(|&idx| tables[idx].qualifier().to_string())
+        .collect();
+
+    for conj in candidate_conjuncts {
+        let refs = expr_referenced_qualifiers(conj);
+        if refs.is_empty() {
+            multi_conjuncts.push(conj.clone());
+        } else if refs.len() == 1 {
+            let target_qual = refs.iter().next().unwrap();
+            if let Some(pos) = region_rel_indices
+                .iter()
+                .position(|&idx| tables[idx].qualifier() == target_qual)
+            {
+                table_local_conjuncts[pos].push(conj.clone());
+            } else {
+                unhandled_conjuncts.push(conj.clone());
+            }
+        } else if refs.is_subset(&region_qualifiers) {
+            multi_conjuncts.push(conj.clone());
+        } else {
+            unhandled_conjuncts.push(conj.clone());
+        }
+    }
+
+    let mut relations = Vec::with_capacity(num_rels);
+    for (local_id, &global_idx) in region_rel_indices.iter().enumerate() {
+        let t = &tables[global_idx];
+        let base_scan = plan_table_scan(t, table_local_conjuncts[local_id].clone(), true);
+        relations.push(JoinGraphRelation {
+            id: local_id,
+            global_idx,
+            qualifier: t.qualifier().to_string(),
+            table_info: t.clone(),
+            base_scan,
+        });
+    }
+
+    let mut predicates = Vec::with_capacity(multi_conjuncts.len());
+    for conj in multi_conjuncts {
+        let refs = expr_referenced_qualifiers(&conj);
+        let mut rel_ids = HashSet::new();
+        for qual in &refs {
+            if let Some(pos) = region_rel_indices
+                .iter()
+                .position(|&idx| tables[idx].qualifier() == qual)
+            {
+                rel_ids.insert(pos);
+            }
+        }
+
+        let is_equality = match &conj {
+            Expr::Binary {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            } => {
+                let l_refs = expr_referenced_qualifiers(left);
+                let r_refs = expr_referenced_qualifiers(right);
+                l_refs.len() == 1 && r_refs.len() == 1 && l_refs != r_refs
+            }
+            _ => false,
+        };
+
+        predicates.push(JoinGraphPredicate {
+            expr: conj,
+            referenced_qualifiers: refs,
+            referenced_rel_ids: rel_ids,
+            is_equality,
+        });
+    }
+
+    (
+        JoinGraph {
+            relations,
+            predicates,
+        },
+        table_local_conjuncts,
+        unhandled_conjuncts,
+    )
+}
+
+/// Optimizes a bound query where all joins are INNER JOINs into an optimal reordered plan.
+fn optimize_all_inner_joins(
     bound: &BoundSelect,
     tables: &[TableOptInfo],
     where_conjuncts: &[Expr],
@@ -839,174 +1137,48 @@ fn optimize_inner_joins_cost_based(
         all_conjuncts.extend(split_conjunction(&j.on));
     }
 
-    // Collect single-table local conjuncts for each table
-    let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); num_tables];
-    let mut join_multi_conjuncts: Vec<Expr> = Vec::new();
+    let region_indices: Vec<usize> = (0..num_tables).collect();
+    let (graph, _table_locals, unhandled) =
+        build_join_graph(&region_indices, tables, &all_conjuncts);
 
-    for conj in all_conjuncts {
-        let refs = expr_referenced_qualifiers(&conj);
-        if refs.len() == 1 {
-            let target_qual = refs.iter().next().unwrap();
-            if let Some(pos) = tables.iter().position(|t| t.qualifier() == target_qual) {
-                table_local_conjuncts[pos].push(conj);
-            } else {
-                join_multi_conjuncts.push(conj);
-            }
-        } else {
-            join_multi_conjuncts.push(conj);
+    let best_plan = if num_tables <= MAX_ENUMERATED_RELATIONS {
+        optimize_inner_join_region_dp(&graph)
+    } else {
+        optimize_inner_join_region_greedy(&graph)
+    };
+
+    let mut remaining_post = unhandled;
+    for (p_idx, pred) in graph.predicates.iter().enumerate() {
+        if !best_plan.used_predicates[p_idx] {
+            remaining_post.push(pred.expr.clone());
         }
     }
 
-    // Generate permutations of 0..num_tables
-    let mut indices: Vec<usize> = (0..num_tables).collect();
-    let mut permutations = Vec::new();
-    generate_permutations(&mut indices, 0, &mut permutations);
+    let post_join_filter = recombine_conjunction(remaining_post);
+    let mut cur_cost = best_plan.cost;
+    let mut cur_rows = best_plan.rows;
 
-    struct PermutationResult {
-        perm: Vec<usize>,
-        base_scan: PhysicalTableScan,
-        joins: Vec<PhysicalJoin>,
-        post_filter: Option<Expr>,
-        total_cost: f64,
-        output_rows: f64,
+    if let Some(pf) = &post_join_filter {
+        cur_cost += CostModel::filter_cost(cur_rows);
+        let sel = CardinalityEstimator::estimate_expr_selectivity(pf, None, &tables[0].schema);
+        cur_rows = (cur_rows * sel).max(if cur_rows > 0.0 { 1.0 } else { 0.0 });
     }
 
-    let mut best_result: Option<PermutationResult> = None;
-
-    for perm in permutations {
-        let base_idx = perm[0];
-        let base_scan = plan_table_scan(
-            &tables[base_idx],
-            table_local_conjuncts[base_idx].clone(),
-            true,
-        );
-
-        let mut available_qualifiers: HashSet<String> = HashSet::new();
-        available_qualifiers.insert(tables[base_idx].qualifier().to_string());
-
-        let mut used_multi_conjuncts = vec![false; join_multi_conjuncts.len()];
-        let mut physical_joins = Vec::new();
-
-        let mut cur_cost = base_scan.cost;
-        let mut cur_rows = base_scan.estimated_rows;
-
-        for &right_idx in perm.iter().skip(1) {
-            let right_qual = tables[right_idx].qualifier().to_string();
-            available_qualifiers.insert(right_qual.clone());
-
-            let mut step_on_conjuncts = Vec::new();
-            for (c_idx, conj) in join_multi_conjuncts.iter().enumerate() {
-                if !used_multi_conjuncts[c_idx] {
-                    let refs = expr_referenced_qualifiers(conj);
-                    if refs.is_subset(&available_qualifiers) && refs.contains(&right_qual) {
-                        step_on_conjuncts.push(conj.clone());
-                        used_multi_conjuncts[c_idx] = true;
-                    }
-                }
-            }
-
-            let on_expr = recombine_conjunction(step_on_conjuncts)
-                .unwrap_or(Expr::Literal(Value::Boolean(true)));
-
-            let right_scan = plan_table_scan(
-                &tables[right_idx],
-                table_local_conjuncts[right_idx].clone(),
-                true,
-            );
-
-            let join_cost = CostModel::nested_loop_join_cost(
-                cur_cost,
-                cur_rows,
-                right_scan.cost,
-                right_scan.estimated_rows,
-            );
-            let join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
-                cur_rows,
-                tables[base_idx].stats.as_ref(),
-                right_scan.estimated_rows,
-                tables[right_idx].stats.as_ref(),
-                &on_expr,
-                &tables[right_idx].schema,
-            );
-
-            cur_cost = join_cost;
-            cur_rows = join_rows;
-
-            physical_joins.push(PhysicalJoin {
-                join_type: JoinType::Inner,
-                right: right_scan,
-                on: on_expr,
-                estimated_rows: join_rows,
-                cost: join_cost,
-            });
-        }
-
-        let mut remaining_post = Vec::new();
-        for (c_idx, conj) in join_multi_conjuncts.iter().enumerate() {
-            if !used_multi_conjuncts[c_idx] {
-                remaining_post.push(conj.clone());
-            }
-        }
-        let post_filter = recombine_conjunction(remaining_post);
-        if let Some(pf) = &post_filter {
-            cur_cost += CostModel::filter_cost(cur_rows);
-            let sel = CardinalityEstimator::estimate_expr_selectivity(pf, None, &tables[0].schema);
-            cur_rows = (cur_rows * sel).max(if cur_rows > 0.0 { 1.0 } else { 0.0 });
-        }
-
-        if !bound.order_by.is_empty() {
-            cur_cost += CostModel::sort_cost(cur_rows);
-        }
-        if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
-            cur_cost += CostModel::aggregate_cost(cur_rows);
-        }
-        if !bound.window_exprs.is_empty() {
-            cur_cost += CostModel::window_cost(cur_rows);
-        }
-
-        let cand = PermutationResult {
-            perm: perm.clone(),
-            base_scan,
-            joins: physical_joins,
-            post_filter,
-            total_cost: cur_cost,
-            output_rows: cur_rows,
-        };
-
-        best_result = match best_result {
-            None => Some(cand),
-            Some(existing) => {
-                const EPSILON: f64 = 1e-9;
-                let cost_diff = cand.total_cost - existing.total_cost;
-                if cost_diff < -EPSILON {
-                    Some(cand)
-                } else if cost_diff.abs() <= EPSILON {
-                    // Tie-breaker: prefer identity permutation (0..N) or lexicographically earlier
-                    let cand_is_identity = cand.perm.iter().enumerate().all(|(i, &p)| i == p);
-                    let exist_is_identity = existing.perm.iter().enumerate().all(|(i, &p)| i == p);
-                    if cand_is_identity && !exist_is_identity {
-                        Some(cand)
-                    } else if !cand_is_identity && exist_is_identity {
-                        Some(existing)
-                    } else if cand.perm < existing.perm {
-                        Some(cand)
-                    } else {
-                        Some(existing)
-                    }
-                } else {
-                    Some(existing)
-                }
-            }
-        };
+    if !bound.order_by.is_empty() {
+        cur_cost += CostModel::sort_cost(cur_rows);
     }
-
-    let chosen = best_result.unwrap();
+    if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+        cur_cost += CostModel::aggregate_cost(cur_rows);
+    }
+    if !bound.window_exprs.is_empty() {
+        cur_cost += CostModel::window_cost(cur_rows);
+    }
 
     Ok(PhysicalPlan {
         ctes: bound.ctes.clone(),
-        base_table: chosen.base_scan,
-        joins: chosen.joins,
-        post_join_filter: chosen.post_filter,
+        base_table: best_plan.base_scan,
+        joins: best_plan.joins,
+        post_join_filter,
         group_by: bound.group_by.clone(),
         aggregates: bound.aggregates.clone(),
         having: bound.having.clone(),
@@ -1016,20 +1188,239 @@ fn optimize_inner_joins_cost_based(
         offset: bound.offset,
         limit: bound.limit,
         set_op: None,
-        total_cost: chosen.total_cost,
-        estimated_rows: chosen.output_rows,
+        total_cost: cur_cost,
+        estimated_rows: cur_rows,
     })
 }
 
-fn generate_permutations(indices: &mut [usize], start: usize, out: &mut Vec<Vec<usize>>) {
-    if start == indices.len() {
-        out.push(indices.to_vec());
-        return;
+/// Optimizes a bound query with OUTER JOIN barriers, preserving outer join boundaries.
+fn optimize_with_outer_barriers(
+    bound: &BoundSelect,
+    tables: &[TableOptInfo],
+    where_conjuncts: &[Expr],
+) -> Result<PhysicalPlan> {
+    let is_multi_table = !bound.joins.is_empty();
+    let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); tables.len()];
+    let mut post_join_conjuncts: Vec<Expr> = Vec::new();
+
+    // 1. Classify WHERE conjuncts per table with outer join pushdown safety
+    for conjunct in where_conjuncts {
+        let refs = expr_referenced_qualifiers(conjunct);
+        if refs.len() == 1 {
+            let target_qualifier = refs.iter().next().unwrap();
+            if let Some(tbl_idx) = tables
+                .iter()
+                .position(|t| t.qualifier() == target_qualifier)
+            {
+                if tbl_idx == 0 {
+                    let has_right_or_full = bound
+                        .joins
+                        .iter()
+                        .any(|j| j.join_type == JoinType::Right || j.join_type == JoinType::Full);
+                    if has_right_or_full {
+                        post_join_conjuncts.push(conjunct.clone());
+                    } else {
+                        table_local_conjuncts[0].push(conjunct.clone());
+                    }
+                } else {
+                    let this_join_type = bound.joins[tbl_idx - 1].join_type;
+                    let is_outer_right =
+                        this_join_type == JoinType::Left || this_join_type == JoinType::Full;
+                    let subsequent_outer = bound.joins[tbl_idx..]
+                        .iter()
+                        .any(|j| j.join_type == JoinType::Right || j.join_type == JoinType::Full);
+                    if is_outer_right || subsequent_outer {
+                        post_join_conjuncts.push(conjunct.clone());
+                    } else {
+                        table_local_conjuncts[tbl_idx].push(conjunct.clone());
+                    }
+                }
+            } else {
+                post_join_conjuncts.push(conjunct.clone());
+            }
+        } else {
+            post_join_conjuncts.push(conjunct.clone());
+        }
     }
-    for i in start..indices.len() {
-        indices.swap(start, i);
-        generate_permutations(indices, start + 1, out);
-        indices.swap(start, i);
+
+    // 2. Process JOIN ON clauses
+    let mut optimized_joins = Vec::new();
+    for (join_idx, bound_join) in bound.joins.iter().enumerate() {
+        let right_table_idx = join_idx + 1;
+        let right_qualifier = tables[right_table_idx].qualifier();
+        let on_conjuncts = split_conjunction(&bound_join.on);
+        let mut remaining_on = Vec::new();
+
+        for on_conj in on_conjuncts {
+            let refs = expr_referenced_qualifiers(&on_conj);
+            if bound_join.join_type == JoinType::Inner {
+                if refs.len() == 1 && refs.contains(right_qualifier) {
+                    table_local_conjuncts[right_table_idx].push(on_conj);
+                } else if refs.len() == 1 && refs.contains(tables[0].qualifier()) {
+                    table_local_conjuncts[0].push(on_conj);
+                } else {
+                    remaining_on.push(on_conj);
+                }
+            } else if bound_join.join_type == JoinType::Left {
+                if refs.len() == 1 && refs.contains(right_qualifier) {
+                    table_local_conjuncts[right_table_idx].push(on_conj);
+                } else {
+                    remaining_on.push(on_conj);
+                }
+            } else if bound_join.join_type == JoinType::Right {
+                if refs.len() == 1 && refs.contains(tables[0].qualifier()) {
+                    table_local_conjuncts[0].push(on_conj);
+                } else {
+                    remaining_on.push(on_conj);
+                }
+            } else {
+                // Full join: cannot push down on predicates to either side
+                remaining_on.push(on_conj);
+            }
+        }
+
+        let on_expr =
+            recombine_conjunction(remaining_on).unwrap_or(Expr::Literal(Value::Boolean(true)));
+        optimized_joins.push((bound_join.join_type, on_expr));
+    }
+
+    // 3. Plan Base Table Scan
+    let base_table_scan =
+        plan_table_scan(&tables[0], table_local_conjuncts[0].clone(), is_multi_table);
+
+    let mut physical_joins = Vec::new();
+    let mut cur_cost = base_table_scan.cost;
+    let mut cur_rows = base_table_scan.estimated_rows;
+
+    for (join_idx, (join_type, on_expr)) in optimized_joins.into_iter().enumerate() {
+        let right_table_idx = join_idx + 1;
+        let right_table_scan = plan_table_scan(
+            &tables[right_table_idx],
+            table_local_conjuncts[right_table_idx].clone(),
+            is_multi_table,
+        );
+
+        let join_cost = CostModel::nested_loop_join_cost(
+            cur_cost,
+            cur_rows,
+            right_table_scan.cost,
+            right_table_scan.estimated_rows,
+        );
+        let join_rows = CardinalityEstimator::estimate_join_cardinality(
+            join_type,
+            cur_rows,
+            tables[0].stats.as_ref(),
+            right_table_scan.estimated_rows,
+            tables[right_table_idx].stats.as_ref(),
+            &on_expr,
+            &tables[right_table_idx].schema,
+        );
+
+        cur_cost = join_cost;
+        cur_rows = join_rows;
+
+        physical_joins.push(PhysicalJoin {
+            join_type,
+            right: right_table_scan,
+            on: on_expr,
+            estimated_rows: join_rows,
+            cost: join_cost,
+        });
+    }
+
+    let post_join_filter = recombine_conjunction(post_join_conjuncts);
+    if let Some(post_f) = &post_join_filter {
+        cur_cost += CostModel::filter_cost(cur_rows);
+        let sel = CardinalityEstimator::estimate_expr_selectivity(post_f, None, &tables[0].schema);
+        cur_rows = (cur_rows * sel).max(if cur_rows > 0.0 { 1.0 } else { 0.0 });
+    }
+
+    if !bound.order_by.is_empty() {
+        cur_cost += CostModel::sort_cost(cur_rows);
+    }
+    if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+        cur_cost += CostModel::aggregate_cost(cur_rows);
+    }
+    if !bound.window_exprs.is_empty() {
+        cur_cost += CostModel::window_cost(cur_rows);
+    }
+
+    Ok(PhysicalPlan {
+        ctes: bound.ctes.clone(),
+        base_table: base_table_scan,
+        joins: physical_joins,
+        post_join_filter,
+        group_by: bound.group_by.clone(),
+        aggregates: bound.aggregates.clone(),
+        having: bound.having.clone(),
+        window_exprs: bound.window_exprs.clone(),
+        projections: bound.projections.clone(),
+        order_by: bound.order_by.clone(),
+        offset: bound.offset,
+        limit: bound.limit,
+        set_op: None,
+        total_cost: cur_cost,
+        estimated_rows: cur_rows,
+    })
+}
+
+/// Cost-based and statistics-aware query optimizer and physical access-path planner.
+pub struct Optimizer;
+
+impl Optimizer {
+    /// Optimizes a bound SQL query (`BoundSelect`) into a deterministic cost-based `PhysicalPlan`.
+    pub fn optimize(bound: &BoundSelect, tables: &[TableOptInfo]) -> Result<PhysicalPlan> {
+        let is_multi_table = !bound.joins.is_empty();
+
+        let where_conjuncts = match &bound.filter {
+            Some(f) => split_conjunction(f),
+            None => Vec::new(),
+        };
+
+        if !is_multi_table {
+            let base_table_scan = plan_table_scan(&tables[0], where_conjuncts, false);
+            let mut cur_cost = base_table_scan.cost;
+            let cur_rows = base_table_scan.estimated_rows;
+
+            if !bound.order_by.is_empty() {
+                cur_cost += CostModel::sort_cost(cur_rows);
+            }
+            if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+                cur_cost += CostModel::aggregate_cost(cur_rows);
+            }
+            if !bound.window_exprs.is_empty() {
+                cur_cost += CostModel::window_cost(cur_rows);
+            }
+
+            return Ok(PhysicalPlan {
+                ctes: bound.ctes.clone(),
+                base_table: base_table_scan,
+                joins: Vec::new(),
+                post_join_filter: None,
+                group_by: bound.group_by.clone(),
+                aggregates: bound.aggregates.clone(),
+                having: bound.having.clone(),
+                window_exprs: bound.window_exprs.clone(),
+                projections: bound.projections.clone(),
+                order_by: bound.order_by.clone(),
+                offset: bound.offset,
+                limit: bound.limit,
+                set_op: None,
+                total_cost: cur_cost,
+                estimated_rows: cur_rows,
+            });
+        }
+
+        // Multi-table query: check if all joins are INNER JOINs eligible for full reordering
+        let has_any_stats = tables.iter().any(|t| t.stats.is_some());
+        let all_inner = bound.joins.iter().all(|j| j.join_type == JoinType::Inner);
+
+        if all_inner && tables.len() >= 2 && has_any_stats {
+            return optimize_all_inner_joins(bound, tables, &where_conjuncts);
+        }
+
+        // Query with OUTER JOIN barriers or unanalyzed default sequential ordering
+        optimize_with_outer_barriers(bound, tables, &where_conjuncts)
     }
 }
 
