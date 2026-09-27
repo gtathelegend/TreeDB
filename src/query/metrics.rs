@@ -19,6 +19,10 @@ pub enum OperatorKind {
     LimitOffset,
     /// Nested-loop join.
     NestedLoopJoin { join_type: String },
+    /// In-memory hash join.
+    HashJoin { join_type: String },
+    /// External spilled hash join.
+    ExternalHashJoin { join_type: String },
     /// Group-by and aggregate computation.
     Aggregate,
     /// Window function evaluation.
@@ -45,6 +49,8 @@ impl fmt::Display for OperatorKind {
             Self::Sort => write!(f, "Sort"),
             Self::LimitOffset => write!(f, "LimitOffset"),
             Self::NestedLoopJoin { join_type } => write!(f, "NestedLoopJoin ({join_type})"),
+            Self::HashJoin { join_type } => write!(f, "HashJoin ({join_type})"),
+            Self::ExternalHashJoin { join_type } => write!(f, "ExternalHashJoin ({join_type})"),
             Self::Aggregate => write!(f, "Aggregate"),
             Self::Window => write!(f, "Window"),
             Self::Subquery { kind } => write!(f, "Subquery ({kind})"),
@@ -72,21 +78,27 @@ pub struct OperatorCounters {
     pub rows_passed: usize,
     /// Total rows rejected by filter predicate evaluation.
     pub rows_rejected: usize,
+    /// Total rows consumed from the left relation during join.
+    pub rows_left: usize,
+    /// Total rows consumed from the right relation during join.
+    pub rows_right: usize,
     /// Candidate cross-product pairs examined during join evaluation.
     pub candidate_pairs: usize,
     /// Join pairs that satisfied the join condition.
     pub matched_rows: usize,
     /// Distinct group keys produced during aggregation.
     pub group_count: usize,
-    /// Number of distinct spill partitions used during external aggregation.
+    /// Number of distinct spill partitions used during external aggregation or hash join.
     pub spill_partitions: usize,
-    /// Number of temporary runs created during external sort or aggregation spilling.
+    /// Number of temporary runs created during external sort, aggregation, or join spilling.
     pub runs_created: usize,
-    /// Total bytes written/spilled to temporary files during external sort or aggregation.
+    /// Total bytes written/spilled to temporary files during external execution.
     pub bytes_spilled: usize,
     /// Number of merge passes executed during external sorting or aggregation.
     pub merge_passes: usize,
-    /// Peak in-memory bytes used during sort or aggregation operations.
+    /// Number of partition passes executed during external hash join.
+    pub partition_passes: usize,
+    /// Peak in-memory bytes used during sort, aggregation, or join operations.
     pub peak_memory_bytes: usize,
 }
 
@@ -510,10 +522,44 @@ pub fn format_plan_with_metrics(
                 proper_on = join.on
             ));
             write_indent(&mut out, indent + 1);
-            out.push_str(&format!(
-                "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
-                join.cost, join.estimated_rows, metrics.total_rows
-            ));
+            if let Some(root) = &metrics.root_operator {
+                if let Some(jm) = find_operator_metrics(root, &|k| {
+                    matches!(
+                        k,
+                        OperatorKind::NestedLoopJoin { .. }
+                            | OperatorKind::HashJoin { .. }
+                            | OperatorKind::ExternalHashJoin { .. }
+                    )
+                }) {
+                    if jm.counters.runs_created > 0 || jm.counters.bytes_spilled > 0 {
+                        out.push_str(&format!(
+                            "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, runs_created: {}, bytes_spilled: {}, partition_passes: {}, peak_memory_bytes: {}\n",
+                            join.cost,
+                            join.estimated_rows,
+                            metrics.total_rows,
+                            jm.counters.runs_created,
+                            jm.counters.bytes_spilled,
+                            jm.counters.partition_passes,
+                            jm.counters.peak_memory_bytes
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
+                            join.cost, join.estimated_rows, metrics.total_rows
+                        ));
+                    }
+                } else {
+                    out.push_str(&format!(
+                        "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
+                        join.cost, join.estimated_rows, metrics.total_rows
+                    ));
+                }
+            } else {
+                out.push_str(&format!(
+                    "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
+                    join.cost, join.estimated_rows, metrics.total_rows
+                ));
+            }
             indent += 1;
 
             if idx == 0 {

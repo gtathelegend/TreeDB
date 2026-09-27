@@ -510,4 +510,22 @@ pub enum Error {
     /// Corrupted or truncated temporary aggregation partition/run file.
     #[error("External aggregation run corruption detected: {0}")]
     ExternalAggregateRunCorrupted(String),
+
+    /// External hash join temporary file I/O or directory error.
+    #[error("External join I/O error: {0}")]
+    ExternalJoinIo(String),
+
+    /// External hash join temporary disk quota exceeded.
+    #[error(
+        "External join disk quota exceeded: spilled {bytes_spilled} bytes, limit is {limit} bytes"
+    )]
+    ExternalJoinQuotaExceeded { bytes_spilled: usize, limit: usize },
+
+    /// External hash join maximum partition passes exceeded.
+    #[error("External join max passes exceeded: reached {passes}, limit is {limit}")]
+    ExternalJoinMaxPassesExceeded { passes: usize, limit: usize },
+
+    /// Corrupted or truncated temporary join partition file.
+    #[error("External join partition corruption detected: {0}")]
+    ExternalJoinRunCorrupted(String),
 }

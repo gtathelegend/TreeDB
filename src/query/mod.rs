@@ -3,6 +3,7 @@ pub mod cardinality;
 pub mod cost;
 pub mod expr;
 pub mod external_aggregate;
+pub mod external_hash_join;
 pub mod external_sort;
 pub mod metrics;
 pub mod operator;
@@ -28,6 +29,11 @@ pub use external_aggregate::{
     estimate_group_entry_memory, hash_group_key, AggregateConfig, AggregateExecutionMetrics,
     ExternalAggregator, TempAggregateFile, DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES, TEMP_AGG_MAGIC,
     TEMP_AGG_VERSION,
+};
+pub use external_hash_join::{
+    analyze_equi_join, hash_join_key, EquiJoinPlan, ExternalHashJoiner, JoinConfig,
+    JoinExecutionMetrics, JoinKey, TempJoinFile, DEFAULT_JOIN_MEMORY_BUDGET_BYTES, TEMP_JOIN_MAGIC,
+    TEMP_JOIN_VERSION,
 };
 pub use external_sort::{
     estimate_row_memory, write_sorted_run, ExternalSorter, RunReader, SortConfig,

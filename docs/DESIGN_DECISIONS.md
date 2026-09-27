@@ -878,6 +878,37 @@ This document records key architectural and design choices, their rationale, and
   * **Memory Boundedness:** Enables queries with massive group cardinality or large input streams to complete reliably within bounded memory without out-of-memory crashes.
   * **Exclusion from WAL/Storage:** Intermediate aggregation states are statement-local execution artifacts. Excluding them from database pages and WAL prevents lock contention, avoids freelist churn, and adds zero overhead to crash recovery.
 
+## Decision 50: External Hash Join, Spill-to-Disk Partitioning, and Bounded-Memory Relational Joins
+
+* **Decision:** Implement an external hash join subsystem with disk spilling, recursive re-partitioning, and bounded-memory execution for large equi-join queries while preserving exact SQL semantics:
+  1. **Dual-Path Join Architecture (In-Memory Fast Path & Partitioned Spill Path):**
+     * If the estimated memory required to build the right-side hash table is within the configured budget (`JoinConfig.memory_budget_bytes`, default 64 KB), the join executes entirely in memory with zero file I/O overhead.
+     * When memory requirements exceed the budget, both the left and right relations are partitioned into up to `max_temp_files` temporary runs (`TempJoinFile`) using a deterministic salted hash function `hash_join_key(key, pass)`.
+  2. **Equi-Join Analysis & Residual Predicate Evaluation:**
+     * `analyze_equi_join` deconstructs the join `ON` predicate into eligible equality conjuncts (`a.key = b.key`) and residual conjuncts (`a.val > b.val`).
+     * The equality keys drive partition hashing and hash table lookups, while residual predicates are evaluated against candidate joined tuples before emission.
+     * Joins without equality predicates automatically fall back to the existing nested-loop join path.
+  3. **SQL Join Semantics & 3VL NULL Isolation:**
+     * Under SQL three-valued logic, `NULL = NULL` is UNKNOWN and never constitutes a match in equi-joins.
+     * Rows containing `NULL` in any component of their join key are isolated:
+       * For `INNER JOIN`: NULL key rows on either side are discarded.
+       * For `LEFT JOIN`: Left rows with NULL keys are emitted with `NULL` for all right-side columns; right rows with NULL keys are discarded.
+  4. **Composite Join Key Support & IEEE Float Canonicalization:**
+     * Supports composite join keys `(k1, k2, ...)` across all supported TreeDB types (`Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`).
+     * `CanonicalValue` maps float `-0.0` to `+0.0` and all IEEE NaN bit patterns to a canonical NaN representation.
+  5. **Recursive Multi-Pass Partitioning & Duplicate-Key Skew Guard:**
+     * Matching partition pairs $(L_i, R_i)$ are joined independently. If a partition pair still exceeds the memory budget, it is recursively partitioned at `pass + 1` with a new hash salt.
+     * If all keys in a build partition are identical (heavy duplicate key skew), further hashing cannot split the partition; the engine accommodates the partition in memory atomically to complete the join without infinite recursion.
+  6. **External Runtime Artifacts & RAII Cleanup (`TEMP_JOIN_MAGIC = b"TJRN"`):**
+     * Temporary join partitions (`TempJoinFile`) are stored outside `.treedb` database pages and WAL.
+     * RAII `Drop` implementation ensures immediate file deletion on normal return, errors, transaction aborts, or panics.
+  7. **Resource Limits & Structured Errors:**
+     * Configurable limits: `max_temp_bytes` (`Error::ExternalJoinQuotaExceeded`) and `max_partition_passes` (`Error::ExternalJoinMaxPassesExceeded`).
+  8. **Execution Telemetry & EXPLAIN ANALYZE:**
+     * `OperatorCounters` and `JoinExecutionMetrics` track `rows_left`, `rows_right`, `rows_output`, `candidate_pairs`, `matched_rows`, `spill_partitions`, `runs_created`, `bytes_spilled`, `partition_passes`, and `peak_memory_bytes`.
+* **Rationale:**
+  * **Memory Isolation & Crash Safety:** Ephemeral join partitions are query runtime artifacts that do not modify persistent database pages or write WAL log records, preventing buffer pool pollution and eliminating overhead during crash recovery.
+
 
 
 

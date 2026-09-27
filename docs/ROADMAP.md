@@ -586,8 +586,24 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 35: Advanced Query Processing & Optimizer Enhancements (Future)
-* [ ] Hash join and merge join physical execution operators
+## Phase 35: External Hash Join & Spill-to-Disk JOIN (Completed)
+* [x] Dedicated external hash join subsystem (`ExternalHashJoiner`, `JoinConfig`, `TempJoinFile`, `JoinExecutionMetrics`)
+* [x] Dual-path execution: in-memory fast path for sub-budget relations, partitioned spill-to-disk for super-budget relations
+* [x] Deterministic partition file binary format (`TEMP_JOIN_MAGIC = b"TJRN"`, 16-byte header, little-endian encoded `Row` records)
+* [x] Equi-join condition analysis & deconstruction (`analyze_equi_join`, `EquiJoinPlan`) with residual predicate evaluation
+* [x] Complete SQL join semantics preservation: `INNER JOIN`, `LEFT JOIN`, composite keys, duplicate keys ($N \times M$), and NULL key isolation
+* [x] SQL 3-Valued Logic: `NULL = NULL` is UNKNOWN and never matches; left NULL keys are emitted with right NULL-padding in LEFT JOIN
+* [x] Multi-pass recursive sub-partitioning with salted hash function (`hash_join_key(key, pass)`) and duplicate key skew accommodation
+* [x] RAII-managed temporary partition file lifecycle with guaranteed automatic cleanup on `Drop`
+* [x] Complete isolation from WAL, transaction commit/rollback, and `.treedb` persistent database pages
+* [x] Resource safeguards: `max_temp_bytes` (`Error::ExternalJoinQuotaExceeded`) and `max_partition_passes` (`Error::ExternalJoinMaxPassesExceeded`)
+* [x] Execution metrics & `EXPLAIN ANALYZE` integration reporting `rows_left`, `rows_right`, `candidate_pairs`, `matched_rows`, `spill_partitions`, `runs_created`, `bytes_spilled`, `partition_passes`, `peak_memory_bytes`
+* [x] 12 dedicated integration tests in `tests/external_hash_join.rs` including randomized differential reference oracle (616 total passing test suite)
+
+---
+
+## Phase 36: Advanced Query Processing & Optimizer Enhancements (Future)
+* [ ] Merge join physical execution operator
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
 * [ ] Expression indexes & partial indexes

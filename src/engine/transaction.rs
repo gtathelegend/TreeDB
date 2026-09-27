@@ -3279,28 +3279,75 @@ impl<'db> Transaction<'db> {
             let right_count = right_rows.len();
             let candidate_pairs = left_count * right_count;
 
-            let (next_schema, next_rows) = self.join_rows_with_outer_internal(
-                current_rows,
-                &current_schema,
-                &right_rows,
-                &right_schema,
-                join.join_type,
-                &join.on,
-                outer_contexts,
-                cte_store,
-            )?;
+            let (next_schema, next_rows, join_exec_metrics) = if outer_contexts.is_empty() {
+                crate::query::operator::JoinOperator::apply_with_config(
+                    current_rows,
+                    &current_schema,
+                    &right_rows,
+                    &right_schema,
+                    join.join_type,
+                    &join.on,
+                    &self.db.join_config,
+                )?
+            } else {
+                let (ns, nr) = self.join_rows_with_outer_internal(
+                    current_rows,
+                    &current_schema,
+                    &right_rows,
+                    &right_schema,
+                    join.join_type,
+                    &join.on,
+                    outer_contexts,
+                    cte_store,
+                )?;
+                let metrics = crate::query::external_hash_join::JoinExecutionMetrics {
+                    rows_left: left_count,
+                    rows_right: right_count,
+                    rows_output: nr.len(),
+                    candidate_pairs,
+                    matched_rows: nr.len(),
+                    ..Default::default()
+                };
+                (ns, nr, metrics)
+            };
+
+            let op_kind =
+                if join_exec_metrics.runs_created > 0 || join_exec_metrics.bytes_spilled > 0 {
+                    crate::query::OperatorKind::ExternalHashJoin {
+                        join_type: format!("{:?}", join.join_type),
+                    }
+                } else if crate::query::external_hash_join::analyze_equi_join(
+                    &join.on,
+                    &current_schema,
+                    &right_schema,
+                )
+                .is_some()
+                {
+                    crate::query::OperatorKind::HashJoin {
+                        join_type: format!("{:?}", join.join_type),
+                    }
+                } else {
+                    crate::query::OperatorKind::NestedLoopJoin {
+                        join_type: format!("{:?}", join.join_type),
+                    }
+                };
 
             let mut join_metric = crate::query::OperatorMetrics::new(
-                crate::query::OperatorKind::NestedLoopJoin {
-                    join_type: format!("{:?}", join.join_type),
-                },
+                op_kind,
                 Some(join.estimated_rows),
                 Some(join.cost),
             );
             join_metric.input_rows = left_count + right_count;
             join_metric.actual_rows = next_rows.len();
-            join_metric.counters.candidate_pairs = candidate_pairs;
-            join_metric.counters.matched_rows = next_rows.len();
+            join_metric.counters.rows_left = left_count;
+            join_metric.counters.rows_right = right_count;
+            join_metric.counters.candidate_pairs = join_exec_metrics.candidate_pairs;
+            join_metric.counters.matched_rows = join_exec_metrics.matched_rows;
+            join_metric.counters.spill_partitions = join_exec_metrics.spill_partitions;
+            join_metric.counters.runs_created = join_exec_metrics.runs_created;
+            join_metric.counters.bytes_spilled = join_exec_metrics.bytes_spilled;
+            join_metric.counters.partition_passes = join_exec_metrics.partition_passes;
+            join_metric.counters.peak_memory_bytes = join_exec_metrics.peak_memory_bytes;
             join_metric.add_child(current_op);
             join_metric.add_child(right_op);
 
@@ -4002,6 +4049,18 @@ impl<'db> Transaction<'db> {
         on: &crate::query::expr::Expr,
         outer_contexts: &[(&Row, &Schema)],
     ) -> Result<(Schema, Vec<Row>)> {
+        if outer_contexts.is_empty() {
+            let (s, r, _) = crate::query::operator::JoinOperator::apply_with_config(
+                left_rows,
+                left_schema,
+                right_rows,
+                right_schema,
+                join_type,
+                on,
+                &self.db.join_config,
+            )?;
+            return Ok((s, r));
+        }
         let mut cte_store = std::collections::HashMap::new();
         self.join_rows_with_outer_internal(
             left_rows,

@@ -200,7 +200,8 @@ impl FilterOperator {
 pub struct JoinOperator;
 
 impl JoinOperator {
-    /// Executes a nested-loop join between `left_rows` and `right_rows` using `join_type` and `on_predicate`.
+    /// Executes a join between `left_rows` and `right_rows` using `join_type` and `on_predicate`
+    /// with default join configuration.
     ///
     /// Returns the combined intermediate `Schema` and the resulting joined `Vec<Row>`.
     pub fn apply(
@@ -211,53 +212,116 @@ impl JoinOperator {
         join_type: JoinType,
         on_predicate: &Expr,
     ) -> Result<(Schema, Vec<Row>)> {
-        let mut combined_columns =
-            Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
+        Self::apply_with_config(
+            left_rows,
+            left_schema,
+            right_rows,
+            right_schema,
+            join_type,
+            on_predicate,
+            &crate::query::external_hash_join::JoinConfig::default(),
+        )
+        .map(|(s, r, _)| (s, r))
+    }
 
-        for col in &left_schema.columns {
-            combined_columns.push(col.clone());
-        }
+    /// Executes a join between `left_rows` and `right_rows` using `join_type`, `on_predicate`,
+    /// and the provided `JoinConfig`.
+    ///
+    /// If the `on_predicate` contains eligible equi-join conjuncts, executes hash join
+    /// (in-memory or spilled depending on data volume and memory budget);
+    /// otherwise falls back to nested-loop join.
+    pub fn apply_with_config(
+        left_rows: Vec<Row>,
+        left_schema: &Schema,
+        right_rows: &[Row],
+        right_schema: &Schema,
+        join_type: JoinType,
+        on_predicate: &Expr,
+        config: &crate::query::external_hash_join::JoinConfig,
+    ) -> Result<(
+        Schema,
+        Vec<Row>,
+        crate::query::external_hash_join::JoinExecutionMetrics,
+    )> {
+        if let Some(equi_plan) = crate::query::external_hash_join::analyze_equi_join(
+            on_predicate,
+            left_schema,
+            right_schema,
+        ) {
+            let joiner = crate::query::external_hash_join::ExternalHashJoiner::new(
+                left_schema,
+                right_schema,
+                join_type,
+                equi_plan,
+                config.clone(),
+            );
+            joiner.execute(left_rows, right_rows.to_vec())
+        } else {
+            let mut combined_columns =
+                Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
 
-        for col in &right_schema.columns {
-            let mut col_copy = col.clone();
-            if join_type == JoinType::Left {
-                col_copy.nullable = true;
+            for col in &left_schema.columns {
+                combined_columns.push(col.clone());
             }
-            combined_columns.push(col_copy);
-        }
 
-        let joined_schema = Schema::new_projected(combined_columns);
-        let mut out_rows = Vec::new();
+            for col in &right_schema.columns {
+                let mut col_copy = col.clone();
+                if join_type == JoinType::Left {
+                    col_copy.nullable = true;
+                }
+                combined_columns.push(col_copy);
+            }
 
-        for left_row in left_rows {
-            let mut matched = false;
+            let joined_schema = Schema::new_projected(combined_columns);
+            let mut out_rows = Vec::new();
+            let mut candidate_pairs = 0;
+            let mut matched_rows = 0;
 
-            for right_row in right_rows {
-                let mut combined_values =
-                    Vec::with_capacity(left_row.values.len() + right_row.values.len());
-                combined_values.extend_from_slice(&left_row.values);
-                combined_values.extend_from_slice(&right_row.values);
-                let joined_row = Row::new(combined_values);
+            for left_row in &left_rows {
+                let mut matched = false;
 
-                let on_val = on_predicate.evaluate(&joined_row, &joined_schema)?;
-                if on_val == Value::Boolean(true) {
-                    matched = true;
-                    out_rows.push(joined_row);
+                for right_row in right_rows {
+                    candidate_pairs += 1;
+                    let mut combined_values =
+                        Vec::with_capacity(left_row.values.len() + right_row.values.len());
+                    combined_values.extend_from_slice(&left_row.values);
+                    combined_values.extend_from_slice(&right_row.values);
+                    let joined_row = Row::new(combined_values);
+
+                    let on_val = on_predicate.evaluate(&joined_row, &joined_schema)?;
+                    if on_val == Value::Boolean(true) {
+                        matched = true;
+                        matched_rows += 1;
+                        out_rows.push(joined_row);
+                    }
+                }
+
+                if join_type == JoinType::Left && !matched {
+                    let mut combined_values =
+                        Vec::with_capacity(left_row.values.len() + right_schema.columns.len());
+                    combined_values.extend_from_slice(&left_row.values);
+                    for _ in 0..right_schema.columns.len() {
+                        combined_values.push(Value::Null);
+                    }
+                    out_rows.push(Row::new(combined_values));
                 }
             }
 
-            if join_type == JoinType::Left && !matched {
-                let mut combined_values =
-                    Vec::with_capacity(left_row.values.len() + right_schema.columns.len());
-                combined_values.extend_from_slice(&left_row.values);
-                for _ in 0..right_schema.columns.len() {
-                    combined_values.push(Value::Null);
-                }
-                out_rows.push(Row::new(combined_values));
-            }
-        }
+            let metrics = crate::query::external_hash_join::JoinExecutionMetrics {
+                rows_left: left_rows.len(),
+                rows_right: right_rows.len(),
+                rows_output: out_rows.len(),
+                spill_partitions: 0,
+                runs_created: 0,
+                bytes_spilled: 0,
+                partition_passes: 0,
+                peak_memory_bytes: 0,
+                candidate_pairs,
+                matched_rows,
+            };
 
-        Ok((joined_schema, out_rows))
+            Ok((joined_schema, out_rows, metrics))
+        }
     }
 }
 

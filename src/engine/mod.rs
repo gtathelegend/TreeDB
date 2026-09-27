@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
 use crate::query::external_aggregate::AggregateConfig;
+use crate::query::external_hash_join::JoinConfig;
 use crate::query::external_sort::SortConfig;
 use crate::query::plan_cache::{PlanCache, PlanCacheStats};
 use crate::query::stats::{StatsRegistry, TableStatistics};
@@ -42,6 +43,7 @@ pub struct TreeDb {
     pub(crate) plan_cache: PlanCache,
     pub(crate) sort_config: SortConfig,
     pub(crate) aggregate_config: AggregateConfig,
+    pub(crate) join_config: JoinConfig,
 }
 
 impl TreeDb {
@@ -77,6 +79,7 @@ impl TreeDb {
             plan_cache: PlanCache::new(),
             sort_config: SortConfig::default(),
             aggregate_config: AggregateConfig::default(),
+            join_config: JoinConfig::default(),
         })
     }
 
@@ -104,6 +107,7 @@ impl TreeDb {
             plan_cache: PlanCache::new(),
             sort_config: SortConfig::default(),
             aggregate_config: AggregateConfig::default(),
+            join_config: JoinConfig::default(),
         })
     }
 
@@ -125,6 +129,7 @@ impl TreeDb {
             plan_cache: PlanCache::new(),
             sort_config: SortConfig::default(),
             aggregate_config: AggregateConfig::default(),
+            join_config: JoinConfig::default(),
         }
     }
 
@@ -747,5 +752,20 @@ impl TreeDb {
     /// Sets the active external aggregation configuration.
     pub fn set_aggregate_config(&mut self, config: AggregateConfig) {
         self.aggregate_config = config;
+    }
+
+    /// Returns a reference to the active external hash join configuration.
+    pub fn join_config(&self) -> &JoinConfig {
+        &self.join_config
+    }
+
+    /// Returns a mutable reference to the active external hash join configuration.
+    pub fn join_config_mut(&mut self) -> &mut JoinConfig {
+        &mut self.join_config
+    }
+
+    /// Sets the active external hash join configuration.
+    pub fn set_join_config(&mut self, config: JoinConfig) {
+        self.join_config = config;
     }
 }
