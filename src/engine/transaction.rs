@@ -1332,11 +1332,15 @@ impl<'db> Transaction<'db> {
         } else {
             let mut cols = Vec::new();
             let q = plan.base_table.qualifier();
+            let base_is_nullable = plan.joins.iter().any(|j| {
+                j.join_type == crate::sql::ast::JoinType::Right
+                    || j.join_type == crate::sql::ast::JoinType::Full
+            });
             for col in &base_schema.columns {
                 cols.push(crate::engine::types::Column::new(
                     format!("{q}.{}", col.name),
                     col.data_type,
-                    col.nullable,
+                    col.nullable || base_is_nullable,
                 ));
             }
             for join in &plan.joins {
@@ -1345,7 +1349,9 @@ impl<'db> Transaction<'db> {
                 let rq = join.right.qualifier();
                 for col in &right_schema.columns {
                     let mut right_col = col.clone();
-                    if join.join_type == crate::sql::ast::JoinType::Left {
+                    if join.join_type == crate::sql::ast::JoinType::Left
+                        || join.join_type == crate::sql::ast::JoinType::Full
+                    {
                         right_col.nullable = true;
                     }
                     cols.push(crate::engine::types::Column::new(
@@ -4086,22 +4092,36 @@ impl<'db> Transaction<'db> {
         outer_contexts: &[(&Row, &Schema)],
         cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
     ) -> Result<(Schema, Vec<Row>)> {
-        let mut combined_columns = left_schema.columns.clone();
+        let mut combined_columns =
+            Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
+        for col in &left_schema.columns {
+            let mut left_col = col.clone();
+            if join_type == crate::sql::ast::JoinType::Right
+                || join_type == crate::sql::ast::JoinType::Full
+            {
+                left_col.nullable = true;
+            }
+            combined_columns.push(left_col);
+        }
         for col in &right_schema.columns {
             let mut right_col = col.clone();
-            if join_type == crate::sql::ast::JoinType::Left {
+            if join_type == crate::sql::ast::JoinType::Left
+                || join_type == crate::sql::ast::JoinType::Full
+            {
                 right_col.nullable = true;
             }
             combined_columns.push(right_col);
         }
         let combined_schema = Schema::new_projected(combined_columns);
 
+        let left_null_values = vec![Value::Null; left_schema.columns.len()];
         let right_null_values = vec![Value::Null; right_schema.columns.len()];
         let mut result_rows = Vec::new();
+        let mut right_matched = vec![false; right_rows.len()];
 
         for l_row in left_rows {
-            let mut matched = false;
-            for r_row in right_rows {
+            let mut left_matched = false;
+            for (r_idx, r_row) in right_rows.iter().enumerate() {
                 let mut combined_vals = Vec::with_capacity(l_row.values.len() + r_row.values.len());
                 combined_vals.extend_from_slice(&l_row.values);
                 combined_vals.extend_from_slice(&r_row.values);
@@ -4115,11 +4135,15 @@ impl<'db> Transaction<'db> {
                     cte_store,
                 )?;
                 if on_val == Value::Boolean(true) {
-                    matched = true;
+                    left_matched = true;
+                    right_matched[r_idx] = true;
                     result_rows.push(candidate_row);
                 }
             }
-            if !matched && join_type == crate::sql::ast::JoinType::Left {
+            if !left_matched
+                && (join_type == crate::sql::ast::JoinType::Left
+                    || join_type == crate::sql::ast::JoinType::Full)
+            {
                 let mut combined_vals =
                     Vec::with_capacity(l_row.values.len() + right_null_values.len());
                 combined_vals.extend_from_slice(&l_row.values);
@@ -4127,6 +4151,21 @@ impl<'db> Transaction<'db> {
                 result_rows.push(Row::new(combined_vals));
             }
         }
+
+        if join_type == crate::sql::ast::JoinType::Right
+            || join_type == crate::sql::ast::JoinType::Full
+        {
+            for (r_idx, r_row) in right_rows.iter().enumerate() {
+                if !right_matched[r_idx] {
+                    let mut combined_vals =
+                        Vec::with_capacity(left_null_values.len() + r_row.values.len());
+                    combined_vals.extend_from_slice(&left_null_values);
+                    combined_vals.extend_from_slice(&r_row.values);
+                    result_rows.push(Row::new(combined_vals));
+                }
+            }
+        }
+
         Ok((combined_schema, result_rows))
     }
 

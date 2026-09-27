@@ -404,6 +404,10 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Equi-Join Analysis & Residual Predicates:** Deconstructs join conditions via `analyze_equi_join` into equality keys for hashing and residual predicates evaluated on candidate matched rows. Non-equi joins gracefully use the nested-loop path.
   * **SQL Semantics & 3VL NULL Isolation:** Preserves exact SQL three-valued logic where `NULL = NULL` is UNKNOWN and never matches. Supports composite keys, duplicate keys ($N \times M$), LEFT JOIN NULL-padding, and recursive sub-partitioning with duplicate key skew protection.
   * **Temporary Runtime Lifecycle:** Join partitions are external runtime artifacts outside `.treedb` pages, freelist, and WAL, automatically cleaned up on `Drop` via RAII wrappers.
+* **RIGHT and FULL OUTER JOINs & Generalized Match Tracking (`JoinType::{Right, Full}`):**
+  * **Generalized Match Bitset Tracking:** Supports `RIGHT JOIN`, `RIGHT OUTER JOIN`, `FULL JOIN`, and `FULL OUTER JOIN` across in-memory hash join, external spilled join, and nested-loop join paths. Both probe-side and build-side match statuses are maintained, gating match status on full residual predicate evaluation.
+  * **Dynamic Schema Nullability:** Output column ordering strictly preserves `left columns + right columns`. Left columns are marked nullable for `RIGHT` and `FULL` joins; right columns are marked nullable for `LEFT` and `FULL` joins.
+  * **Spilled Outer-Join Integrity:** NULL keys and unmatched partition streams preserve outer rows without duplication or omission across recursive partitioning passes.
 
 ---
 
@@ -428,6 +432,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **External Sort Non-Persistence & Equivalence Invariant:** Temporary sort runs are strictly runtime external artifacts excluded from WAL and persistent database pages. Spilling decisions never alter query results, row ordering, duplicates, or column structures compared to in-memory execution.
 * **External Aggregation Non-Persistence & Equivalence Invariant:** Temporary aggregation partition runs are strictly runtime external artifacts excluded from WAL and persistent database pages. Spilling decisions produce results 100% mathematically and semantically identical to in-memory aggregation.
 * **External Hash Join Non-Persistence & Equivalence Invariant:** Temporary join partition runs are strictly runtime external artifacts excluded from WAL and persistent database pages. Spilling decisions produce results 100% mathematically and semantically identical to in-memory join execution.
+* **Outer Join Output & Multiplicity Invariant:** Outer joins (`LEFT`, `RIGHT`, `FULL`) preserve all unmatched rows with NULL padding for opposing relation columns, maintain $N \times M$ Cartesian product multiplicity for duplicate matching keys, and evaluate residual predicates before recording match participation.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -441,6 +446,7 @@ The following capabilities are intentionally deferred to subsequent phases:
 * Multi-column composite secondary indexes.
 * Index-only covering scans.
 * Merge join physical operator.
+* Generalized outer-join reordering in cost optimizer.
 * DDL statements (`ALTER TABLE`) in SQL grammar.
 * Recursive CTE `UNION DISTINCT`, `SEARCH`, `CYCLE` clauses, and mutual recursion.
 * Derived tables (`FROM (SELECT ...)`).

@@ -289,6 +289,32 @@ impl CardinalityEstimator {
         let sel = Self::estimate_expr_selectivity(on_expr, None, schema);
         (left_rows * right_rows * sel).max(1.0)
     }
+
+    /// Estimates the output cardinality for a join operation taking `JoinType` into account.
+    pub fn estimate_join_cardinality(
+        join_type: crate::sql::ast::JoinType,
+        left_rows: f64,
+        left_stats: Option<&TableStatistics>,
+        right_rows: f64,
+        right_stats: Option<&TableStatistics>,
+        on_expr: &Expr,
+        schema: &Schema,
+    ) -> f64 {
+        let inner_est = Self::estimate_inner_join_cardinality(
+            left_rows,
+            left_stats,
+            right_rows,
+            right_stats,
+            on_expr,
+            schema,
+        );
+        match join_type {
+            crate::sql::ast::JoinType::Inner => inner_est,
+            crate::sql::ast::JoinType::Left => inner_est.max(left_rows),
+            crate::sql::ast::JoinType::Right => inner_est.max(right_rows),
+            crate::sql::ast::JoinType::Full => inner_est.max(left_rows).max(right_rows),
+        }
+    }
 }
 
 fn extract_col_and_val(left: &Expr, right: &Expr) -> (Option<String>, Option<Value>) {

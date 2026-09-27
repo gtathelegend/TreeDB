@@ -321,6 +321,8 @@ impl<'a> Lexer<'a> {
             "JOIN" => TokenKind::Join,
             "INNER" => TokenKind::Inner,
             "LEFT" => TokenKind::Left,
+            "RIGHT" => TokenKind::Right,
+            "FULL" => TokenKind::Full,
             "OUTER" => TokenKind::Outer,
             "ON" => TokenKind::On,
             "CREATE" => TokenKind::Create,

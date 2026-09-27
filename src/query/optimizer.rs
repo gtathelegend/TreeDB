@@ -675,11 +675,22 @@ impl Optimizer {
                     .position(|t| t.qualifier() == target_qualifier)
                 {
                     if tbl_idx == 0 {
-                        table_local_conjuncts[0].push(conjunct);
+                        let has_right_or_full = bound.joins.iter().any(|j| {
+                            j.join_type == JoinType::Right || j.join_type == JoinType::Full
+                        });
+                        if has_right_or_full {
+                            post_join_conjuncts.push(conjunct);
+                        } else {
+                            table_local_conjuncts[0].push(conjunct);
+                        }
                     } else {
-                        let is_right_of_left_join =
-                            bound.joins[tbl_idx - 1].join_type == JoinType::Left;
-                        if is_right_of_left_join {
+                        let this_join_type = bound.joins[tbl_idx - 1].join_type;
+                        let is_outer_right =
+                            this_join_type == JoinType::Left || this_join_type == JoinType::Full;
+                        let subsequent_outer = bound.joins[tbl_idx..].iter().any(|j| {
+                            j.join_type == JoinType::Right || j.join_type == JoinType::Full
+                        });
+                        if is_outer_right || subsequent_outer {
                             post_join_conjuncts.push(conjunct);
                         } else {
                             table_local_conjuncts[tbl_idx].push(conjunct);
@@ -717,6 +728,15 @@ impl Optimizer {
                     } else {
                         remaining_on.push(on_conj);
                     }
+                } else if bound_join.join_type == JoinType::Right {
+                    if refs.len() == 1 && refs.contains(tables[0].qualifier()) {
+                        table_local_conjuncts[0].push(on_conj);
+                    } else {
+                        remaining_on.push(on_conj);
+                    }
+                } else {
+                    // Full join: cannot push down on predicates to either side
+                    remaining_on.push(on_conj);
                 }
             }
 
@@ -747,7 +767,8 @@ impl Optimizer {
                 right_table_scan.cost,
                 right_table_scan.estimated_rows,
             );
-            let join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
+            let join_rows = CardinalityEstimator::estimate_join_cardinality(
+                join_type,
                 cur_rows,
                 tables[0].stats.as_ref(),
                 right_table_scan.estimated_rows,

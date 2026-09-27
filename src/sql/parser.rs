@@ -1262,6 +1262,41 @@ impl<'a> Parser<'a> {
                     self.advance(); // consume JOIN
                     JoinType::Left
                 }
+                TokenKind::Right => {
+                    self.advance(); // consume RIGHT
+                    if self.peek().kind == TokenKind::Outer {
+                        self.advance(); // consume OUTER
+                    }
+                    let join_token = self.peek();
+                    if join_token.kind != TokenKind::Join {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected JOIN after RIGHT, found {}",
+                                join_token.kind
+                            ),
+                            start: join_token.span.start,
+                            end: join_token.span.end,
+                        });
+                    }
+                    self.advance(); // consume JOIN
+                    JoinType::Right
+                }
+                TokenKind::Full => {
+                    self.advance(); // consume FULL
+                    if self.peek().kind == TokenKind::Outer {
+                        self.advance(); // consume OUTER
+                    }
+                    let join_token = self.peek();
+                    if join_token.kind != TokenKind::Join {
+                        return Err(Error::SqlParseError {
+                            message: format!("expected JOIN after FULL, found {}", join_token.kind),
+                            start: join_token.span.start,
+                            end: join_token.span.end,
+                        });
+                    }
+                    self.advance(); // consume JOIN
+                    JoinType::Full
+                }
                 _ => break,
             };
 

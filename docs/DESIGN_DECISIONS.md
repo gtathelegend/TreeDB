@@ -909,6 +909,43 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * **Memory Isolation & Crash Safety:** Ephemeral join partitions are query runtime artifacts that do not modify persistent database pages or write WAL log records, preventing buffer pool pollution and eliminating overhead during crash recovery.
 
+---
+
+### Decision 51: RIGHT and FULL OUTER JOIN with Generalized Match Tracking & Spilled Execution
+* **Context:** TreeDB supported `INNER JOIN` and `LEFT JOIN` (in-memory and external hash join). Supporting `RIGHT JOIN` and `FULL JOIN` required generalized outer-join match tracking across in-memory hash join, external spilled hash join, and nested-loop join paths while strictly preserving SQL 3-valued logic, duplicate multiplicity, residual predicate gating, and schema nullability.
+* **Decision:**
+  1. **Unified Relational Join Enum (`JoinType`):**
+     * Extended `JoinType` to `Inner`, `Left`, `Right`, and `Full`.
+     * Grammar recognizes `RIGHT JOIN`, `RIGHT OUTER JOIN`, `FULL JOIN`, and `FULL OUTER JOIN` (case-insensitive).
+  2. **Logical vs. Physical Orientation & Output Schema:**
+     * Regardless of physical build/probe orientation, logical output schema order remains `left columns + right columns`.
+     * Column nullability is derived dynamically:
+       * `LEFT JOIN`: Right columns become nullable.
+       * `RIGHT JOIN`: Left columns become nullable.
+       * `FULL JOIN`: Both left and right columns become nullable.
+  3. **Generalized Match Tracking Invariant:**
+     * In-memory hash join maintains a `right_matched: Vec<bool>` bitset alongside the probe-side `left_matched` boolean.
+     * Candidate matches are only marked as matched if **both** the hash equality condition and all residual non-equi join predicates evaluate to `Value::Boolean(true)`.
+     * If a residual predicate fails, candidate rows remain unmatched and are emitted with NULL-padding according to the join type.
+  4. **Spilled Outer-Join Partitioning & Preservation:**
+     * Both relations are deterministically partitioned into $N$ partition pairs using `hash_join_key(key, pass)`.
+     * Rows with `NULL` keys cannot match in equi-joins and are routed to partition 0:
+       * Left rows with `NULL` keys are emitted with NULL-padded right columns in `LEFT` and `FULL` joins.
+       * Right rows with `NULL` keys are emitted with NULL-padded left columns in `RIGHT` and `FULL` joins.
+     * For partition pairs where one side is empty:
+       * Non-empty left partition emits NULL-padded rows for `LEFT` and `FULL` joins.
+       * Non-empty right partition emits NULL-padded rows for `RIGHT` and `FULL` joins.
+     * Recursive multi-pass partitioning preserves outer-join match tracking at all recursion depths.
+  5. **WHERE Pushdown & Cardinality Invariants:**
+     * WHERE predicates referencing tables outer-preserved by `RIGHT` or `FULL` joins are safely deferred to post-join filter execution.
+     * Outer-join cardinality bounds:
+       * $\text{Card}(\text{LEFT}) \ge \text{left\_rows}$
+       * $\text{Card}(\text{RIGHT}) \ge \text{right\_rows}$
+       * $\text{Card}(\text{FULL}) \ge \max(\text{left\_rows}, \text{right\_rows})$
+* **Rationale:**
+  * **Complete SQL Outer-Join Conformance:** Preserves standard SQL outer join semantics, duplicate counts, and 3VL without modifying storage pages or WAL logging.
+
+
 
 
 

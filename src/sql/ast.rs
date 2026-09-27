@@ -644,6 +644,10 @@ pub enum JoinType {
     Inner,
     /// LEFT OUTER JOIN: All left-side rows are emitted, with NULL-padded right side when no match.
     Left,
+    /// RIGHT OUTER JOIN: All right-side rows are emitted, with NULL-padded left side when no match.
+    Right,
+    /// FULL OUTER JOIN: All left-side and right-side rows are emitted, with NULL-padded opposite side when no match.
+    Full,
 }
 
 impl fmt::Display for JoinType {
@@ -651,6 +655,8 @@ impl fmt::Display for JoinType {
         match self {
             JoinType::Inner => write!(f, "INNER JOIN"),
             JoinType::Left => write!(f, "LEFT JOIN"),
+            JoinType::Right => write!(f, "RIGHT JOIN"),
+            JoinType::Full => write!(f, "FULL JOIN"),
         }
     }
 }

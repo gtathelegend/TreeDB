@@ -602,7 +602,21 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 36: Advanced Query Processing & Optimizer Enhancements (Future)
+## Phase 36: RIGHT/FULL OUTER JOIN & Generalized Join Planning (Completed)
+* [x] Extended `JoinType` enum (`Inner`, `Left`, `Right`, `Full`) and parser recognition for `RIGHT JOIN`, `RIGHT OUTER JOIN`, `FULL JOIN`, and `FULL OUTER JOIN`
+* [x] Generalized match tracking: dual-side match bitset (`right_matched`, `left_matched`) gating on residual predicate satisfaction
+* [x] Complete SQL outer join semantics: `RIGHT JOIN` right preservation, `FULL JOIN` dual-side preservation, $N \times M$ duplicates, and 3VL NULL keys
+* [x] In-memory hash join, partitioned spilled hash join, and fallback nested-loop execution for all join types
+* [x] Recursive multi-pass partition spilling for `RIGHT` and `FULL` outer joins with automatic temp partition file cleanup
+* [x] Dynamic schema nullability derivation: right cols nullable for LEFT/FULL, left cols nullable for RIGHT/FULL
+* [x] Optimizer WHERE predicate pushdown safety and cardinality bounds ($\text{Card}(\text{FULL}) \ge \max(\text{left}, \text{right})$)
+* [x] Full composition with subqueries, CTEs, recursive CTEs, window functions, aggregation, and set operations
+* [x] Prepared statements, plan cache reuse, transaction rollback, and database close/reopen persistence safety
+* [x] 12 dedicated integration tests in `tests/outer_join.rs` including randomized differential reference oracle (628 total passing test suite)
+
+---
+
+## Phase 37: Advanced Query Processing & Optimizer Enhancements (Future)
 * [ ] Merge join physical execution operator
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
@@ -610,6 +624,7 @@ This roadmap outlines the planned development phases for TreeDB.
 * [ ] Derived tables (`FROM (SELECT ...)`)
 * [ ] Subquery flattening and decorrelation
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

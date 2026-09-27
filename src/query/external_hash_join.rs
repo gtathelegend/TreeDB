@@ -619,11 +619,15 @@ pub fn create_joined_schema(
     let mut combined_columns =
         Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
     for col in &left_schema.columns {
-        combined_columns.push(col.clone());
+        let mut col_copy = col.clone();
+        if join_type == JoinType::Right || join_type == JoinType::Full {
+            col_copy.nullable = true;
+        }
+        combined_columns.push(col_copy);
     }
     for col in &right_schema.columns {
         let mut col_copy = col.clone();
-        if join_type == JoinType::Left {
+        if join_type == JoinType::Left || join_type == JoinType::Full {
             col_copy.nullable = true;
         }
         combined_columns.push(col_copy);
@@ -685,11 +689,24 @@ impl<'a> ExternalHashJoiner<'a> {
         };
 
         if left_rows.is_empty() {
-            return Ok((joined_schema, Vec::new(), metrics));
+            if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
+                let left_nulls = vec![Value::Null; self.left_schema.columns.len()];
+                let mut out_rows = Vec::with_capacity(right_rows.len());
+                for r_row in right_rows {
+                    let mut vals = Vec::with_capacity(left_nulls.len() + r_row.values.len());
+                    vals.extend_from_slice(&left_nulls);
+                    vals.extend_from_slice(&r_row.values);
+                    out_rows.push(Row::new(vals));
+                }
+                metrics.rows_output = out_rows.len();
+                return Ok((joined_schema, out_rows, metrics));
+            } else {
+                return Ok((joined_schema, Vec::new(), metrics));
+            }
         }
 
         if right_rows.is_empty() {
-            if self.join_type == JoinType::Left {
+            if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
                 let right_nulls = vec![Value::Null; self.right_schema.columns.len()];
                 let mut out_rows = Vec::with_capacity(left_rows.len());
                 for l_row in left_rows {
@@ -739,11 +756,12 @@ impl<'a> ExternalHashJoiner<'a> {
         joined_schema: &Schema,
         metrics: &mut JoinExecutionMetrics,
     ) -> Result<(Vec<Row>, usize)> {
-        let mut build_map: HashMap<JoinKey, Vec<Row>> = HashMap::new();
+        let mut build_map: HashMap<JoinKey, Vec<(usize, Row)>> = HashMap::new();
         let mut build_mem = 0;
         let mut peak_mem = 0;
+        let mut right_matched = vec![false; right_rows.len()];
 
-        for r_row in right_rows {
+        for (r_idx, r_row) in right_rows.iter().enumerate() {
             let key = JoinKey::from_row(r_row, self.right_schema, &self.right_keys)?;
             // SQL NULL semantics: NULL keys cannot match in equi-join
             if key.has_null() {
@@ -756,16 +774,20 @@ impl<'a> ExternalHashJoiner<'a> {
                 peak_mem = build_mem;
             }
 
-            build_map.entry(key).or_default().push(r_row.clone());
+            build_map
+                .entry(key)
+                .or_default()
+                .push((r_idx, r_row.clone()));
         }
 
+        let left_nulls = vec![Value::Null; self.left_schema.columns.len()];
         let right_nulls = vec![Value::Null; self.right_schema.columns.len()];
         let mut out_rows = Vec::new();
 
         for l_row in left_rows {
             let key = JoinKey::from_row(l_row, self.left_schema, &self.left_keys)?;
             if key.has_null() {
-                if self.join_type == JoinType::Left {
+                if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
                     let mut combined = Vec::with_capacity(l_row.values.len() + right_nulls.len());
                     combined.extend_from_slice(&l_row.values);
                     combined.extend_from_slice(&right_nulls);
@@ -774,10 +796,10 @@ impl<'a> ExternalHashJoiner<'a> {
                 continue;
             }
 
-            let mut matched = false;
+            let mut left_matched = false;
             if let Some(r_matches) = build_map.get(&key) {
                 metrics.candidate_pairs += r_matches.len();
-                for r_row in r_matches {
+                for (r_idx, r_row) in r_matches {
                     let mut combined = Vec::with_capacity(l_row.values.len() + r_row.values.len());
                     combined.extend_from_slice(&l_row.values);
                     combined.extend_from_slice(&r_row.values);
@@ -791,18 +813,32 @@ impl<'a> ExternalHashJoiner<'a> {
                     };
 
                     if passed {
-                        matched = true;
+                        left_matched = true;
+                        right_matched[*r_idx] = true;
                         metrics.matched_rows += 1;
                         out_rows.push(candidate);
                     }
                 }
             }
 
-            if !matched && self.join_type == JoinType::Left {
+            if !left_matched
+                && (self.join_type == JoinType::Left || self.join_type == JoinType::Full)
+            {
                 let mut combined = Vec::with_capacity(l_row.values.len() + right_nulls.len());
                 combined.extend_from_slice(&l_row.values);
                 combined.extend_from_slice(&right_nulls);
                 out_rows.push(Row::new(combined));
+            }
+        }
+
+        if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
+            for (r_idx, r_row) in right_rows.iter().enumerate() {
+                if !right_matched[r_idx] {
+                    let mut combined = Vec::with_capacity(left_nulls.len() + r_row.values.len());
+                    combined.extend_from_slice(&left_nulls);
+                    combined.extend_from_slice(&r_row.values);
+                    out_rows.push(Row::new(combined));
+                }
             }
         }
 
@@ -837,8 +873,8 @@ impl<'a> ExternalHashJoiner<'a> {
         for l_row in left_rows {
             let key = JoinKey::from_row(&l_row, self.left_schema, &self.left_keys)?;
             let part_idx = if key.has_null() {
-                // If key has NULL, place in partition 0 for LEFT JOIN preservation;
-                // for INNER JOIN it won't match any right partition row.
+                // If key has NULL, place in partition 0 for LEFT/FULL JOIN preservation;
+                // for INNER/RIGHT JOIN it won't match any right partition row.
                 0
             } else {
                 (hash_join_key(&key, pass) as usize) % num_partitions
@@ -864,11 +900,13 @@ impl<'a> ExternalHashJoiner<'a> {
         // 2. Partition Right rows
         for r_row in right_rows {
             let key = JoinKey::from_row(&r_row, self.right_schema, &self.right_keys)?;
-            if key.has_null() {
-                // SQL NULL semantics: NULL right rows never match in INNER or LEFT join
-                continue;
-            }
-            let part_idx = (hash_join_key(&key, pass) as usize) % num_partitions;
+            let part_idx = if key.has_null() {
+                // For RIGHT/FULL JOIN, place in partition 0 for unmatched right preservation;
+                // for INNER/LEFT JOIN it won't match any left row.
+                0
+            } else {
+                (hash_join_key(&key, pass) as usize) % num_partitions
+            };
 
             if right_writers[part_idx].is_none() {
                 let pw = PartitionWriter::create(&temp_dir)?;
@@ -941,12 +979,26 @@ impl<'a> ExternalHashJoiner<'a> {
                 None => Vec::new(),
             };
 
+            if left_part.is_empty() && right_part.is_empty() {
+                continue;
+            }
+
             if left_part.is_empty() {
+                if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
+                    let left_nulls = vec![Value::Null; self.left_schema.columns.len()];
+                    for r_row in right_part {
+                        let mut combined =
+                            Vec::with_capacity(left_nulls.len() + r_row.values.len());
+                        combined.extend_from_slice(&left_nulls);
+                        combined.extend_from_slice(&r_row.values);
+                        out_rows.push(Row::new(combined));
+                    }
+                }
                 continue;
             }
 
             if right_part.is_empty() {
-                if self.join_type == JoinType::Left {
+                if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
                     let right_nulls = vec![Value::Null; self.right_schema.columns.len()];
                     for l_row in left_part {
                         let mut combined =

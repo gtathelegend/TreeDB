@@ -261,12 +261,16 @@ impl JoinOperator {
                 Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
 
             for col in &left_schema.columns {
-                combined_columns.push(col.clone());
+                let mut col_copy = col.clone();
+                if join_type == JoinType::Right || join_type == JoinType::Full {
+                    col_copy.nullable = true;
+                }
+                combined_columns.push(col_copy);
             }
 
             for col in &right_schema.columns {
                 let mut col_copy = col.clone();
-                if join_type == JoinType::Left {
+                if join_type == JoinType::Left || join_type == JoinType::Full {
                     col_copy.nullable = true;
                 }
                 combined_columns.push(col_copy);
@@ -276,11 +280,15 @@ impl JoinOperator {
             let mut out_rows = Vec::new();
             let mut candidate_pairs = 0;
             let mut matched_rows = 0;
+            let mut right_matched = vec![false; right_rows.len()];
+
+            let left_nulls = vec![Value::Null; left_schema.columns.len()];
+            let right_nulls = vec![Value::Null; right_schema.columns.len()];
 
             for left_row in &left_rows {
-                let mut matched = false;
+                let mut left_matched = false;
 
-                for right_row in right_rows {
+                for (r_idx, right_row) in right_rows.iter().enumerate() {
                     candidate_pairs += 1;
                     let mut combined_values =
                         Vec::with_capacity(left_row.values.len() + right_row.values.len());
@@ -290,20 +298,31 @@ impl JoinOperator {
 
                     let on_val = on_predicate.evaluate(&joined_row, &joined_schema)?;
                     if on_val == Value::Boolean(true) {
-                        matched = true;
+                        left_matched = true;
+                        right_matched[r_idx] = true;
                         matched_rows += 1;
                         out_rows.push(joined_row);
                     }
                 }
 
-                if join_type == JoinType::Left && !matched {
+                if !left_matched && (join_type == JoinType::Left || join_type == JoinType::Full) {
                     let mut combined_values =
-                        Vec::with_capacity(left_row.values.len() + right_schema.columns.len());
+                        Vec::with_capacity(left_row.values.len() + right_nulls.len());
                     combined_values.extend_from_slice(&left_row.values);
-                    for _ in 0..right_schema.columns.len() {
-                        combined_values.push(Value::Null);
-                    }
+                    combined_values.extend_from_slice(&right_nulls);
                     out_rows.push(Row::new(combined_values));
+                }
+            }
+
+            if join_type == JoinType::Right || join_type == JoinType::Full {
+                for (r_idx, right_row) in right_rows.iter().enumerate() {
+                    if !right_matched[r_idx] {
+                        let mut combined_values =
+                            Vec::with_capacity(left_nulls.len() + right_row.values.len());
+                        combined_values.extend_from_slice(&left_nulls);
+                        combined_values.extend_from_slice(&right_row.values);
+                        out_rows.push(Row::new(combined_values));
+                    }
                 }
             }
 
