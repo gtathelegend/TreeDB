@@ -3,10 +3,10 @@ use crate::error::{Error, Result};
 use crate::sql::ast::{
     AnalyzeStatement, ColumnDef, CreateIndexStatement, CreateTableStatement, Cte, CteQuery,
     DeleteStatement, DerivedQuery, DropIndexStatement, DropTableStatement, ExplainStatement,
-    InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem, SelectStatement,
-    SetOperator, SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral, SqlUnaryOp, Statement,
-    TableRef, UpdateAssignment, UpdateStatement, WindowFrame, WindowFrameBound, WindowFunction,
-    WindowSpec, WithClause,
+    InsertStatement, JoinClause, JoinType, OrderByExpr, OrderDirection, SelectItem,
+    SelectStatement, SetOperator, SetQuery, SetQueryBody, SqlBinaryOp, SqlExpr, SqlLiteral,
+    SqlUnaryOp, Statement, TableRef, UpdateAssignment, UpdateStatement, WindowFrame,
+    WindowFrameBound, WindowFunction, WindowSpec, WithClause,
 };
 use crate::sql::span::SourceSpan;
 use crate::sql::token::{Token, TokenKind};

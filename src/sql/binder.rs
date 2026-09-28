@@ -446,11 +446,7 @@ impl<'a> BindingContext<'a> {
                     col.nullable,
                 ));
                 if non_semi_tables.len() <= 1 && !tbl.is_semi_or_anti {
-                    cols.push(Column::new(
-                        col.name.clone(),
-                        col.data_type,
-                        col.nullable,
-                    ));
+                    cols.push(Column::new(col.name.clone(), col.data_type, col.nullable));
                 }
             }
         }
@@ -787,11 +783,7 @@ fn collect_aggregates(
 /// Binds a parsed `SelectStatement` AST against a single table's `Schema`.
 pub fn bind_select(statement: &SelectStatement, schema: &Schema) -> Result<BoundSelect> {
     let name = statement.from.name();
-    let binding = TableBinding::new(
-        name,
-        statement.from.alias(),
-        schema,
-    );
+    let binding = TableBinding::new(name, statement.from.alias(), schema);
     bind_select_multi(statement, &[binding])
 }
 

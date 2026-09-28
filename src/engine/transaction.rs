@@ -1096,9 +1096,7 @@ impl<'db> Transaction<'db> {
             visible_ctes.push(crate::sql::binder::BoundCte {
                 name: alias.clone(),
                 output_schema,
-                kind: crate::sql::binder::BoundCteKind::NonRecursive {
-                    plan: inner_plan,
-                },
+                kind: crate::sql::binder::BoundCteKind::NonRecursive { plan: inner_plan },
                 dependencies: Vec::new(),
             });
         }
@@ -1106,20 +1104,24 @@ impl<'db> Transaction<'db> {
         for j in &rewritten_ast.joins {
             if let crate::sql::ast::TableRef::Derived { query, alias } = &j.table {
                 let inner_plan = match query {
-                    crate::sql::ast::DerivedQuery::Select(select_stmt) => {
-                        self.plan_select_with_outer_ctes_and_params(select_stmt, &visible_ctes, params)?
-                    }
-                    crate::sql::ast::DerivedQuery::SetOperation(set_stmt) => {
-                        self.plan_set_query_with_outer_ctes_and_params(set_stmt, &visible_ctes, params)?
-                    }
+                    crate::sql::ast::DerivedQuery::Select(select_stmt) => self
+                        .plan_select_with_outer_ctes_and_params(
+                            select_stmt,
+                            &visible_ctes,
+                            params,
+                        )?,
+                    crate::sql::ast::DerivedQuery::SetOperation(set_stmt) => self
+                        .plan_set_query_with_outer_ctes_and_params(
+                            set_stmt,
+                            &visible_ctes,
+                            params,
+                        )?,
                 };
                 let output_schema = self.derive_cte_output_schema(&inner_plan, &visible_ctes)?;
                 visible_ctes.push(crate::sql::binder::BoundCte {
                     name: alias.clone(),
                     output_schema,
-                    kind: crate::sql::binder::BoundCteKind::NonRecursive {
-                        plan: inner_plan,
-                    },
+                    kind: crate::sql::binder::BoundCteKind::NonRecursive { plan: inner_plan },
                     dependencies: Vec::new(),
                 });
             }
@@ -1141,14 +1143,9 @@ impl<'db> Transaction<'db> {
                 self.db.get_statistics(from_name).cloned()
             };
             table_infos.push(
-                crate::query::optimizer::TableOptInfo::new(
-                    from_name,
-                    from_alias,
-                    schema,
-                    indexes,
-                )
-                .with_cte(is_cte)
-                .with_stats(stats),
+                crate::query::optimizer::TableOptInfo::new(from_name, from_alias, schema, indexes)
+                    .with_cte(is_cte)
+                    .with_stats(stats),
             );
         }
 
@@ -1164,14 +1161,9 @@ impl<'db> Transaction<'db> {
                 self.db.get_statistics(join_name).cloned()
             };
             table_infos.push(
-                crate::query::optimizer::TableOptInfo::new(
-                    join_name,
-                    join_alias,
-                    schema,
-                    indexes,
-                )
-                .with_cte(is_cte)
-                .with_stats(stats),
+                crate::query::optimizer::TableOptInfo::new(join_name, join_alias, schema, indexes)
+                    .with_cte(is_cte)
+                    .with_stats(stats),
             );
         }
 
@@ -1184,12 +1176,8 @@ impl<'db> Transaction<'db> {
                     || j.join_type == crate::sql::ast::JoinType::Anti
             };
             bindings.push(
-                crate::sql::TableBinding::new(
-                    &t.name,
-                    t.alias.as_deref(),
-                    &t.schema,
-                )
-                .with_semi_or_anti(is_semi_or_anti),
+                crate::sql::TableBinding::new(&t.name, t.alias.as_deref(), &t.schema)
+                    .with_semi_or_anti(is_semi_or_anti),
             );
         }
 

@@ -42,44 +42,46 @@ impl QueryRewriter {
     /// Recursively flattens derived tables in FROM and INNER/LEFT JOIN clauses when safe.
     fn flatten_derived_tables(stmt: &mut SelectStatement, rewrites: &mut Vec<String>) {
         // A. Attempt to flatten FROM derived table
-        if let TableRef::Derived { query, alias } = &stmt.from.clone() {
-            if let DerivedQuery::Select(inner_stmt) = query {
-                if Self::can_safely_flatten_derived_select(inner_stmt) {
-                    let inner_from = &inner_stmt.from;
-                    let inner_name = inner_from.name().to_string();
-                    let inner_alias = alias.clone();
+        if let TableRef::Derived {
+            query: DerivedQuery::Select(inner_stmt),
+            alias,
+        } = &stmt.from.clone()
+        {
+            if Self::can_safely_flatten_derived_select(inner_stmt) {
+                let inner_from = &inner_stmt.from;
+                let inner_name = inner_from.name().to_string();
+                let inner_alias = alias.clone();
 
-                    // Replace FROM with the inner table (aliased as the derived table alias)
-                    stmt.from = TableRef::Table {
-                        name: inner_name.clone(),
-                        alias: Some(inner_alias.clone()),
+                // Replace FROM with the inner table (aliased as the derived table alias)
+                stmt.from = TableRef::Table {
+                    name: inner_name.clone(),
+                    alias: Some(inner_alias.clone()),
+                };
+
+                // Merge inner selection with outer selection
+                if let Some(inner_sel) = &inner_stmt.selection {
+                    let mapped_inner_sel =
+                        Self::qualify_or_map_expr(inner_sel, &inner_name, &inner_alias);
+                    stmt.selection = match stmt.selection.take() {
+                        Some(outer_sel) => Some(SqlExpr::Binary {
+                            left: Box::new(mapped_inner_sel),
+                            op: SqlBinaryOp::And,
+                            right: Box::new(outer_sel),
+                        }),
+                        None => Some(mapped_inner_sel),
                     };
-
-                    // Merge inner selection with outer selection
-                    if let Some(inner_sel) = &inner_stmt.selection {
-                        let mapped_inner_sel =
-                            Self::qualify_or_map_expr(inner_sel, &inner_name, &inner_alias);
-                        stmt.selection = match stmt.selection.take() {
-                            Some(outer_sel) => Some(SqlExpr::Binary {
-                                left: Box::new(mapped_inner_sel),
-                                op: SqlBinaryOp::And,
-                                right: Box::new(outer_sel),
-                            }),
-                            None => Some(mapped_inner_sel),
-                        };
-                    }
-
-                    // If the inner query had joins, graft them before outer joins
-                    if !inner_stmt.joins.is_empty() {
-                        let mut grafted_joins = inner_stmt.joins.clone();
-                        grafted_joins.append(&mut stmt.joins);
-                        stmt.joins = grafted_joins;
-                    }
-
-                    rewrites.push(format!(
-                        "DerivedTableFlatten: flattened derived table '{alias}' into base table '{inner_name}' with predicate pushdown"
-                    ));
                 }
+
+                // If the inner query had joins, graft them before outer joins
+                if !inner_stmt.joins.is_empty() {
+                    let mut grafted_joins = inner_stmt.joins.clone();
+                    grafted_joins.append(&mut stmt.joins);
+                    stmt.joins = grafted_joins;
+                }
+
+                rewrites.push(format!(
+                    "DerivedTableFlatten: flattened derived table '{alias}' into base table '{inner_name}' with predicate pushdown"
+                ));
             }
         }
 
@@ -87,40 +89,42 @@ impl QueryRewriter {
         let mut new_joins = Vec::with_capacity(stmt.joins.len());
         for join in &stmt.joins {
             let mut flattened = false;
-            if let TableRef::Derived { query, alias } = &join.table {
-                if let DerivedQuery::Select(inner_stmt) = query {
-                    if (join.join_type == JoinType::Inner || join.join_type == JoinType::Left)
-                        && Self::can_safely_flatten_derived_select(inner_stmt)
-                        && inner_stmt.joins.is_empty()
-                    {
-                        let inner_name = inner_stmt.from.name().to_string();
-                        let inner_alias = alias.clone();
+            if let TableRef::Derived {
+                query: DerivedQuery::Select(inner_stmt),
+                alias,
+            } = &join.table
+            {
+                if (join.join_type == JoinType::Inner || join.join_type == JoinType::Left)
+                    && Self::can_safely_flatten_derived_select(inner_stmt)
+                    && inner_stmt.joins.is_empty()
+                {
+                    let inner_name = inner_stmt.from.name().to_string();
+                    let inner_alias = alias.clone();
 
-                        let mut merged_on = join.on.clone();
-                        if let Some(inner_sel) = &inner_stmt.selection {
-                            let mapped_inner_sel =
-                                Self::qualify_or_map_expr(inner_sel, &inner_name, &inner_alias);
-                            merged_on = SqlExpr::Binary {
-                                left: Box::new(merged_on),
-                                op: SqlBinaryOp::And,
-                                right: Box::new(mapped_inner_sel),
-                            };
-                        }
-
-                        new_joins.push(JoinClause {
-                            join_type: join.join_type,
-                            table: TableRef::Table {
-                                name: inner_name.clone(),
-                                alias: Some(inner_alias.clone()),
-                            },
-                            on: merged_on,
-                        });
-
-                        rewrites.push(format!(
-                            "DerivedTableFlatten: flattened joined derived table '{alias}' into base table '{inner_name}' with predicate pushdown"
-                        ));
-                        flattened = true;
+                    let mut merged_on = join.on.clone();
+                    if let Some(inner_sel) = &inner_stmt.selection {
+                        let mapped_inner_sel =
+                            Self::qualify_or_map_expr(inner_sel, &inner_name, &inner_alias);
+                        merged_on = SqlExpr::Binary {
+                            left: Box::new(merged_on),
+                            op: SqlBinaryOp::And,
+                            right: Box::new(mapped_inner_sel),
+                        };
                     }
+
+                    new_joins.push(JoinClause {
+                        join_type: join.join_type,
+                        table: TableRef::Table {
+                            name: inner_name.clone(),
+                            alias: Some(inner_alias.clone()),
+                        },
+                        on: merged_on,
+                    });
+
+                    rewrites.push(format!(
+                        "DerivedTableFlatten: flattened joined derived table '{alias}' into base table '{inner_name}' with predicate pushdown"
+                    ));
+                    flattened = true;
                 }
             }
 
@@ -179,9 +183,9 @@ impl QueryRewriter {
                 Self::expr_contains_aggregate_or_window(left)
                     || Self::expr_contains_aggregate_or_window(right)
             }
-            SqlExpr::Unary { expr, .. }
-            | SqlExpr::IsNull(expr)
-            | SqlExpr::IsNotNull(expr) => Self::expr_contains_aggregate_or_window(expr),
+            SqlExpr::Unary { expr, .. } | SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
+                Self::expr_contains_aggregate_or_window(expr)
+            }
             SqlExpr::InList { expr, list, .. } => {
                 Self::expr_contains_aggregate_or_window(expr)
                     || list.iter().any(Self::expr_contains_aggregate_or_window)
@@ -219,7 +223,9 @@ impl QueryRewriter {
 
             // Pattern 1: `EXISTS (SELECT ... FROM child WHERE ...)`
             if let SqlExpr::Exists { subquery, negated } = &conjunct {
-                if let Some(semi_join) = Self::try_decorrelate_exists(subquery, *negated, &existing_qualifiers) {
+                if let Some(semi_join) =
+                    Self::try_decorrelate_exists(subquery, *negated, &existing_qualifiers)
+                {
                     let child_name = semi_join.table.name().to_string();
                     let kind = if *negated { "ANTI JOIN" } else { "SEMI JOIN" };
                     let on_str = format!("{}", semi_join.on);
@@ -241,7 +247,9 @@ impl QueryRewriter {
                     negated: false,
                 } = expr.as_ref()
                 {
-                    if let Some(anti_join) = Self::try_decorrelate_exists(subquery, true, &existing_qualifiers) {
+                    if let Some(anti_join) =
+                        Self::try_decorrelate_exists(subquery, true, &existing_qualifiers)
+                    {
                         let child_name = anti_join.table.name().to_string();
                         let on_str = format!("{}", anti_join.on);
                         rewrites.push(format!(
@@ -258,7 +266,9 @@ impl QueryRewriter {
             } = &conjunct
             {
                 // Pattern 2: `col IN (SELECT child_col FROM child WHERE ...)`
-                if let Some(semi_join) = Self::try_decorrelate_in_subquery(left_expr, subquery, &existing_qualifiers) {
+                if let Some(semi_join) =
+                    Self::try_decorrelate_in_subquery(left_expr, subquery, &existing_qualifiers)
+                {
                     let child_name = semi_join.table.name().to_string();
                     let on_str = format!("{}", semi_join.on);
                     rewrites.push(format!(
@@ -289,9 +299,9 @@ impl QueryRewriter {
             SqlExpr::Binary { left, right, .. } => {
                 Self::expr_contains_subquery(left) || Self::expr_contains_subquery(right)
             }
-            SqlExpr::Unary { expr, .. }
-            | SqlExpr::IsNull(expr)
-            | SqlExpr::IsNotNull(expr) => Self::expr_contains_subquery(expr),
+            SqlExpr::Unary { expr, .. } | SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
+                Self::expr_contains_subquery(expr)
+            }
             SqlExpr::InList { expr, list, .. } => {
                 Self::expr_contains_subquery(expr) || list.iter().any(Self::expr_contains_subquery)
             }
@@ -496,13 +506,17 @@ impl QueryRewriter {
                 op: *op,
                 expr: Box::new(Self::qualify_or_map_expr(expr, orig_table, new_alias)),
             },
-            SqlExpr::IsNull(expr) => {
-                SqlExpr::IsNull(Box::new(Self::qualify_or_map_expr(expr, orig_table, new_alias)))
-            }
+            SqlExpr::IsNull(expr) => SqlExpr::IsNull(Box::new(Self::qualify_or_map_expr(
+                expr, orig_table, new_alias,
+            ))),
             SqlExpr::IsNotNull(expr) => SqlExpr::IsNotNull(Box::new(Self::qualify_or_map_expr(
                 expr, orig_table, new_alias,
             ))),
-            SqlExpr::InList { expr, list, negated } => SqlExpr::InList {
+            SqlExpr::InList {
+                expr,
+                list,
+                negated,
+            } => SqlExpr::InList {
                 expr: Box::new(Self::qualify_or_map_expr(expr, orig_table, new_alias)),
                 list: list
                     .iter()
