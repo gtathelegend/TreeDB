@@ -980,6 +980,31 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * **Semantic Soundness & Performance:** Guarantees optimal join orders for common multi-table analytical queries while avoiding semantic corruption across outer joins and ensuring predictable, deterministic planning time.
 
+---
+
+### Decision 53: Logical Query Rewriting, Subquery Decorrelation, and Physical Column Pruning Deferral
+* **Context:** In Phase 38, TreeDB introduced logical query rewriting to flatten safe derived tables and decorrelate supported subqueries (`EXISTS`, `NOT EXISTS`, `IN`) into `SEMI` and `ANTI` joins, as well as `EXPLAIN ANALYZE` execution telemetry. An architectural decision was required regarding physical column projection pruning.
+* **Decision:**
+  > Phase 38 implements logical query rewriting and subquery decorrelation. Physical column pruning is deferred because TreeDB's current row-oriented storage reads complete records before terminal projection.
+  1. **Logical Derived Table Flattening & Predicate Pushdown (`QueryRewriter`):**
+     * Flattens safe non-complex derived queries in `FROM` and `JOIN` positions (`TableRef::Derived`), replacing the derived subquery with its underlying base table, updating table qualifiers, and pushing inner `WHERE` predicates into outer selection or join `ON` conditions.
+     * Enforces strict safety barriers: derived queries containing `GROUP BY`, `HAVING`, aggregates, window functions, `LIMIT`, `OFFSET`, `WITH` clauses, or set operations are blocked from flattening and safely planned as statement-local CTEs.
+     * Outer join barriers: `RIGHT JOIN` and `FULL JOIN` are never flattened or bypassed during predicate pushdown.
+  2. **Subquery Decorrelation to SEMI / ANTI Joins:**
+     * `EXISTS (SELECT ... FROM child WHERE ...)` rewrites to `SEMI JOIN child ON ...`.
+     * `NOT EXISTS (SELECT ... FROM child WHERE ...)` rewrites to `ANTI JOIN child ON ...`.
+     * `col IN (SELECT child_col FROM child WHERE ...)` rewrites to `SEMI JOIN child ON col = child.child_col AND ...`.
+     * Table qualifier collision prevention: If the subquery table's qualifier matches any existing table in the outer query scope, decorrelation is safely skipped to avoid duplicate table ambiguity.
+     * Subquery selection qualification: Unqualified column references in subquery predicates are mapped with `qualify_or_map_expr` to ensure they bind strictly to the decorrelated relation.
+  3. **SQL Three-Valued Logic (3VL) Preservation for NOT IN:**
+     * Naive conversion of `NOT IN` to standard anti-join is strictly prohibited because `NOT IN` with inner NULLs evaluates to UNKNOWN (falsy) for all rows. `NOT IN` remains an unflattened subquery evaluated via exact 3VL logic.
+  4. **Explicit Deferral of Physical Column Projection Pruning:**
+     * TreeDB's storage engine is row-oriented, storing serialized tuples in 4 KiB slotted pages (`RecordPage`). Scan operators (`TableScan`, `IndexScan`) retrieve complete physical records, and column projection occurs at the terminal stage (`ProjectionOperator`).
+     * Introducing partial tuple deserialization without a columnar layout or vectorized block format would introduce storage fragility without physical I/O reduction. True physical projection pruning is formally deferred to future columnar/vectorized phases.
+* **Rationale:**
+  * Maximizes query optimization opportunities (derived table flattening, join reordering, and SEMI/ANTI join evaluation) while preserving exact SQL semantics and keeping storage abstractions clean and robust.
+
+
 
 
 

@@ -81,6 +81,8 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **External Hash Join & Spill-to-Disk JOIN** | **Implemented** | Bounded in-memory hash join with partitioned spill-to-disk execution (`ExternalHashJoiner`, `JoinConfig`, `TempJoinFile`, `JoinExecutionMetrics`), deterministic binary partition format, exact SQL join semantics preservation (`INNER JOIN`, `LEFT JOIN`, composite equi-join keys, residual predicates, SQL 3VL `NULL != NULL`), salted multi-pass recursive sub-partitioning, RAII temporary file cleanup, WAL and database page exclusion, EXPLAIN ANALYZE telemetry |
 | **RIGHT & FULL OUTER JOINs & Generalized Planning** | **Implemented** | Generalized outer join execution (`RIGHT JOIN`, `RIGHT OUTER JOIN`, `FULL JOIN`, `FULL OUTER JOIN`), dual-side match bitset tracking, residual predicate gating, dynamic schema nullability derivation, spilled outer partition preservation, WHERE pushdown safety, plan caching & telemetry |
 | **Cost-Based Join Reordering & Join Enumeration** | **Implemented** | Deterministic cost-based join reordering inside safe `INNER JOIN` regions (`JoinGraph`, `JoinGraphRelation`, `JoinGraphPredicate`), subset Dynamic Programming ($O(n \cdot 2^n)$) for $N \le 8$, deterministic $O(n^2)$ greedy candidate fallback ($N > 8$), strict outer-join optimization barriers (`LEFT`, `RIGHT`, `FULL`), 5-tier deterministic tie-breaking, earliest legal predicate placement, plan caching & telemetry |
+| **Query Rewriter, Subquery Decorrelation & Explain Analyze** | **Implemented** | Safe derived-table flattening, predicate pushdown, subquery decorrelation (`EXISTS`, `NOT EXISTS`, `IN` to SEMI/ANTI joins), alias qualification mapping, 3VL NULL preservation, runtime plan execution telemetry, physical column pruning deferred |
+
 
 
 

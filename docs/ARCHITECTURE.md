@@ -437,6 +437,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **External Hash Join Non-Persistence & Equivalence Invariant:** Temporary join partition runs are strictly runtime external artifacts excluded from WAL and persistent database pages. Spilling decisions produce results 100% mathematically and semantically identical to in-memory join execution.
 * **Outer Join Output & Multiplicity Invariant:** Outer joins (`LEFT`, `RIGHT`, `FULL`) preserve all unmatched rows with NULL padding for opposing relation columns, maintain $N \times M$ Cartesian product multiplicity for duplicate matching keys, and evaluate residual predicates before recording match participation.
 * **Join Reordering & Outer Join Barrier Invariant:** TreeDB performs cost-based join reordering exclusively inside semantically safe `INNER JOIN` regions using bounded DP subset enumeration ($N \le 8$) and deterministic greedy fallback ($N > 8$). `LEFT JOIN`, `RIGHT JOIN`, and `FULL JOIN` are impenetrable optimization barriers across which join orders are never permuted.
+* **Query Rewriting & Subquery Decorrelation Invariant:** Logical query rewriting safely flattens derived tables with predicate pushdown and decorrelates `EXISTS`, `NOT EXISTS`, and `IN` subqueries into `SEMI` / `ANTI` joins without altering result cardinalities, duplicates, or NULL semantics. `NOT IN` subqueries are preserved for exact SQL three-valued logic (3VL) evaluation.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
@@ -453,9 +454,9 @@ The following capabilities are intentionally deferred to subsequent phases:
 * Generalized outer-join reordering in cost optimizer.
 * DDL statements (`ALTER TABLE`) in SQL grammar.
 * Recursive CTE `UNION DISTINCT`, `SEARCH`, `CYCLE` clauses, and mutual recursion.
-* Derived tables (`FROM (SELECT ...)`).
-* Subquery flattening and cost-based decorrelation.
+* **Physical column projection pruning** (deferred because TreeDB's current row-oriented storage reads complete records before terminal projection).
 * Multi-threading, concurrency control, and MVCC.
+
 
 
 

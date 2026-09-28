@@ -630,14 +630,34 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 38: Advanced Query Processing & Optimizer Enhancements (Future)
+---
+
+## Phase 38: Query Rewriting, Subquery Decorrelation & Explain Analyze (Completed)
+* [x] Logical query rewriter (`QueryRewriter::rewrite_select`) with deterministic transformation logging (`Logical Rewrite` section in EXPLAIN)
+* [x] Derived table parsing and AST representation (`TableRef::Derived { query, alias }`, `DerivedQuery::Select`, `DerivedQuery::SetOperation`)
+* [x] Safe derived-table flattening into base scans with predicate pushdown and column identifier qualification mapping (`qualify_or_map_expr`)
+* [x] Semantic barrier enforcement: derived tables with `GROUP BY`, `HAVING`, aggregates, window functions, `LIMIT`, `OFFSET`, `WITH`, or set operations are safely isolated and planned as statement-local CTEs
+* [x] Outer join optimization barrier preservation: `RIGHT JOIN` and `FULL JOIN` are never flattened or bypassed during predicate pushdown
+* [x] Subquery decorrelation: `EXISTS` -> `SEMI JOIN`, `NOT EXISTS` -> `ANTI JOIN`, `IN (SELECT ...)` -> `SEMI JOIN`
+* [x] Table qualifier collision protection: decorrelation safely avoided when subquery relation qualifier matches outer relation scope
+* [x] Exact SQL 3VL logic preservation: `NOT IN` subqueries preserved as unflattened subquery expressions evaluated via 3VL
+* [x] `JoinType::Semi` and `JoinType::Anti` physical execution support in `JoinOperator` nested-loop join and `ExternalHashJoiner` partitioned spill join
+* [x] Preferential join ON column resolution (`BindingContext::for_join_on_binding`, `in_join_on`) resolving non-semi tables first with clean semi/anti table fallback
+* [x] `EXPLAIN ANALYZE` physical plan execution with real-time operator counters (`candidate_pairs`, `bytes_spilled`, `runs_created`, `rows_passed`, `rows_rejected`) and estimate error ratio
+* [x] Physical column projection pruning explicitly deferred: TreeDB's current row-oriented storage reads complete records before terminal projection
+* [x] Parameter-sensitive plan caching, prepared statement reuse, transaction rollback, and database persistence safety
+* [x] 18 dedicated integration tests in `tests/explain.rs`, 18 in `tests/explain_analyze.rs`, and 24 in `tests/subquery.rs` (640 total passing test suite)
+
+---
+
+## Phase 39: Advanced Indexing & Query Processing (Future)
 * [ ] Merge join physical execution operator
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
 * [ ] Expression indexes & partial indexes
-* [ ] Derived tables (`FROM (SELECT ...)`)
-* [ ] Subquery flattening and decorrelation
+* [ ] Columnar projection pushdown & vectorized scan engine
 * [ ] Interactive CLI commands (`create-table`, `list-tables`, `stats`)
+
 
 
 

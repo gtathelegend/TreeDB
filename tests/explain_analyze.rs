@@ -715,3 +715,85 @@ fn test_randomized_explain_analyze_oracle() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_phase38_semantic_smoke_tests() -> Result<()> {
+    let ctx = TestContext::new("phase38_smoke");
+    let mut db = ctx.db();
+    let mut txn = db.begin_transaction()?;
+
+    txn.execute_statement("CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT);")?;
+    txn.execute_statement(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_id BIGINT, amount INT);",
+    )?;
+
+    txn.execute_statement(
+        "INSERT INTO customers (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');",
+    )?;
+    txn.execute_statement(
+        "INSERT INTO orders (id, customer_id, amount) VALUES (10, 1, 150), (20, 1, 200), (30, 2, 50), (40, 3, 300);",
+    )?;
+
+    // 1. Derived table
+    let res_derived = txn.execute_sql(
+        "SELECT o.id, o.customer_id, c.name FROM (SELECT id, customer_id FROM orders WHERE amount > 100) o JOIN customers c ON o.customer_id = c.id ORDER BY o.id ASC;",
+    )?;
+    assert_eq!(res_derived.rows.len(), 3); // orders 10 (Alice), 20 (Alice), 40 (Charlie)
+    assert_eq!(res_derived.rows[0].values[0], Value::Int64(10));
+    assert_eq!(
+        res_derived.rows[0].values[2],
+        Value::String("Alice".to_string())
+    );
+    assert_eq!(res_derived.rows[1].values[0], Value::Int64(20));
+    assert_eq!(res_derived.rows[2].values[0], Value::Int64(40));
+
+    // 2. EXISTS
+    let res_exists = txn.execute_sql(
+        "SELECT c.id, c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id) ORDER BY c.id ASC;",
+    )?;
+    assert_eq!(res_exists.rows.len(), 3); // all 3 customers have orders
+
+    // 3. NOT EXISTS (with filter ensuring some don't match)
+    let res_not_exists = txn.execute_sql(
+        "SELECT c.id, c.name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 250) ORDER BY c.id ASC;",
+    )?;
+    // Charlie has order 40 with amount 300 (> 250). Alice (max 200) and Bob (max 50) have no order > 250.
+    assert_eq!(res_not_exists.rows.len(), 2);
+    assert_eq!(
+        res_not_exists.rows[0].values[1],
+        Value::String("Alice".to_string())
+    );
+    assert_eq!(
+        res_not_exists.rows[1].values[1],
+        Value::String("Bob".to_string())
+    );
+
+    // 4. IN
+    let res_in = txn.execute_sql(
+        "SELECT c.id, c.name FROM customers c WHERE c.id IN (SELECT customer_id FROM orders WHERE amount <= 50) ORDER BY c.id ASC;",
+    )?;
+    assert_eq!(res_in.rows.len(), 1);
+    assert_eq!(res_in.rows[0].values[1], Value::String("Bob".to_string()));
+
+    // 5. NULL-sensitive NOT IN
+    txn.execute_statement("CREATE TABLE t_outer (x BIGINT PRIMARY KEY);")?;
+    txn.execute_statement("CREATE TABLE t_inner_with_null (id BIGINT PRIMARY KEY, y BIGINT);")?;
+    txn.execute_statement("CREATE TABLE t_inner_empty (id BIGINT PRIMARY KEY, y BIGINT);")?;
+
+    txn.execute_statement("INSERT INTO t_outer (x) VALUES (1), (2), (3);")?;
+    txn.execute_statement("INSERT INTO t_inner_with_null (id, y) VALUES (1, 1), (2, NULL);")?;
+
+    // 5a. Empty inner relation: ALL outer rows return
+    let res_empty = txn.execute_sql(
+        "SELECT x FROM t_outer WHERE x NOT IN (SELECT y FROM t_inner_empty) ORDER BY x ASC;",
+    )?;
+    assert_eq!(res_empty.rows.len(), 3);
+
+    // 5b. Inner relation containing NULL: 3VL yields UNKNOWN, so 0 rows return
+    let res_null =
+        txn.execute_sql("SELECT x FROM t_outer WHERE x NOT IN (SELECT y FROM t_inner_with_null);")?;
+    assert_eq!(res_null.rows.len(), 0);
+
+    txn.commit()?;
+    Ok(())
+}
