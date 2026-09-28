@@ -554,11 +554,17 @@ pub struct BoundCreateIndex {
     pub name: String,
     /// Target table name.
     pub table_name: String,
-    /// Target column name.
+    /// Target column names.
+    pub column_names: Vec<String>,
+    /// Target column name (first column, for backwards compatibility).
     pub column_name: String,
-    /// Target column index in the table schema.
+    /// Target column indices in the table schema.
+    pub column_indices: Vec<usize>,
+    /// Target column index in the table schema (first column, for backwards compatibility).
     pub column_index: usize,
-    /// Target column data type.
+    /// Target column data types.
+    pub data_types: Vec<DataType>,
+    /// Target column data type (first column, for backwards compatibility).
     pub data_type: DataType,
     /// Whether this index enforces uniqueness.
     pub unique: bool,
@@ -578,43 +584,79 @@ pub fn bind_create_index(
 ) -> Result<BoundCreateIndex> {
     crate::engine::catalog::validate_index_name(&stmt.name)?;
 
+    if stmt.column_names.is_empty() {
+        return Err(Error::InvalidIndexDefinition(
+            "index must contain at least one column".to_string(),
+        ));
+    }
+
+    if stmt.column_names.len() > crate::index::composite::MAX_INDEX_COLUMNS {
+        return Err(Error::InvalidIndexDefinition(format!(
+            "index contains {} columns, which exceeds maximum of {}",
+            stmt.column_names.len(),
+            crate::index::composite::MAX_INDEX_COLUMNS
+        )));
+    }
+
     // 1. Resolve table schema through catalog
     let schema = catalog.get_table_schema(&stmt.table_name)?;
 
-    // 2. Resolve column in table schema
-    let (col_idx, col) = schema
-        .columns
-        .iter()
-        .enumerate()
-        .find(|(_, c)| c.name == stmt.column_name)
-        .ok_or_else(|| Error::IndexColumnNotFound(stmt.column_name.clone()))?;
+    // 2. Resolve columns in table schema
+    let mut column_indices = Vec::with_capacity(stmt.column_names.len());
+    let mut data_types = Vec::with_capacity(stmt.column_names.len());
+    let mut seen = std::collections::HashSet::new();
 
-    // 3. Check duplicate index name
+    for col_name in &stmt.column_names {
+        if !seen.insert(col_name) {
+            return Err(Error::InvalidIndexDefinition(format!(
+                "duplicate column '{col_name}' in index definition"
+            )));
+        }
+
+        let (col_idx, col) = schema
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.name == *col_name)
+            .ok_or_else(|| Error::IndexColumnNotFound(col_name.clone()))?;
+
+        // 3. Validate data type is supported by IndexKey
+        match col.data_type {
+            DataType::Boolean
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::String
+            | DataType::Bytes => {}
+            DataType::Null => {
+                return Err(Error::InvalidIndexDefinition(format!(
+                    "cannot index column '{col_name}' of type Null"
+                )));
+            }
+        }
+
+        column_indices.push(col_idx);
+        data_types.push(col.data_type);
+    }
+
+    // 4. Check duplicate index name
     if catalog.get_index(&stmt.name)?.is_some() {
         return Err(Error::DuplicateIndexName(stmt.name.clone()));
     }
 
-    // 4. Validate data type is supported by IndexKey
-    match col.data_type {
-        DataType::Boolean
-        | DataType::Int64
-        | DataType::UInt64
-        | DataType::Float64
-        | DataType::String
-        | DataType::Bytes => {}
-        DataType::Null => {
-            return Err(Error::InvalidIndexDefinition(
-                "cannot index column of type Null".to_string(),
-            ));
-        }
-    }
+    let first_col_name = stmt.column_names[0].clone();
+    let first_col_idx = column_indices[0];
+    let first_data_type = data_types[0];
 
     Ok(BoundCreateIndex {
         name: stmt.name.clone(),
         table_name: stmt.table_name.clone(),
-        column_name: stmt.column_name.clone(),
-        column_index: col_idx,
-        data_type: col.data_type,
+        column_names: stmt.column_names.clone(),
+        column_name: first_col_name,
+        column_indices,
+        column_index: first_col_idx,
+        data_types,
+        data_type: first_data_type,
         unique: stmt.unique,
     })
 }

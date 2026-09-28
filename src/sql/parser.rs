@@ -542,50 +542,77 @@ impl<'a> Parser<'a> {
         if self.peek().kind == TokenKind::RParen {
             let tok = self.peek().clone();
             return Err(Error::SqlParseError {
-                message: "CREATE INDEX requires exactly one column name, found empty column list"
+                message: "CREATE INDEX requires at least one column name, found empty column list"
                     .to_string(),
                 start: tok.span.start,
                 end: tok.span.end,
             });
         }
 
-        let column_name = match &self.peek().kind {
-            TokenKind::Ident(s) => s.clone(),
-            _ => {
-                let tok = self.peek().clone();
+        let mut column_names = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        loop {
+            let col_tok = self.peek().clone();
+            let col = match &col_tok.kind {
+                TokenKind::Ident(s) => s.clone(),
+                _ => {
+                    return Err(Error::SqlParseError {
+                        message: format!(
+                            "expected column name in CREATE INDEX, expressions and function calls are not supported; found {}",
+                            col_tok.kind
+                        ),
+                        start: col_tok.span.start,
+                        end: col_tok.span.end,
+                    });
+                }
+            };
+            self.advance(); // consume column name
+
+            if !seen.insert(col.clone()) {
+                return Err(Error::SqlParseError {
+                    message: format!("duplicate column '{col}' in CREATE INDEX"),
+                    start: col_tok.span.start,
+                    end: col_tok.span.end,
+                });
+            }
+
+            column_names.push(col);
+
+            if column_names.len() > crate::index::composite::MAX_INDEX_COLUMNS {
                 return Err(Error::SqlParseError {
                     message: format!(
-                        "expected column name in CREATE INDEX, expressions and function calls are not supported; found {}",
-                        tok.kind
+                        "CREATE INDEX exceeds maximum column limit of {}",
+                        crate::index::composite::MAX_INDEX_COLUMNS
                     ),
+                    start: col_tok.span.start,
+                    end: col_tok.span.end,
+                });
+            }
+
+            if self.peek().kind == TokenKind::Comma {
+                self.advance(); // consume comma
+                if self.peek().kind == TokenKind::RParen {
+                    let tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: "trailing comma in CREATE INDEX column list is not allowed"
+                            .to_string(),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+            } else if self.peek().kind == TokenKind::RParen {
+                break;
+            } else {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected ',' or ')' in CREATE INDEX, found {}", tok.kind),
                     start: tok.span.start,
                     end: tok.span.end,
                 });
             }
-        };
-        self.advance(); // consume column name
-
-        if self.peek().kind == TokenKind::Comma {
-            let tok = self.peek().clone();
-            return Err(Error::SqlParseError {
-                message: "composite indexes (multiple columns) are not supported in CREATE INDEX"
-                    .to_string(),
-                start: tok.span.start,
-                end: tok.span.end,
-            });
         }
 
-        if self.peek().kind != TokenKind::RParen {
-            let tok = self.peek().clone();
-            return Err(Error::SqlParseError {
-                message: format!(
-                    "expected ')' after column name in CREATE INDEX, found {}",
-                    tok.kind
-                ),
-                start: tok.span.start,
-                end: tok.span.end,
-            });
-        }
         self.advance(); // consume ')'
 
         if self.peek().kind == TokenKind::Semicolon {
@@ -604,12 +631,12 @@ impl<'a> Parser<'a> {
             });
         }
 
-        Ok(CreateIndexStatement {
+        Ok(CreateIndexStatement::new_composite(
             name,
             table_name,
-            column_name,
+            column_names,
             unique,
-        })
+        ))
     }
 
     /// Parses a complete SQL `DROP INDEX` statement.

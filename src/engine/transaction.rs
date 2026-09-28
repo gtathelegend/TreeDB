@@ -606,12 +606,23 @@ impl<'db> Transaction<'db> {
         column_name: &str,
         unique: bool,
     ) -> Result<crate::engine::catalog::IndexId> {
+        self.create_composite_index(table_name, index_name, &[column_name], unique)
+    }
+
+    /// Creates a new persistent composite secondary index within this transaction.
+    pub fn create_composite_index(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        column_names: &[&str],
+        unique: bool,
+    ) -> Result<crate::engine::catalog::IndexId> {
         self.ensure_active()?;
-        let res = crate::engine::catalog::Catalog::create_index(
+        let res = crate::engine::catalog::Catalog::create_composite_index(
             &mut self.db.buffer_pool,
             table_name,
             index_name,
-            column_name,
+            column_names,
             unique,
         );
         if res.is_ok() {
@@ -1918,17 +1929,18 @@ impl<'db> Transaction<'db> {
         stmt: &crate::sql::CreateIndexStatement,
     ) -> Result<StatementResult> {
         self.ensure_active()?;
-        {
+        let bound = {
             let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
             let catalog = TxnBufferPoolCatalog {
                 bp: &bp_cell,
                 ctes: None,
             };
-            crate::sql::binder::bind_create_index(stmt, &catalog)?;
-        }
-        self.create_index(&stmt.table_name, &stmt.name, &stmt.column_name, stmt.unique)?;
+            crate::sql::binder::bind_create_index(stmt, &catalog)?
+        };
+        let cols_refs: Vec<&str> = bound.column_names.iter().map(|s| s.as_str()).collect();
+        self.create_composite_index(&bound.table_name, &bound.name, &cols_refs, bound.unique)?;
         Ok(StatementResult::CreatedIndex {
-            index: stmt.name.clone(),
+            index: bound.name,
         })
     }
 

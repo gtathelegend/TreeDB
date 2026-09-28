@@ -133,24 +133,45 @@ pub struct CreateIndexStatement {
     pub name: String,
     /// Target table name.
     pub table_name: String,
-    /// Target column name to index.
+    /// Target column names to index.
+    pub column_names: Vec<String>,
+    /// Target column name to index (first column, for backwards compatibility).
     pub column_name: String,
     /// Whether this index enforces uniqueness.
     pub unique: bool,
 }
 
 impl CreateIndexStatement {
-    /// Creates a new `CreateIndexStatement`.
+    /// Creates a new single-column `CreateIndexStatement`.
     pub fn new(
         name: impl Into<String>,
         table_name: impl Into<String>,
         column_name: impl Into<String>,
         unique: bool,
     ) -> Self {
+        let col = column_name.into();
         Self {
             name: name.into(),
             table_name: table_name.into(),
-            column_name: column_name.into(),
+            column_names: vec![col.clone()],
+            column_name: col,
+            unique,
+        }
+    }
+
+    /// Creates a new composite `CreateIndexStatement`.
+    pub fn new_composite(
+        name: impl Into<String>,
+        table_name: impl Into<String>,
+        column_names: Vec<String>,
+        unique: bool,
+    ) -> Self {
+        let col = column_names.first().cloned().unwrap_or_default();
+        Self {
+            name: name.into(),
+            table_name: table_name.into(),
+            column_names,
+            column_name: col,
             unique,
         }
     }
@@ -158,17 +179,18 @@ impl CreateIndexStatement {
 
 impl fmt::Display for CreateIndexStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cols = self.column_names.join(", ");
         if self.unique {
             write!(
                 f,
                 "CREATE UNIQUE INDEX {} ON {} ({})",
-                self.name, self.table_name, self.column_name
+                self.name, self.table_name, cols
             )
         } else {
             write!(
                 f,
                 "CREATE INDEX {} ON {} ({})",
-                self.name, self.table_name, self.column_name
+                self.name, self.table_name, cols
             )
         }
     }

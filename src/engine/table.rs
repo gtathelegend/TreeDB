@@ -90,11 +90,20 @@ impl<'a> Table<'a> {
         // Validate unique secondary index constraints
         for (meta, sec_idx) in &self.indexes {
             if meta.unique {
-                let val = &row.values[meta.column_idx];
-                let idx_key = IndexKey::from_value(val);
+                let idx_key = meta.extract_index_key(row);
                 let existing = sec_idx.lookup(self.buffer_pool, &idx_key)?;
                 if !existing.is_empty() {
-                    return Err(Error::DuplicateIndexKey(format!("{val}")));
+                    let vals_str = meta
+                        .column_indices
+                        .iter()
+                        .map(|&i| format!("{}", row.values[i]))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::DuplicateIndexKey(if meta.column_indices.len() == 1 {
+                        vals_str
+                    } else {
+                        format!("({vals_str})")
+                    }));
                 }
             }
         }
@@ -105,8 +114,7 @@ impl<'a> Table<'a> {
 
         // Maintain secondary indexes
         for (meta, sec_idx) in &mut self.indexes {
-            let val = &row.values[meta.column_idx];
-            let idx_key = IndexKey::from_value(val);
+            let idx_key = meta.extract_index_key(row);
             sec_idx.insert(self.buffer_pool, &idx_key, rid)?;
         }
 
@@ -162,13 +170,22 @@ impl<'a> Table<'a> {
 
         // Validate uniqueness on changed indexed values
         for (meta, sec_idx) in &self.indexes {
-            let old_val = &old_row.values[meta.column_idx];
-            let new_val = &row.values[meta.column_idx];
-            if meta.unique && old_val != new_val {
-                let idx_key = IndexKey::from_value(new_val);
-                let existing = sec_idx.lookup(self.buffer_pool, &idx_key)?;
+            let old_key = meta.extract_index_key(&old_row);
+            let new_key = meta.extract_index_key(row);
+            if meta.unique && old_key != new_key {
+                let existing = sec_idx.lookup(self.buffer_pool, &new_key)?;
                 if existing.iter().any(|&r| r != old_rid) {
-                    return Err(Error::DuplicateIndexKey(format!("{new_val}")));
+                    let vals_str = meta
+                        .column_indices
+                        .iter()
+                        .map(|&i| format!("{}", row.values[i]))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::DuplicateIndexKey(if meta.column_indices.len() == 1 {
+                        vals_str
+                    } else {
+                        format!("({vals_str})")
+                    }));
                 }
             }
         }
@@ -180,10 +197,8 @@ impl<'a> Table<'a> {
 
         // Update secondary indexes
         for (meta, sec_idx) in &mut self.indexes {
-            let old_val = &old_row.values[meta.column_idx];
-            let new_val = &row.values[meta.column_idx];
-            let old_key = IndexKey::from_value(old_val);
-            let new_key = IndexKey::from_value(new_val);
+            let old_key = meta.extract_index_key(&old_row);
+            let new_key = meta.extract_index_key(row);
 
             sec_idx.delete(self.buffer_pool, &old_key, old_rid)?;
             sec_idx.insert(self.buffer_pool, &new_key, new_rid)?;
@@ -209,8 +224,7 @@ impl<'a> Table<'a> {
                         let decoded = self.metadata.schema.decode_tuple(&b)?;
                         // Remove from all secondary indexes
                         for (meta, sec_idx) in &mut self.indexes {
-                            let val = &decoded.values[meta.column_idx];
-                            let idx_key = IndexKey::from_value(val);
+                            let idx_key = meta.extract_index_key(&decoded);
                             sec_idx.delete(self.buffer_pool, &idx_key, rid)?;
                         }
                         Some(decoded)
@@ -330,6 +344,104 @@ impl<'a> Table<'a> {
         }
 
         Ok(rows)
+    }
+
+    /// Performs a composite point or prefix lookup on a secondary index, returning matching record IDs.
+    pub fn composite_index_lookup_rids(
+        &mut self,
+        index_name: &str,
+        prefix_values: &[Value],
+    ) -> Result<Vec<RecordId>> {
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        if prefix_values.is_empty() {
+            return Err(Error::InvalidIndexDefinition(
+                "prefix values cannot be empty".to_string(),
+            ));
+        }
+
+        if prefix_values.len() == meta.column_indices.len() {
+            let key = crate::index::composite::CompositeIndexKey::from_values(prefix_values)
+                .to_index_key(meta.column_indices.len());
+            sec_idx.lookup(self.buffer_pool, &key)
+        } else {
+            let start_bytes = crate::index::composite::CompositeIndexKey::encode_prefix_values(
+                prefix_values,
+                meta.column_indices.len(),
+            );
+            let end_bytes = crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
+            let start_key = IndexKey::new(start_bytes);
+            let end_key = end_bytes.map(IndexKey::new);
+            let entries = sec_idx.scan(self.buffer_pool, Some(&start_key), end_key.as_ref())?;
+            Ok(entries.into_iter().map(|(_k, rid)| rid).collect())
+        }
+    }
+
+    /// Performs a composite point or prefix lookup on a secondary index, returning all matching rows.
+    pub fn composite_index_lookup(
+        &mut self,
+        index_name: &str,
+        prefix_values: &[Value],
+    ) -> Result<Vec<Row>> {
+        let rids = self.composite_index_lookup_rids(index_name, prefix_values)?;
+        let mut rows = Vec::with_capacity(rids.len());
+        for rid in rids {
+            if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+                let row = self.metadata.schema.decode_tuple(&bytes)?;
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Performs a bounded range scan on a composite secondary index.
+    pub fn composite_index_scan(
+        &mut self,
+        index_name: &str,
+        start_key: Option<&IndexKey>,
+        end_key: Option<&IndexKey>,
+    ) -> Result<Vec<Row>> {
+        let sec_idx = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let entries = sec_idx.scan(self.buffer_pool, start_key, end_key)?;
+        let mut rows = Vec::with_capacity(entries.len());
+
+        for (_k, rid) in entries {
+            if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+                let row = self.metadata.schema.decode_tuple(&bytes)?;
+                rows.push(row);
+            }
+        }
+
+        Ok(rows)
+    }
+
+    /// Performs a bounded range scan on a composite secondary index, returning record IDs directly.
+    pub fn composite_index_scan_rids(
+        &mut self,
+        index_name: &str,
+        start_key: Option<&IndexKey>,
+        end_key: Option<&IndexKey>,
+    ) -> Result<Vec<RecordId>> {
+        let sec_idx = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let entries = sec_idx.scan(self.buffer_pool, start_key, end_key)?;
+        Ok(entries.into_iter().map(|(_k, rid)| rid).collect())
     }
 
     /// Validates the structural invariants of the table's underlying primary B+ Tree.
@@ -465,12 +577,39 @@ impl<'a> Table<'a> {
         }
 
         for (meta, _sec_idx) in &self.indexes {
-            let col_idx = meta.column_idx;
-            let col_nulls = null_counts[col_idx];
-            let col_distinct = distinct_sets[col_idx].len();
-            let idx_stats =
-                IndexStatistics::new(row_count.saturating_sub(col_nulls), col_distinct, col_nulls);
-            table_stats = table_stats.with_index(&meta.name, idx_stats);
+            let col_count = meta.column_indices.len();
+            if col_count == 1 {
+                let col_idx = meta.column_indices[0];
+                let col_nulls = null_counts[col_idx];
+                let col_distinct = distinct_sets[col_idx].len();
+                let idx_stats = IndexStatistics::new(row_count.saturating_sub(col_nulls), col_distinct, col_nulls);
+                table_stats = table_stats.with_index(&meta.name, idx_stats);
+            } else {
+                let mut composite_keys = HashSet::new();
+                let mut null_rows = 0;
+                for row in &rows {
+                    let has_null = meta.column_indices.iter().any(|&i| row.values[i].is_null());
+                    if has_null {
+                        null_rows += 1;
+                    }
+                    let key = meta.extract_index_key(row);
+                    composite_keys.insert(key);
+                }
+                let distinct_composite = composite_keys.len();
+                let first_col_idx = meta.column_indices[0];
+                let scalar_ndv = distinct_sets[first_col_idx].len();
+                let est_leaves = ((row_count + 100) / 100).max(1);
+                let idx_stats = IndexStatistics::new_composite(
+                    row_count.saturating_sub(null_rows),
+                    scalar_ndv,
+                    null_rows,
+                    col_count,
+                    distinct_composite,
+                    2,
+                    est_leaves,
+                );
+                table_stats = table_stats.with_index(&meta.name, idx_stats);
+            }
         }
 
         Ok(table_stats)

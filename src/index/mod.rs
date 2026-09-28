@@ -1,10 +1,12 @@
 pub mod bplus_tree;
+pub mod composite;
 pub mod internal;
 pub mod leaf;
 pub mod node;
 pub mod secondary;
 
 pub use bplus_tree::BPlusTree;
+pub use composite::{CompositeIndexKey, MAX_INDEX_COLUMNS};
 pub use internal::InternalNode;
 pub use leaf::LeafNode;
 pub use node::{
@@ -16,3 +18,4 @@ pub use secondary::{
     IndexKey, SecondaryIndex, SecondaryInternalNode, SecondaryLeafNode, SEC_INTERNAL_HEADER_SIZE,
     SEC_LEAF_HEADER_SIZE,
 };
+

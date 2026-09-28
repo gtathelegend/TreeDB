@@ -56,19 +56,52 @@ impl ColumnStatistics {
 pub struct IndexStatistics {
     /// Total number of indexed entries.
     pub indexed_row_count: usize,
-    /// Number of distinct index keys.
+    /// Number of distinct scalar prefix index keys (scalar column NDV).
     pub distinct_key_count: usize,
     /// Number of `NULL` index entries.
     pub null_count: usize,
+    /// Number of columns in this index.
+    pub column_count: usize,
+    /// Number of distinct full composite index keys (composite key NDV).
+    pub composite_ndv: usize,
+    /// Estimated index height (levels in B+ Tree).
+    pub index_height: usize,
+    /// Estimated leaf/page count.
+    pub estimated_leaf_pages: usize,
 }
 
 impl IndexStatistics {
-    /// Creates a new `IndexStatistics` record.
+    /// Creates a new `IndexStatistics` record for a single-column index.
     pub fn new(indexed_row_count: usize, distinct_key_count: usize, null_count: usize) -> Self {
         Self {
             indexed_row_count,
             distinct_key_count,
             null_count,
+            column_count: 1,
+            composite_ndv: distinct_key_count,
+            index_height: 1,
+            estimated_leaf_pages: 1,
+        }
+    }
+
+    /// Creates a new `IndexStatistics` record for a composite secondary index.
+    pub fn new_composite(
+        indexed_row_count: usize,
+        distinct_key_count: usize,
+        null_count: usize,
+        column_count: usize,
+        composite_ndv: usize,
+        index_height: usize,
+        estimated_leaf_pages: usize,
+    ) -> Self {
+        Self {
+            indexed_row_count,
+            distinct_key_count,
+            null_count,
+            column_count,
+            composite_ndv,
+            index_height,
+            estimated_leaf_pages,
         }
     }
 }

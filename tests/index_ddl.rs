@@ -114,7 +114,6 @@ fn test_parser_index_ddl_malformed_syntax() {
     let invalid_queries = [
         "CREATE INDEX idx ON users;",         // Missing parentheses and column
         "CREATE INDEX idx ON users ();",      // Empty column list
-        "CREATE INDEX idx ON users (a, b);",  // Multiple columns (composite) rejected
         "CREATE INDEX idx ON users (a + 1);", // Expression rejected
         "CREATE INDEX idx ON users (LOWER(a));", // Function call rejected
         "CREATE INDEX ON users (a);",         // Missing index name
