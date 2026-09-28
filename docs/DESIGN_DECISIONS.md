@@ -1004,6 +1004,37 @@ This document records key architectural and design choices, their rationale, and
 * **Rationale:**
   * Maximizes query optimization opportunities (derived table flattening, join reordering, and SEMI/ANTI join evaluation) while preserving exact SQL semantics and keeping storage abstractions clean and robust.
 
+---
+
+### Decision 54: Cost-Based SEMI/ANTI Join Planning, Physical Existence Probes, and Exact SQL Semantics
+* **Context:** In Phase 38, TreeDB introduced logical subquery decorrelation (`EXISTS`, `NOT EXISTS`, `IN` -> `SEMI`/`ANTI` joins). However, physical execution defaulted to nested loop or basic hash join without cost-based strategy selection or index existence probing. A cost-based physical planner was needed to evaluate candidate SEMI/ANTI physical execution strategies (nested-loop, in-memory hash, external spilled hash, and index existence probes) and choose the cheapest execution path while strictly preserving SQL semantics and 3VL NULL isolation.
+* **Decision:**
+  > TreeDB integrates cost-based SEMI and ANTI join planning directly into the query optimizer, selecting among Nested Loop, In-Memory Hash, External Spilled Hash, and Index Existence Probes based on calibrated cost modeling and cardinality estimation.
+  1. **Physical Join Strategies (`JoinStrategy`):**
+     * `JoinStrategy::NestedLoop`: Outer loop with early termination on the first matching inner row.
+     * `JoinStrategy::Hash`: In-memory hash table built on inner join keys with single-hit probe matching; spills to disk via `ExternalHashJoiner` when memory budget is exceeded.
+     * `JoinStrategy::IndexProbe`: Point lookups directly into the inner table's primary B+ Tree or secondary index for each outer row, terminating immediately upon confirming existence.
+  2. **Index Existence Probe Execution & Tuple-Fetch Skipping:**
+     * When joining against an indexed inner column, `execute_index_probe_semi_anti` probes the index directly per outer row.
+     * **Secondary Index Fast Path:** If no residual predicates are present, existence is verified purely via `sec_idx.lookup()` without fetching any raw tuple bytes from `RecordStore`.
+     * **Residual Filter Evaluation:** When residual predicates exist, matching `RecordId`s are resolved and candidate rows fetched sequentially from `RecordStore`, terminating at the first tuple satisfying all residual filters.
+     * Evaluates outer expressions and residual filters using pure `Expr::evaluate` calls, preventing re-borrowing of active database and buffer pool references.
+  3. **Cost Model & Cardinality Estimation for SEMI/ANTI Joins:**
+     * Introduced `HASH_BUILD_CPU_COST = 0.01` and `HASH_PROBE_CPU_COST = 0.005` in `src/query/cost.rs`.
+     * Implemented `nested_loop_semi_cost`, `nested_loop_anti_cost`, `index_probe_join_cost`, `hash_semi_cost`, and `hash_anti_cost`.
+     * Calibrated `single_probe_cost` in `index_probe_join_cost` to reflect buffer-cached B+ Tree and secondary index lookups (`ROW_CPU_COST * 2.0` / `SEC_INDEX_FETCH_COST` + optional `TUPLE_FETCH_COST` if residuals present), ensuring indexed lookups compete accurately against full scans and hash builds.
+     * Estimated cardinality is strictly bounded within $[0, |A|]$ based on match probability derived from inner and outer distinct value counts.
+  4. **Exact SQL Semantics & 3VL NULL Isolation:**
+     * **Duplicate Elimination:** SEMI joins emit at most one instance of an outer row regardless of the multiplicity of matches in the inner relation.
+     * **Existence Only:** Columns projected strictly from the outer relation; inner schema is never leaked into the output.
+     * **SQL 3-Valued Logic:** `NULL = NULL` never matches in equi-join predicates. `NOT IN` subqueries containing inner `NULL`s are preserved as unflattened subquery expressions evaluated via 3VL.
+  5. **Plan Cache Invalidation & Telemetry Integration:**
+     * `PlanCacheKey` tracks secondary index dependencies referenced by `PhysicalJoin.index_name`, ensuring cache invalidation on `DROP INDEX`.
+     * `EXPLAIN ANALYZE` surfaces comprehensive runtime metrics: `outer_rows`, `inner_rows`, `matched_outer_rows`, `unmatched_outer_rows`, `candidate_pairs`, `rows_output`, `index_probes`, `successful_probes`, `failed_probes`, `hash_build_rows`, `hash_probe_rows`, `bytes_spilled`, `runs_created`.
+* **Rationale:**
+  * Drastically accelerates correlated subquery execution and decorrelated joins by replacing $O(N \times M)$ scans with $O(N \log M)$ index probes or $O(N + M)$ hash lookups, while guaranteeing exact SQL equivalence and zero runtime memory or pin leaks.
+
+
 
 
 

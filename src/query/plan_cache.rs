@@ -362,6 +362,11 @@ fn collect_references_from_plan(
         if let AccessPath::SecondaryIndexScan { index_name, .. } = &join.right.access_path {
             indexes.insert(index_name.clone());
         }
+        if let Some(idx_name) = &join.index_name {
+            if idx_name != "__primary__" {
+                indexes.insert(idx_name.clone());
+            }
+        }
     }
 
     for cte in &plan.ctes {

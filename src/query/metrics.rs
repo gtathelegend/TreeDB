@@ -23,6 +23,18 @@ pub enum OperatorKind {
     HashJoin { join_type: String },
     /// External spilled hash join.
     ExternalHashJoin { join_type: String },
+    /// Secondary or primary index existence probe for SEMI join.
+    IndexSemiProbe { index_name: String },
+    /// Secondary or primary index existence probe for ANTI join.
+    IndexAntiProbe { index_name: String },
+    /// In-memory or streaming hash SEMI join.
+    HashSemiJoin,
+    /// In-memory or streaming hash ANTI join.
+    HashAntiJoin,
+    /// Nested-loop SEMI join with early match exit.
+    NestedLoopSemiJoin,
+    /// Nested-loop ANTI join with early match exit.
+    NestedLoopAntiJoin,
     /// Group-by and aggregate computation.
     Aggregate,
     /// Window function evaluation.
@@ -51,6 +63,16 @@ impl fmt::Display for OperatorKind {
             Self::NestedLoopJoin { join_type } => write!(f, "NestedLoopJoin ({join_type})"),
             Self::HashJoin { join_type } => write!(f, "HashJoin ({join_type})"),
             Self::ExternalHashJoin { join_type } => write!(f, "ExternalHashJoin ({join_type})"),
+            Self::IndexSemiProbe { index_name } => {
+                write!(f, "IndexSemiProbe (index: {index_name})")
+            }
+            Self::IndexAntiProbe { index_name } => {
+                write!(f, "IndexAntiProbe (index: {index_name})")
+            }
+            Self::HashSemiJoin => write!(f, "HashSemiJoin"),
+            Self::HashAntiJoin => write!(f, "HashAntiJoin"),
+            Self::NestedLoopSemiJoin => write!(f, "NestedLoopSemiJoin"),
+            Self::NestedLoopAntiJoin => write!(f, "NestedLoopAntiJoin"),
             Self::Aggregate => write!(f, "Aggregate"),
             Self::Window => write!(f, "Window"),
             Self::Subquery { kind } => write!(f, "Subquery ({kind})"),
@@ -86,6 +108,22 @@ pub struct OperatorCounters {
     pub candidate_pairs: usize,
     /// Join pairs that satisfied the join condition.
     pub matched_rows: usize,
+    /// Outer rows that found at least one match during SEMI join.
+    pub matched_outer_rows: usize,
+    /// Outer rows that had no qualifying match during ANTI join.
+    pub unmatched_outer_rows: usize,
+    /// Number of index existence probes performed during SEMI/ANTI join.
+    pub index_probes: usize,
+    /// Number of index existence probes that found a matching entry.
+    pub successful_probes: usize,
+    /// Number of index existence probes that found no matching entry.
+    pub failed_probes: usize,
+    /// Number of inner rows inserted into the hash table.
+    pub hash_build_rows: usize,
+    /// Number of outer rows probed against the hash table.
+    pub hash_probe_rows: usize,
+    /// Total rows output by this operator.
+    pub rows_output: usize,
     /// Distinct group keys produced during aggregation.
     pub group_count: usize,
     /// Number of distinct spill partitions used during external aggregation or hash join.
@@ -516,11 +554,53 @@ pub fn format_plan_with_metrics(
     } else {
         for (idx, join) in plan.joins.iter().enumerate() {
             write_indent(&mut out, indent);
-            out.push_str(&format!(
-                "NestedLoopJoin ({:?}, on: [{proper_on}])\n",
-                join.join_type,
-                proper_on = join.on
-            ));
+            let is_semi_anti = join.join_type == crate::sql::ast::JoinType::Semi
+                || join.join_type == crate::sql::ast::JoinType::Anti;
+            if is_semi_anti {
+                let base_title = match (join.join_type, join.strategy) {
+                    (
+                        crate::sql::ast::JoinType::Semi,
+                        crate::query::optimizer::JoinStrategy::IndexProbe,
+                    ) => "SemiJoin [IndexSemiProbe]",
+                    (
+                        crate::sql::ast::JoinType::Semi,
+                        crate::query::optimizer::JoinStrategy::Hash,
+                    ) => "SemiJoin [HashSemiJoin]",
+                    (
+                        crate::sql::ast::JoinType::Semi,
+                        crate::query::optimizer::JoinStrategy::NestedLoop,
+                    ) => "SemiJoin [NestedLoopSemiJoin]",
+                    (
+                        crate::sql::ast::JoinType::Anti,
+                        crate::query::optimizer::JoinStrategy::IndexProbe,
+                    ) => "AntiJoin [IndexAntiProbe]",
+                    (
+                        crate::sql::ast::JoinType::Anti,
+                        crate::query::optimizer::JoinStrategy::Hash,
+                    ) => "AntiJoin [HashAntiJoin]",
+                    (
+                        crate::sql::ast::JoinType::Anti,
+                        crate::query::optimizer::JoinStrategy::NestedLoop,
+                    ) => "AntiJoin [NestedLoopAntiJoin]",
+                    _ => "Join",
+                };
+                out.push_str(&format!(
+                    "{base_title} (on: [{proper_on}])\n",
+                    proper_on = join.on
+                ));
+                write_indent(&mut out, indent + 1);
+                out.push_str(&format!("strategy={:?}\n", join.strategy));
+                if let Some(idx_name) = &join.index_name {
+                    write_indent(&mut out, indent + 1);
+                    out.push_str(&format!("index={idx_name}\n"));
+                }
+            } else {
+                out.push_str(&format!(
+                    "NestedLoopJoin ({:?}, on: [{proper_on}])\n",
+                    join.join_type,
+                    proper_on = join.on
+                ));
+            }
             write_indent(&mut out, indent + 1);
             if let Some(root) = &metrics.root_operator {
                 if let Some(jm) = find_operator_metrics(root, &|k| {
@@ -529,9 +609,35 @@ pub fn format_plan_with_metrics(
                         OperatorKind::NestedLoopJoin { .. }
                             | OperatorKind::HashJoin { .. }
                             | OperatorKind::ExternalHashJoin { .. }
+                            | OperatorKind::IndexSemiProbe { .. }
+                            | OperatorKind::IndexAntiProbe { .. }
+                            | OperatorKind::HashSemiJoin
+                            | OperatorKind::HashAntiJoin
+                            | OperatorKind::NestedLoopSemiJoin
+                            | OperatorKind::NestedLoopAntiJoin
                     )
                 }) {
-                    if jm.counters.runs_created > 0 || jm.counters.bytes_spilled > 0 {
+                    if is_semi_anti {
+                        out.push_str(&format!(
+                            "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, outer_rows: {}, inner_rows: {}, matched_outer_rows: {}, unmatched_outer_rows: {}, candidate_pairs: {}, rows_output: {}, index_probes: {}, successful_probes: {}, failed_probes: {}, hash_build_rows: {}, hash_probe_rows: {}, bytes_spilled: {}, runs_created: {}\n",
+                            join.cost,
+                            join.estimated_rows,
+                            metrics.total_rows,
+                            jm.counters.rows_left,
+                            jm.counters.rows_right,
+                            jm.counters.matched_outer_rows,
+                            jm.counters.unmatched_outer_rows,
+                            jm.counters.candidate_pairs,
+                            jm.actual_rows,
+                            jm.counters.index_probes,
+                            jm.counters.successful_probes,
+                            jm.counters.failed_probes,
+                            jm.counters.hash_build_rows,
+                            jm.counters.hash_probe_rows,
+                            jm.counters.bytes_spilled,
+                            jm.counters.runs_created
+                        ));
+                    } else if jm.counters.runs_created > 0 || jm.counters.bytes_spilled > 0 {
                         out.push_str(&format!(
                             "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, runs_created: {}, bytes_spilled: {}, partition_passes: {}, peak_memory_bytes: {}\n",
                             join.cost,

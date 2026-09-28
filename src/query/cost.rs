@@ -13,6 +13,8 @@ pub const SORT_CPU_COST: f64 = 0.05;
 pub const JOIN_CPU_COST: f64 = 0.02;
 pub const AGG_CPU_COST: f64 = 0.01;
 pub const WINDOW_CPU_COST: f64 = 0.02;
+pub const HASH_BUILD_CPU_COST: f64 = 0.01;
+pub const HASH_PROBE_CPU_COST: f64 = 0.005;
 
 /// Centralized, deterministic cost model estimating execution effort for physical plans.
 pub struct CostModel;
@@ -58,6 +60,110 @@ impl CostModel {
         let left_r = left_rows.max(1.0);
         let right_r = right_rows.max(1.0);
         left_cost + (left_r * right_cost) + (JOIN_CPU_COST * left_r * right_r)
+    }
+
+    /// Computes the cost of a nested-loop SEMI join with early exit on first match.
+    pub fn nested_loop_semi_cost(
+        left_cost: f64,
+        left_rows: f64,
+        right_cost: f64,
+        right_rows: f64,
+        match_prob: f64,
+    ) -> f64 {
+        let left_r = left_rows.max(1.0);
+        let right_r = right_rows.max(1.0);
+        let p = match_prob.clamp(0.0, 1.0);
+        let avg_inner_scanned = (p * (right_r * 0.5)) + ((1.0 - p) * right_r);
+        left_cost
+            + (left_r * (avg_inner_scanned * (ROW_CPU_COST + JOIN_CPU_COST)))
+            + (right_cost * 0.1)
+    }
+
+    /// Computes the cost of a nested-loop ANTI join with early exit on first match.
+    pub fn nested_loop_anti_cost(
+        left_cost: f64,
+        left_rows: f64,
+        right_cost: f64,
+        right_rows: f64,
+        match_prob: f64,
+    ) -> f64 {
+        Self::nested_loop_semi_cost(left_cost, left_rows, right_cost, right_rows, match_prob)
+    }
+
+    /// Computes the cost of an index existence probe for SEMI/ANTI joins.
+    pub fn index_probe_join_cost(
+        left_cost: f64,
+        left_rows: f64,
+        null_frac: f64,
+        is_primary_key: bool,
+        has_residual_filter: bool,
+    ) -> f64 {
+        let left_r = left_rows.max(1.0);
+        let non_null_fraction = (1.0 - null_frac).clamp(0.0, 1.0);
+        let probe_rows = left_r * non_null_fraction;
+
+        let single_probe_cost = if is_primary_key {
+            (ROW_CPU_COST * 2.0)
+                + (if has_residual_filter {
+                    TUPLE_FETCH_COST
+                } else {
+                    0.0
+                })
+        } else {
+            SEC_INDEX_FETCH_COST
+                + (if has_residual_filter {
+                    TUPLE_FETCH_COST
+                } else {
+                    0.0
+                })
+        };
+
+        left_cost + (probe_rows * single_probe_cost) + (left_r * ROW_CPU_COST)
+    }
+
+    /// Computes the cost of a hash SEMI join (in-memory or external partitioned spill).
+    pub fn hash_semi_cost(
+        left_cost: f64,
+        left_rows: f64,
+        right_cost: f64,
+        right_rows: f64,
+        memory_budget_bytes: usize,
+    ) -> f64 {
+        let left_r = left_rows.max(1.0);
+        let right_r = right_rows.max(1.0);
+        let estimated_row_bytes = 64.0;
+        let estimated_build_bytes = right_r * estimated_row_bytes;
+
+        let build_cost = right_cost + (right_r * (ROW_CPU_COST + HASH_BUILD_CPU_COST));
+        let probe_cost = left_r * (ROW_CPU_COST + HASH_PROBE_CPU_COST);
+
+        let spill_cost = if estimated_build_bytes > (memory_budget_bytes as f64) {
+            let page_size = 4096.0;
+            let left_pages = (left_r * estimated_row_bytes / page_size).ceil();
+            let right_pages = (estimated_build_bytes / page_size).ceil();
+            2.0 * PAGE_READ_COST * (left_pages + right_pages)
+        } else {
+            0.0
+        };
+
+        left_cost + build_cost + probe_cost + spill_cost
+    }
+
+    /// Computes the cost of a hash ANTI join.
+    pub fn hash_anti_cost(
+        left_cost: f64,
+        left_rows: f64,
+        right_cost: f64,
+        right_rows: f64,
+        memory_budget_bytes: usize,
+    ) -> f64 {
+        Self::hash_semi_cost(
+            left_cost,
+            left_rows,
+            right_cost,
+            right_rows,
+            memory_budget_bytes,
+        )
     }
 
     /// Computes the cost of evaluating residual filter expressions.

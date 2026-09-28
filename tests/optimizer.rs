@@ -969,6 +969,8 @@ fn baseline_execute(
             on: j.on.clone(),
             estimated_rows: 0.0,
             cost: 0.0,
+            strategy: treedb::query::JoinStrategy::NestedLoop,
+            index_name: None,
         });
     }
 

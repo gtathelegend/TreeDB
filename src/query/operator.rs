@@ -271,6 +271,8 @@ impl JoinOperator {
                 let mut out_rows = Vec::new();
                 let mut candidate_pairs = 0;
                 let mut matched_rows = 0;
+                let mut matched_outer_rows = 0;
+                let mut unmatched_outer_rows = 0;
 
                 for left_row in &left_rows {
                     let mut left_matched = false;
@@ -290,6 +292,12 @@ impl JoinOperator {
                         }
                     }
 
+                    if left_matched {
+                        matched_outer_rows += 1;
+                    } else {
+                        unmatched_outer_rows += 1;
+                    }
+
                     if (join_type == JoinType::Semi && left_matched)
                         || (join_type == JoinType::Anti && !left_matched)
                     {
@@ -303,6 +311,10 @@ impl JoinOperator {
                     rows_output: out_rows.len(),
                     candidate_pairs,
                     matched_rows,
+                    matched_outer_rows,
+                    unmatched_outer_rows,
+                    hash_build_rows: 0,
+                    hash_probe_rows: 0,
                     spill_partitions: 0,
                     runs_created: 0,
                     bytes_spilled: 0,
@@ -393,6 +405,10 @@ impl JoinOperator {
                 peak_memory_bytes: 0,
                 candidate_pairs,
                 matched_rows,
+                matched_outer_rows: 0,
+                unmatched_outer_rows: 0,
+                hash_build_rows: 0,
+                hash_probe_rows: 0,
             };
 
             Ok((joined_schema, out_rows, metrics))

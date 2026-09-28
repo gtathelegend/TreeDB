@@ -3193,6 +3193,18 @@ impl<'db> Transaction<'db> {
 
         // 2. Execute Joins sequentially
         for join in &plan.joins {
+            if join.strategy == crate::query::optimizer::JoinStrategy::IndexProbe {
+                if let Some((next_rows, probe_metric)) = self.execute_index_probe_semi_anti(
+                    &current_rows,
+                    &current_schema,
+                    join,
+                    &current_op,
+                )? {
+                    current_rows = next_rows;
+                    current_op = probe_metric;
+                    continue;
+                }
+            }
             let (right_schema, right_rows, right_op) = {
                 if let Some((cte_schema, cte_rows)) = cte_store.get(&join.right.table_name) {
                     let raw_schema = cte_schema.clone();
@@ -3386,26 +3398,35 @@ impl<'db> Transaction<'db> {
                 (ns, nr, metrics)
             };
 
-            let op_kind =
-                if join_exec_metrics.runs_created > 0 || join_exec_metrics.bytes_spilled > 0 {
-                    crate::query::OperatorKind::ExternalHashJoin {
+            let op_kind = if join_exec_metrics.runs_created > 0
+                || join_exec_metrics.bytes_spilled > 0
+            {
+                crate::query::OperatorKind::ExternalHashJoin {
+                    join_type: format!("{:?}", join.join_type),
+                }
+            } else if crate::query::external_hash_join::analyze_equi_join(
+                &join.on,
+                &current_schema,
+                &right_schema,
+            )
+            .is_some()
+            {
+                match join.join_type {
+                    crate::sql::JoinType::Semi => crate::query::OperatorKind::HashSemiJoin,
+                    crate::sql::JoinType::Anti => crate::query::OperatorKind::HashAntiJoin,
+                    _ => crate::query::OperatorKind::HashJoin {
                         join_type: format!("{:?}", join.join_type),
-                    }
-                } else if crate::query::external_hash_join::analyze_equi_join(
-                    &join.on,
-                    &current_schema,
-                    &right_schema,
-                )
-                .is_some()
-                {
-                    crate::query::OperatorKind::HashJoin {
+                    },
+                }
+            } else {
+                match join.join_type {
+                    crate::sql::JoinType::Semi => crate::query::OperatorKind::NestedLoopSemiJoin,
+                    crate::sql::JoinType::Anti => crate::query::OperatorKind::NestedLoopAntiJoin,
+                    _ => crate::query::OperatorKind::NestedLoopJoin {
                         join_type: format!("{:?}", join.join_type),
-                    }
-                } else {
-                    crate::query::OperatorKind::NestedLoopJoin {
-                        join_type: format!("{:?}", join.join_type),
-                    }
-                };
+                    },
+                }
+            };
 
             let mut join_metric = crate::query::OperatorMetrics::new(
                 op_kind,
@@ -3418,6 +3439,11 @@ impl<'db> Transaction<'db> {
             join_metric.counters.rows_right = right_count;
             join_metric.counters.candidate_pairs = join_exec_metrics.candidate_pairs;
             join_metric.counters.matched_rows = join_exec_metrics.matched_rows;
+            join_metric.counters.matched_outer_rows = join_exec_metrics.matched_outer_rows;
+            join_metric.counters.unmatched_outer_rows = join_exec_metrics.unmatched_outer_rows;
+            join_metric.counters.hash_build_rows = join_exec_metrics.hash_build_rows;
+            join_metric.counters.hash_probe_rows = join_exec_metrics.hash_probe_rows;
+            join_metric.counters.rows_output = next_rows.len();
             join_metric.counters.spill_partitions = join_exec_metrics.spill_partitions;
             join_metric.counters.runs_created = join_exec_metrics.runs_created;
             join_metric.counters.bytes_spilled = join_exec_metrics.bytes_spilled;
@@ -3682,6 +3708,262 @@ impl<'db> Transaction<'db> {
             )?;
         }
         Ok(())
+    }
+
+    fn execute_index_probe_semi_anti(
+        &mut self,
+        current_rows: &[Row],
+        current_schema: &Schema,
+        join: &crate::query::optimizer::PhysicalJoin,
+        current_op: &crate::query::OperatorMetrics,
+    ) -> Result<Option<(Vec<Row>, crate::query::OperatorMetrics)>> {
+        let index_name = match &join.index_name {
+            Some(idx) => idx.clone(),
+            None => return Ok(None),
+        };
+
+        let mut table = self.open_table(&join.right.table_name)?;
+        let raw_schema = table.schema().clone();
+        let right_qualifier = join.right.qualifier();
+
+        let on_conjuncts = crate::query::optimizer::split_conjunction(&join.on);
+        let mut equi_pair: Option<(crate::query::expr::Expr, String)> = None;
+        let mut residual_on: Vec<crate::query::expr::Expr> = Vec::new();
+
+        for conj in &on_conjuncts {
+            if equi_pair.is_none() {
+                if let crate::query::expr::Expr::Binary {
+                    left,
+                    op: crate::query::expr::BinaryOp::Eq,
+                    right,
+                } = conj
+                {
+                    let l_refs = crate::query::optimizer::expr_referenced_qualifiers(left);
+                    let r_refs = crate::query::optimizer::expr_referenced_qualifiers(right);
+
+                    if l_refs.len() == 1 && r_refs.len() == 1 {
+                        let l_q = l_refs.iter().next().unwrap();
+                        let r_q = r_refs.iter().next().unwrap();
+
+                        if l_q == right_qualifier && r_q != right_qualifier {
+                            if let crate::query::expr::Expr::Column(inner_col) = left.as_ref() {
+                                let in_name = inner_col.split('.').next_back().unwrap_or(inner_col);
+                                equi_pair = Some((*right.clone(), in_name.to_string()));
+                                continue;
+                            }
+                        } else if r_q == right_qualifier && l_q != right_qualifier {
+                            if let crate::query::expr::Expr::Column(inner_col) = right.as_ref() {
+                                let in_name = inner_col.split('.').next_back().unwrap_or(inner_col);
+                                equi_pair = Some((*left.clone(), in_name.to_string()));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            residual_on.push(conj.clone());
+        }
+
+        let (outer_expr, _) = match equi_pair {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let cols: Vec<crate::engine::types::Column> = raw_schema
+            .columns
+            .iter()
+            .map(|c| {
+                crate::engine::types::Column::new(
+                    format!("{right_qualifier}.{}", c.name),
+                    c.data_type,
+                    c.nullable,
+                )
+            })
+            .collect();
+        let right_schema = Schema::new_projected(cols);
+
+        let mut combined_cols = current_schema.columns.clone();
+        combined_cols.extend(right_schema.columns.clone());
+        let combined_schema = Schema::new_projected(combined_cols);
+
+        let is_pk = index_name == "__primary__";
+        let is_semi = join.join_type == crate::sql::JoinType::Semi;
+
+        let mut out_rows = Vec::new();
+        let mut index_probes = 0;
+        let mut successful_probes = 0;
+        let mut failed_probes = 0;
+        let mut matched_outer_rows = 0;
+        let mut unmatched_outer_rows = 0;
+        let mut inner_rows_fetched = 0;
+        let mut candidate_pairs = 0;
+
+        for outer_row in current_rows {
+            let outer_val = match outer_expr.evaluate(outer_row, current_schema)? {
+                Value::Null => {
+                    unmatched_outer_rows += 1;
+                    if !is_semi {
+                        out_rows.push(outer_row.clone());
+                    }
+                    continue;
+                }
+                v => v,
+            };
+
+            index_probes += 1;
+            let mut match_found = false;
+
+            if is_pk {
+                if let Some(inner_row) = table.get(&outer_val)? {
+                    inner_rows_fetched += 1;
+                    candidate_pairs += 1;
+
+                    let passes_residual = match &join.right.residual_filter {
+                        Some(f) => {
+                            let val = f.evaluate(&inner_row, &raw_schema)?;
+                            val == Value::Boolean(true)
+                        }
+                        None => true,
+                    };
+
+                    if passes_residual {
+                        let passes_on = if residual_on.is_empty() {
+                            true
+                        } else {
+                            let mut combined_values =
+                                Vec::with_capacity(outer_row.values.len() + inner_row.values.len());
+                            combined_values.extend_from_slice(&outer_row.values);
+                            combined_values.extend_from_slice(&inner_row.values);
+                            let combined_row = Row::new(combined_values);
+
+                            let mut all_ok = true;
+                            for r_expr in &residual_on {
+                                if r_expr.evaluate(&combined_row, &combined_schema)?
+                                    != Value::Boolean(true)
+                                {
+                                    all_ok = false;
+                                    break;
+                                }
+                            }
+                            all_ok
+                        };
+
+                        if passes_on {
+                            match_found = true;
+                        }
+                    }
+                }
+            } else {
+                let rids = table.index_lookup_rids(&index_name, &outer_val)?;
+                let has_residuals = join.right.residual_filter.is_some() || !residual_on.is_empty();
+
+                if !has_residuals {
+                    if !rids.is_empty() {
+                        match_found = true;
+                        candidate_pairs += 1;
+                    }
+                } else {
+                    for rid in rids {
+                        candidate_pairs += 1;
+                        if let Some(inner_row) = table.get_row_by_rid(rid)? {
+                            inner_rows_fetched += 1;
+                            let passes_residual = match &join.right.residual_filter {
+                                Some(f) => {
+                                    let val = f.evaluate(&inner_row, &raw_schema)?;
+                                    val == Value::Boolean(true)
+                                }
+                                None => true,
+                            };
+
+                            if passes_residual {
+                                let passes_on = if residual_on.is_empty() {
+                                    true
+                                } else {
+                                    let mut combined_values = Vec::with_capacity(
+                                        outer_row.values.len() + inner_row.values.len(),
+                                    );
+                                    combined_values.extend_from_slice(&outer_row.values);
+                                    combined_values.extend_from_slice(&inner_row.values);
+                                    let combined_row = Row::new(combined_values);
+
+                                    let mut all_ok = true;
+                                    for r_expr in &residual_on {
+                                        if r_expr.evaluate(&combined_row, &combined_schema)?
+                                            != Value::Boolean(true)
+                                        {
+                                            all_ok = false;
+                                            break;
+                                        }
+                                    }
+                                    all_ok
+                                };
+
+                                if passes_on {
+                                    match_found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if match_found {
+                successful_probes += 1;
+                matched_outer_rows += 1;
+                if is_semi {
+                    out_rows.push(outer_row.clone());
+                }
+            } else {
+                failed_probes += 1;
+                unmatched_outer_rows += 1;
+                if !is_semi {
+                    out_rows.push(outer_row.clone());
+                }
+            }
+        }
+
+        let op_kind = if is_semi {
+            crate::query::OperatorKind::IndexSemiProbe {
+                index_name: index_name.clone(),
+            }
+        } else {
+            crate::query::OperatorKind::IndexAntiProbe {
+                index_name: index_name.clone(),
+            }
+        };
+
+        let mut join_metric =
+            crate::query::OperatorMetrics::new(op_kind, Some(join.estimated_rows), Some(join.cost));
+        join_metric.input_rows = current_rows.len() + inner_rows_fetched;
+        join_metric.actual_rows = out_rows.len();
+        join_metric.counters.rows_left = current_rows.len();
+        join_metric.counters.rows_right = inner_rows_fetched;
+        join_metric.counters.matched_outer_rows = matched_outer_rows;
+        join_metric.counters.unmatched_outer_rows = unmatched_outer_rows;
+        join_metric.counters.index_probes = index_probes;
+        join_metric.counters.successful_probes = successful_probes;
+        join_metric.counters.failed_probes = failed_probes;
+        join_metric.counters.candidate_pairs = candidate_pairs;
+        join_metric.counters.rows_output = out_rows.len();
+
+        let mut inner_scan_metric = crate::query::OperatorMetrics::new(
+            crate::query::OperatorKind::TableScan {
+                table_name: join.right.table_name.clone(),
+                access_path: format!("IndexProbe({index_name})"),
+            },
+            Some(join.right.estimated_rows),
+            Some(join.right.cost),
+        );
+        inner_scan_metric.input_rows = inner_rows_fetched;
+        inner_scan_metric.actual_rows = inner_rows_fetched;
+        inner_scan_metric.counters.index_lookups = index_probes;
+        inner_scan_metric.counters.tuples_fetched = inner_rows_fetched;
+
+        join_metric.add_child(current_op.clone());
+        join_metric.add_child(inner_scan_metric);
+
+        Ok(Some((out_rows, join_metric)))
     }
 
     fn pre_evaluate_uncorrelated_subqueries_in_expr(

@@ -302,6 +302,74 @@ impl CardinalityEstimator {
         rows.max(1.0)
     }
 
+    /// Estimates the probability that an individual outer row has at least one matching row in the inner relation.
+    pub fn estimate_semi_match_probability(
+        left_rows: f64,
+        left_stats: Option<&TableStatistics>,
+        right_rows: f64,
+        right_stats: Option<&TableStatistics>,
+        on_expr: &Expr,
+        schema: &Schema,
+    ) -> f64 {
+        if left_rows <= 0.0 || right_rows <= 0.0 {
+            return 0.0;
+        }
+
+        let conjuncts = crate::query::optimizer::split_conjunction(on_expr);
+        if conjuncts.is_empty() {
+            return 1.0;
+        }
+
+        let mut equi_found = false;
+        let mut prob = 1.0;
+
+        for conj in &conjuncts {
+            if let Expr::Binary {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            } = conj
+            {
+                if let (Expr::Column(col_a), Expr::Column(col_b)) = (left.as_ref(), right.as_ref())
+                {
+                    equi_found = true;
+                    let name_a = col_a.split('.').next_back().unwrap_or(col_a);
+                    let name_b = col_b.split('.').next_back().unwrap_or(col_b);
+
+                    let null_frac_a = left_stats
+                        .and_then(|s| s.column(name_a))
+                        .map(|c| c.null_fraction())
+                        .unwrap_or(0.0);
+
+                    let ndv_a = left_stats
+                        .and_then(|s| s.column(name_a))
+                        .map(|c| c.distinct_count as f64)
+                        .unwrap_or(left_rows);
+
+                    let ndv_b = right_stats
+                        .and_then(|s| s.column(name_b))
+                        .map(|c| c.distinct_count as f64)
+                        .unwrap_or(right_rows);
+
+                    let max_ndv = ndv_a.max(ndv_b).max(1.0);
+                    let equi_p = (ndv_b / max_ndv).clamp(0.0, 1.0);
+                    prob *= (1.0 - null_frac_a) * equi_p;
+                    continue;
+                }
+            }
+
+            let sel = Self::estimate_expr_selectivity(conj, None, schema);
+            prob *= sel;
+        }
+
+        if !equi_found {
+            let sel = Self::estimate_expr_selectivity(on_expr, None, schema);
+            prob = 1.0 - (1.0 - sel).powf(right_rows.max(1.0));
+        }
+
+        prob.clamp(0.0, 1.0)
+    }
+
     /// Estimates the output cardinality for a join operation taking `JoinType` into account.
     pub fn estimate_join_cardinality(
         join_type: crate::sql::ast::JoinType,
@@ -312,21 +380,77 @@ impl CardinalityEstimator {
         on_expr: &Expr,
         schema: &Schema,
     ) -> f64 {
-        let inner_est = Self::estimate_inner_join_cardinality(
-            left_rows,
-            left_stats,
-            right_rows,
-            right_stats,
-            on_expr,
-            schema,
-        );
         match join_type {
-            crate::sql::ast::JoinType::Inner => inner_est,
-            crate::sql::ast::JoinType::Left => inner_est.max(left_rows),
-            crate::sql::ast::JoinType::Right => inner_est.max(right_rows),
-            crate::sql::ast::JoinType::Full => inner_est.max(left_rows).max(right_rows),
-            crate::sql::ast::JoinType::Semi => inner_est.min(left_rows).max(1.0),
-            crate::sql::ast::JoinType::Anti => (left_rows - inner_est).max(0.0).max(1.0),
+            crate::sql::ast::JoinType::Inner => Self::estimate_inner_join_cardinality(
+                left_rows,
+                left_stats,
+                right_rows,
+                right_stats,
+                on_expr,
+                schema,
+            ),
+            crate::sql::ast::JoinType::Left => Self::estimate_inner_join_cardinality(
+                left_rows,
+                left_stats,
+                right_rows,
+                right_stats,
+                on_expr,
+                schema,
+            )
+            .max(left_rows),
+            crate::sql::ast::JoinType::Right => Self::estimate_inner_join_cardinality(
+                left_rows,
+                left_stats,
+                right_rows,
+                right_stats,
+                on_expr,
+                schema,
+            )
+            .max(right_rows),
+            crate::sql::ast::JoinType::Full => Self::estimate_inner_join_cardinality(
+                left_rows,
+                left_stats,
+                right_rows,
+                right_stats,
+                on_expr,
+                schema,
+            )
+            .max(left_rows)
+            .max(right_rows),
+            crate::sql::ast::JoinType::Semi => {
+                if left_rows <= 0.0 || right_rows <= 0.0 {
+                    0.0
+                } else {
+                    let p = Self::estimate_semi_match_probability(
+                        left_rows,
+                        left_stats,
+                        right_rows,
+                        right_stats,
+                        on_expr,
+                        schema,
+                    );
+                    (left_rows * p).clamp(if p > 0.0 { 1.0 } else { 0.0 }, left_rows)
+                }
+            }
+            crate::sql::ast::JoinType::Anti => {
+                if left_rows <= 0.0 {
+                    0.0
+                } else if right_rows <= 0.0 {
+                    left_rows
+                } else {
+                    let p = Self::estimate_semi_match_probability(
+                        left_rows,
+                        left_stats,
+                        right_rows,
+                        right_stats,
+                        on_expr,
+                        schema,
+                    );
+                    let non_match_p = 1.0 - p;
+                    (left_rows * non_match_p)
+                        .clamp(if non_match_p > 0.0 { 1.0 } else { 0.0 }, left_rows)
+                }
+            }
         }
     }
 }

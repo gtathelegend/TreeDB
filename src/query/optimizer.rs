@@ -114,10 +114,31 @@ impl PhysicalTableScan {
     }
 }
 
+/// Execution strategy chosen for a physical relational join operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JoinStrategy {
+    /// Nested-loop join evaluating on-predicate across Cartesian product or with early match exit.
+    NestedLoop,
+    /// In-memory or streaming hash join.
+    Hash,
+    /// Existence probe against an inner index (primary key or secondary index).
+    IndexProbe,
+}
+
+impl fmt::Display for JoinStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NestedLoop => write!(f, "NestedLoop"),
+            Self::Hash => write!(f, "Hash"),
+            Self::IndexProbe => write!(f, "IndexProbe"),
+        }
+    }
+}
+
 /// Physical relational join node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalJoin {
-    /// Relational join type (Inner or Left).
+    /// Relational join type (Inner, Left, Semi, Anti, etc.).
     pub join_type: JoinType,
     /// Right-hand table scan node.
     pub right: PhysicalTableScan,
@@ -127,6 +148,10 @@ pub struct PhysicalJoin {
     pub estimated_rows: f64,
     /// Estimated total cumulative cost through this join step.
     pub cost: f64,
+    /// Physical execution strategy.
+    pub strategy: JoinStrategy,
+    /// Optional index name utilized when strategy is `IndexProbe`.
+    pub index_name: Option<String>,
 }
 
 /// Physical relational set operation node.
@@ -443,17 +468,46 @@ impl fmt::Display for PhysicalPlan {
         } else {
             for (idx, join) in self.joins.iter().enumerate() {
                 write_indent(f, indent)?;
-                writeln!(
-                    f,
-                    "NestedLoopJoin ({:?}, on: [{}])",
-                    join.join_type, join.on
-                )?;
-                write_indent(f, indent + 1)?;
-                writeln!(
-                    f,
-                    "cost: {:.2}, estimated_rows: {:.0}",
-                    join.cost, join.estimated_rows
-                )?;
+                if join.join_type == JoinType::Semi || join.join_type == JoinType::Anti {
+                    let base_title = match (join.join_type, join.strategy) {
+                        (JoinType::Semi, JoinStrategy::IndexProbe) => "SemiJoin [IndexSemiProbe]",
+                        (JoinType::Semi, JoinStrategy::Hash) => "SemiJoin [HashSemiJoin]",
+                        (JoinType::Semi, JoinStrategy::NestedLoop) => {
+                            "SemiJoin [NestedLoopSemiJoin]"
+                        }
+                        (JoinType::Anti, JoinStrategy::IndexProbe) => "AntiJoin [IndexAntiProbe]",
+                        (JoinType::Anti, JoinStrategy::Hash) => "AntiJoin [HashAntiJoin]",
+                        (JoinType::Anti, JoinStrategy::NestedLoop) => {
+                            "AntiJoin [NestedLoopAntiJoin]"
+                        }
+                        _ => "Join",
+                    };
+                    writeln!(f, "{base_title} (on: [{}])", join.on)?;
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "strategy={:?}", join.strategy)?;
+                    write_indent(f, indent + 1)?;
+                    writeln!(
+                        f,
+                        "cost: {:.2}, estimated_rows: {:.0}",
+                        join.cost, join.estimated_rows
+                    )?;
+                    if let Some(idx_name) = &join.index_name {
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "index={idx_name}")?;
+                    }
+                } else {
+                    writeln!(
+                        f,
+                        "NestedLoopJoin ({:?}, on: [{}])",
+                        join.join_type, join.on
+                    )?;
+                    write_indent(f, indent + 1)?;
+                    writeln!(
+                        f,
+                        "cost: {:.2}, estimated_rows: {:.0}",
+                        join.cost, join.estimated_rows
+                    )?;
+                }
                 format_subqueries_in_expr(&join.on, f, indent + 1)?;
                 indent += 1;
                 if idx == 0 {
@@ -843,6 +897,8 @@ fn optimize_inner_join_region_dp(graph: &JoinGraph) -> DPPlan {
                     on: on_expr,
                     estimated_rows: join_rows,
                     cost: join_cost,
+                    strategy: JoinStrategy::NestedLoop,
+                    index_name: None,
                 });
 
                 let mut cand_perm = left_plan.perm.clone();
@@ -1026,6 +1082,8 @@ fn optimize_inner_join_region_greedy(graph: &JoinGraph) -> DPPlan {
             on: on_expr,
             estimated_rows: chosen.join_rows,
             cost: chosen.join_cost,
+            strategy: JoinStrategy::NestedLoop,
+            index_name: None,
         });
 
         cur_cost = chosen.join_cost;
@@ -1329,7 +1387,22 @@ fn optimize_with_outer_barriers(
             &tables[right_table_idx].schema,
         );
 
-        cur_cost = join_cost;
+        let (chosen_strategy, chosen_index, chosen_cost) =
+            if join_type == JoinType::Semi || join_type == JoinType::Anti {
+                plan_semi_anti_strategy(
+                    cur_cost,
+                    cur_rows,
+                    &tables[0],
+                    &tables[right_table_idx],
+                    &right_table_scan,
+                    &on_expr,
+                    join_type,
+                )
+            } else {
+                (JoinStrategy::NestedLoop, None, join_cost)
+            };
+
+        cur_cost = chosen_cost;
         cur_rows = join_rows;
 
         physical_joins.push(PhysicalJoin {
@@ -1337,7 +1410,9 @@ fn optimize_with_outer_barriers(
             right: right_table_scan,
             on: on_expr,
             estimated_rows: join_rows,
-            cost: join_cost,
+            cost: chosen_cost,
+            strategy: chosen_strategy,
+            index_name: chosen_index,
         });
     }
 
@@ -1376,6 +1451,163 @@ fn optimize_with_outer_barriers(
         total_cost: cur_cost,
         estimated_rows: cur_rows,
     })
+}
+
+/// Evaluates costs of applicable physical strategies for SEMI/ANTI joins and selects the cheapest.
+fn plan_semi_anti_strategy(
+    left_cost: f64,
+    left_rows: f64,
+    left_table: &TableOptInfo,
+    right_table: &TableOptInfo,
+    right_scan: &PhysicalTableScan,
+    on_expr: &Expr,
+    join_type: JoinType,
+) -> (JoinStrategy, Option<String>, f64) {
+    let match_prob = CardinalityEstimator::estimate_semi_match_probability(
+        left_rows,
+        left_table.stats.as_ref(),
+        right_scan.estimated_rows,
+        right_table.stats.as_ref(),
+        on_expr,
+        &right_table.schema,
+    );
+
+    // 1. NestedLoop Strategy
+    let nl_cost = if join_type == JoinType::Semi {
+        CostModel::nested_loop_semi_cost(
+            left_cost,
+            left_rows,
+            right_scan.cost,
+            right_scan.estimated_rows,
+            match_prob,
+        )
+    } else {
+        CostModel::nested_loop_anti_cost(
+            left_cost,
+            left_rows,
+            right_scan.cost,
+            right_scan.estimated_rows,
+            match_prob,
+        )
+    };
+
+    let mut best_strategy = JoinStrategy::NestedLoop;
+    let mut best_index = None;
+    let mut best_cost = nl_cost;
+
+    // Check if on_expr contains an equi-join condition
+    let on_conjuncts = split_conjunction(on_expr);
+    let right_qualifier = right_table.qualifier();
+    let mut equi_pair: Option<(String, String)> = None;
+
+    for conj in &on_conjuncts {
+        if let Expr::Binary {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } = conj
+        {
+            let l_refs = expr_referenced_qualifiers(left);
+            let r_refs = expr_referenced_qualifiers(right);
+
+            if l_refs.len() == 1 && r_refs.len() == 1 {
+                let l_q = l_refs.iter().next().unwrap();
+                let r_q = r_refs.iter().next().unwrap();
+
+                if l_q == right_qualifier && r_q != right_qualifier {
+                    if let (Expr::Column(inner_col), Expr::Column(outer_col)) =
+                        (left.as_ref(), right.as_ref())
+                    {
+                        let in_name = inner_col.split('.').next_back().unwrap_or(inner_col);
+                        let out_name = outer_col.split('.').next_back().unwrap_or(outer_col);
+                        equi_pair = Some((out_name.to_string(), in_name.to_string()));
+                        break;
+                    }
+                } else if r_q == right_qualifier && l_q != right_qualifier {
+                    if let (Expr::Column(outer_col), Expr::Column(inner_col)) =
+                        (left.as_ref(), right.as_ref())
+                    {
+                        let in_name = inner_col.split('.').next_back().unwrap_or(inner_col);
+                        let out_name = outer_col.split('.').next_back().unwrap_or(outer_col);
+                        equi_pair = Some((out_name.to_string(), in_name.to_string()));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Hash Join Strategy (if equi-join condition exists)
+    if equi_pair.is_some() {
+        let hash_cost = if join_type == JoinType::Semi {
+            CostModel::hash_semi_cost(
+                left_cost,
+                left_rows,
+                right_scan.cost,
+                right_scan.estimated_rows,
+                crate::query::DEFAULT_JOIN_MEMORY_BUDGET_BYTES,
+            )
+        } else {
+            CostModel::hash_anti_cost(
+                left_cost,
+                left_rows,
+                right_scan.cost,
+                right_scan.estimated_rows,
+                crate::query::DEFAULT_JOIN_MEMORY_BUDGET_BYTES,
+            )
+        };
+
+        if hash_cost < best_cost {
+            best_cost = hash_cost;
+            best_strategy = JoinStrategy::Hash;
+            best_index = None;
+        }
+    }
+
+    // 3. Index Existence Probe Strategy (if equi-join condition and inner table has index)
+    if let Some((outer_col, inner_col)) = &equi_pair {
+        if !right_table.is_cte {
+            let pk_col = &right_table.schema.columns[right_table.schema.primary_key_idx].name;
+            let mut available_index: Option<(bool, String)> = None;
+
+            if pk_col == inner_col {
+                available_index = Some((true, "__primary__".to_string()));
+            } else if let Some(sec_idx) = right_table
+                .indexes
+                .iter()
+                .find(|idx| right_table.schema.columns[idx.column_idx].name == *inner_col)
+            {
+                available_index = Some((false, sec_idx.name.clone()));
+            }
+
+            if let Some((is_pk, idx_name)) = available_index {
+                let null_frac = left_table
+                    .stats
+                    .as_ref()
+                    .and_then(|s| s.column(outer_col))
+                    .map(|c| c.null_fraction())
+                    .unwrap_or(0.0);
+
+                let has_residual = right_scan.residual_filter.is_some() || on_conjuncts.len() > 1;
+
+                let idx_cost = CostModel::index_probe_join_cost(
+                    left_cost,
+                    left_rows,
+                    null_frac,
+                    is_pk,
+                    has_residual,
+                );
+
+                if idx_cost < best_cost {
+                    best_cost = idx_cost;
+                    best_strategy = JoinStrategy::IndexProbe;
+                    best_index = Some(idx_name);
+                }
+            }
+        }
+    }
+
+    (best_strategy, best_index, best_cost)
 }
 
 /// Cost-based and statistics-aware query optimizer and physical access-path planner.

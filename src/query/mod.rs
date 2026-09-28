@@ -51,8 +51,8 @@ pub use operator::{
     QueryResult, SetOperationOperator, SortDirection, SortKey, SortOperator, WindowOperator,
 };
 pub use optimizer::{
-    AccessPath, Optimizer, PhysicalJoin, PhysicalPlan, PhysicalSetOp, PhysicalTableScan,
-    SecondaryScanType, TableOptInfo,
+    AccessPath, JoinStrategy, Optimizer, PhysicalJoin, PhysicalPlan, PhysicalSetOp,
+    PhysicalTableScan, SecondaryScanType, TableOptInfo,
 };
 pub use plan_cache::{
     extract_plan_references, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,

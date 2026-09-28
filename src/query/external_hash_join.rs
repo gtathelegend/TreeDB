@@ -124,6 +124,14 @@ pub struct JoinExecutionMetrics {
     pub candidate_pairs: usize,
     /// Total rows that satisfied the join condition.
     pub matched_rows: usize,
+    /// Outer rows that had at least one match (for SEMI/ANTI).
+    pub matched_outer_rows: usize,
+    /// Outer rows that had no match (for SEMI/ANTI).
+    pub unmatched_outer_rows: usize,
+    /// Number of rows built into the hash table.
+    pub hash_build_rows: usize,
+    /// Number of rows probed against the hash table.
+    pub hash_probe_rows: usize,
 }
 
 /// Composite join key constructed from evaluated equi-join expressions.
@@ -689,6 +697,10 @@ impl<'a> ExternalHashJoiner<'a> {
             peak_memory_bytes: 0,
             candidate_pairs: 0,
             matched_rows: 0,
+            matched_outer_rows: 0,
+            unmatched_outer_rows: 0,
+            hash_build_rows: 0,
+            hash_probe_rows: 0,
         };
 
         if left_rows.is_empty() {
@@ -711,8 +723,10 @@ impl<'a> ExternalHashJoiner<'a> {
         if right_rows.is_empty() {
             if self.join_type == JoinType::Anti {
                 metrics.rows_output = left_rows.len();
+                metrics.unmatched_outer_rows = left_rows.len();
                 return Ok((joined_schema, left_rows, metrics));
             } else if self.join_type == JoinType::Semi {
+                metrics.unmatched_outer_rows = left_rows.len();
                 return Ok((joined_schema, Vec::new(), metrics));
             } else if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
                 let right_nulls = vec![Value::Null; self.right_schema.columns.len()];
@@ -776,6 +790,7 @@ impl<'a> ExternalHashJoiner<'a> {
                 continue;
             }
 
+            metrics.hash_build_rows += 1;
             let row_mem = estimate_row_memory(r_row);
             build_mem += row_mem;
             if build_mem > peak_mem {
@@ -796,7 +811,10 @@ impl<'a> ExternalHashJoiner<'a> {
             let key = JoinKey::from_row(l_row, self.left_schema, &self.left_keys)?;
             if key.has_null() {
                 if self.join_type == JoinType::Anti {
+                    metrics.unmatched_outer_rows += 1;
                     out_rows.push(l_row.clone());
+                } else if self.join_type == JoinType::Semi {
+                    metrics.unmatched_outer_rows += 1;
                 } else if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
                     let mut combined = Vec::with_capacity(l_row.values.len() + right_nulls.len());
                     combined.extend_from_slice(&l_row.values);
@@ -806,6 +824,7 @@ impl<'a> ExternalHashJoiner<'a> {
                 continue;
             }
 
+            metrics.hash_probe_rows += 1;
             let mut left_matched = false;
             if let Some(r_matches) = build_map.get(&key) {
                 metrics.candidate_pairs += r_matches.len();
@@ -845,6 +864,12 @@ impl<'a> ExternalHashJoiner<'a> {
                         }
                     }
                 }
+            }
+
+            if left_matched {
+                metrics.matched_outer_rows += 1;
+            } else {
+                metrics.unmatched_outer_rows += 1;
             }
 
             if self.join_type == JoinType::Semi {

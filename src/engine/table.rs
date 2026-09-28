@@ -8,6 +8,7 @@ use crate::index::secondary::{IndexKey, SecondaryIndex};
 use crate::query::stats::{ColumnStatistics, IndexStatistics, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::record_store::RecordStore;
+use crate::RecordId;
 
 /// High-level relational table handle coordinating schema validation,
 /// canonical primary key indexing in the primary B+ Tree, tuple storage in the RecordStore,
@@ -276,6 +277,29 @@ impl<'a> Table<'a> {
         }
 
         Ok(rows)
+    }
+
+    /// Performs a point lookup on a secondary index, returning matching record IDs without decoding tuples.
+    pub fn index_lookup_rids(&mut self, index_name: &str, value: &Value) -> Result<Vec<RecordId>> {
+        let sec_idx = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let idx_key = IndexKey::from_value(value);
+        sec_idx.lookup(self.buffer_pool, &idx_key)
+    }
+
+    /// Fetches and decodes a row tuple given its record storage ID.
+    pub fn get_row_by_rid(&mut self, rid: RecordId) -> Result<Option<Row>> {
+        if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+            let row = self.metadata.schema.decode_tuple(&bytes)?;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Performs an ordered range scan on a secondary index in `[start, end)`.

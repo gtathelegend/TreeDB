@@ -650,7 +650,24 @@ This roadmap outlines the planned development phases for TreeDB.
 
 ---
 
-## Phase 39: Advanced Indexing & Query Processing (Future)
+## Phase 39: Cost-Based SEMI/ANTI Join Planning & Subquery Execution (Completed)
+* [x] Physical join strategies: `JoinStrategy::NestedLoop`, `JoinStrategy::Hash`, and `JoinStrategy::IndexProbe`
+* [x] Index existence probe execution (`execute_index_probe_semi_anti`): direct B+ Tree and secondary index point lookups per outer row
+* [x] Secondary index fast path: verifies existence purely via `sec_idx.lookup()` without fetching raw tuple bytes from `RecordStore` when residual filters are absent
+* [x] Residual filter evaluation: sequentially fetches matching candidate tuples by `RecordId` with early termination on first match
+* [x] Safe expression evaluation: pure `Expr::evaluate` calls avoid re-borrowing active database / buffer pool references
+* [x] Cost model extensions: `HASH_BUILD_CPU_COST = 0.01`, `HASH_PROBE_CPU_COST = 0.005`, `nested_loop_semi_cost`, `nested_loop_anti_cost`, `hash_semi_cost`, `hash_anti_cost`, and `index_probe_join_cost`
+* [x] Buffer-cached single probe calibration: calibrated probe cost reflecting cached tree traversal (`ROW_CPU_COST * 2.0` / `SEC_INDEX_FETCH_COST` + optional `TUPLE_FETCH_COST`)
+* [x] Cardinality estimator: `estimate_semi_match_probability` and bounded join cardinality estimation within $[0, |A|]$
+* [x] Plan cache integration: `PlanCacheKey` tracks secondary index dependencies referenced by `PhysicalJoin.index_name`
+* [x] Exact SQL semantics preservation: duplicate elimination, existence only (no inner columns exposed), SQL 3VL `NULL != NULL` isolation, and `NOT IN` subquery preservation
+* [x] Runtime metrics & EXPLAIN ANALYZE: `outer_rows`, `inner_rows`, `matched_outer_rows`, `unmatched_outer_rows`, `candidate_pairs`, `rows_output`, `index_probes`, `successful_probes`, `failed_probes`, `hash_build_rows`, `hash_probe_rows`, `bytes_spilled`, `runs_created`
+* [x] Quality gates: 653 tests passing across all suites with 0 warnings in cargo clippy and clean cargo fmt
+* [x] 13 dedicated integration tests in `tests/semi_anti_optimizer.rs` covering all 51 items including randomized differential oracle (653 total passing test suite)
+
+---
+
+## Phase 40: Advanced Indexing & Query Processing (Future)
 * [ ] Merge join physical execution operator
 * [ ] Index-only covering scans
 * [ ] Multi-column composite secondary indexes
