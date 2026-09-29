@@ -59,6 +59,28 @@ impl fmt::Display for AccessPath {
                 SecondaryScanType::PointLookup(val) => {
                     write!(f, "SecondaryIndexScan({index_name}, PointLookup({val}))")
                 }
+                SecondaryScanType::CompositePointLookup(vals) => {
+                    let tuple_str = vals
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(
+                        f,
+                        "SecondaryIndexScan({index_name}, PointLookup(({tuple_str})))"
+                    )
+                }
+                SecondaryScanType::PrefixScan(vals) => {
+                    let tuple_str = vals
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(
+                        f,
+                        "SecondaryIndexScan({index_name}, PrefixScan(({tuple_str})))"
+                    )
+                }
                 SecondaryScanType::RangeScan { start, end } => {
                     write!(
                         f,
@@ -81,8 +103,12 @@ impl fmt::Display for AccessPath {
 /// Secondary index scan mode.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SecondaryScanType {
-    /// Exact point lookup on an indexed column value.
+    /// Exact point lookup on a single-column indexed value.
     PointLookup(Value),
+    /// Exact point lookup on all columns of a composite secondary index.
+    CompositePointLookup(Vec<Value>),
+    /// Prefix scan on leading columns of a composite secondary index.
+    PrefixScan(Vec<Value>),
     /// Range scan on an indexed column in `[start, end)`.
     RangeScan {
         start: Option<Value>,
@@ -1804,73 +1830,161 @@ fn plan_table_scan(
 
     // Candidate 4: Secondary Indexes
     for sec_meta in &table.indexes {
-        let sec_col = &schema.columns[sec_meta.column_idx];
-        let col_name = &sec_col.name;
-        let col_type = sec_col.data_type;
+        if sec_meta.column_indices.len() <= 1 {
+            let sec_col = &schema.columns[sec_meta.column_idx];
+            let col_name = &sec_col.name;
+            let col_type = sec_col.data_type;
 
-        // 4a. Point Lookups
-        for (idx, conj) in unqual_conjuncts.iter().enumerate() {
-            if let Some(val) = extract_col_equality(conj, col_name, col_type) {
-                if !val.is_null() {
-                    let mut residual = unqual_conjuncts.clone();
-                    residual.remove(idx);
-                    let residual_filter = recombine_conjunction(residual);
-                    let est_rows = CardinalityEstimator::estimate_sec_point_rows(
-                        table.stats.as_ref(),
-                        sec_meta,
-                    );
-                    let cost = CostModel::secondary_point_lookup_cost(est_rows);
-                    candidates.push(AccessPathCandidate {
-                        access_path: AccessPath::SecondaryIndexScan {
-                            index_name: sec_meta.name.clone(),
-                            index_id: sec_meta.index_id,
-                            scan_type: SecondaryScanType::PointLookup(val),
-                        },
-                        residual_filter,
-                        estimated_rows: est_rows,
-                        cost,
-                        priority: 2,
-                        index_id: Some(sec_meta.index_id),
-                        index_name: Some(sec_meta.name.clone()),
-                    });
+            // 4a. Point Lookups
+            for (idx, conj) in unqual_conjuncts.iter().enumerate() {
+                if let Some(val) = extract_col_equality(conj, col_name, col_type) {
+                    if !val.is_null() {
+                        let mut residual = unqual_conjuncts.clone();
+                        residual.remove(idx);
+                        let residual_filter = recombine_conjunction(residual);
+                        let est_rows = CardinalityEstimator::estimate_sec_point_rows(
+                            table.stats.as_ref(),
+                            sec_meta,
+                        );
+                        let cost = CostModel::secondary_point_lookup_cost(est_rows);
+                        candidates.push(AccessPathCandidate {
+                            access_path: AccessPath::SecondaryIndexScan {
+                                index_name: sec_meta.name.clone(),
+                                index_id: sec_meta.index_id,
+                                scan_type: SecondaryScanType::PointLookup(val),
+                            },
+                            residual_filter,
+                            estimated_rows: est_rows,
+                            cost,
+                            priority: 2,
+                            index_id: Some(sec_meta.index_id),
+                            index_name: Some(sec_meta.name.clone()),
+                        });
+                    }
                 }
             }
-        }
 
-        // 4b. Range Scans
-        let (sec_start, sec_end, used_indices) =
-            extract_col_range_bounds(&unqual_conjuncts, col_name, col_type);
-        if sec_start.is_some() || sec_end.is_some() {
-            let residual: Vec<Expr> = unqual_conjuncts
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !used_indices.contains(i))
-                .map(|(_, c)| c.clone())
-                .collect();
-            let residual_filter = recombine_conjunction(residual);
-            let est_rows = CardinalityEstimator::estimate_sec_range_rows(
-                table.stats.as_ref(),
-                sec_meta,
-                sec_start.as_ref(),
-                sec_end.as_ref(),
-            );
-            let cost = CostModel::secondary_range_scan_cost(est_rows);
-            candidates.push(AccessPathCandidate {
-                access_path: AccessPath::SecondaryIndexScan {
-                    index_name: sec_meta.name.clone(),
-                    index_id: sec_meta.index_id,
-                    scan_type: SecondaryScanType::RangeScan {
-                        start: sec_start,
-                        end: sec_end,
+            // 4b. Range Scans
+            let (sec_start, sec_end, used_indices) =
+                extract_col_range_bounds(&unqual_conjuncts, col_name, col_type);
+            if sec_start.is_some() || sec_end.is_some() {
+                let residual: Vec<Expr> = unqual_conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !used_indices.contains(i))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                let residual_filter = recombine_conjunction(residual);
+                let est_rows = CardinalityEstimator::estimate_sec_range_rows(
+                    table.stats.as_ref(),
+                    sec_meta,
+                    sec_start.as_ref(),
+                    sec_end.as_ref(),
+                );
+                let cost = CostModel::secondary_range_scan_cost(est_rows);
+                candidates.push(AccessPathCandidate {
+                    access_path: AccessPath::SecondaryIndexScan {
+                        index_name: sec_meta.name.clone(),
+                        index_id: sec_meta.index_id,
+                        scan_type: SecondaryScanType::RangeScan {
+                            start: sec_start,
+                            end: sec_end,
+                        },
                     },
-                },
-                residual_filter,
-                estimated_rows: est_rows,
-                cost,
-                priority: 2,
-                index_id: Some(sec_meta.index_id),
-                index_name: Some(sec_meta.name.clone()),
-            });
+                    residual_filter,
+                    estimated_rows: est_rows,
+                    cost,
+                    priority: 2,
+                    index_id: Some(sec_meta.index_id),
+                    index_name: Some(sec_meta.name.clone()),
+                });
+            }
+        } else {
+            // Composite secondary index
+            let mut prefix_values = Vec::new();
+            let mut used_indices = HashSet::new();
+
+            for &col_idx in &sec_meta.column_indices {
+                let col = &schema.columns[col_idx];
+                let mut found_eq = None;
+                for (c_idx, conj) in unqual_conjuncts.iter().enumerate() {
+                    if used_indices.contains(&c_idx) {
+                        continue;
+                    }
+                    if let Some(val) = extract_col_equality(conj, &col.name, col.data_type) {
+                        if !val.is_null() {
+                            found_eq = Some((c_idx, val));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((c_idx, val)) = found_eq {
+                    used_indices.insert(c_idx);
+                    prefix_values.push(val);
+                } else {
+                    // Contiguous prefix broke — stop matching further columns
+                    break;
+                }
+            }
+
+            let m = prefix_values.len();
+            let total_cols = sec_meta.column_indices.len();
+
+            if m == total_cols {
+                // Full composite key exact point lookup
+                let residual: Vec<Expr> = unqual_conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !used_indices.contains(i))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                let residual_filter = recombine_conjunction(residual);
+                let est_rows =
+                    CardinalityEstimator::estimate_sec_point_rows(table.stats.as_ref(), sec_meta);
+                let cost = CostModel::secondary_point_lookup_cost(est_rows);
+                candidates.push(AccessPathCandidate {
+                    access_path: AccessPath::SecondaryIndexScan {
+                        index_name: sec_meta.name.clone(),
+                        index_id: sec_meta.index_id,
+                        scan_type: SecondaryScanType::CompositePointLookup(prefix_values),
+                    },
+                    residual_filter,
+                    estimated_rows: est_rows,
+                    cost,
+                    priority: 2,
+                    index_id: Some(sec_meta.index_id),
+                    index_name: Some(sec_meta.name.clone()),
+                });
+            } else if m > 0 {
+                // Proper composite prefix scan
+                let residual: Vec<Expr> = unqual_conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !used_indices.contains(i))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                let residual_filter = recombine_conjunction(residual);
+                let est_rows = CardinalityEstimator::estimate_sec_prefix_rows(
+                    table.stats.as_ref(),
+                    sec_meta,
+                    m,
+                );
+                let cost = CostModel::secondary_range_scan_cost(est_rows);
+                candidates.push(AccessPathCandidate {
+                    access_path: AccessPath::SecondaryIndexScan {
+                        index_name: sec_meta.name.clone(),
+                        index_id: sec_meta.index_id,
+                        scan_type: SecondaryScanType::PrefixScan(prefix_values),
+                    },
+                    residual_filter,
+                    estimated_rows: est_rows,
+                    cost,
+                    priority: 2,
+                    index_id: Some(sec_meta.index_id),
+                    index_name: Some(sec_meta.name.clone()),
+                });
+            }
         }
     }
 

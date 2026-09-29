@@ -42,6 +42,7 @@ impl CompositeIndexKey {
     ///   - Fixed-length components (`Null`, `Boolean`, `Int64`, `UInt64`, `Float64`): written directly.
     ///   - Variable-length components (`String`, `Bytes`): tag `6` or `7`, followed by the payload where
     ///     `0x00` is escaped as `[0x00, 0xFF]`, and terminated with `[0x00, 0x00]`.
+    ///
     ///   This guarantees that lexicographic byte comparison strictly matches lexicographic tuple comparison.
     pub fn encode(&self) -> Vec<u8> {
         if self.components.is_empty() {

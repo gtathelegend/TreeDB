@@ -1939,9 +1939,7 @@ impl<'db> Transaction<'db> {
         };
         let cols_refs: Vec<&str> = bound.column_names.iter().map(|s| s.as_str()).collect();
         self.create_composite_index(&bound.table_name, &bound.name, &cols_refs, bound.unique)?;
-        Ok(StatementResult::CreatedIndex {
-            index: bound.name,
-        })
+        Ok(StatementResult::CreatedIndex { index: bound.name })
     }
 
     fn execute_drop_index(
@@ -2582,6 +2580,10 @@ impl<'db> Transaction<'db> {
                     crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
                         table.index_lookup(index_name, val)?
                     }
+                    crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals)
+                    | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
+                        table.composite_index_lookup(index_name, vals)?
+                    }
                     crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
                         table.index_scan(index_name, start.as_ref(), end.as_ref())?
                     }
@@ -2700,6 +2702,10 @@ impl<'db> Transaction<'db> {
                 } => match scan_type {
                     crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
                         table.index_lookup(index_name, val)?
+                    }
+                    crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals)
+                    | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
+                        table.composite_index_lookup(index_name, vals)?
                     }
                     crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
                         table.index_scan(index_name, start.as_ref(), end.as_ref())?
@@ -3132,6 +3138,12 @@ impl<'db> Transaction<'db> {
                             crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
                                 table.index_lookup(index_name, val)?
                             }
+                            crate::query::optimizer::SecondaryScanType::CompositePointLookup(
+                                vals,
+                            )
+                            | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
+                                table.composite_index_lookup(index_name, vals)?
+                            }
                             crate::query::optimizer::SecondaryScanType::RangeScan {
                                 start,
                                 end,
@@ -3302,6 +3314,10 @@ impl<'db> Transaction<'db> {
                             match scan_type {
                                 crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
                                     table.index_lookup(index_name, val)?
+                                }
+                                crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals)
+                                | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
+                                    table.composite_index_lookup(index_name, vals)?
                                 }
                                 crate::query::optimizer::SecondaryScanType::RangeScan {
                                     start,

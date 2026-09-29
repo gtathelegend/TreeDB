@@ -99,11 +99,13 @@ impl<'a> Table<'a> {
                         .map(|&i| format!("{}", row.values[i]))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    return Err(Error::DuplicateIndexKey(if meta.column_indices.len() == 1 {
-                        vals_str
-                    } else {
-                        format!("({vals_str})")
-                    }));
+                    return Err(Error::DuplicateIndexKey(
+                        if meta.column_indices.len() == 1 {
+                            vals_str
+                        } else {
+                            format!("({vals_str})")
+                        },
+                    ));
                 }
             }
         }
@@ -181,11 +183,13 @@ impl<'a> Table<'a> {
                         .map(|&i| format!("{}", row.values[i]))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    return Err(Error::DuplicateIndexKey(if meta.column_indices.len() == 1 {
-                        vals_str
-                    } else {
-                        format!("({vals_str})")
-                    }));
+                    return Err(Error::DuplicateIndexKey(
+                        if meta.column_indices.len() == 1 {
+                            vals_str
+                        } else {
+                            format!("({vals_str})")
+                        },
+                    ));
                 }
             }
         }
@@ -374,7 +378,8 @@ impl<'a> Table<'a> {
                 prefix_values,
                 meta.column_indices.len(),
             );
-            let end_bytes = crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
+            let end_bytes =
+                crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
             let start_key = IndexKey::new(start_bytes);
             let end_key = end_bytes.map(IndexKey::new);
             let entries = sec_idx.scan(self.buffer_pool, Some(&start_key), end_key.as_ref())?;
@@ -582,7 +587,11 @@ impl<'a> Table<'a> {
                 let col_idx = meta.column_indices[0];
                 let col_nulls = null_counts[col_idx];
                 let col_distinct = distinct_sets[col_idx].len();
-                let idx_stats = IndexStatistics::new(row_count.saturating_sub(col_nulls), col_distinct, col_nulls);
+                let idx_stats = IndexStatistics::new(
+                    row_count.saturating_sub(col_nulls),
+                    col_distinct,
+                    col_nulls,
+                );
                 table_stats = table_stats.with_index(&meta.name, idx_stats);
             } else {
                 let mut composite_keys = HashSet::new();

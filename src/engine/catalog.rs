@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
 use crate::index::composite::{CompositeIndexKey, MAX_INDEX_COLUMNS};
 use crate::index::leaf::LeafNode;
+use crate::index::node::INVALID_PAGE_ID;
 use crate::index::secondary::{IndexKey, SecondaryIndex, SecondaryLeafNode};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::metadata::{DEFAULT_METADATA_PAGE_ID, HEADER_PAGE_ID};
@@ -63,6 +64,7 @@ pub const INDEX_ENTRY_HEADER_SIZE_V1: usize = 18;
 /// - `12`: `unique: u8` (0 = non-unique, 1 = unique)
 /// - `13`: `column_count: u8` (number of indexed columns)
 /// - `14..16`: `name_len: u16`
+///
 /// Followed by `column_count * 2` bytes for `column_indices` (u16 each), then `name_len` bytes for UTF-8 name.
 pub const INDEX_ENTRY_HEADER_SIZE_V2: usize = 16;
 
@@ -1034,14 +1036,27 @@ impl Catalog {
         // 6. Allocate and populate secondary index B+ Tree
         let mut sec_index = SecondaryIndex::new_empty();
         for (idx_key, rid) in entries_to_insert {
-            sec_index.insert(buffer_pool, &idx_key, rid)?;
+            if let Err(e) = sec_index.insert(buffer_pool, &idx_key, rid) {
+                if let Ok(pages) = sec_index.collect_all_pages(buffer_pool) {
+                    for pid in pages {
+                        let _ = buffer_pool.free_page(pid);
+                    }
+                }
+                return Err(e);
+            }
         }
         let root_page_id = if sec_index.is_empty() {
             let pid = buffer_pool.allocate_page(PageType::Leaf)?;
             let leaf = SecondaryLeafNode::new();
-            {
+            let res = (|| -> Result<()> {
                 let page_mut = buffer_pool.get_page_mut(pid)?;
                 leaf.serialize(page_mut)?;
+                Ok(())
+            })();
+            if let Err(e) = res {
+                let _ = buffer_pool.unpin_page(pid, false);
+                let _ = buffer_pool.free_page(pid);
+                return Err(e);
             }
             buffer_pool.unpin_page(pid, true)?;
             pid
@@ -1060,67 +1075,81 @@ impl Catalog {
 
         // 7. Store index metadata entry in catalog
         let entry_size = index_meta.byte_size();
-        if root_cat.can_fit(entry_size) {
-            root_cat.add_index_entry(index_meta)?;
-            let page_mut = buffer_pool.fetch_page_mut(root_cat_page_id)?;
-            root_cat.serialize(page_mut)?;
-            buffer_pool.unpin_page(root_cat_page_id, true)?;
-        } else {
-            {
+        let store_res = (|| -> Result<()> {
+            if root_cat.can_fit(entry_size) {
+                root_cat.add_index_entry(index_meta)?;
                 let page_mut = buffer_pool.fetch_page_mut(root_cat_page_id)?;
                 root_cat.serialize(page_mut)?;
-            }
-            buffer_pool.unpin_page(root_cat_page_id, true)?;
-
-            let mut curr_pid = root_cat.next_catalog_page_id;
-            let mut prev_pid = root_cat_page_id;
-            let mut inserted = false;
-
-            while curr_pid != NO_NEXT_CATALOG_PAGE {
-                let mut cat = {
-                    let page = buffer_pool.fetch_page(curr_pid)?;
-                    let c = CatalogPage::deserialize(page)?;
-                    buffer_pool.unpin_page(curr_pid, false)?;
-                    c
-                };
-
-                if cat.can_fit(entry_size) {
-                    cat.add_index_entry(index_meta.clone())?;
-                    let page_mut = buffer_pool.fetch_page_mut(curr_pid)?;
-                    cat.serialize(page_mut)?;
-                    buffer_pool.unpin_page(curr_pid, true)?;
-                    inserted = true;
-                    break;
-                }
-
-                prev_pid = curr_pid;
-                curr_pid = cat.next_catalog_page_id;
-            }
-
-            if !inserted {
-                let new_cat_pid = buffer_pool.allocate_page(PageType::Catalog)?;
-                let mut new_cat = CatalogPage::new(new_cat_pid);
-                new_cat.add_index_entry(index_meta)?;
-
+                buffer_pool.unpin_page(root_cat_page_id, true)?;
+            } else {
                 {
-                    let new_page_mut = buffer_pool.get_page_mut(new_cat_pid)?;
-                    new_cat.serialize(new_page_mut)?;
+                    let page_mut = buffer_pool.fetch_page_mut(root_cat_page_id)?;
+                    root_cat.serialize(page_mut)?;
                 }
-                buffer_pool.unpin_page(new_cat_pid, true)?;
+                buffer_pool.unpin_page(root_cat_page_id, true)?;
 
-                let mut prev_cat = {
-                    let page = buffer_pool.fetch_page(prev_pid)?;
-                    let c = CatalogPage::deserialize(page)?;
-                    buffer_pool.unpin_page(prev_pid, false)?;
-                    c
-                };
-                prev_cat.next_catalog_page_id = new_cat_pid;
-                {
-                    let prev_page_mut = buffer_pool.fetch_page_mut(prev_pid)?;
-                    prev_cat.serialize(prev_page_mut)?;
+                let mut curr_pid = root_cat.next_catalog_page_id;
+                let mut prev_pid = root_cat_page_id;
+                let mut inserted = false;
+
+                while curr_pid != NO_NEXT_CATALOG_PAGE {
+                    let mut cat = {
+                        let page = buffer_pool.fetch_page(curr_pid)?;
+                        let c = CatalogPage::deserialize(page)?;
+                        buffer_pool.unpin_page(curr_pid, false)?;
+                        c
+                    };
+
+                    if cat.can_fit(entry_size) {
+                        cat.add_index_entry(index_meta.clone())?;
+                        let page_mut = buffer_pool.fetch_page_mut(curr_pid)?;
+                        cat.serialize(page_mut)?;
+                        buffer_pool.unpin_page(curr_pid, true)?;
+                        inserted = true;
+                        break;
+                    }
+
+                    prev_pid = curr_pid;
+                    curr_pid = cat.next_catalog_page_id;
                 }
-                buffer_pool.unpin_page(prev_pid, true)?;
+
+                if !inserted {
+                    let new_cat_pid = buffer_pool.allocate_page(PageType::Catalog)?;
+                    let mut new_cat = CatalogPage::new(new_cat_pid);
+                    new_cat.add_index_entry(index_meta)?;
+
+                    {
+                        let new_page_mut = buffer_pool.get_page_mut(new_cat_pid)?;
+                        new_cat.serialize(new_page_mut)?;
+                    }
+                    buffer_pool.unpin_page(new_cat_pid, true)?;
+
+                    let mut prev_cat = {
+                        let page = buffer_pool.fetch_page(prev_pid)?;
+                        let c = CatalogPage::deserialize(page)?;
+                        buffer_pool.unpin_page(prev_pid, false)?;
+                        c
+                    };
+                    prev_cat.next_catalog_page_id = new_cat_pid;
+                    {
+                        let prev_page_mut = buffer_pool.fetch_page_mut(prev_pid)?;
+                        prev_cat.serialize(prev_page_mut)?;
+                    }
+                    buffer_pool.unpin_page(prev_pid, true)?;
+                }
             }
+            Ok(())
+        })();
+
+        if let Err(e) = store_res {
+            if let Ok(pages) = sec_index.collect_all_pages(buffer_pool) {
+                for pid in pages {
+                    let _ = buffer_pool.free_page(pid);
+                }
+            } else if root_page_id != INVALID_PAGE_ID {
+                let _ = buffer_pool.free_page(root_page_id);
+            }
+            return Err(e);
         }
 
         Ok(new_index_id)

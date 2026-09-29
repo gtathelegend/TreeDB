@@ -27,7 +27,7 @@
 //!   R24 – MAX_INDEX_COLUMNS (8) enforced
 //!   R25 – Multi-column index interoperates correctly alongside a single-column index
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use treedb::engine::types::{Column, DataType, Row, Schema, Value};
@@ -251,7 +251,10 @@ fn test_r06_catalog_persistence_on_reopen() {
         let meta = txn.get_index("idx_dept_level").unwrap().unwrap();
         assert_eq!(meta.column_indices, vec![1, 2]);
         assert!(!meta.unique);
-        assert_eq!(meta.column_idx, 1, "column_idx compat field must equal first index");
+        assert_eq!(
+            meta.column_idx, 1,
+            "column_idx compat field must equal first index"
+        );
 
         let meta2 = txn.get_index("idx_uniq_dl").unwrap().unwrap();
         assert!(meta2.unique);
@@ -347,7 +350,10 @@ fn test_r08_update_maintains_composite_index() {
             &[Value::String("eng".into()), Value::Int64(3)],
         )
         .unwrap();
-    assert!(old.is_empty(), "old composite key must be removed after update");
+    assert!(
+        old.is_empty(),
+        "old composite key must be removed after update"
+    );
 
     // New key must exist
     let new = tbl
@@ -391,7 +397,10 @@ fn test_r09_delete_removes_composite_index_entry() {
             &[Value::String("eng".into()), Value::Int64(3)],
         )
         .unwrap();
-    assert!(found.is_empty(), "deleted row's composite key must be purged");
+    assert!(
+        found.is_empty(),
+        "deleted row's composite key must be purged"
+    );
 
     let found2 = tbl
         .composite_index_lookup(
@@ -615,12 +624,10 @@ fn test_r15_range_scan_lexicographic_order() {
     tbl.insert(&row(4, "hr", 1, 6.0)).unwrap();
     tbl.insert(&row(2, "eng", 2, 8.0)).unwrap();
 
-    let start_key =
-        CompositeIndexKey::from_values(&[Value::String("eng".into()), Value::Int64(1)])
-            .to_index_key(2);
-    let end_key =
-        CompositeIndexKey::from_values(&[Value::String("hr".into()), Value::Int64(2)])
-            .to_index_key(2);
+    let start_key = CompositeIndexKey::from_values(&[Value::String("eng".into()), Value::Int64(1)])
+        .to_index_key(2);
+    let end_key = CompositeIndexKey::from_values(&[Value::String("hr".into()), Value::Int64(2)])
+        .to_index_key(2);
 
     let rows = tbl
         .composite_index_scan("idx_dept_level", Some(&start_key), Some(&end_key))
@@ -666,12 +673,10 @@ fn test_r16_composite_index_scan_with_bounds() {
     }
 
     // Scan [("eng", 3), ("eng", 7)) — exclusive end: ids 3, 4, 5, 6
-    let start_key =
-        CompositeIndexKey::from_values(&[Value::String("eng".into()), Value::Int64(3)])
-            .to_index_key(2);
-    let end_key =
-        CompositeIndexKey::from_values(&[Value::String("eng".into()), Value::Int64(7)])
-            .to_index_key(2);
+    let start_key = CompositeIndexKey::from_values(&[Value::String("eng".into()), Value::Int64(3)])
+        .to_index_key(2);
+    let end_key = CompositeIndexKey::from_values(&[Value::String("eng".into()), Value::Int64(7)])
+        .to_index_key(2);
 
     let rows = tbl
         .composite_index_scan("idx_dept_level", Some(&start_key), Some(&end_key))
@@ -834,7 +839,11 @@ fn test_r19_plan_cache_invalidated_on_create() {
     // Database must remain fully functional — re-execute the prepared statement.
     let r1 = db.execute_prepared(&stmt, &[]).unwrap();
     let r1_qr = r1.into_query().unwrap();
-    assert_eq!(r1_qr.rows.len(), 2, "all rows still visible after index creation");
+    assert_eq!(
+        r1_qr.rows.len(),
+        2,
+        "all rows still visible after index creation"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -864,8 +873,7 @@ fn test_r21_unknown_column_name_rejected() {
     let mut txn = db.begin_transaction().unwrap();
     txn.create_table("orders", orders_schema()).unwrap();
 
-    let err =
-        txn.create_composite_index("orders", "idx_bad", &["dept", "nonexistent_col"], false);
+    let err = txn.create_composite_index("orders", "idx_bad", &["dept", "nonexistent_col"], false);
     assert!(err.is_err(), "unknown column must be rejected");
     txn.abort().unwrap();
 }
@@ -879,7 +887,10 @@ fn test_r22_key_encoding_lexicographic_order() {
     // (A, B) < (A, B') when B < B'
     let t1 = CompositeIndexKey::from_values(&[Value::String("eng".into()), Value::Int64(1)]);
     let t2 = CompositeIndexKey::from_values(&[Value::String("eng".into()), Value::Int64(2)]);
-    assert!(t1.encode() < t2.encode(), "(eng,1) must be less than (eng,2)");
+    assert!(
+        t1.encode() < t2.encode(),
+        "(eng,1) must be less than (eng,2)"
+    );
 
     // (A, Z) < (B, A) when A < B lexicographically
     let t3 = CompositeIndexKey::from_values(&[Value::String("a".into()), Value::Int64(1000)]);
@@ -914,11 +925,15 @@ fn test_r22_key_encoding_lexicographic_order() {
 #[test]
 fn test_r23_key_encoding_roundtrip_mixed_types() {
     let cases: &[&[Value]] = &[
-        &[Value::Int64(-1), Value::UInt64(u64::MAX), Value::Boolean(true)],
+        &[
+            Value::Int64(-1),
+            Value::UInt64(u64::MAX),
+            Value::Boolean(true),
+        ],
         &[
             Value::Null,
             Value::String("hello\0world".to_string()),
-            Value::Float64(3.14),
+            Value::Float64(3.5),
         ],
         &[Value::Boolean(false), Value::Int64(0), Value::Null],
         &[Value::String("".to_string()), Value::UInt64(0)],
@@ -1052,4 +1067,799 @@ fn test_r25_composite_coexists_with_single_column_index() {
     txn2.validate_catalog().unwrap();
     txn2.validate_index("idx_dept").unwrap();
     txn2.validate_index("idx_dept_level").unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R26 — CREATE INDEX backfills existing rows
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r26_create_index_backfills_existing_rows() {
+    let ctx = Ctx::new("r26");
+    let mut db = ctx.create();
+
+    // 1. Create table and insert existing data
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement(
+            "CREATE TABLE staff (id UINT64 PRIMARY KEY, dept TEXT NOT NULL, level INT64 NOT NULL, score DOUBLE);",
+        )
+        .unwrap();
+        txn.execute_statement("INSERT INTO staff VALUES (1, 'eng', 1, 10.0);")
+            .unwrap();
+        txn.execute_statement("INSERT INTO staff VALUES (2, 'eng', 2, 20.0);")
+            .unwrap();
+        txn.execute_statement("INSERT INTO staff VALUES (3, 'eng', 3, 30.0);")
+            .unwrap();
+        txn.execute_statement("INSERT INTO staff VALUES (4, 'sales', 1, 40.0);")
+            .unwrap();
+        txn.execute_statement("INSERT INTO staff VALUES (5, 'sales', 2, 50.0);")
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // 2. Create composite index after rows exist
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement("CREATE INDEX idx_dept_level ON staff (dept, level);")
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // 3. Query through indexed predicates
+    {
+        let mut txn = db.begin_transaction().unwrap();
+
+        // Exact match on both composite columns
+        let r_exact = txn
+            .execute_sql("SELECT id, dept, level FROM staff WHERE dept = 'eng' AND level = 2;")
+            .unwrap();
+        assert_eq!(
+            r_exact.rows,
+            vec![Row::new(vec![
+                Value::UInt64(2),
+                Value::String("eng".into()),
+                Value::Int64(2)
+            ])]
+        );
+
+        // Leading prefix scan
+        let r_prefix = txn
+            .execute_sql("SELECT id, dept, level FROM staff WHERE dept = 'eng' ORDER BY id ASC;")
+            .unwrap();
+        assert_eq!(
+            r_prefix.rows,
+            vec![
+                Row::new(vec![
+                    Value::UInt64(1),
+                    Value::String("eng".into()),
+                    Value::Int64(1)
+                ]),
+                Row::new(vec![
+                    Value::UInt64(2),
+                    Value::String("eng".into()),
+                    Value::Int64(2)
+                ]),
+                Row::new(vec![
+                    Value::UInt64(3),
+                    Value::String("eng".into()),
+                    Value::Int64(3)
+                ]),
+            ]
+        );
+
+        // Non-matching prefix
+        let r_none = txn
+            .execute_sql("SELECT id FROM staff WHERE dept = 'hr';")
+            .unwrap();
+        assert_eq!(r_none.len(), 0);
+
+        // Programmatic index validation
+        let mut tbl = txn.open_table("staff").unwrap();
+        tbl.validate_indexes().unwrap();
+        let found = tbl
+            .composite_index_lookup("idx_dept_level", &[Value::String("sales".into())])
+            .unwrap();
+        assert_eq!(ids_of(&found), BTreeSet::from([4, 5]));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R27 — CREATE UNIQUE INDEX backfill detects duplicates and rolls back
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r27_create_unique_index_backfill_duplicate_detection() {
+    let ctx = Ctx::new("r27");
+    let mut db = ctx.create();
+
+    // 1. Create table and insert duplicate composite keys
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement(
+            "CREATE TABLE users (id UINT64 PRIMARY KEY, dept TEXT NOT NULL, level INT64 NOT NULL);",
+        )
+        .unwrap();
+        txn.execute_statement("INSERT INTO users VALUES (1, 'eng', 1);")
+            .unwrap();
+        txn.execute_statement("INSERT INTO users VALUES (2, 'eng', 1);")
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // 2. Attempt to create unique composite index — must fail atomically
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        let err = txn
+            .execute_statement("CREATE UNIQUE INDEX idx_users_dept_level ON users (dept, level);")
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::DuplicateIndexKey(_)),
+            "expected DuplicateIndexKey error, got {err:?}"
+        );
+
+        // Index metadata must NOT be registered in catalog
+        assert!(txn.get_index("idx_users_dept_level").unwrap().is_none());
+
+        // Existing rows must remain intact
+        let r = txn
+            .execute_sql("SELECT id, dept, level FROM users ORDER BY id ASC;")
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r.rows[0].values[0], Value::UInt64(1));
+        assert_eq!(r.rows[1].values[0], Value::UInt64(2));
+
+        txn.validate_catalog().unwrap();
+        txn.validate_tree().unwrap();
+        txn.commit().unwrap();
+    }
+
+    // 3. Reopen database and verify state is pristine
+    {
+        let mut db2 = ctx.open();
+        let mut txn2 = db2.begin_transaction().unwrap();
+        assert!(txn2.get_index("idx_users_dept_level").unwrap().is_none());
+        let r = txn2
+            .execute_sql("SELECT id FROM users ORDER BY id ASC;")
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        txn2.validate_catalog().unwrap();
+        txn2.validate_tree().unwrap();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R28 — Successful UNIQUE backfill
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r28_successful_unique_backfill() {
+    let ctx = Ctx::new("r28");
+    let mut db = ctx.create();
+
+    // 1. Create table with unique data
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement(
+            "CREATE TABLE staff (id UINT64 PRIMARY KEY, dept TEXT NOT NULL, level INT64 NOT NULL);",
+        )
+        .unwrap();
+        txn.execute_statement("INSERT INTO staff VALUES (1, 'eng', 1);")
+            .unwrap();
+        txn.execute_statement("INSERT INTO staff VALUES (2, 'eng', 2);")
+            .unwrap();
+        txn.execute_statement("INSERT INTO staff VALUES (3, 'hr', 1);")
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // 2. CREATE UNIQUE INDEX succeeds
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement("CREATE UNIQUE INDEX idx_uniq_dept_level ON staff (dept, level);")
+            .unwrap();
+        let meta = txn.get_index("idx_uniq_dept_level").unwrap().unwrap();
+        assert!(meta.unique);
+        assert_eq!(meta.column_indices, vec![1, 2]);
+
+        // Lookups through index
+        let r = txn
+            .execute_sql("SELECT id FROM staff WHERE dept = 'eng' AND level = 2;")
+            .unwrap();
+        assert_eq!(r.rows, vec![Row::new(vec![Value::UInt64(2)])]);
+
+        // Attempting to insert duplicate now fails
+        let err = txn
+            .execute_statement("INSERT INTO staff VALUES (4, 'eng', 2);")
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateIndexKey(_)));
+
+        txn.validate_catalog().unwrap();
+        txn.commit().unwrap();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R29 — Backfill persistence across reopen
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r29_backfill_persistence() {
+    let ctx = Ctx::new("r29");
+
+    {
+        let mut db = ctx.create();
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement(
+            "CREATE TABLE items (id UINT64 PRIMARY KEY, cat TEXT NOT NULL, subcat TEXT NOT NULL, price DOUBLE);",
+        )
+        .unwrap();
+        for i in 1..=20u64 {
+            let cat = if i % 2 == 0 { "elec" } else { "home" };
+            let subcat = format!("sub_{}", i % 5);
+            let sql = format!("INSERT INTO items VALUES ({i}, '{cat}', '{subcat}', 99.9);");
+            txn.execute_statement(&sql).unwrap();
+        }
+        txn.execute_statement("CREATE INDEX idx_cat_subcat ON items (cat, subcat);")
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Reopen database and verify indexed queries work
+    {
+        let mut db = ctx.open();
+        let mut txn = db.begin_transaction().unwrap();
+        let meta = txn.get_index("idx_cat_subcat").unwrap().unwrap();
+        assert_eq!(meta.column_indices, vec![1, 2]);
+
+        let res = txn
+            .execute_sql(
+                "SELECT id FROM items WHERE cat = 'elec' AND subcat = 'sub_0' ORDER BY id ASC;",
+            )
+            .unwrap();
+        assert_eq!(
+            res.rows,
+            vec![
+                Row::new(vec![Value::UInt64(10)]),
+                Row::new(vec![Value::UInt64(20)])
+            ]
+        );
+
+        let mut tbl = txn.open_table("items").unwrap();
+        tbl.validate_indexes().unwrap();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R30 — Failed backfill recovery and freelist validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r30_failed_backfill_recovery() {
+    let ctx = Ctx::new("r30");
+    let mut db = ctx.create();
+
+    // 1. Initial setup
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement(
+            "CREATE TABLE records (id UINT64 PRIMARY KEY, group_id TEXT NOT NULL, code INT64 NOT NULL);",
+        )
+        .unwrap();
+        for i in 1..=10u64 {
+            let code = if i == 5 { 1 } else { i as i64 }; // code 1 is duplicated for rows 1 and 5
+            let sql = format!("INSERT INTO records VALUES ({i}, 'grpA', {code});");
+            txn.execute_statement(&sql).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    // 2. Transaction fails during unique backfill
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        let err = txn
+            .execute_statement("CREATE UNIQUE INDEX idx_uniq_grp_code ON records (group_id, code);")
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateIndexKey(_)));
+        txn.abort().unwrap();
+    }
+
+    // 3. Verify database integrity
+    {
+        let mut db2 = ctx.open();
+        let mut txn = db2.begin_transaction().unwrap();
+        assert!(txn.get_index("idx_uniq_grp_code").unwrap().is_none());
+        let count = txn.execute_sql("SELECT COUNT(*) FROM records;").unwrap();
+        assert_eq!(count.rows[0].values[0], Value::UInt64(10));
+
+        txn.validate_catalog().unwrap();
+        txn.validate_tree().unwrap();
+        let mut tbl = txn.open_table("records").unwrap();
+        tbl.validate_indexes().unwrap();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R31 — Single-column prefix planning on composite index
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r31_single_column_prefix_plan() {
+    let ctx = Ctx::new("r31");
+    let mut db = ctx.create();
+    let mut txn = db.begin_transaction().unwrap();
+
+    txn.execute_statement(
+        "CREATE TABLE staff (id UINT64 PRIMARY KEY, dept TEXT NOT NULL, level INT64 NOT NULL);",
+    )
+    .unwrap();
+    txn.execute_statement("CREATE INDEX idx_dept_level ON staff (dept, level);")
+        .unwrap();
+    txn.execute_statement(
+        "INSERT INTO staff VALUES (1, 'eng', 1), (2, 'eng', 2), (3, 'sales', 1);",
+    )
+    .unwrap();
+
+    let plan = txn
+        .explain_sql("SELECT * FROM staff WHERE dept = 'eng';")
+        .unwrap();
+    assert!(
+        plan.contains("SecondaryIndexScan(idx_dept_level, PrefixScan((\"eng\")))"),
+        "expected PrefixScan((\"eng\")), got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("PointLookup"),
+        "prefix scan must NOT be planned as PointLookup, got:\n{plan}"
+    );
+
+    let res = txn
+        .execute_sql("SELECT id, dept, level FROM staff WHERE dept = 'eng' ORDER BY id ASC;")
+        .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![
+            Row::new(vec![
+                Value::UInt64(1),
+                Value::String("eng".into()),
+                Value::Int64(1)
+            ]),
+            Row::new(vec![
+                Value::UInt64(2),
+                Value::String("eng".into()),
+                Value::Int64(2)
+            ]),
+        ]
+    );
+
+    txn.commit().unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R32 — Two-column prefix planning on 3-column composite index
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r32_two_column_prefix_plan() {
+    let ctx = Ctx::new("r32");
+    let mut db = ctx.create();
+    let mut txn = db.begin_transaction().unwrap();
+
+    txn.execute_statement(
+        "CREATE TABLE metrics (id UINT64 PRIMARY KEY, tenant TEXT NOT NULL, region TEXT NOT NULL, shard INT64 NOT NULL, val DOUBLE);",
+    )
+    .unwrap();
+    txn.execute_statement("CREATE INDEX idx_trs ON metrics (tenant, region, shard);")
+        .unwrap();
+    txn.execute_statement(
+        "INSERT INTO metrics VALUES (1, 't1', 'us-east', 1, 10.0), (2, 't1', 'us-east', 2, 20.0), (3, 't1', 'us-west', 1, 30.0);",
+    )
+    .unwrap();
+
+    let plan = txn
+        .explain_sql("SELECT * FROM metrics WHERE tenant = 't1' AND region = 'us-east';")
+        .unwrap();
+    assert!(
+        plan.contains("SecondaryIndexScan(idx_trs, PrefixScan((\"t1\", \"us-east\")))"),
+        "expected PrefixScan((\"t1\", \"us-east\")), got:\n{plan}"
+    );
+
+    let res = txn
+        .execute_sql("SELECT id, val FROM metrics WHERE tenant = 't1' AND region = 'us-east' ORDER BY id ASC;")
+        .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![
+            Row::new(vec![Value::UInt64(1), Value::Float64(10.0)]),
+            Row::new(vec![Value::UInt64(2), Value::Float64(20.0)]),
+        ]
+    );
+
+    txn.commit().unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R33 — Full composite equality uses PointLookup
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r33_full_composite_equality_point_lookup() {
+    let ctx = Ctx::new("r33");
+    let mut db = ctx.create();
+    let mut txn = db.begin_transaction().unwrap();
+
+    txn.execute_statement(
+        "CREATE TABLE metrics (id UINT64 PRIMARY KEY, tenant TEXT NOT NULL, region TEXT NOT NULL, shard INT64 NOT NULL);",
+    )
+    .unwrap();
+    txn.execute_statement("CREATE INDEX idx_trs ON metrics (tenant, region, shard);")
+        .unwrap();
+    txn.execute_statement(
+        "INSERT INTO metrics VALUES (1, 't1', 'us-east', 1), (2, 't1', 'us-east', 2);",
+    )
+    .unwrap();
+
+    let plan = txn
+        .explain_sql(
+            "SELECT * FROM metrics WHERE tenant = 't1' AND region = 'us-east' AND shard = 2;",
+        )
+        .unwrap();
+    assert!(
+        plan.contains("SecondaryIndexScan(idx_trs, PointLookup((\"t1\", \"us-east\", 2)))"),
+        "expected PointLookup((\"t1\", \"us-east\", 2)), got:\n{plan}"
+    );
+
+    let res = txn
+        .execute_sql(
+            "SELECT id FROM metrics WHERE tenant = 't1' AND region = 'us-east' AND shard = 2;",
+        )
+        .unwrap();
+    assert_eq!(res.rows, vec![Row::new(vec![Value::UInt64(2)])]);
+
+    txn.commit().unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R34 — Non-leading column cannot use index as prefix
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r34_non_leading_column_cannot_use_prefix() {
+    let ctx = Ctx::new("r34");
+    let mut db = ctx.create();
+    let mut txn = db.begin_transaction().unwrap();
+
+    txn.execute_statement(
+        "CREATE TABLE staff (id UINT64 PRIMARY KEY, dept TEXT NOT NULL, level INT64 NOT NULL, role TEXT NOT NULL);",
+    )
+    .unwrap();
+    txn.execute_statement("CREATE INDEX idx_dept_level_role ON staff (dept, level, role);")
+        .unwrap();
+    txn.execute_statement("INSERT INTO staff VALUES (1, 'eng', 3, 'dev'), (2, 'hr', 3, 'mgr');")
+        .unwrap();
+
+    // Query on level only (non-leading)
+    let plan_b = txn
+        .explain_sql("SELECT * FROM staff WHERE level = 3;")
+        .unwrap();
+    assert!(
+        plan_b.contains("FullTableScan"),
+        "non-leading column must fallback to FullTableScan, got:\n{plan_b}"
+    );
+
+    // Query on role only
+    let plan_c = txn
+        .explain_sql("SELECT * FROM staff WHERE role = 'dev';")
+        .unwrap();
+    assert!(
+        plan_c.contains("FullTableScan"),
+        "non-leading column must fallback to FullTableScan, got:\n{plan_c}"
+    );
+
+    let res = txn
+        .execute_sql("SELECT id FROM staff WHERE level = 3 ORDER BY id ASC;")
+        .unwrap();
+    assert_eq!(res.len(), 2);
+
+    txn.commit().unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R35 — Prefix with residual predicate
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r35_prefix_with_residual_predicate() {
+    let ctx = Ctx::new("r35");
+    let mut db = ctx.create();
+    let mut txn = db.begin_transaction().unwrap();
+
+    txn.execute_statement(
+        "CREATE TABLE staff (id UINT64 PRIMARY KEY, dept TEXT NOT NULL, level INT64 NOT NULL, score DOUBLE NOT NULL);",
+    )
+    .unwrap();
+    txn.execute_statement("CREATE INDEX idx_dept_level ON staff (dept, level);")
+        .unwrap();
+    txn.execute_statement(
+        "INSERT INTO staff VALUES (1, 'eng', 1, 10.0), (2, 'eng', 2, 25.0), (3, 'eng', 3, 50.0);",
+    )
+    .unwrap();
+
+    // Prefix on dept with residual filter on unindexed column score
+    let plan = txn
+        .explain_sql("SELECT id, score FROM staff WHERE dept = 'eng' AND score > 20.0;")
+        .unwrap();
+    assert!(
+        plan.contains("SecondaryIndexScan(idx_dept_level, PrefixScan((\"eng\")))"),
+        "expected PrefixScan((\"eng\")), got:\n{plan}"
+    );
+
+    let res = txn
+        .execute_sql(
+            "SELECT id, score FROM staff WHERE dept = 'eng' AND score > 20.0 ORDER BY id ASC;",
+        )
+        .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![
+            Row::new(vec![Value::UInt64(2), Value::Float64(25.0)]),
+            Row::new(vec![Value::UInt64(3), Value::Float64(50.0)]),
+        ]
+    );
+
+    // Prefix on first column of 3-column index with gap: WHERE dept = 'eng' AND role = 'dev'
+    txn.execute_statement(
+        "CREATE TABLE emp (id UINT64 PRIMARY KEY, a TEXT NOT NULL, b INT64 NOT NULL, c TEXT NOT NULL);",
+    )
+    .unwrap();
+    txn.execute_statement("CREATE INDEX idx_abc ON emp (a, b, c);")
+        .unwrap();
+    txn.execute_statement("INSERT INTO emp VALUES (1, 'eng', 10, 'dev'), (2, 'eng', 20, 'qa');")
+        .unwrap();
+
+    let plan_gap = txn
+        .explain_sql("SELECT * FROM emp WHERE a = 'eng' AND c = 'dev';")
+        .unwrap();
+    assert!(
+        plan_gap.contains("SecondaryIndexScan(idx_abc, PrefixScan((\"eng\")))"),
+        "expected contiguous prefix scan with gap as residual, got:\n{plan_gap}"
+    );
+
+    let res_gap = txn
+        .execute_sql("SELECT id FROM emp WHERE a = 'eng' AND c = 'dev';")
+        .unwrap();
+    assert_eq!(res_gap.rows, vec![Row::new(vec![Value::UInt64(1)])]);
+
+    txn.commit().unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R36 — Prepared statement prefix planning
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r36_prepared_statement_prefix_and_plan_cache() {
+    let ctx = Ctx::new("r36");
+    let mut db = ctx.create();
+
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement(
+            "CREATE TABLE staff (id UINT64 PRIMARY KEY, dept TEXT NOT NULL, level INT64 NOT NULL);",
+        )
+        .unwrap();
+        txn.execute_statement("CREATE INDEX idx_dept_level ON staff (dept, level);")
+            .unwrap();
+        txn.execute_statement(
+            "INSERT INTO staff VALUES (1, 'eng', 1), (2, 'eng', 2), (3, 'sales', 1);",
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    let stmt = db
+        .prepare_sql("SELECT id, level FROM staff WHERE dept = ? ORDER BY id ASC;")
+        .unwrap();
+
+    // 1st run: compile & cache plan
+    let r1 = db
+        .execute_prepared(&stmt, &[Value::String("eng".into())])
+        .unwrap()
+        .into_query()
+        .unwrap();
+    assert_eq!(
+        r1.rows,
+        vec![
+            Row::new(vec![Value::UInt64(1), Value::Int64(1)]),
+            Row::new(vec![Value::UInt64(2), Value::Int64(2)]),
+        ]
+    );
+
+    // 2nd run with same param: plan cache hit
+    let r2 = db
+        .execute_prepared(&stmt, &[Value::String("eng".into())])
+        .unwrap()
+        .into_query()
+        .unwrap();
+    assert_eq!(
+        r2.rows,
+        vec![
+            Row::new(vec![Value::UInt64(1), Value::Int64(1)]),
+            Row::new(vec![Value::UInt64(2), Value::Int64(2)]),
+        ]
+    );
+
+    let stats = db.plan_cache_stats();
+    assert!(stats.hits > 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R37 — Plan cache invalidation when composite index is created
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r37_plan_cache_invalidation_on_composite_index_create() {
+    let ctx = Ctx::new("r37");
+    let mut db = ctx.create();
+
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement(
+            "CREATE TABLE staff (id UINT64 PRIMARY KEY, dept TEXT NOT NULL, level INT64 NOT NULL);",
+        )
+        .unwrap();
+        txn.execute_statement("INSERT INTO staff VALUES (1, 'eng', 3), (2, 'hr', 5);")
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // 1. Prepare and execute without index -> FullTableScan cached
+    let stmt = db
+        .prepare_sql("SELECT id FROM staff WHERE dept = ?;")
+        .unwrap();
+    let r1 = db
+        .execute_prepared(&stmt, &[Value::String("eng".into())])
+        .unwrap();
+    assert_eq!(r1.into_query().unwrap().len(), 1);
+
+    // 2. Second execution -> Cache hit
+    let r2 = db
+        .execute_prepared(&stmt, &[Value::String("eng".into())])
+        .unwrap();
+    assert_eq!(r2.into_query().unwrap().len(), 1);
+    let hits_before = db.plan_cache_stats().hits;
+    assert!(hits_before > 0);
+
+    // 3. CREATE composite index -> invalidates plan cache
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement("CREATE INDEX idx_dept_level ON staff (dept, level);")
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // 4. Third execution: replanned with composite index PrefixScan
+    let r3 = db
+        .execute_prepared(&stmt, &[Value::String("eng".into())])
+        .unwrap();
+    assert_eq!(r3.into_query().unwrap().len(), 1);
+
+    // 5. Fourth execution: cache hit on new plan
+    let r4 = db
+        .execute_prepared(&stmt, &[Value::String("eng".into())])
+        .unwrap();
+    assert_eq!(r4.into_query().unwrap().len(), 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R38 — Randomized differential oracle for composite prefix + residual scans
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r38_randomized_oracle_prefix_and_residuals() {
+    let ctx = Ctx::new("r38");
+    let mut db = ctx.create();
+
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement(
+            "CREATE TABLE dataset (id UINT64 PRIMARY KEY, dept TEXT NOT NULL, level INT64, score DOUBLE);",
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    let depts = ["eng", "hr", "sales", "finance", "legal"];
+    let mut oracle: BTreeMap<u64, (String, Option<i64>, Option<f64>)> = BTreeMap::new();
+
+    // Populate initial rows
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        for id in 1..=50u64 {
+            let dept = depts[(id as usize * 7) % depts.len()].to_string();
+            let level = if id % 6 == 0 {
+                None
+            } else {
+                Some((id as i64 * 3) % 10)
+            };
+            let score = if id % 7 == 0 {
+                None
+            } else {
+                Some((id as f64 * 1.5) % 100.0)
+            };
+
+            let level_str = level
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "NULL".into());
+            let score_str = score
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "NULL".into());
+            let sql =
+                format!("INSERT INTO dataset VALUES ({id}, '{dept}', {level_str}, {score_str});");
+            txn.execute_statement(&sql).unwrap();
+            oracle.insert(id, (dept, level, score));
+        }
+        txn.commit().unwrap();
+    }
+
+    // CREATE INDEX backfill
+    {
+        let mut txn = db.begin_transaction().unwrap();
+        txn.execute_statement("CREATE INDEX idx_dept_level ON dataset (dept, level);")
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Perform mutations & verify oracle agreement
+    for step in 51..=80u64 {
+        let mut txn = db.begin_transaction().unwrap();
+
+        if step % 3 == 0 {
+            // INSERT
+            let dept = depts[(step as usize * 11) % depts.len()].to_string();
+            let level = (step as i64 * 2) % 10;
+            let score = step as f64 * 0.5;
+            let sql =
+                format!("INSERT INTO dataset VALUES ({step}, '{dept}', {level}, {score:.1});");
+            txn.execute_statement(&sql).unwrap();
+            oracle.insert(step, (dept, Some(level), Some(score)));
+        } else if step % 3 == 1 {
+            // DELETE an existing row
+            if let Some(&first_id) = oracle.keys().next() {
+                let sql = format!("DELETE FROM dataset WHERE id = {first_id};");
+                txn.execute_statement(&sql).unwrap();
+                oracle.remove(&first_id);
+            }
+        }
+
+        // Check query: Prefix query with residual
+        let target_dept = depts[(step as usize * 3) % depts.len()];
+        let sql = format!(
+            "SELECT id FROM dataset WHERE dept = '{target_dept}' AND score > 25.0 ORDER BY id ASC;"
+        );
+        let res = txn.execute_sql(&sql).unwrap();
+        let expected_ids: Vec<u64> = oracle
+            .iter()
+            .filter(|(_, (d, _, sc))| d == target_dept && sc.is_some() && sc.unwrap() > 25.0)
+            .map(|(&id, _)| id)
+            .collect();
+
+        let actual_ids: Vec<u64> = res
+            .rows
+            .iter()
+            .map(|r| {
+                if let Value::UInt64(v) = r.values[0] {
+                    v
+                } else {
+                    panic!("unexpected")
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            actual_ids, expected_ids,
+            "mismatch at step {step} for query '{sql}'"
+        );
+
+        txn.commit().unwrap();
+    }
 }

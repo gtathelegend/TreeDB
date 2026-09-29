@@ -226,6 +226,24 @@ impl CardinalityEstimator {
         1.0
     }
 
+    /// Estimates output cardinality for a composite secondary index prefix scan.
+    pub fn estimate_sec_prefix_rows(
+        stats: Option<&TableStatistics>,
+        _index_meta: &IndexMetadata,
+        prefix_len: usize,
+    ) -> f64 {
+        let p_len = prefix_len.max(1) as i32;
+        if let Some(st) = stats {
+            let base_rows = st.row_count as f64;
+            if base_rows <= 0.0 {
+                return 0.0;
+            }
+            let sel = DEFAULT_RANGE_SELECTIVITY / (p_len as f64);
+            return (base_rows * sel).max(1.0);
+        }
+        (DEFAULT_TABLE_ROWS * 0.01 / (p_len as f64)).max(1.0)
+    }
+
     /// Estimates output cardinality for a secondary index range scan.
     pub fn estimate_sec_range_rows(
         stats: Option<&TableStatistics>,
