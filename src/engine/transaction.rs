@@ -2616,6 +2616,19 @@ impl<'db> Transaction<'db> {
                     crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
                         table.index_scan(index_name, start.as_ref(), end.as_ref())?
                     }
+                    crate::query::optimizer::SecondaryScanType::SkipScan {
+                        skipped_prefix_columns,
+                        constrained_columns,
+                    } => {
+                        let constrained_values: Vec<Value> =
+                            constrained_columns.iter().map(|(_, v)| v.clone()).collect();
+                        let (rows, _) = table.index_skip_scan(
+                            index_name,
+                            skipped_prefix_columns.len(),
+                            &constrained_values,
+                        )?;
+                        rows
+                    }
                 },
                 crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
             };
@@ -2743,6 +2756,19 @@ impl<'db> Transaction<'db> {
                     }
                     crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
                         table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                    }
+                    crate::query::optimizer::SecondaryScanType::SkipScan {
+                        skipped_prefix_columns,
+                        constrained_columns,
+                    } => {
+                        let constrained_values: Vec<Value> =
+                            constrained_columns.iter().map(|(_, v)| v.clone()).collect();
+                        let (rows, _) = table.index_skip_scan(
+                            index_name,
+                            skipped_prefix_columns.len(),
+                            &constrained_values,
+                        )?;
+                        rows
                     }
                 },
                 crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
@@ -3151,6 +3177,7 @@ impl<'db> Transaction<'db> {
                 let raw_schema = table.schema().clone();
                 let mut index_lookups = 0;
                 let mut is_index_only = false;
+                let mut skip_scan_stats: Option<crate::engine::table::SkipScanStats> = None;
                 let initial_rows = match &plan.base_table.access_path {
                     crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
                         index_lookups = 1;
@@ -3167,32 +3194,63 @@ impl<'db> Transaction<'db> {
                         index_name,
                         scan_type,
                         ..
-                    } => {
-                        index_lookups = 1;
-                        match scan_type {
-                            crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
-                                table.index_lookup(index_name, val)?
-                            }
-                            crate::query::optimizer::SecondaryScanType::CompositePointLookup(
-                                vals,
-                            )
-                            | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
-                                table.composite_index_lookup(index_name, vals)?
-                            }
-                            crate::query::optimizer::SecondaryScanType::RangeScan {
-                                start,
-                                end,
-                            } => table.index_scan(index_name, start.as_ref(), end.as_ref())?,
+                    } => match scan_type {
+                        crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                            index_lookups = 1;
+                            table.index_lookup(index_name, val)?
                         }
-                    }
+                        crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals)
+                        | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
+                            index_lookups = 1;
+                            table.composite_index_lookup(index_name, vals)?
+                        }
+                        crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
+                            index_lookups = 1;
+                            table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                        }
+                        crate::query::optimizer::SecondaryScanType::SkipScan {
+                            skipped_prefix_columns,
+                            constrained_columns,
+                        } => {
+                            let constrained_values: Vec<Value> =
+                                constrained_columns.iter().map(|(_, v)| v.clone()).collect();
+                            let (rows, stats) = table.index_skip_scan(
+                                index_name,
+                                skipped_prefix_columns.len(),
+                                &constrained_values,
+                            )?;
+                            index_lookups = stats.skip_scan_probes;
+                            skip_scan_stats = Some(stats);
+                            rows
+                        }
+                    },
                     crate::query::optimizer::AccessPath::IndexOnlyScan {
                         index_name,
                         scan_type,
                         ..
                     } => {
-                        index_lookups = 1;
                         is_index_only = true;
-                        table.index_only_scan(index_name, scan_type)?
+                        match scan_type {
+                            crate::query::optimizer::SecondaryScanType::SkipScan {
+                                skipped_prefix_columns,
+                                constrained_columns,
+                            } => {
+                                let constrained_values: Vec<Value> =
+                                    constrained_columns.iter().map(|(_, v)| v.clone()).collect();
+                                let (rows, stats) = table.index_only_skip_scan(
+                                    index_name,
+                                    skipped_prefix_columns.len(),
+                                    &constrained_values,
+                                )?;
+                                index_lookups = stats.skip_scan_probes;
+                                skip_scan_stats = Some(stats);
+                                rows
+                            }
+                            _ => {
+                                index_lookups = 1;
+                                table.index_only_scan(index_name, scan_type)?
+                            }
+                        }
                     }
                     crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
                 };
@@ -3209,21 +3267,30 @@ impl<'db> Transaction<'db> {
                 scan_metric.actual_rows = initial_rows.len();
                 scan_metric.counters.index_lookups = index_lookups;
                 scan_metric.counters.rows_evaluated = initial_rows.len();
+                if let Some(stats) = &skip_scan_stats {
+                    scan_metric.counters.distinct_prefix_values = stats.distinct_prefix_values;
+                    scan_metric.counters.skip_scan_probes = stats.skip_scan_probes;
+                    scan_metric.counters.index_entries_examined = stats.index_entries_examined;
+                }
                 if is_index_only {
                     scan_metric.counters.tuples_fetched = 0;
                     scan_metric.counters.base_records_fetched = 0;
                     scan_metric.counters.base_records_avoided = initial_rows.len();
-                    scan_metric.counters.index_entries_examined = initial_rows.len();
+                    if skip_scan_stats.is_none() {
+                        scan_metric.counters.index_entries_examined = initial_rows.len();
+                    }
                     scan_metric.counters.covered_rows_output = initial_rows.len();
                 } else {
                     scan_metric.counters.tuples_fetched = initial_rows.len();
                     scan_metric.counters.base_records_fetched = initial_rows.len();
                     scan_metric.counters.base_records_avoided = 0;
-                    scan_metric.counters.index_entries_examined = if index_lookups > 0 {
-                        initial_rows.len()
-                    } else {
-                        0
-                    };
+                    if skip_scan_stats.is_none() {
+                        scan_metric.counters.index_entries_examined = if index_lookups > 0 {
+                            initial_rows.len()
+                        } else {
+                            0
+                        };
+                    }
                     scan_metric.counters.covered_rows_output = 0;
                 }
 
@@ -3354,6 +3421,7 @@ impl<'db> Transaction<'db> {
                     let raw_schema = table.schema().clone();
                     let mut index_lookups = 0;
                     let mut is_index_only = false;
+                    let mut skip_scan_stats: Option<crate::engine::table::SkipScanStats> = None;
                     let initial_rows = match &join.right.access_path {
                         crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
                             index_lookups = 1;
@@ -3370,30 +3438,70 @@ impl<'db> Transaction<'db> {
                             index_name,
                             scan_type,
                             ..
-                        } => {
-                            index_lookups = 1;
-                            match scan_type {
-                                crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
-                                    table.index_lookup(index_name, val)?
-                                }
-                                crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals)
-                                | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
-                                    table.composite_index_lookup(index_name, vals)?
-                                }
-                                crate::query::optimizer::SecondaryScanType::RangeScan {
-                                    start,
-                                    end,
-                                } => table.index_scan(index_name, start.as_ref(), end.as_ref())?,
+                        } => match scan_type {
+                            crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                                index_lookups = 1;
+                                table.index_lookup(index_name, val)?
                             }
-                        }
+                            crate::query::optimizer::SecondaryScanType::CompositePointLookup(
+                                vals,
+                            )
+                            | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
+                                index_lookups = 1;
+                                table.composite_index_lookup(index_name, vals)?
+                            }
+                            crate::query::optimizer::SecondaryScanType::RangeScan {
+                                start,
+                                end,
+                            } => {
+                                index_lookups = 1;
+                                table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                            }
+                            crate::query::optimizer::SecondaryScanType::SkipScan {
+                                skipped_prefix_columns,
+                                constrained_columns,
+                            } => {
+                                let constrained_values: Vec<Value> =
+                                    constrained_columns.iter().map(|(_, v)| v.clone()).collect();
+                                let (rows, stats) = table.index_skip_scan(
+                                    index_name,
+                                    skipped_prefix_columns.len(),
+                                    &constrained_values,
+                                )?;
+                                index_lookups = stats.skip_scan_probes;
+                                skip_scan_stats = Some(stats);
+                                rows
+                            }
+                        },
                         crate::query::optimizer::AccessPath::IndexOnlyScan {
                             index_name,
                             scan_type,
                             ..
                         } => {
-                            index_lookups = 1;
                             is_index_only = true;
-                            table.index_only_scan(index_name, scan_type)?
+                            match scan_type {
+                                crate::query::optimizer::SecondaryScanType::SkipScan {
+                                    skipped_prefix_columns,
+                                    constrained_columns,
+                                } => {
+                                    let constrained_values: Vec<Value> = constrained_columns
+                                        .iter()
+                                        .map(|(_, v)| v.clone())
+                                        .collect();
+                                    let (rows, stats) = table.index_only_skip_scan(
+                                        index_name,
+                                        skipped_prefix_columns.len(),
+                                        &constrained_values,
+                                    )?;
+                                    index_lookups = stats.skip_scan_probes;
+                                    skip_scan_stats = Some(stats);
+                                    rows
+                                }
+                                _ => {
+                                    index_lookups = 1;
+                                    table.index_only_scan(index_name, scan_type)?
+                                }
+                            }
                         }
                         crate::query::optimizer::AccessPath::FullTableScan => {
                             table.scan(None, None)?
@@ -3412,21 +3520,30 @@ impl<'db> Transaction<'db> {
                     scan_metric.actual_rows = initial_rows.len();
                     scan_metric.counters.index_lookups = index_lookups;
                     scan_metric.counters.rows_evaluated = initial_rows.len();
+                    if let Some(stats) = &skip_scan_stats {
+                        scan_metric.counters.distinct_prefix_values = stats.distinct_prefix_values;
+                        scan_metric.counters.skip_scan_probes = stats.skip_scan_probes;
+                        scan_metric.counters.index_entries_examined = stats.index_entries_examined;
+                    }
                     if is_index_only {
                         scan_metric.counters.tuples_fetched = 0;
                         scan_metric.counters.base_records_fetched = 0;
                         scan_metric.counters.base_records_avoided = initial_rows.len();
-                        scan_metric.counters.index_entries_examined = initial_rows.len();
+                        if skip_scan_stats.is_none() {
+                            scan_metric.counters.index_entries_examined = initial_rows.len();
+                        }
                         scan_metric.counters.covered_rows_output = initial_rows.len();
                     } else {
                         scan_metric.counters.tuples_fetched = initial_rows.len();
                         scan_metric.counters.base_records_fetched = initial_rows.len();
                         scan_metric.counters.base_records_avoided = 0;
-                        scan_metric.counters.index_entries_examined = if index_lookups > 0 {
-                            initial_rows.len()
-                        } else {
-                            0
-                        };
+                        if skip_scan_stats.is_none() {
+                            scan_metric.counters.index_entries_examined = if index_lookups > 0 {
+                                initial_rows.len()
+                            } else {
+                                0
+                            };
+                        }
                         scan_metric.counters.covered_rows_output = 0;
                     }
 

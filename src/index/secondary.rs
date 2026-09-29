@@ -1,10 +1,10 @@
-use std::collections::HashSet;
-
 use crate::engine::types::{DataType, Value};
 use crate::error::{Error, Result};
+use crate::index::composite::CompositeIndexKey;
 use crate::index::node::{RecordId, INVALID_PAGE_ID};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::{Page, PageId, PageType, PAGE_PAYLOAD_SIZE};
+use std::collections::HashSet;
 
 /// Canonical, order-preserving encoded key for secondary B+ Tree indexing.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -783,6 +783,85 @@ impl SecondaryIndex {
     ) -> Result<Vec<(IndexKey, RecordId)>> {
         let entries = self.scan_entries(buffer_pool, start, end)?;
         Ok(entries.into_iter().map(|e| (e.key, e.rid)).collect())
+    }
+
+    /// Enumerates distinct leading-prefix values of length `skipped_prefix_len` in deterministic key order.
+    pub fn distinct_prefix_values(
+        &self,
+        buffer_pool: &mut BufferPool,
+        total_columns: usize,
+        skipped_prefix_len: usize,
+        col_types: &[DataType],
+    ) -> Result<Vec<Vec<Value>>> {
+        if self.is_empty() || skipped_prefix_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Descend to leftmost leaf page
+        let mut curr_pid = self.root_page_id;
+        loop {
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            let page_type = page.page_type();
+
+            match page_type {
+                PageType::Leaf => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    break;
+                }
+                PageType::Internal => {
+                    let internal = match SecondaryInternalNode::deserialize(page) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = buffer_pool.unpin_page(curr_pid, false);
+                            return Err(e);
+                        }
+                    };
+                    let next_pid = internal.children[0];
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    curr_pid = next_pid;
+                }
+                other => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_pid} during distinct prefix scan"
+                    )));
+                }
+            }
+        }
+
+        let mut distinct_prefixes: Vec<Vec<Value>> = Vec::new();
+        let mut last_prefix: Option<Vec<Value>> = None;
+        let mut leaf_pid = curr_pid;
+
+        while leaf_pid != INVALID_PAGE_ID {
+            let page = buffer_pool.fetch_page(leaf_pid)?;
+            let leaf = match SecondaryLeafNode::deserialize(page) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(leaf_pid, false);
+                    return Err(e);
+                }
+            };
+            buffer_pool.unpin_page(leaf_pid, false)?;
+
+            for entry in &leaf.entries {
+                let prefix = CompositeIndexKey::decode_prefix_values(
+                    &entry.key.bytes,
+                    total_columns,
+                    skipped_prefix_len,
+                    col_types,
+                )?;
+
+                if last_prefix.as_ref() != Some(&prefix) {
+                    last_prefix = Some(prefix.clone());
+                    distinct_prefixes.push(prefix);
+                }
+            }
+
+            leaf_pid = leaf.next_leaf;
+        }
+
+        Ok(distinct_prefixes)
     }
 
     /// Inserts a `(IndexKey, covered_payload, RecordId)` pair into the secondary index.

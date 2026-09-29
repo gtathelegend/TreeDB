@@ -264,6 +264,59 @@ impl CardinalityEstimator {
         (DEFAULT_TABLE_ROWS * 0.01).max(1.0)
     }
 
+    /// Estimates the number of distinct prefix combinations for skipped prefix columns.
+    pub fn estimate_distinct_prefixes(
+        stats: Option<&TableStatistics>,
+        schema: &Schema,
+        skipped_col_indices: &[usize],
+    ) -> f64 {
+        if let Some(st) = stats {
+            let mut total_distinct = 1.0;
+            for &idx in skipped_col_indices {
+                let col_name = &schema.columns[idx].name;
+                if let Some(col_st) = st.column(col_name) {
+                    if col_st.distinct_count > 0 {
+                        total_distinct *= col_st.distinct_count as f64;
+                    } else {
+                        total_distinct *= 10.0;
+                    }
+                } else {
+                    total_distinct *= 10.0;
+                }
+            }
+            total_distinct.min(st.row_count as f64).max(1.0)
+        } else {
+            10.0
+        }
+    }
+
+    /// Estimates output cardinality for a composite secondary index skip scan.
+    pub fn estimate_skip_scan_rows(
+        stats: Option<&TableStatistics>,
+        schema: &Schema,
+        constrained_col_indices: &[usize],
+    ) -> f64 {
+        if let Some(st) = stats {
+            let base_rows = st.row_count as f64;
+            let mut sel = 1.0;
+            for &idx in constrained_col_indices {
+                let col_name = &schema.columns[idx].name;
+                if let Some(col_st) = st.column(col_name) {
+                    if col_st.distinct_count > 0 {
+                        sel *= 1.0 / (col_st.distinct_count as f64);
+                    } else {
+                        sel *= DEFAULT_EQ_SELECTIVITY;
+                    }
+                } else {
+                    sel *= DEFAULT_EQ_SELECTIVITY;
+                }
+            }
+            (base_rows * sel).max(1.0)
+        } else {
+            1.0
+        }
+    }
+
     /// Estimates the output cardinality for an inner join between left and right relations.
     pub fn estimate_inner_join_cardinality(
         left_rows: f64,

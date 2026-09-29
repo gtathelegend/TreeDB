@@ -101,6 +101,21 @@ impl fmt::Display for AccessPath {
                             .unwrap_or_else(|| "None".into())
                     )
                 }
+                SecondaryScanType::SkipScan {
+                    skipped_prefix_columns,
+                    constrained_columns,
+                } => {
+                    let prefix_str = skipped_prefix_columns.join(", ");
+                    let constr_str = constrained_columns
+                        .iter()
+                        .map(|(col, val)| format!("{col} = {val}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(
+                        f,
+                        "IndexSkipScan(index={index_name}, skipped_prefix=[{prefix_str}], constrained=[{constr_str}])"
+                    )
+                }
             },
             Self::IndexOnlyScan {
                 index_name,
@@ -151,6 +166,21 @@ impl fmt::Display for AccessPath {
                                 .unwrap_or_else(|| "None".into())
                         )
                     }
+                    SecondaryScanType::SkipScan {
+                        skipped_prefix_columns,
+                        constrained_columns,
+                    } => {
+                        let prefix_str = skipped_prefix_columns.join(", ");
+                        let constr_str = constrained_columns
+                            .iter()
+                            .map(|(col, val)| format!("{col} = {val}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        write!(
+                            f,
+                            "IndexOnlySkipScan(index={index_name}, skipped_prefix=[{prefix_str}], constrained=[{constr_str}], covered=[{cov_str}])"
+                        )
+                    }
                 }
             }
             Self::FullTableScan => write!(f, "FullTableScan"),
@@ -171,6 +201,11 @@ pub enum SecondaryScanType {
     RangeScan {
         start: Option<Value>,
         end: Option<Value>,
+    },
+    /// Skip scan on a composite index with skipped leading prefix and constrained suffix.
+    SkipScan {
+        skipped_prefix_columns: Vec<String>,
+        constrained_columns: Vec<(String, Value)>,
     },
 }
 
@@ -2177,26 +2212,149 @@ fn plan_table_scan(
                         index_name: Some(sec_meta.name.clone()),
                     });
                 }
-            } else if is_covering {
-                // Full composite index scan if covering all columns
-                let cost = CostModel::index_only_range_scan_cost(full_rows);
-                candidates.push(AccessPathCandidate {
-                    access_path: AccessPath::IndexOnlyScan {
-                        index_name: sec_meta.name.clone(),
-                        index_id: sec_meta.index_id,
-                        scan_type: SecondaryScanType::RangeScan {
-                            start: None,
-                            end: None,
+            } else {
+                // Check for Skip Scan candidate (unconstrained leading prefix + contiguous constrained suffix)
+                if total_cols >= 2 {
+                    if let Some(first_constrained_idx) = (1..total_cols).find(|&p| {
+                        let col_idx = sec_meta.column_indices[p];
+                        let col = &schema.columns[col_idx];
+                        unqual_conjuncts.iter().any(|conj| {
+                            extract_col_equality(conj, &col.name, col.data_type).is_some()
+                                || matches!(conj, Expr::IsNull(inner) if matches!(inner.as_ref(), Expr::Column(n) if n == &col.name))
+                        })
+                    }) {
+                        let skipped_prefix_len = first_constrained_idx;
+                        let skipped_prefix_columns: Vec<String> = sec_meta.column_indices
+                            [0..skipped_prefix_len]
+                            .iter()
+                            .map(|&i| schema.columns[i].name.clone())
+                            .collect();
+                        let skipped_col_indices =
+                            sec_meta.column_indices[0..skipped_prefix_len].to_vec();
+
+                        let mut constrained_columns = Vec::new();
+                        let mut constrained_col_indices = Vec::new();
+                        let mut skip_used_conjuncts = HashSet::new();
+
+                        for &col_idx in &sec_meta.column_indices[first_constrained_idx..] {
+                            let col = &schema.columns[col_idx];
+                            let mut found_eq = None;
+                            for (c_idx, conj) in unqual_conjuncts.iter().enumerate() {
+                                if skip_used_conjuncts.contains(&c_idx) {
+                                    continue;
+                                }
+                                if let Some(val) =
+                                    extract_col_equality(conj, &col.name, col.data_type)
+                                {
+                                    found_eq = Some((c_idx, val));
+                                    break;
+                                } else if let Expr::IsNull(inner) = conj {
+                                    if let Expr::Column(name) = inner.as_ref() {
+                                        if name == &col.name {
+                                            found_eq = Some((c_idx, Value::Null));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some((c_idx, val)) = found_eq {
+                                skip_used_conjuncts.insert(c_idx);
+                                constrained_columns.push((col.name.clone(), val));
+                                constrained_col_indices.push(col_idx);
+                            } else {
+                                break;
+                            }
+                        }
+
+                        if !constrained_columns.is_empty() {
+                            let residual: Vec<Expr> = unqual_conjuncts
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| !skip_used_conjuncts.contains(i))
+                                .map(|(_, c)| c.clone())
+                                .collect();
+                            let residual_filter = recombine_conjunction(residual);
+
+                            let est_distinct_prefixes =
+                                CardinalityEstimator::estimate_distinct_prefixes(
+                                    table.stats.as_ref(),
+                                    schema,
+                                    &skipped_col_indices,
+                                );
+                            let est_rows = CardinalityEstimator::estimate_skip_scan_rows(
+                                table.stats.as_ref(),
+                                schema,
+                                &constrained_col_indices,
+                            );
+
+                            if is_covering {
+                                let cost = CostModel::index_only_skip_scan_cost(
+                                    est_distinct_prefixes,
+                                    est_rows,
+                                );
+                                candidates.push(AccessPathCandidate {
+                                    access_path: AccessPath::IndexOnlyScan {
+                                        index_name: sec_meta.name.clone(),
+                                        index_id: sec_meta.index_id,
+                                        scan_type: SecondaryScanType::SkipScan {
+                                            skipped_prefix_columns: skipped_prefix_columns.clone(),
+                                            constrained_columns: constrained_columns.clone(),
+                                        },
+                                        covered_columns: covered_column_names.clone(),
+                                    },
+                                    residual_filter,
+                                    estimated_rows: est_rows,
+                                    cost,
+                                    priority: 1,
+                                    index_id: Some(sec_meta.index_id),
+                                    index_name: Some(sec_meta.name.clone()),
+                                });
+                            } else {
+                                let cost =
+                                    CostModel::skip_scan_cost(est_distinct_prefixes, est_rows);
+                                candidates.push(AccessPathCandidate {
+                                    access_path: AccessPath::SecondaryIndexScan {
+                                        index_name: sec_meta.name.clone(),
+                                        index_id: sec_meta.index_id,
+                                        scan_type: SecondaryScanType::SkipScan {
+                                            skipped_prefix_columns,
+                                            constrained_columns,
+                                        },
+                                    },
+                                    residual_filter,
+                                    estimated_rows: est_rows,
+                                    cost,
+                                    priority: 2,
+                                    index_id: Some(sec_meta.index_id),
+                                    index_name: Some(sec_meta.name.clone()),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                if is_covering {
+                    // Full composite index scan if covering all columns
+                    let cost = CostModel::index_only_range_scan_cost(full_rows);
+                    candidates.push(AccessPathCandidate {
+                        access_path: AccessPath::IndexOnlyScan {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::RangeScan {
+                                start: None,
+                                end: None,
+                            },
+                            covered_columns: covered_column_names.clone(),
                         },
-                        covered_columns: covered_column_names.clone(),
-                    },
-                    residual_filter: full_residual.clone(),
-                    estimated_rows: full_rows,
-                    cost,
-                    priority: 1,
-                    index_id: Some(sec_meta.index_id),
-                    index_name: Some(sec_meta.name.clone()),
-                });
+                        residual_filter: full_residual.clone(),
+                        estimated_rows: full_rows,
+                        cost,
+                        priority: 1,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
+                }
             }
         }
     }

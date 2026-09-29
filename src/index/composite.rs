@@ -225,6 +225,90 @@ impl CompositeIndexKey {
         }
         Ok(values)
     }
+
+    /// Decodes the first `prefix_len` typed values from an order-preserving byte slice of an index with `total_columns`.
+    pub fn decode_prefix_values(
+        bytes: &[u8],
+        total_columns: usize,
+        prefix_len: usize,
+        col_types: &[crate::engine::types::DataType],
+    ) -> Result<Vec<Value>> {
+        if total_columns == 1 {
+            let val = IndexKey::new(bytes.to_vec()).to_value(col_types[0])?;
+            return Ok(vec![val]);
+        }
+
+        let mut values = Vec::with_capacity(prefix_len);
+        let mut offset = 0;
+
+        while offset < bytes.len() && values.len() < prefix_len {
+            let tag = bytes[offset];
+            let col_type = col_types[values.len()];
+            match tag {
+                0..=2 => {
+                    let k = IndexKey::new(vec![tag]);
+                    values.push(k.to_value(col_type)?);
+                    offset += 1;
+                }
+                3..=5 => {
+                    if offset + 9 > bytes.len() {
+                        return Err(Error::IndexCorruption(
+                            "unexpected end of bytes reading fixed-length composite key component"
+                                .to_string(),
+                        ));
+                    }
+                    let k = IndexKey::new(bytes[offset..offset + 9].to_vec());
+                    values.push(k.to_value(col_type)?);
+                    offset += 9;
+                }
+                6..=7 => {
+                    let mut payload = vec![tag];
+                    let mut cur = offset + 1;
+                    let mut terminated = false;
+
+                    while cur < bytes.len() {
+                        if bytes[cur] == 0x00 {
+                            if cur + 1 < bytes.len() {
+                                if bytes[cur + 1] == 0xFF {
+                                    payload.push(0x00);
+                                    cur += 2;
+                                    continue;
+                                } else if bytes[cur + 1] == 0x00 {
+                                    cur += 2;
+                                    terminated = true;
+                                    break;
+                                }
+                            }
+                            return Err(Error::IndexCorruption(
+                                "corrupt escaped 0x00 in variable-length composite component"
+                                    .to_string(),
+                            ));
+                        } else {
+                            payload.push(bytes[cur]);
+                            cur += 1;
+                        }
+                    }
+
+                    if !terminated {
+                        return Err(Error::IndexCorruption(
+                            "unterminated variable-length composite component".to_string(),
+                        ));
+                    }
+
+                    let k = IndexKey::new(payload);
+                    values.push(k.to_value(col_type)?);
+                    offset = cur;
+                }
+                other => {
+                    return Err(Error::IndexCorruption(format!(
+                        "unknown tag {other} in composite index key"
+                    )));
+                }
+            }
+        }
+
+        Ok(values)
+    }
 }
 
 #[cfg(test)]

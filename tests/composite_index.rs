@@ -1542,8 +1542,12 @@ fn test_r34_non_leading_column_cannot_use_prefix() {
         .explain_sql("SELECT * FROM staff WHERE level = 3;")
         .unwrap();
     assert!(
-        plan_b.contains("FullTableScan"),
-        "non-leading column must fallback to FullTableScan, got:\n{plan_b}"
+        plan_b.contains("IndexSkipScan") || plan_b.contains("FullTableScan"),
+        "non-leading column must use IndexSkipScan or fallback to FullTableScan, got:\n{plan_b}"
+    );
+    assert!(
+        !plan_b.contains("PrefixScan"),
+        "non-leading column must not generate a fake PrefixScan"
     );
 
     // Query on role only
@@ -1551,8 +1555,12 @@ fn test_r34_non_leading_column_cannot_use_prefix() {
         .explain_sql("SELECT * FROM staff WHERE role = 'dev';")
         .unwrap();
     assert!(
-        plan_c.contains("FullTableScan"),
-        "non-leading column must fallback to FullTableScan, got:\n{plan_c}"
+        plan_c.contains("IndexSkipScan") || plan_c.contains("FullTableScan"),
+        "non-leading column must use IndexSkipScan or fallback to FullTableScan, got:\n{plan_c}"
+    );
+    assert!(
+        !plan_c.contains("PrefixScan"),
+        "non-leading column must not generate a fake PrefixScan"
     );
 
     let res = txn

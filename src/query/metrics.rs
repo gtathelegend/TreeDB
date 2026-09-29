@@ -146,6 +146,10 @@ pub struct OperatorCounters {
     pub base_records_avoided: usize,
     /// Number of covered rows output directly from index without base table access.
     pub covered_rows_output: usize,
+    /// Number of distinct leading-prefix values discovered from the index during skip scan.
+    pub distinct_prefix_values: usize,
+    /// Number of point lookups / prefix range scans executed across distinct prefix values during skip scan.
+    pub skip_scan_probes: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -559,7 +563,27 @@ pub fn format_plan_with_metrics(
             if let Some(scan_op) =
                 find_operator_metrics(root, &|k| matches!(k, OperatorKind::TableScan { .. }))
             {
-                if scan_op.counters.base_records_avoided > 0
+                if scan_op.counters.skip_scan_probes > 0 {
+                    out.push_str(&format!(
+                        "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, distinct_prefix_values: {}, actual_prefix_values: {}, skip_scan_probes: {}, probes: {}, index_entries: {}, index_entries_examined: {}, rows: {}, rows_matched: {}, base_fetched: {}, base_records_fetched: {}, base_avoided: {}, base_records_avoided: {}, covered_rows_output: {}\n",
+                        plan.base_table.cost,
+                        plan.base_table.estimated_rows,
+                        actual_rows_str,
+                        scan_op.counters.distinct_prefix_values,
+                        scan_op.counters.distinct_prefix_values,
+                        scan_op.counters.skip_scan_probes,
+                        scan_op.counters.skip_scan_probes,
+                        scan_op.counters.index_entries_examined,
+                        scan_op.counters.index_entries_examined,
+                        actual_rows_str,
+                        actual_rows_str,
+                        scan_op.counters.base_records_fetched,
+                        scan_op.counters.base_records_fetched,
+                        scan_op.counters.base_records_avoided,
+                        scan_op.counters.base_records_avoided,
+                        scan_op.counters.covered_rows_output
+                    ));
+                } else if scan_op.counters.base_records_avoided > 0
                     || scan_op.counters.index_entries_examined > 0
                 {
                     out.push_str(&format!(

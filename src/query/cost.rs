@@ -16,6 +16,8 @@ pub const WINDOW_CPU_COST: f64 = 0.02;
 pub const HASH_BUILD_CPU_COST: f64 = 0.01;
 pub const HASH_PROBE_CPU_COST: f64 = 0.005;
 
+pub const SKIP_SCAN_PROBE_COST: f64 = 0.05;
+
 /// Centralized, deterministic cost model estimating execution effort for physical plans.
 pub struct CostModel;
 
@@ -60,6 +62,20 @@ impl CostModel {
     pub fn index_only_range_scan_cost(estimated_matches: f64) -> f64 {
         let matches = estimated_matches.max(1.0);
         SEC_INDEX_LOOKUP_COST + ((ROW_CPU_COST + SEC_INDEX_FETCH_COST) * matches)
+    }
+
+    /// Computes the cost of a composite index skip scan.
+    pub fn skip_scan_cost(distinct_prefixes: f64, estimated_matches: f64) -> f64 {
+        let prefixes = distinct_prefixes.max(1.0);
+        let matches = estimated_matches.max(1.0);
+        (prefixes * SKIP_SCAN_PROBE_COST) + ((TUPLE_FETCH_COST + SEC_INDEX_FETCH_COST) * matches)
+    }
+
+    /// Computes the cost of a covering composite index skip scan (avoids base-record fetches).
+    pub fn index_only_skip_scan_cost(distinct_prefixes: f64, estimated_matches: f64) -> f64 {
+        let prefixes = distinct_prefixes.max(1.0);
+        let matches = estimated_matches.max(1.0);
+        (prefixes * SKIP_SCAN_PROBE_COST) + ((ROW_CPU_COST + SEC_INDEX_FETCH_COST) * matches)
     }
 
     /// Computes the cost of a nested-loop join.

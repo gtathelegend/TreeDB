@@ -264,6 +264,7 @@ In addition to the primary key B+ Tree (`Key (u64) -> RecordId`), TreeDB support
 * **Covering Payload (`INCLUDE`):** Secondary leaf pages (Format Version 1) store an optional serialized `CoveredPayload` alongside the `RecordId`.
 * **Included Column Decoupling:** Included columns do NOT participate in the search key, leaf ordering, separator key routing, or unique constraint enforcement.
 * **Index-Only Access:** When an index covers all referenced query columns, scans retrieve the key values and covered payload directly from the secondary B+ Tree leaf pages without issuing reads to the `RecordStore`.
+* **Distinct Prefix Enumeration (`distinct_prefix_values`):** Streams distinct values of leading key prefixes directly across B+ Tree leaf pages in key order, allowing cost-based skip scans (`IndexSkipScan` / `IndexOnlySkipScan`) to probe `(prefix, suffix)` combinations without full table scans or duplicate prefix discoveries.
 
 ---
 

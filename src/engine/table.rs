@@ -10,6 +10,17 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::record_store::RecordStore;
 use crate::RecordId;
 
+/// Runtime statistics collected during secondary index skip scan execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SkipScanStats {
+    /// Number of distinct leading-prefix values discovered from the index.
+    pub distinct_prefix_values: usize,
+    /// Number of point lookups / prefix range scans executed across distinct prefix values.
+    pub skip_scan_probes: usize,
+    /// Total number of secondary index leaf entries examined across all probes.
+    pub index_entries_examined: usize,
+}
+
 /// High-level relational table handle coordinating schema validation,
 /// canonical primary key indexing in the primary B+ Tree, tuple storage in the RecordStore,
 /// and automatic secondary index maintenance.
@@ -465,6 +476,21 @@ impl<'a> Table<'a> {
             .map(|(m, s)| (m.clone(), *s))
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
+        if let crate::query::optimizer::SecondaryScanType::SkipScan {
+            skipped_prefix_columns,
+            constrained_columns,
+        } = scan_type
+        {
+            let constrained_values: Vec<Value> =
+                constrained_columns.iter().map(|(_, v)| v.clone()).collect();
+            let (rows, _) = self.index_only_skip_scan(
+                index_name,
+                skipped_prefix_columns.len(),
+                &constrained_values,
+            )?;
+            return Ok(rows);
+        }
+
         let entries: Vec<crate::index::secondary::SecondaryLeafEntry> = match scan_type {
             crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
                 let idx_key = if meta.column_indices.len() == 1 {
@@ -504,6 +530,9 @@ impl<'a> Table<'a> {
                 let start_key = start.as_ref().map(IndexKey::from_value);
                 let end_key = end.as_ref().map(IndexKey::from_value);
                 sec_idx.scan_entries(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?
+            }
+            crate::query::optimizer::SecondaryScanType::SkipScan { .. } => {
+                unreachable!("SkipScan is handled above")
             }
         };
 
@@ -551,6 +580,174 @@ impl<'a> Table<'a> {
         }
 
         Ok(rows)
+    }
+
+    /// Performs an index skip scan over a composite secondary index, enumerating distinct leading-prefix
+    /// values and probing for `(prefix, constrained_suffix)`. Fetches base records from `RecordStore`.
+    pub fn index_skip_scan(
+        &mut self,
+        index_name: &str,
+        skipped_prefix_len: usize,
+        constrained_suffix: &[Value],
+    ) -> Result<(Vec<Row>, SkipScanStats)> {
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let key_col_types: Vec<crate::engine::types::DataType> = meta
+            .column_indices
+            .iter()
+            .map(|&i| self.metadata.schema.columns[i].data_type)
+            .collect();
+
+        let distinct_prefixes = sec_idx.distinct_prefix_values(
+            self.buffer_pool,
+            meta.column_indices.len(),
+            skipped_prefix_len,
+            &key_col_types,
+        )?;
+
+        let mut stats = SkipScanStats {
+            distinct_prefix_values: distinct_prefixes.len(),
+            skip_scan_probes: 0,
+            index_entries_examined: 0,
+        };
+
+        let mut rows = Vec::new();
+        let total_cols = meta.column_indices.len();
+
+        for prefix in distinct_prefixes {
+            stats.skip_scan_probes += 1;
+            let mut probe_values = prefix;
+            probe_values.extend_from_slice(constrained_suffix);
+
+            let entries = if probe_values.len() == total_cols {
+                let key = crate::index::composite::CompositeIndexKey::from_values(&probe_values)
+                    .to_index_key(total_cols);
+                sec_idx.lookup_entries(self.buffer_pool, &key)?
+            } else {
+                let start_bytes = crate::index::composite::CompositeIndexKey::encode_prefix_values(
+                    &probe_values,
+                    total_cols,
+                );
+                let end_bytes =
+                    crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
+                let start_key = IndexKey::new(start_bytes);
+                let end_key = end_bytes.map(IndexKey::new);
+                sec_idx.scan_entries(self.buffer_pool, Some(&start_key), end_key.as_ref())?
+            };
+
+            stats.index_entries_examined += entries.len();
+
+            for entry in entries {
+                if let Some(bytes) = self.record_store.get(self.buffer_pool, entry.rid)? {
+                    let row = self.metadata.schema.decode_tuple(&bytes)?;
+                    rows.push(row);
+                }
+            }
+        }
+
+        Ok((rows, stats))
+    }
+
+    /// Performs an index-only skip scan over a composite secondary index, reconstructing rows directly
+    /// from decoded index keys and included payloads without fetching base records from `RecordStore`.
+    pub fn index_only_skip_scan(
+        &mut self,
+        index_name: &str,
+        skipped_prefix_len: usize,
+        constrained_suffix: &[Value],
+    ) -> Result<(Vec<Row>, SkipScanStats)> {
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let schema_len = self.metadata.schema.columns.len();
+        let key_col_types: Vec<crate::engine::types::DataType> = meta
+            .column_indices
+            .iter()
+            .map(|&i| self.metadata.schema.columns[i].data_type)
+            .collect();
+        let inc_col_types: Vec<crate::engine::types::DataType> = meta
+            .include_column_indices
+            .iter()
+            .map(|&i| self.metadata.schema.columns[i].data_type)
+            .collect();
+
+        let distinct_prefixes = sec_idx.distinct_prefix_values(
+            self.buffer_pool,
+            meta.column_indices.len(),
+            skipped_prefix_len,
+            &key_col_types,
+        )?;
+
+        let mut stats = SkipScanStats {
+            distinct_prefix_values: distinct_prefixes.len(),
+            skip_scan_probes: 0,
+            index_entries_examined: 0,
+        };
+
+        let mut rows = Vec::new();
+        let total_cols = meta.column_indices.len();
+
+        for prefix in distinct_prefixes {
+            stats.skip_scan_probes += 1;
+            let mut probe_values = prefix;
+            probe_values.extend_from_slice(constrained_suffix);
+
+            let entries = if probe_values.len() == total_cols {
+                let key = crate::index::composite::CompositeIndexKey::from_values(&probe_values)
+                    .to_index_key(total_cols);
+                sec_idx.lookup_entries(self.buffer_pool, &key)?
+            } else {
+                let start_bytes = crate::index::composite::CompositeIndexKey::encode_prefix_values(
+                    &probe_values,
+                    total_cols,
+                );
+                let end_bytes =
+                    crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
+                let start_key = IndexKey::new(start_bytes);
+                let end_key = end_bytes.map(IndexKey::new);
+                sec_idx.scan_entries(self.buffer_pool, Some(&start_key), end_key.as_ref())?
+            };
+
+            stats.index_entries_examined += entries.len();
+
+            for entry in entries {
+                let mut row_values = vec![Value::Null; schema_len];
+
+                // Decode key columns
+                let key_values = crate::index::composite::CompositeIndexKey::decode_values(
+                    &entry.key.bytes,
+                    &key_col_types,
+                )?;
+
+                for (&col_idx, val) in meta.column_indices.iter().zip(key_values) {
+                    row_values[col_idx] = val;
+                }
+
+                // Decode included columns
+                if !meta.include_column_indices.is_empty() && !entry.payload.is_empty() {
+                    let inc_values = crate::index::covering::CoveredPayload::decode(
+                        &entry.payload,
+                        &inc_col_types,
+                    )?;
+                    for (&inc_idx, val) in meta.include_column_indices.iter().zip(inc_values) {
+                        row_values[inc_idx] = val;
+                    }
+                }
+
+                rows.push(Row::new(row_values));
+            }
+        }
+
+        Ok((rows, stats))
     }
 
     /// Validates the structural invariants of the table's underlying primary B+ Tree.

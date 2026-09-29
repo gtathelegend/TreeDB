@@ -416,6 +416,13 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Generalized Match Bitset Tracking:** Supports `RIGHT JOIN`, `RIGHT OUTER JOIN`, `FULL JOIN`, and `FULL OUTER JOIN` across in-memory hash join, external spilled join, and nested-loop join paths. Both probe-side and build-side match statuses are maintained, gating match status on full residual predicate evaluation.
   * **Dynamic Schema Nullability:** Output column ordering strictly preserves `left columns + right columns`. Left columns are marked nullable for `RIGHT` and `FULL` joins; right columns are marked nullable for `LEFT` and `FULL` joins.
   * **Spilled Outer-Join Integrity:** NULL keys and unmatched partition streams preserve outer rows without duplication or omission across recursive partitioning passes.
+* **Cost-Based Index Skip Scan & Advanced Composite-Index Access (`SecondaryScanType::SkipScan`):**
+  * **Physical Access Path:** Dedicated physical scan path over composite secondary indexes for queries where leading columns are unconstrained followed by contiguous equality-constrained suffix columns.
+  * **Distinct Prefix Enumeration:** Streams distinct values of the skipped leading prefix directly from the B+ Tree index in leaf key order without performing table scans or repeatedly discovering prefixes (`SecondaryIndex::distinct_prefix_values`).
+  * **Index Probing:** For each discovered distinct prefix, constructs a probe key `(prefix, suffix)` and performs an index lookup/prefix range scan to collect matching records.
+  * **Cost-Based Optimization:** Compares the cost of skip scanning ($\text{distinct\_prefixes} \times \text{probe\_cost} + \text{matches} \times \text{fetch\_cost}$) against full table scan and other index access paths using table and column statistics. High cardinality skipped prefixes fall back to full table scan.
+  * **Covering & Index-Only Execution:** Integrates with covering indexes (`IndexOnlySkipScan`), reconstructing all query columns from index keys and included payloads without fetching base records from `RecordStore`.
+  * **Ordering & Pagination:** Preserves leading-prefix index ordering when requested by `ORDER BY` and supports safe early-termination for `LIMIT` / `OFFSET`.
 
 ---
 
@@ -447,6 +454,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
 * **Covering Index & Index-Only Invariant:** An `IndexOnlyScan` access path is selected only when all columns referenced across the query projection, residual filters, grouping, order by, window expressions, and join predicates are completely satisfied by the secondary index (key columns + included columns). Genuine index-only scans perform zero `RecordStore` reads (`base_records_fetched == 0`, `base_records_avoided > 0`).
+* **Index Skip Scan Invariant:** `IndexSkipScan` and `IndexOnlySkipScan` access paths are never constructed as fake prefix scans. Distinct skipped-prefix values are extracted directly from the secondary index in leaf order, probed with the constrained suffix, and selected strictly when cost modeling predicts lower cost than a sequential scan.
 * **Page Reachability & Reservation Invariant:** Page 0 (Header) and Page 1 (Metadata) are strictly reserved (`is_reserved_page(page_id) == true`) and can never be freed or recycled. Every page ID in the database is either reachable via index/metadata/heap or tracked in the persistent freelist.
 
 ---
