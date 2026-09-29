@@ -617,12 +617,25 @@ impl<'db> Transaction<'db> {
         column_names: &[&str],
         unique: bool,
     ) -> Result<crate::engine::catalog::IndexId> {
+        self.create_covering_index(table_name, index_name, column_names, &[], unique)
+    }
+
+    /// Creates a new persistent covering secondary index within this transaction.
+    pub fn create_covering_index(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        column_names: &[&str],
+        include_column_names: &[&str],
+        unique: bool,
+    ) -> Result<crate::engine::catalog::IndexId> {
         self.ensure_active()?;
-        let res = crate::engine::catalog::Catalog::create_composite_index(
+        let res = crate::engine::catalog::Catalog::create_covering_index(
             &mut self.db.buffer_pool,
             table_name,
             index_name,
             column_names,
+            include_column_names,
             unique,
         );
         if res.is_ok() {
@@ -1938,7 +1951,18 @@ impl<'db> Transaction<'db> {
             crate::sql::binder::bind_create_index(stmt, &catalog)?
         };
         let cols_refs: Vec<&str> = bound.column_names.iter().map(|s| s.as_str()).collect();
-        self.create_composite_index(&bound.table_name, &bound.name, &cols_refs, bound.unique)?;
+        let inc_refs: Vec<&str> = bound
+            .include_column_names
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        self.create_covering_index(
+            &bound.table_name,
+            &bound.name,
+            &cols_refs,
+            &inc_refs,
+            bound.unique,
+        )?;
         Ok(StatementResult::CreatedIndex { index: bound.name })
     }
 
@@ -2576,6 +2600,11 @@ impl<'db> Transaction<'db> {
                     index_name,
                     scan_type,
                     ..
+                }
+                | crate::query::optimizer::AccessPath::IndexOnlyScan {
+                    index_name,
+                    scan_type,
+                    ..
                 } => match scan_type {
                     crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
                         table.index_lookup(index_name, val)?
@@ -2696,6 +2725,11 @@ impl<'db> Transaction<'db> {
                     table.scan(start.as_ref(), end.as_ref())?
                 }
                 crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                    index_name,
+                    scan_type,
+                    ..
+                }
+                | crate::query::optimizer::AccessPath::IndexOnlyScan {
                     index_name,
                     scan_type,
                     ..
@@ -3116,6 +3150,7 @@ impl<'db> Transaction<'db> {
                 let mut table = self.open_table(&plan.base_table.table_name)?;
                 let raw_schema = table.schema().clone();
                 let mut index_lookups = 0;
+                let mut is_index_only = false;
                 let initial_rows = match &plan.base_table.access_path {
                     crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
                         index_lookups = 1;
@@ -3150,6 +3185,15 @@ impl<'db> Transaction<'db> {
                             } => table.index_scan(index_name, start.as_ref(), end.as_ref())?,
                         }
                     }
+                    crate::query::optimizer::AccessPath::IndexOnlyScan {
+                        index_name,
+                        scan_type,
+                        ..
+                    } => {
+                        index_lookups = 1;
+                        is_index_only = true;
+                        table.index_only_scan(index_name, scan_type)?
+                    }
                     crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
                 };
 
@@ -3163,9 +3207,25 @@ impl<'db> Transaction<'db> {
                 );
                 scan_metric.input_rows = initial_rows.len();
                 scan_metric.actual_rows = initial_rows.len();
-                scan_metric.counters.tuples_fetched = initial_rows.len();
                 scan_metric.counters.index_lookups = index_lookups;
                 scan_metric.counters.rows_evaluated = initial_rows.len();
+                if is_index_only {
+                    scan_metric.counters.tuples_fetched = 0;
+                    scan_metric.counters.base_records_fetched = 0;
+                    scan_metric.counters.base_records_avoided = initial_rows.len();
+                    scan_metric.counters.index_entries_examined = initial_rows.len();
+                    scan_metric.counters.covered_rows_output = initial_rows.len();
+                } else {
+                    scan_metric.counters.tuples_fetched = initial_rows.len();
+                    scan_metric.counters.base_records_fetched = initial_rows.len();
+                    scan_metric.counters.base_records_avoided = 0;
+                    scan_metric.counters.index_entries_examined = if index_lookups > 0 {
+                        initial_rows.len()
+                    } else {
+                        0
+                    };
+                    scan_metric.counters.covered_rows_output = 0;
+                }
 
                 let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
                     Some(filter) => {
@@ -3293,6 +3353,7 @@ impl<'db> Transaction<'db> {
                     let mut table = self.open_table(&join.right.table_name)?;
                     let raw_schema = table.schema().clone();
                     let mut index_lookups = 0;
+                    let mut is_index_only = false;
                     let initial_rows = match &join.right.access_path {
                         crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
                             index_lookups = 1;
@@ -3325,6 +3386,15 @@ impl<'db> Transaction<'db> {
                                 } => table.index_scan(index_name, start.as_ref(), end.as_ref())?,
                             }
                         }
+                        crate::query::optimizer::AccessPath::IndexOnlyScan {
+                            index_name,
+                            scan_type,
+                            ..
+                        } => {
+                            index_lookups = 1;
+                            is_index_only = true;
+                            table.index_only_scan(index_name, scan_type)?
+                        }
                         crate::query::optimizer::AccessPath::FullTableScan => {
                             table.scan(None, None)?
                         }
@@ -3340,9 +3410,25 @@ impl<'db> Transaction<'db> {
                     );
                     scan_metric.input_rows = initial_rows.len();
                     scan_metric.actual_rows = initial_rows.len();
-                    scan_metric.counters.tuples_fetched = initial_rows.len();
                     scan_metric.counters.index_lookups = index_lookups;
                     scan_metric.counters.rows_evaluated = initial_rows.len();
+                    if is_index_only {
+                        scan_metric.counters.tuples_fetched = 0;
+                        scan_metric.counters.base_records_fetched = 0;
+                        scan_metric.counters.base_records_avoided = initial_rows.len();
+                        scan_metric.counters.index_entries_examined = initial_rows.len();
+                        scan_metric.counters.covered_rows_output = initial_rows.len();
+                    } else {
+                        scan_metric.counters.tuples_fetched = initial_rows.len();
+                        scan_metric.counters.base_records_fetched = initial_rows.len();
+                        scan_metric.counters.base_records_avoided = 0;
+                        scan_metric.counters.index_entries_examined = if index_lookups > 0 {
+                            initial_rows.len()
+                        } else {
+                            0
+                        };
+                        scan_metric.counters.covered_rows_output = 0;
+                    }
 
                     let (filtered_rows, table_op) = match &join.right.residual_filter {
                         Some(filter) => {

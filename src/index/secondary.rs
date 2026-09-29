@@ -158,11 +158,51 @@ impl IndexKey {
 pub const SEC_LEAF_HEADER_SIZE: usize = 8;
 pub const SEC_NODE_MAX_PAYLOAD_BYTES: usize = 3800;
 
-/// Leaf node in a secondary B+ Tree index storing sorted `(IndexKey, RecordId)` pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondaryLeafEntry {
+    /// Canonical, order-preserving search key.
+    pub key: IndexKey,
+    /// Optional serialized covered payload bytes.
+    pub payload: Vec<u8>,
+    /// Physical base table record locator.
+    pub rid: RecordId,
+}
+
+impl PartialOrd for SecondaryLeafEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SecondaryLeafEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key
+            .cmp(&other.key)
+            .then_with(|| self.rid.cmp(&other.rid))
+    }
+}
+
+impl SecondaryLeafEntry {
+    /// Creates a standard entry without covered payload.
+    pub fn new(key: IndexKey, rid: RecordId) -> Self {
+        Self {
+            key,
+            payload: Vec::new(),
+            rid,
+        }
+    }
+
+    /// Creates an entry with covered payload.
+    pub fn with_payload(key: IndexKey, payload: Vec<u8>, rid: RecordId) -> Self {
+        Self { key, payload, rid }
+    }
+}
+
+/// Leaf node in a secondary B+ Tree index storing sorted `SecondaryLeafEntry` items.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecondaryLeafNode {
     pub next_leaf: PageId,
-    pub entries: Vec<(IndexKey, RecordId)>,
+    pub entries: Vec<SecondaryLeafEntry>,
 }
 
 impl Default for SecondaryLeafNode {
@@ -184,7 +224,7 @@ impl SecondaryLeafNode {
             + self
                 .entries
                 .iter()
-                .map(|(k, _)| 2 + k.bytes.len() + 8)
+                .map(|e| 2 + e.key.bytes.len() + 2 + e.payload.len() + 8)
                 .sum::<usize>()
     }
 
@@ -200,12 +240,13 @@ impl SecondaryLeafNode {
         let payload = page.payload_mut();
         payload[0..2].copy_from_slice(&(self.entries.len() as u16).to_le_bytes());
         payload[2..6].copy_from_slice(&self.next_leaf.to_le_bytes());
-        payload[6..8].fill(0); // reserved
+        payload[6..8].copy_from_slice(&1u16.to_le_bytes()); // format version 1 (covering payload support)
 
         let mut offset = SEC_LEAF_HEADER_SIZE;
-        for (key, rid) in &self.entries {
-            let klen = key.bytes.len();
-            if offset + 2 + klen + 8 > PAGE_PAYLOAD_SIZE {
+        for entry in &self.entries {
+            let klen = entry.key.bytes.len();
+            let plen = entry.payload.len();
+            if offset + 2 + klen + 2 + plen + 8 > PAGE_PAYLOAD_SIZE {
                 return Err(Error::IndexCorruption(format!(
                     "secondary leaf page {} overflowed payload capacity",
                     page.id()
@@ -213,9 +254,13 @@ impl SecondaryLeafNode {
             }
             payload[offset..offset + 2].copy_from_slice(&(klen as u16).to_le_bytes());
             offset += 2;
-            payload[offset..offset + klen].copy_from_slice(&key.bytes);
+            payload[offset..offset + klen].copy_from_slice(&entry.key.bytes);
             offset += klen;
-            payload[offset..offset + 8].copy_from_slice(&rid.to_bytes());
+            payload[offset..offset + 2].copy_from_slice(&(plen as u16).to_le_bytes());
+            offset += 2;
+            payload[offset..offset + plen].copy_from_slice(&entry.payload);
+            offset += plen;
+            payload[offset..offset + 8].copy_from_slice(&entry.rid.to_bytes());
             offset += 8;
         }
 
@@ -230,54 +275,119 @@ impl SecondaryLeafNode {
         let payload = page.payload();
         let entry_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
         let next_leaf = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+        let format_version = u16::from_le_bytes([payload[6], payload[7]]);
 
         let mut entries = Vec::with_capacity(entry_count);
         let mut offset = SEC_LEAF_HEADER_SIZE;
 
-        for _ in 0..entry_count {
-            if offset + 2 > PAGE_PAYLOAD_SIZE {
-                return Err(Error::IndexCorruption(format!(
-                    "unexpected end of payload on secondary leaf page {}",
-                    page.id()
-                )));
+        if format_version == 0 {
+            // Legacy format without payload
+            for _ in 0..entry_count {
+                if offset + 2 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let klen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+
+                if offset + klen + 8 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading entry on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let key_bytes = payload[offset..offset + klen].to_vec();
+                offset += klen;
+
+                let mut rid_bytes = [0u8; 8];
+                rid_bytes.copy_from_slice(&payload[offset..offset + 8]);
+                offset += 8;
+                let rid = RecordId::from_bytes(rid_bytes);
+
+                entries.push(SecondaryLeafEntry::new(IndexKey::new(key_bytes), rid));
             }
-            let klen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
-            offset += 2;
+        } else {
+            // Covering format with payload
+            for _ in 0..entry_count {
+                if offset + 2 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let klen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
 
-            if offset + klen + 8 > PAGE_PAYLOAD_SIZE {
-                return Err(Error::IndexCorruption(format!(
-                    "unexpected end of payload reading entry on secondary leaf page {}",
-                    page.id()
-                )));
+                if offset + klen + 2 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading key on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let key_bytes = payload[offset..offset + klen].to_vec();
+                offset += klen;
+
+                let plen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+
+                if offset + plen + 8 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading payload on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let entry_payload = payload[offset..offset + plen].to_vec();
+                offset += plen;
+
+                let mut rid_bytes = [0u8; 8];
+                rid_bytes.copy_from_slice(&payload[offset..offset + 8]);
+                offset += 8;
+                let rid = RecordId::from_bytes(rid_bytes);
+
+                entries.push(SecondaryLeafEntry::with_payload(
+                    IndexKey::new(key_bytes),
+                    entry_payload,
+                    rid,
+                ));
             }
-            let key_bytes = payload[offset..offset + klen].to_vec();
-            offset += klen;
-
-            let mut rid_bytes = [0u8; 8];
-            rid_bytes.copy_from_slice(&payload[offset..offset + 8]);
-            offset += 8;
-            let rid = RecordId::from_bytes(rid_bytes);
-
-            entries.push((IndexKey::new(key_bytes), rid));
         }
 
         Ok(Self { next_leaf, entries })
     }
 
-    pub fn insert(&mut self, key: IndexKey, rid: RecordId) -> Result<()> {
-        let target = (key, rid);
-        match self.entries.binary_search(&target) {
-            Ok(_) => Ok(()), // identical entry already exists
+    pub fn insert_with_payload(
+        &mut self,
+        key: IndexKey,
+        payload: Vec<u8>,
+        rid: RecordId,
+    ) -> Result<()> {
+        match self
+            .entries
+            .binary_search_by(|e| e.key.cmp(&key).then_with(|| e.rid.cmp(&rid)))
+        {
+            Ok(idx) => {
+                self.entries[idx].payload = payload;
+                Ok(())
+            }
             Err(idx) => {
-                self.entries.insert(idx, target);
+                self.entries
+                    .insert(idx, SecondaryLeafEntry::with_payload(key, payload, rid));
                 Ok(())
             }
         }
     }
 
+    pub fn insert(&mut self, key: IndexKey, rid: RecordId) -> Result<()> {
+        self.insert_with_payload(key, Vec::new(), rid)
+    }
+
     pub fn remove(&mut self, key: &IndexKey, rid: RecordId) -> bool {
-        let target = (key.clone(), rid);
-        if let Ok(idx) = self.entries.binary_search(&target) {
+        if let Ok(idx) = self
+            .entries
+            .binary_search_by(|e| e.key.cmp(key).then_with(|| e.rid.cmp(&rid)))
+        {
             self.entries.remove(idx);
             true
         } else {
@@ -288,7 +398,7 @@ impl SecondaryLeafNode {
     pub fn split(&mut self, new_page_id: PageId) -> (SecondaryLeafNode, IndexKey) {
         let mid = self.entries.len() / 2;
         let right_entries = self.entries.split_off(mid);
-        let split_key = right_entries[0].0.clone();
+        let split_key = right_entries[0].key.clone();
 
         let right_leaf = SecondaryLeafNode {
             next_leaf: self.next_leaf,
@@ -497,8 +607,12 @@ impl SecondaryIndex {
         self.root_page_id == INVALID_PAGE_ID
     }
 
-    /// Performs a point lookup for all `RecordId`s associated with `key`.
-    pub fn lookup(&self, buffer_pool: &mut BufferPool, key: &IndexKey) -> Result<Vec<RecordId>> {
+    /// Performs a point lookup for all entries matching `key`, returning `SecondaryLeafEntry`s.
+    pub fn lookup_entries(
+        &self,
+        buffer_pool: &mut BufferPool,
+        key: &IndexKey,
+    ) -> Result<Vec<SecondaryLeafEntry>> {
         if self.is_empty() {
             return Ok(Vec::new());
         }
@@ -519,14 +633,14 @@ impl SecondaryIndex {
                     };
                     buffer_pool.unpin_page(curr_pid, false)?;
 
-                    let mut rids = Vec::new();
+                    let mut results = Vec::new();
                     let mut leaf_node = leaf;
 
                     'scan: loop {
-                        for (k, rid) in &leaf_node.entries {
-                            if k == key {
-                                rids.push(*rid);
-                            } else if k > key {
+                        for entry in &leaf_node.entries {
+                            if &entry.key == key {
+                                results.push(entry.clone());
+                            } else if &entry.key > key {
                                 break 'scan;
                             }
                         }
@@ -547,7 +661,7 @@ impl SecondaryIndex {
                         buffer_pool.unpin_page(leaf_pid, false)?;
                     }
 
-                    return Ok(rids);
+                    return Ok(results);
                 }
                 PageType::Internal => {
                     let internal = match SecondaryInternalNode::deserialize(page) {
@@ -571,13 +685,19 @@ impl SecondaryIndex {
         }
     }
 
-    /// Performs an ordered range scan over `(IndexKey, RecordId)` entries within `[start, end)`.
-    pub fn scan(
+    /// Performs a point lookup for all `RecordId`s associated with `key`.
+    pub fn lookup(&self, buffer_pool: &mut BufferPool, key: &IndexKey) -> Result<Vec<RecordId>> {
+        let entries = self.lookup_entries(buffer_pool, key)?;
+        Ok(entries.into_iter().map(|e| e.rid).collect())
+    }
+
+    /// Performs an ordered range scan returning `SecondaryLeafEntry`s within `[start, end)`.
+    pub fn scan_entries(
         &self,
         buffer_pool: &mut BufferPool,
         start: Option<&IndexKey>,
         end: Option<&IndexKey>,
-    ) -> Result<Vec<(IndexKey, RecordId)>> {
+    ) -> Result<Vec<SecondaryLeafEntry>> {
         if self.is_empty() {
             return Ok(Vec::new());
         }
@@ -631,18 +751,18 @@ impl SecondaryIndex {
             };
             buffer_pool.unpin_page(leaf_pid, false)?;
 
-            for (k, rid) in leaf.entries {
+            for entry in leaf.entries {
                 if let Some(s) = start {
-                    if &k < s {
+                    if &entry.key < s {
                         continue;
                     }
                 }
                 if let Some(e) = end {
-                    if &k >= e {
+                    if &entry.key >= e {
                         break 'leaf_loop;
                     }
                 }
-                results.push((k, rid));
+                results.push(entry);
             }
 
             if leaf.next_leaf == INVALID_PAGE_ID {
@@ -654,17 +774,29 @@ impl SecondaryIndex {
         Ok(results)
     }
 
-    /// Inserts a `(IndexKey, RecordId)` pair into the secondary index.
-    pub fn insert(
+    /// Performs an ordered range scan over `(IndexKey, RecordId)` entries within `[start, end)`.
+    pub fn scan(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<&IndexKey>,
+        end: Option<&IndexKey>,
+    ) -> Result<Vec<(IndexKey, RecordId)>> {
+        let entries = self.scan_entries(buffer_pool, start, end)?;
+        Ok(entries.into_iter().map(|e| (e.key, e.rid)).collect())
+    }
+
+    /// Inserts a `(IndexKey, covered_payload, RecordId)` pair into the secondary index.
+    pub fn insert_with_payload(
         &mut self,
         buffer_pool: &mut BufferPool,
         key: &IndexKey,
+        payload: &[u8],
         record_id: RecordId,
     ) -> Result<()> {
         if self.is_empty() {
             let root_pid = buffer_pool.allocate_page(PageType::Leaf)?;
             let mut leaf = SecondaryLeafNode::new();
-            leaf.insert(key.clone(), record_id)?;
+            leaf.insert_with_payload(key.clone(), payload.to_vec(), record_id)?;
             {
                 let page_mut = buffer_pool.get_page_mut(root_pid)?;
                 leaf.serialize(page_mut)?;
@@ -717,7 +849,7 @@ impl SecondaryIndex {
             l
         };
 
-        leaf.insert(key.clone(), record_id)?;
+        leaf.insert_with_payload(key.clone(), payload.to_vec(), record_id)?;
 
         if !leaf.is_full() {
             let page_mut = buffer_pool.fetch_page_mut(target_leaf_pid)?;
@@ -744,6 +876,16 @@ impl SecondaryIndex {
 
         // Propagate promoted split_key upward
         self.insert_into_parent(buffer_pool, &path, target_leaf_pid, split_key, new_leaf_pid)
+    }
+
+    /// Inserts a `(IndexKey, RecordId)` pair into the secondary index.
+    pub fn insert(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        key: &IndexKey,
+        record_id: RecordId,
+    ) -> Result<()> {
+        self.insert_with_payload(buffer_pool, key, &[], record_id)
     }
 
     fn insert_into_parent(
@@ -972,7 +1114,7 @@ impl SecondaryIndex {
                                 "secondary leaf page {pid} entries not strictly sorted"
                             )));
                         }
-                        if unique && prev.0 == curr.0 {
+                        if unique && prev.key == curr.key {
                             return Err(Error::IndexCorruption(format!(
                                 "duplicate key in unique secondary index on leaf page {pid}"
                             )));

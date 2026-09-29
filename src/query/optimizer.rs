@@ -28,6 +28,13 @@ pub enum AccessPath {
         index_id: IndexId,
         scan_type: SecondaryScanType,
     },
+    /// Index-only scan satisfying all query-referenced columns without fetching base records from RecordStore.
+    IndexOnlyScan {
+        index_name: String,
+        index_id: IndexId,
+        scan_type: SecondaryScanType,
+        covered_columns: Vec<String>,
+    },
     /// Full sequential scan over all tuples.
     FullTableScan,
 }
@@ -95,6 +102,57 @@ impl fmt::Display for AccessPath {
                     )
                 }
             },
+            Self::IndexOnlyScan {
+                index_name,
+                scan_type,
+                covered_columns,
+                ..
+            } => {
+                let cov_str = covered_columns.join(", ");
+                match scan_type {
+                    SecondaryScanType::PointLookup(val) => {
+                        write!(
+                            f,
+                            "IndexOnlyScan({index_name}, PointLookup({val}), covered=[{cov_str}])"
+                        )
+                    }
+                    SecondaryScanType::CompositePointLookup(vals) => {
+                        let tuple_str = vals
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        write!(
+                            f,
+                            "IndexOnlyScan({index_name}, PointLookup(({tuple_str})), covered=[{cov_str}])"
+                        )
+                    }
+                    SecondaryScanType::PrefixScan(vals) => {
+                        let tuple_str = vals
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        write!(
+                            f,
+                            "IndexOnlyScan({index_name}, PrefixScan(({tuple_str})), covered=[{cov_str}])"
+                        )
+                    }
+                    SecondaryScanType::RangeScan { start, end } => {
+                        write!(
+                            f,
+                            "IndexOnlyScan({index_name}, RangeScan(start={}, end={}), covered=[{cov_str}])",
+                            start
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "None".into()),
+                            end.as_ref()
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "None".into())
+                        )
+                    }
+                }
+            }
             Self::FullTableScan => write!(f, "FullTableScan"),
         }
     }
@@ -1132,6 +1190,7 @@ fn build_join_graph(
     region_rel_indices: &[usize],
     tables: &[TableOptInfo],
     candidate_conjuncts: &[Expr],
+    bound: Option<&BoundSelect>,
 ) -> (JoinGraph, Vec<Vec<Expr>>, Vec<Expr>) {
     let num_rels = region_rel_indices.len();
     let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); num_rels];
@@ -1167,7 +1226,13 @@ fn build_join_graph(
     let mut relations = Vec::with_capacity(num_rels);
     for (local_id, &global_idx) in region_rel_indices.iter().enumerate() {
         let t = &tables[global_idx];
-        let base_scan = plan_table_scan(t, table_local_conjuncts[local_id].clone(), true);
+        let ref_cols = bound.map(|b| collect_table_referenced_columns(t, b, candidate_conjuncts));
+        let base_scan = plan_table_scan(
+            t,
+            table_local_conjuncts[local_id].clone(),
+            ref_cols.as_ref(),
+            true,
+        );
         relations.push(JoinGraphRelation {
             id: local_id,
             global_idx,
@@ -1235,7 +1300,7 @@ fn optimize_all_inner_joins(
 
     let region_indices: Vec<usize> = (0..num_tables).collect();
     let (graph, _table_locals, unhandled) =
-        build_join_graph(&region_indices, tables, &all_conjuncts);
+        build_join_graph(&region_indices, tables, &all_conjuncts, Some(bound));
 
     let best_plan = if num_tables <= MAX_ENUMERATED_RELATIONS {
         optimize_inner_join_region_dp(&graph)
@@ -1382,8 +1447,13 @@ fn optimize_with_outer_barriers(
     }
 
     // 3. Plan Base Table Scan
-    let base_table_scan =
-        plan_table_scan(&tables[0], table_local_conjuncts[0].clone(), is_multi_table);
+    let ref_cols_base = collect_table_referenced_columns(&tables[0], bound, where_conjuncts);
+    let base_table_scan = plan_table_scan(
+        &tables[0],
+        table_local_conjuncts[0].clone(),
+        Some(&ref_cols_base),
+        is_multi_table,
+    );
 
     let mut physical_joins = Vec::new();
     let mut cur_cost = base_table_scan.cost;
@@ -1391,9 +1461,12 @@ fn optimize_with_outer_barriers(
 
     for (join_idx, (join_type, on_expr)) in optimized_joins.into_iter().enumerate() {
         let right_table_idx = join_idx + 1;
+        let ref_cols_right =
+            collect_table_referenced_columns(&tables[right_table_idx], bound, where_conjuncts);
         let right_table_scan = plan_table_scan(
             &tables[right_table_idx],
             table_local_conjuncts[right_table_idx].clone(),
+            Some(&ref_cols_right),
             is_multi_table,
         );
 
@@ -1650,7 +1723,9 @@ impl Optimizer {
         };
 
         if !is_multi_table {
-            let base_table_scan = plan_table_scan(&tables[0], where_conjuncts, false);
+            let ref_cols = collect_table_referenced_columns(&tables[0], bound, &where_conjuncts);
+            let base_table_scan =
+                plan_table_scan(&tables[0], where_conjuncts, Some(&ref_cols), false);
             let mut cur_cost = base_table_scan.cost;
             let cur_rows = base_table_scan.estimated_rows;
 
@@ -1713,6 +1788,7 @@ struct AccessPathCandidate {
 fn plan_table_scan(
     table: &TableOptInfo,
     conjuncts: Vec<Expr>,
+    referenced_columns: Option<&HashSet<usize>>,
     _is_multi_table: bool,
 ) -> PhysicalTableScan {
     let qualifier = table.qualifier();
@@ -1768,7 +1844,7 @@ fn plan_table_scan(
     );
     candidates.push(AccessPathCandidate {
         access_path: AccessPath::FullTableScan,
-        residual_filter: full_residual,
+        residual_filter: full_residual.clone(),
         estimated_rows: full_rows,
         cost: full_cost,
         priority: 3,
@@ -1828,17 +1904,32 @@ fn plan_table_scan(
         });
     }
 
-    // Candidate 4: Secondary Indexes
+    // Candidate 4: Secondary Indexes (including Covering Index-Only scans)
     for sec_meta in &table.indexes {
+        let is_covering = match referenced_columns {
+            Some(req_cols) => {
+                !req_cols.is_empty() && req_cols.iter().all(|&c| sec_meta.covers_column(c))
+            }
+            None => false,
+        };
+        let covered_column_names: Vec<String> = sec_meta
+            .include_column_indices
+            .iter()
+            .map(|&i| schema.columns[i].name.clone())
+            .collect();
+
         if sec_meta.column_indices.len() <= 1 {
             let sec_col = &schema.columns[sec_meta.column_idx];
             let col_name = &sec_col.name;
             let col_type = sec_col.data_type;
 
+            let mut matched_predicate = false;
+
             // 4a. Point Lookups
             for (idx, conj) in unqual_conjuncts.iter().enumerate() {
                 if let Some(val) = extract_col_equality(conj, col_name, col_type) {
                     if !val.is_null() {
+                        matched_predicate = true;
                         let mut residual = unqual_conjuncts.clone();
                         residual.remove(idx);
                         let residual_filter = recombine_conjunction(residual);
@@ -1846,20 +1937,39 @@ fn plan_table_scan(
                             table.stats.as_ref(),
                             sec_meta,
                         );
-                        let cost = CostModel::secondary_point_lookup_cost(est_rows);
-                        candidates.push(AccessPathCandidate {
-                            access_path: AccessPath::SecondaryIndexScan {
-                                index_name: sec_meta.name.clone(),
-                                index_id: sec_meta.index_id,
-                                scan_type: SecondaryScanType::PointLookup(val),
-                            },
-                            residual_filter,
-                            estimated_rows: est_rows,
-                            cost,
-                            priority: 2,
-                            index_id: Some(sec_meta.index_id),
-                            index_name: Some(sec_meta.name.clone()),
-                        });
+
+                        if is_covering {
+                            let cost = CostModel::index_only_point_lookup_cost(est_rows);
+                            candidates.push(AccessPathCandidate {
+                                access_path: AccessPath::IndexOnlyScan {
+                                    index_name: sec_meta.name.clone(),
+                                    index_id: sec_meta.index_id,
+                                    scan_type: SecondaryScanType::PointLookup(val),
+                                    covered_columns: covered_column_names.clone(),
+                                },
+                                residual_filter,
+                                estimated_rows: est_rows,
+                                cost,
+                                priority: 0,
+                                index_id: Some(sec_meta.index_id),
+                                index_name: Some(sec_meta.name.clone()),
+                            });
+                        } else {
+                            let cost = CostModel::secondary_point_lookup_cost(est_rows);
+                            candidates.push(AccessPathCandidate {
+                                access_path: AccessPath::SecondaryIndexScan {
+                                    index_name: sec_meta.name.clone(),
+                                    index_id: sec_meta.index_id,
+                                    scan_type: SecondaryScanType::PointLookup(val),
+                                },
+                                residual_filter,
+                                estimated_rows: est_rows,
+                                cost,
+                                priority: 2,
+                                index_id: Some(sec_meta.index_id),
+                                index_name: Some(sec_meta.name.clone()),
+                            });
+                        }
                     }
                 }
             }
@@ -1868,6 +1978,7 @@ fn plan_table_scan(
             let (sec_start, sec_end, used_indices) =
                 extract_col_range_bounds(&unqual_conjuncts, col_name, col_type);
             if sec_start.is_some() || sec_end.is_some() {
+                matched_predicate = true;
                 let residual: Vec<Expr> = unqual_conjuncts
                     .iter()
                     .enumerate()
@@ -1881,20 +1992,64 @@ fn plan_table_scan(
                     sec_start.as_ref(),
                     sec_end.as_ref(),
                 );
-                let cost = CostModel::secondary_range_scan_cost(est_rows);
+
+                if is_covering {
+                    let cost = CostModel::index_only_range_scan_cost(est_rows);
+                    candidates.push(AccessPathCandidate {
+                        access_path: AccessPath::IndexOnlyScan {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::RangeScan {
+                                start: sec_start,
+                                end: sec_end,
+                            },
+                            covered_columns: covered_column_names.clone(),
+                        },
+                        residual_filter,
+                        estimated_rows: est_rows,
+                        cost,
+                        priority: 1,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
+                } else {
+                    let cost = CostModel::secondary_range_scan_cost(est_rows);
+                    candidates.push(AccessPathCandidate {
+                        access_path: AccessPath::SecondaryIndexScan {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::RangeScan {
+                                start: sec_start,
+                                end: sec_end,
+                            },
+                        },
+                        residual_filter,
+                        estimated_rows: est_rows,
+                        cost,
+                        priority: 2,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
+                }
+            }
+
+            // 4c. Full index scan if index covers all required query columns
+            if !matched_predicate && is_covering {
+                let cost = CostModel::index_only_range_scan_cost(full_rows);
                 candidates.push(AccessPathCandidate {
-                    access_path: AccessPath::SecondaryIndexScan {
+                    access_path: AccessPath::IndexOnlyScan {
                         index_name: sec_meta.name.clone(),
                         index_id: sec_meta.index_id,
                         scan_type: SecondaryScanType::RangeScan {
-                            start: sec_start,
-                            end: sec_end,
+                            start: None,
+                            end: None,
                         },
+                        covered_columns: covered_column_names.clone(),
                     },
-                    residual_filter,
-                    estimated_rows: est_rows,
+                    residual_filter: full_residual.clone(),
+                    estimated_rows: full_rows,
                     cost,
-                    priority: 2,
+                    priority: 1,
                     index_id: Some(sec_meta.index_id),
                     index_name: Some(sec_meta.name.clone()),
                 });
@@ -1942,20 +2097,39 @@ fn plan_table_scan(
                 let residual_filter = recombine_conjunction(residual);
                 let est_rows =
                     CardinalityEstimator::estimate_sec_point_rows(table.stats.as_ref(), sec_meta);
-                let cost = CostModel::secondary_point_lookup_cost(est_rows);
-                candidates.push(AccessPathCandidate {
-                    access_path: AccessPath::SecondaryIndexScan {
-                        index_name: sec_meta.name.clone(),
-                        index_id: sec_meta.index_id,
-                        scan_type: SecondaryScanType::CompositePointLookup(prefix_values),
-                    },
-                    residual_filter,
-                    estimated_rows: est_rows,
-                    cost,
-                    priority: 2,
-                    index_id: Some(sec_meta.index_id),
-                    index_name: Some(sec_meta.name.clone()),
-                });
+
+                if is_covering {
+                    let cost = CostModel::index_only_point_lookup_cost(est_rows);
+                    candidates.push(AccessPathCandidate {
+                        access_path: AccessPath::IndexOnlyScan {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::CompositePointLookup(prefix_values),
+                            covered_columns: covered_column_names.clone(),
+                        },
+                        residual_filter,
+                        estimated_rows: est_rows,
+                        cost,
+                        priority: 0,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
+                } else {
+                    let cost = CostModel::secondary_point_lookup_cost(est_rows);
+                    candidates.push(AccessPathCandidate {
+                        access_path: AccessPath::SecondaryIndexScan {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::CompositePointLookup(prefix_values),
+                        },
+                        residual_filter,
+                        estimated_rows: est_rows,
+                        cost,
+                        priority: 2,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
+                }
             } else if m > 0 {
                 // Proper composite prefix scan
                 let residual: Vec<Expr> = unqual_conjuncts
@@ -1970,17 +2144,56 @@ fn plan_table_scan(
                     sec_meta,
                     m,
                 );
-                let cost = CostModel::secondary_range_scan_cost(est_rows);
+
+                if is_covering {
+                    let cost = CostModel::index_only_range_scan_cost(est_rows);
+                    candidates.push(AccessPathCandidate {
+                        access_path: AccessPath::IndexOnlyScan {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::PrefixScan(prefix_values),
+                            covered_columns: covered_column_names.clone(),
+                        },
+                        residual_filter,
+                        estimated_rows: est_rows,
+                        cost,
+                        priority: 1,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
+                } else {
+                    let cost = CostModel::secondary_range_scan_cost(est_rows);
+                    candidates.push(AccessPathCandidate {
+                        access_path: AccessPath::SecondaryIndexScan {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::PrefixScan(prefix_values),
+                        },
+                        residual_filter,
+                        estimated_rows: est_rows,
+                        cost,
+                        priority: 2,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
+                }
+            } else if is_covering {
+                // Full composite index scan if covering all columns
+                let cost = CostModel::index_only_range_scan_cost(full_rows);
                 candidates.push(AccessPathCandidate {
-                    access_path: AccessPath::SecondaryIndexScan {
+                    access_path: AccessPath::IndexOnlyScan {
                         index_name: sec_meta.name.clone(),
                         index_id: sec_meta.index_id,
-                        scan_type: SecondaryScanType::PrefixScan(prefix_values),
+                        scan_type: SecondaryScanType::RangeScan {
+                            start: None,
+                            end: None,
+                        },
+                        covered_columns: covered_column_names.clone(),
                     },
-                    residual_filter,
-                    estimated_rows: est_rows,
+                    residual_filter: full_residual.clone(),
+                    estimated_rows: full_rows,
                     cost,
-                    priority: 2,
+                    priority: 1,
                     index_id: Some(sec_meta.index_id),
                     index_name: Some(sec_meta.name.clone()),
                 });
@@ -2013,6 +2226,131 @@ fn plan_table_scan(
         residual_filter: best.residual_filter,
         estimated_rows: best.estimated_rows,
         cost: best.cost,
+    }
+}
+
+/// Collects all column indices in `table`'s schema that are referenced anywhere across the query.
+pub fn collect_table_referenced_columns(
+    table: &TableOptInfo,
+    bound: &BoundSelect,
+    where_conjuncts: &[Expr],
+) -> HashSet<usize> {
+    let mut cols = HashSet::new();
+    let qual = table.qualifier();
+    let tbl_name = &table.name;
+
+    let mut check_column = |col_str: &str| {
+        if col_str == "*" {
+            for i in 0..table.schema.columns.len() {
+                cols.insert(i);
+            }
+            return;
+        }
+
+        let (target_qual, raw_col) = if let Some(dot) = col_str.find('.') {
+            (&col_str[..dot], &col_str[dot + 1..])
+        } else {
+            ("", col_str)
+        };
+
+        if raw_col == "*" {
+            if target_qual.is_empty() || target_qual == qual || target_qual == tbl_name {
+                for i in 0..table.schema.columns.len() {
+                    cols.insert(i);
+                }
+            }
+            return;
+        }
+
+        if target_qual.is_empty() || target_qual == qual || target_qual == tbl_name {
+            if let Some(pos) = table.schema.columns.iter().position(|c| c.name == raw_col) {
+                cols.insert(pos);
+            }
+        }
+    };
+
+    // 1. Projections
+    for proj in &bound.projections {
+        collect_columns_from_expr(&proj.0, &mut check_column);
+    }
+
+    // 2. WHERE conjuncts
+    for conj in where_conjuncts {
+        collect_columns_from_expr(conj, &mut check_column);
+    }
+
+    // 3. JOIN ON clauses
+    for join in &bound.joins {
+        collect_columns_from_expr(&join.on, &mut check_column);
+    }
+
+    // 4. GROUP BY
+    for gb in &bound.group_by {
+        collect_columns_from_expr(gb, &mut check_column);
+    }
+
+    // 5. Aggregates
+    for agg in &bound.aggregates {
+        match agg {
+            AggregateExpr::CountAll => {}
+            AggregateExpr::Function { expr, .. } => {
+                collect_columns_from_expr(expr, &mut check_column);
+            }
+        }
+    }
+
+    // 6. HAVING
+    if let Some(h) = &bound.having {
+        collect_columns_from_expr(h, &mut check_column);
+    }
+
+    // 7. Window expressions
+    for win in &bound.window_exprs {
+        for arg in &win.args {
+            collect_columns_from_expr(arg, &mut check_column);
+        }
+        if let Some(def) = &win.default {
+            collect_columns_from_expr(def, &mut check_column);
+        }
+        for pb in &win.window_spec.partition_by {
+            collect_columns_from_expr(pb, &mut check_column);
+        }
+        for ob in &win.window_spec.order_by {
+            collect_columns_from_expr(&ob.expression, &mut check_column);
+        }
+    }
+
+    // 8. ORDER BY
+    for ob in &bound.order_by {
+        collect_columns_from_expr(&ob.expression, &mut check_column);
+    }
+
+    cols
+}
+
+fn collect_columns_from_expr(expr: &Expr, cb: &mut impl FnMut(&str)) {
+    match expr {
+        Expr::Column(name) => cb(name),
+        Expr::OuterColumn { name, .. } => cb(name),
+        Expr::Binary { left, right, .. } => {
+            collect_columns_from_expr(left, cb);
+            collect_columns_from_expr(right, cb);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            collect_columns_from_expr(expr, cb);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_columns_from_expr(expr, cb);
+            for item in list {
+                collect_columns_from_expr(item, cb);
+            }
+        }
+        Expr::Subquery(sub) => {
+            for col in &sub.outer_references {
+                cb(col);
+            }
+        }
+        Expr::Literal(_) | Expr::Parameter { .. } => {}
     }
 }
 

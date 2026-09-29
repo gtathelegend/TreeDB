@@ -566,6 +566,12 @@ pub struct BoundCreateIndex {
     pub data_types: Vec<DataType>,
     /// Target column data type (first column, for backwards compatibility).
     pub data_type: DataType,
+    /// Optional included (covered) non-key column names.
+    pub include_column_names: Vec<String>,
+    /// Included (covered) non-key column indices in table schema.
+    pub include_column_indices: Vec<usize>,
+    /// Included (covered) column data types.
+    pub include_data_types: Vec<DataType>,
     /// Whether this index enforces uniqueness.
     pub unique: bool,
 }
@@ -598,10 +604,18 @@ pub fn bind_create_index(
         )));
     }
 
+    if stmt.include_column_names.len() > crate::index::covering::MAX_INDEX_INCLUDE_COLUMNS {
+        return Err(Error::InvalidIndexDefinition(format!(
+            "index contains {} included columns, which exceeds maximum of {}",
+            stmt.include_column_names.len(),
+            crate::index::covering::MAX_INDEX_INCLUDE_COLUMNS
+        )));
+    }
+
     // 1. Resolve table schema through catalog
     let schema = catalog.get_table_schema(&stmt.table_name)?;
 
-    // 2. Resolve columns in table schema
+    // 2. Resolve key columns in table schema
     let mut column_indices = Vec::with_capacity(stmt.column_names.len());
     let mut data_types = Vec::with_capacity(stmt.column_names.len());
     let mut seen = std::collections::HashSet::new();
@@ -620,7 +634,7 @@ pub fn bind_create_index(
             .find(|(_, c)| c.name == *col_name)
             .ok_or_else(|| Error::IndexColumnNotFound(col_name.clone()))?;
 
-        // 3. Validate data type is supported by IndexKey
+        // Validate data type is supported by IndexKey
         match col.data_type {
             DataType::Boolean
             | DataType::Int64
@@ -637,6 +651,48 @@ pub fn bind_create_index(
 
         column_indices.push(col_idx);
         data_types.push(col.data_type);
+    }
+
+    // 3. Resolve included (covered) columns in table schema
+    let mut include_column_indices = Vec::with_capacity(stmt.include_column_names.len());
+    let mut include_data_types = Vec::with_capacity(stmt.include_column_names.len());
+    let mut seen_include = std::collections::HashSet::new();
+
+    for col_name in &stmt.include_column_names {
+        if seen.contains(col_name) {
+            return Err(Error::InvalidIndexDefinition(format!(
+                "column '{col_name}' cannot be both an indexed key column and an included column"
+            )));
+        }
+        if !seen_include.insert(col_name) {
+            return Err(Error::InvalidIndexDefinition(format!(
+                "duplicate included column '{col_name}' in index definition"
+            )));
+        }
+
+        let (col_idx, col) = schema
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.name == *col_name)
+            .ok_or_else(|| Error::IndexColumnNotFound(col_name.clone()))?;
+
+        match col.data_type {
+            DataType::Boolean
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::String
+            | DataType::Bytes => {}
+            DataType::Null => {
+                return Err(Error::InvalidIndexDefinition(format!(
+                    "cannot include column '{col_name}' of type Null"
+                )));
+            }
+        }
+
+        include_column_indices.push(col_idx);
+        include_data_types.push(col.data_type);
     }
 
     // 4. Check duplicate index name
@@ -657,6 +713,9 @@ pub fn bind_create_index(
         column_index: first_col_idx,
         data_types,
         data_type: first_data_type,
+        include_column_names: stmt.include_column_names.clone(),
+        include_column_indices,
+        include_data_types,
         unique: stmt.unique,
     })
 }

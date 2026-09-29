@@ -193,6 +193,57 @@ The 4080-byte payload of a Leaf page is structured as:
 
 ---
 
+## Secondary Index Leaf Page Format (Version 1 — Covering Support)
+
+Secondary index leaf nodes store variable-length encoded composite keys, optional covered payloads (`INCLUDE`), and `RecordId` references:
+
+```text
++---------------------------------------------------------------+
+| Byte 0: format_version (u8 = 1)                               |
++---------------------------------------------------------------+
+| Byte 1..2: entry_count (u16, LE)                              |
++---------------------------------------------------------------+
+| Byte 3..6: next_leaf (u32, LE)                                |
++---------------------------------------------------------------+
+| Following: Packed entries                                     |
+|   For each entry:                                             |
+|     - key_len: u16 (LE)                                       |
+|     - key_bytes: [u8; key_len] (canonical composite key)     |
+|     - payload_len: u16 (LE)                                   |
+|     - payload_bytes: [u8; payload_len] (CoveredPayload)       |
+|     - page_id: u32 (LE) (RecordId)                            |
+|     - slot_id: u32 (LE) (RecordId)                            |
++---------------------------------------------------------------+
+```
+
+### CoveredPayload Binary Format (Version 1)
+
+Covered payloads store included column values within the index leaf entry without modifying index search keys or uniqueness:
+
+```text
++---------------------------------------------------------------+
+| Byte 0: format_version (u8 = 1)                               |
++---------------------------------------------------------------+
+| Byte 1..2: column_count (u16, LE)                             |
++---------------------------------------------------------------+
+| Byte 3..3+ceil(N/8): Null Bitmap (1 = NULL, 0 = Present)      |
++---------------------------------------------------------------+
+| Following: Packed Values in Include Order                     |
+|  - Boolean: 1 byte (0 or 1)                                   |
+|  - Int64:   8 bytes (i64, Little-Endian)                      |
+|  - UInt64:  8 bytes (u64, Little-Endian)                      |
+|  - Float64: 8 bytes (IEEE 754 f64 bits, Little-Endian)        |
+|  - String:  4 bytes length (u32, LE) + UTF-8 payload          |
+|  - Bytes:   4 bytes length (u32, LE) + raw byte payload       |
++---------------------------------------------------------------+
+```
+
+* **Maximum Covered Payload Size:** `MAX_COVERED_PAYLOAD_SIZE = 1000` bytes. Payloads exceeding this limit are rejected deterministically with `Error::ValueTooLarge`.
+* **Maximum Included Columns:** `MAX_INDEX_INCLUDE_COLUMNS = 16`.
+
+
+---
+
 ## B+ Tree Internal Node Payload Layout (`PageType::Internal`)
 
 The 4080-byte payload of an Internal page is structured as:

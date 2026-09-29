@@ -351,7 +351,9 @@ fn collect_references_from_plan(
     if !plan.base_table.table_name.is_empty() {
         tables.insert(plan.base_table.table_name.clone());
     }
-    if let AccessPath::SecondaryIndexScan { index_name, .. } = &plan.base_table.access_path {
+    if let AccessPath::SecondaryIndexScan { index_name, .. }
+    | AccessPath::IndexOnlyScan { index_name, .. } = &plan.base_table.access_path
+    {
         indexes.insert(index_name.clone());
     }
 
@@ -359,7 +361,9 @@ fn collect_references_from_plan(
         if !join.right.table_name.is_empty() {
             tables.insert(join.right.table_name.clone());
         }
-        if let AccessPath::SecondaryIndexScan { index_name, .. } = &join.right.access_path {
+        if let AccessPath::SecondaryIndexScan { index_name, .. }
+        | AccessPath::IndexOnlyScan { index_name, .. } = &join.right.access_path
+        {
             indexes.insert(index_name.clone());
         }
         if let Some(idx_name) = &join.index_name {

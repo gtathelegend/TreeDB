@@ -50,6 +50,18 @@ impl CostModel {
         SEC_INDEX_LOOKUP_COST + ((TUPLE_FETCH_COST + SEC_INDEX_FETCH_COST) * matches)
     }
 
+    /// Computes the cost of a covering secondary index point lookup (avoids base-record fetches).
+    pub fn index_only_point_lookup_cost(estimated_matches: f64) -> f64 {
+        let matches = estimated_matches.max(1.0);
+        SEC_INDEX_LOOKUP_COST + ((ROW_CPU_COST + SEC_INDEX_FETCH_COST) * matches)
+    }
+
+    /// Computes the cost of a covering secondary index range scan (avoids base-record fetches).
+    pub fn index_only_range_scan_cost(estimated_matches: f64) -> f64 {
+        let matches = estimated_matches.max(1.0);
+        SEC_INDEX_LOOKUP_COST + ((ROW_CPU_COST + SEC_INDEX_FETCH_COST) * matches)
+    }
+
     /// Computes the cost of a nested-loop join.
     pub fn nested_loop_join_cost(
         left_cost: f64,

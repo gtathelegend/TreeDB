@@ -256,8 +256,18 @@ pub fn scan(
 
 ---
 
-## 9. Current Limitations & Scope
+## 9. Secondary Indexes & Covering Index Payload Storage
 
-* **No Free-Page Reclamation:** TreeDB currently does not reclaim pages made unreachable by B+ Tree merges. Orphaned pages remain in the database file and will be managed by a future freelist/allocator phase.
-* **No WAL / Crash Atomicity:** While modifications are safely persisted on disk through `buffer_pool.sync()`, deletion is not crash-atomic without a Write-Ahead Log.
+In addition to the primary key B+ Tree (`Key (u64) -> RecordId`), TreeDB supports persistent secondary indexes with composite key encodings and covering payloads:
+
+* **Key Ordering & Suffix Tie-Breaking:** Non-unique secondary index entries append `RecordId` to the composite key (`IndexKey::Composite`), guaranteeing strict uniqueness of leaf keys.
+* **Covering Payload (`INCLUDE`):** Secondary leaf pages (Format Version 1) store an optional serialized `CoveredPayload` alongside the `RecordId`.
+* **Included Column Decoupling:** Included columns do NOT participate in the search key, leaf ordering, separator key routing, or unique constraint enforcement.
+* **Index-Only Access:** When an index covers all referenced query columns, scans retrieve the key values and covered payload directly from the secondary B+ Tree leaf pages without issuing reads to the `RecordStore`.
+
+---
+
+## 10. Current Limitations & Scope
+
 * **Single-Threaded:** Synchronization and concurrency control are deferred to future phases.
+

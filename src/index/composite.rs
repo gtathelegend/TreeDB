@@ -212,6 +212,19 @@ impl CompositeIndexKey {
 
         Ok(Self::new(components))
     }
+
+    /// Decodes an order-preserving byte slice into typed values according to column types.
+    pub fn decode_values(
+        bytes: &[u8],
+        col_types: &[crate::engine::types::DataType],
+    ) -> Result<Vec<Value>> {
+        let composite = Self::decode(bytes, col_types.len())?;
+        let mut values = Vec::with_capacity(col_types.len());
+        for (comp, &col_type) in composite.components.iter().zip(col_types) {
+            values.push(comp.to_value(col_type)?);
+        }
+        Ok(values)
+    }
 }
 
 #[cfg(test)]

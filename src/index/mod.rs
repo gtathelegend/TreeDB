@@ -1,5 +1,6 @@
 pub mod bplus_tree;
 pub mod composite;
+pub mod covering;
 pub mod internal;
 pub mod leaf;
 pub mod node;
@@ -7,6 +8,7 @@ pub mod secondary;
 
 pub use bplus_tree::BPlusTree;
 pub use composite::{CompositeIndexKey, MAX_INDEX_COLUMNS};
+pub use covering::{CoveredPayload, MAX_COVERED_PAYLOAD_SIZE, MAX_INDEX_INCLUDE_COLUMNS};
 pub use internal::InternalNode;
 pub use leaf::LeafNode;
 pub use node::{
@@ -15,6 +17,6 @@ pub use node::{
     LEAF_MAX_ENTRIES, LEAF_MIN_ENTRIES, PAGE_ID_SIZE, RECORD_ID_SIZE,
 };
 pub use secondary::{
-    IndexKey, SecondaryIndex, SecondaryInternalNode, SecondaryLeafNode, SEC_INTERNAL_HEADER_SIZE,
-    SEC_LEAF_HEADER_SIZE,
+    IndexKey, SecondaryIndex, SecondaryInternalNode, SecondaryLeafEntry, SecondaryLeafNode,
+    SEC_INTERNAL_HEADER_SIZE, SEC_LEAF_HEADER_SIZE,
 };

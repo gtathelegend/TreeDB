@@ -117,7 +117,8 @@ impl<'a> Table<'a> {
         // Maintain secondary indexes
         for (meta, sec_idx) in &mut self.indexes {
             let idx_key = meta.extract_index_key(row);
-            sec_idx.insert(self.buffer_pool, &idx_key, rid)?;
+            let payload = meta.extract_covered_payload(row)?;
+            sec_idx.insert_with_payload(self.buffer_pool, &idx_key, &payload, rid)?;
         }
 
         self.sync_metadata_if_needed()?;
@@ -153,7 +154,7 @@ impl<'a> Table<'a> {
     /// 6. Inserts the new tuple into the RecordStore.
     /// 7. Updates the primary B+ Tree index mapping to point to the new `RecordId`.
     /// 8. Deletes the old record from the RecordStore.
-    /// 9. Maintains secondary indexes (deletes old `(old_key, old_rid)` and inserts `(new_key, new_rid)`).
+    /// 9. Maintains secondary indexes (deletes old `(old_key, old_rid)` and inserts `(new_key, new_rid)` with updated payload).
     /// 10. Synchronizes catalog metadata.
     pub fn update(&mut self, row: &Row) -> Result<()> {
         self.metadata.schema.validate_row(row)?;
@@ -203,9 +204,10 @@ impl<'a> Table<'a> {
         for (meta, sec_idx) in &mut self.indexes {
             let old_key = meta.extract_index_key(&old_row);
             let new_key = meta.extract_index_key(row);
+            let new_payload = meta.extract_covered_payload(row)?;
 
             sec_idx.delete(self.buffer_pool, &old_key, old_rid)?;
-            sec_idx.insert(self.buffer_pool, &new_key, new_rid)?;
+            sec_idx.insert_with_payload(self.buffer_pool, &new_key, &new_payload, new_rid)?;
         }
 
         self.sync_metadata_if_needed()?;
@@ -447,6 +449,108 @@ impl<'a> Table<'a> {
 
         let entries = sec_idx.scan(self.buffer_pool, start_key, end_key)?;
         Ok(entries.into_iter().map(|(_k, rid)| rid).collect())
+    }
+
+    /// Performs an index-only scan on a secondary index, reconstructing rows directly
+    /// from decoded index keys and included payloads without fetching from `RecordStore`.
+    pub fn index_only_scan(
+        &mut self,
+        index_name: &str,
+        scan_type: &crate::query::optimizer::SecondaryScanType,
+    ) -> Result<Vec<Row>> {
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let entries: Vec<crate::index::secondary::SecondaryLeafEntry> = match scan_type {
+            crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                let idx_key = if meta.column_indices.len() == 1 {
+                    IndexKey::from_value(val)
+                } else {
+                    crate::index::composite::CompositeIndexKey::from_values(std::slice::from_ref(
+                        val,
+                    ))
+                    .to_index_key(meta.column_indices.len())
+                };
+                sec_idx.lookup_entries(self.buffer_pool, &idx_key)?
+            }
+            crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals) => {
+                let key = crate::index::composite::CompositeIndexKey::from_values(vals)
+                    .to_index_key(meta.column_indices.len());
+                sec_idx.lookup_entries(self.buffer_pool, &key)?
+            }
+            crate::query::optimizer::SecondaryScanType::PrefixScan(prefix_vals) => {
+                if prefix_vals.len() == meta.column_indices.len() {
+                    let key = crate::index::composite::CompositeIndexKey::from_values(prefix_vals)
+                        .to_index_key(meta.column_indices.len());
+                    sec_idx.lookup_entries(self.buffer_pool, &key)?
+                } else {
+                    let start_bytes =
+                        crate::index::composite::CompositeIndexKey::encode_prefix_values(
+                            prefix_vals,
+                            meta.column_indices.len(),
+                        );
+                    let end_bytes =
+                        crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
+                    let start_key = IndexKey::new(start_bytes);
+                    let end_key = end_bytes.map(IndexKey::new);
+                    sec_idx.scan_entries(self.buffer_pool, Some(&start_key), end_key.as_ref())?
+                }
+            }
+            crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
+                let start_key = start.as_ref().map(IndexKey::from_value);
+                let end_key = end.as_ref().map(IndexKey::from_value);
+                sec_idx.scan_entries(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?
+            }
+        };
+
+        let schema_len = self.metadata.schema.columns.len();
+        let key_col_types: Vec<crate::engine::types::DataType> = meta
+            .column_indices
+            .iter()
+            .map(|&i| self.metadata.schema.columns[i].data_type)
+            .collect();
+        let inc_col_types: Vec<crate::engine::types::DataType> = meta
+            .include_column_indices
+            .iter()
+            .map(|&i| self.metadata.schema.columns[i].data_type)
+            .collect();
+
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut row_values = vec![Value::Null; schema_len];
+
+            // Decode key columns
+            let key_values = if meta.column_indices.len() == 1 {
+                let val = entry.key.to_value(key_col_types[0])?;
+                vec![val]
+            } else {
+                crate::index::composite::CompositeIndexKey::decode_values(
+                    &entry.key.bytes,
+                    &key_col_types,
+                )?
+            };
+
+            for (&col_idx, val) in meta.column_indices.iter().zip(key_values) {
+                row_values[col_idx] = val;
+            }
+
+            // Decode included columns
+            if !meta.include_column_indices.is_empty() && !entry.payload.is_empty() {
+                let inc_values =
+                    crate::index::covering::CoveredPayload::decode(&entry.payload, &inc_col_types)?;
+                for (&inc_idx, val) in meta.include_column_indices.iter().zip(inc_values) {
+                    row_values[inc_idx] = val;
+                }
+            }
+
+            rows.push(Row::new(row_values));
+        }
+
+        Ok(rows)
     }
 
     /// Validates the structural invariants of the table's underlying primary B+ Tree.

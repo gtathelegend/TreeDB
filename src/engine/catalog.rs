@@ -17,8 +17,8 @@ use crate::storage::record_store::RecordStore;
 /// Recognizable magic bytes for Catalog pages.
 pub const CATALOG_MAGIC: &[u8; 4] = b"CATL";
 
-/// Format version 2 for Catalog page layout (supporting composite secondary indexes).
-pub const CURRENT_CATALOG_VERSION: u32 = 2;
+/// Format version 3 for Catalog page layout (supporting covering secondary indexes).
+pub const CURRENT_CATALOG_VERSION: u32 = 3;
 
 /// Maximum allowable length for a table name in bytes.
 pub const MAX_TABLE_NAME_LEN: usize = 64;
@@ -30,7 +30,7 @@ pub const MAX_INDEX_NAME_LEN: usize = 64;
 ///
 /// Layout:
 /// - `0..4`: `magic: [u8; 4]` (`CATL`)
-/// - `4..8`: `format_version: u32` (1)
+/// - `4..8`: `format_version: u32` (1, 2, or 3)
 /// - `8..12`: `next_table_id: u32` (Monotonically increasing table ID counter, stored on root catalog page)
 /// - `12..16`: `table_count: u32` (Number of active table entries on this page)
 /// - `16..20`: `next_catalog_page_id: PageId` (0 if no next page)
@@ -56,17 +56,22 @@ pub const TABLE_ENTRY_HEADER_SIZE: usize = 26;
 pub const INDEX_ENTRY_HEADER_SIZE_V1: usize = 18;
 
 /// Fixed-size header for each serialized index entry in the catalog payload for format version 2 (16 bytes).
+pub const INDEX_ENTRY_HEADER_SIZE_V2: usize = 16;
+
+/// Fixed-size header for each serialized index entry in the catalog payload for format version 3 (18 bytes).
 ///
 /// Layout:
 /// - `0..4`: `index_id: u32`
 /// - `4..8`: `table_id: u32`
 /// - `8..12`: `root_page_id: u32`
 /// - `12`: `unique: u8` (0 = non-unique, 1 = unique)
-/// - `13`: `column_count: u8` (number of indexed columns)
-/// - `14..16`: `name_len: u16`
+/// - `13`: `column_count: u8` (number of indexed key columns)
+/// - `14`: `include_column_count: u8` (number of included covered columns)
+/// - `15`: `reserved: u8` (0)
+/// - `16..18`: `name_len: u16`
 ///
-/// Followed by `column_count * 2` bytes for `column_indices` (u16 each), then `name_len` bytes for UTF-8 name.
-pub const INDEX_ENTRY_HEADER_SIZE_V2: usize = 16;
+/// Followed by `column_count * 2` bytes for `column_indices`, `include_column_count * 2` bytes for `include_column_indices`, then `name_len` bytes for UTF-8 name.
+pub const INDEX_ENTRY_HEADER_SIZE_V3: usize = 18;
 
 /// Alias for backwards compatibility.
 pub const INDEX_ENTRY_HEADER_SIZE: usize = INDEX_ENTRY_HEADER_SIZE_V1;
@@ -134,7 +139,7 @@ impl TableMetadata {
     }
 }
 
-/// Persistent metadata describing a secondary index (single-column or composite).
+/// Persistent metadata describing a secondary index (single-column, composite, or covering).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexMetadata {
     /// Unique, stable logical index identifier.
@@ -145,22 +150,45 @@ pub struct IndexMetadata {
     pub root_page_id: PageId,
     /// UTF-8 index name.
     pub name: String,
-    /// Zero-based column indices in the table schema.
+    /// Zero-based key column indices in the table schema.
     pub column_indices: Vec<usize>,
-    /// First column index (preserved for backwards compatibility).
+    /// First key column index (preserved for backwards compatibility).
     pub column_idx: usize,
+    /// Zero-based non-key included (covered) column indices in the table schema.
+    pub include_column_indices: Vec<usize>,
     /// True if the index enforces a unique constraint.
     pub unique: bool,
 }
 
 impl IndexMetadata {
-    /// Constructs a new `IndexMetadata` descriptor.
+    /// Constructs a new `IndexMetadata` descriptor without included columns.
     pub fn new(
         index_id: IndexId,
         table_id: TableId,
         root_page_id: PageId,
         name: String,
         column_indices: Vec<usize>,
+        unique: bool,
+    ) -> Self {
+        Self::new_covering(
+            index_id,
+            table_id,
+            root_page_id,
+            name,
+            column_indices,
+            Vec::new(),
+            unique,
+        )
+    }
+
+    /// Constructs a new covering `IndexMetadata` descriptor with key and included columns.
+    pub fn new_covering(
+        index_id: IndexId,
+        table_id: TableId,
+        root_page_id: PageId,
+        name: String,
+        column_indices: Vec<usize>,
+        include_column_indices: Vec<usize>,
         unique: bool,
     ) -> Self {
         let column_idx = column_indices.first().copied().unwrap_or(0);
@@ -171,19 +199,70 @@ impl IndexMetadata {
             name,
             column_indices,
             column_idx,
+            include_column_indices,
             unique,
         }
     }
 
-    /// Computes the serialized byte size of this index metadata entry in catalog format v2.
+    /// Computes the serialized byte size of this index metadata entry in catalog format v3.
     pub fn byte_size(&self) -> usize {
-        INDEX_ENTRY_HEADER_SIZE_V2 + (self.column_indices.len() * 2) + self.name.len()
+        INDEX_ENTRY_HEADER_SIZE_V3
+            + (self.column_indices.len() * 2)
+            + (self.include_column_indices.len() * 2)
+            + self.name.len()
     }
 
-    /// Extracts the canonical `IndexKey` from a row for this index.
+    /// Returns true if this index has any included (covered) non-key columns.
+    pub fn is_covering(&self) -> bool {
+        !self.include_column_indices.is_empty()
+    }
+
+    /// Returns true if this index covers the specified column index (as key or included column).
+    pub fn covers_column(&self, col_idx: usize) -> bool {
+        self.column_indices.contains(&col_idx) || self.include_column_indices.contains(&col_idx)
+    }
+
+    /// Returns all column indices provided by this index (key columns followed by included columns).
+    pub fn all_column_indices(&self) -> Vec<usize> {
+        let mut cols = self.column_indices.clone();
+        cols.extend_from_slice(&self.include_column_indices);
+        cols
+    }
+
+    /// Extracts the canonical `IndexKey` from a row for this index's key columns.
     pub fn extract_index_key(&self, row: &crate::engine::types::Row) -> IndexKey {
         let composite = CompositeIndexKey::from_row_columns(row, &self.column_indices);
         composite.to_index_key(self.column_indices.len())
+    }
+
+    /// Extracts and encodes the binary covered payload from a row for this index's included columns.
+    pub fn extract_covered_payload(&self, row: &crate::engine::types::Row) -> Result<Vec<u8>> {
+        if self.include_column_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let values: Vec<crate::engine::types::Value> = self
+            .include_column_indices
+            .iter()
+            .map(|&idx| row.values[idx].clone())
+            .collect();
+        crate::index::covering::CoveredPayload::encode(&values)
+    }
+
+    /// Decodes a binary covered payload into typed `Value`s matching this index's included column types.
+    pub fn decode_covered_values(
+        &self,
+        schema: &crate::engine::types::Schema,
+        payload: &[u8],
+    ) -> Result<Vec<crate::engine::types::Value>> {
+        if self.include_column_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let expected_types: Vec<crate::engine::types::DataType> = self
+            .include_column_indices
+            .iter()
+            .map(|&idx| schema.columns[idx].data_type)
+            .collect();
+        crate::index::covering::CoveredPayload::decode(payload, &expected_types)
     }
 }
 
@@ -324,7 +403,7 @@ impl CatalogPage {
             offset += entry_len;
         }
 
-        // 3. Write index entries (Format v2)
+        // 3. Write index entries (Format v3)
         for idx in &self.indexes {
             let idx_len = idx.byte_size();
 
@@ -338,17 +417,24 @@ impl CatalogPage {
             let name_bytes = idx.name.as_bytes();
             let name_len = name_bytes.len();
             let col_count = idx.column_indices.len();
+            let include_col_count = idx.include_column_indices.len();
 
             payload[offset..offset + 4].copy_from_slice(&idx.index_id.0.to_le_bytes());
             payload[offset + 4..offset + 8].copy_from_slice(&idx.table_id.0.to_le_bytes());
             payload[offset + 8..offset + 12].copy_from_slice(&idx.root_page_id.to_le_bytes());
             payload[offset + 12] = if idx.unique { 1 } else { 0 };
             payload[offset + 13] = col_count as u8;
-            payload[offset + 14..offset + 16].copy_from_slice(&(name_len as u16).to_le_bytes());
+            payload[offset + 14] = include_col_count as u8;
+            payload[offset + 15] = 0; // reserved padding
+            payload[offset + 16..offset + 18].copy_from_slice(&(name_len as u16).to_le_bytes());
 
-            let mut cur = offset + INDEX_ENTRY_HEADER_SIZE_V2;
+            let mut cur = offset + INDEX_ENTRY_HEADER_SIZE_V3;
             for &c_idx in &idx.column_indices {
                 payload[cur..cur + 2].copy_from_slice(&(c_idx as u16).to_le_bytes());
+                cur += 2;
+            }
+            for &inc_idx in &idx.include_column_indices {
+                payload[cur..cur + 2].copy_from_slice(&(inc_idx as u16).to_le_bytes());
                 cur += 2;
             }
             payload[cur..cur + name_len].copy_from_slice(name_bytes);
@@ -386,7 +472,7 @@ impl CatalogPage {
         }
 
         let format_version = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-        if format_version != 1 && format_version != CURRENT_CATALOG_VERSION {
+        if format_version != 1 && format_version != 2 && format_version != CURRENT_CATALOG_VERSION {
             return Err(Error::CatalogVersionUnsupported {
                 found: format_version,
                 supported: CURRENT_CATALOG_VERSION,
@@ -625,7 +711,7 @@ impl CatalogPage {
                 ));
 
                 offset = cur + name_len;
-            } else {
+            } else if format_version == 2 {
                 // format_version == 2
                 if offset + INDEX_ENTRY_HEADER_SIZE_V2 > PAGE_PAYLOAD_SIZE {
                     return Err(Error::CatalogCorruption(format!(
@@ -711,6 +797,111 @@ impl CatalogPage {
                     root_page_id,
                     name,
                     column_indices,
+                    unique,
+                ));
+
+                offset = cur + name_len;
+            } else {
+                // format_version == 3 (covering index support)
+                if offset + INDEX_ENTRY_HEADER_SIZE_V3 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::CatalogCorruption(format!(
+                        "unexpected end of payload reading index entry header v3 on page {}",
+                        page.id()
+                    )));
+                }
+
+                let index_id = u32::from_le_bytes([
+                    payload[offset],
+                    payload[offset + 1],
+                    payload[offset + 2],
+                    payload[offset + 3],
+                ]);
+                let table_id = u32::from_le_bytes([
+                    payload[offset + 4],
+                    payload[offset + 5],
+                    payload[offset + 6],
+                    payload[offset + 7],
+                ]);
+                let root_page_id = u32::from_le_bytes([
+                    payload[offset + 8],
+                    payload[offset + 9],
+                    payload[offset + 10],
+                    payload[offset + 11],
+                ]);
+                let unique = match payload[offset + 12] {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(Error::CatalogCorruption(format!(
+                            "invalid unique flag {other} on index in page {}",
+                            page.id()
+                        )));
+                    }
+                };
+                let col_count = payload[offset + 13] as usize;
+                let include_col_count = payload[offset + 14] as usize;
+                let name_len =
+                    u16::from_le_bytes([payload[offset + 16], payload[offset + 17]]) as usize;
+
+                if col_count == 0 || col_count > MAX_INDEX_COLUMNS {
+                    return Err(Error::CatalogCorruption(format!(
+                        "invalid index column count {col_count} on page {}",
+                        page.id()
+                    )));
+                }
+                if include_col_count > crate::index::covering::MAX_INDEX_INCLUDE_COLUMNS {
+                    return Err(Error::CatalogCorruption(format!(
+                        "invalid index include column count {include_col_count} on page {}",
+                        page.id()
+                    )));
+                }
+
+                if name_len == 0 || name_len > MAX_INDEX_NAME_LEN {
+                    return Err(Error::CatalogCorruption(format!(
+                        "invalid index name length {name_len} on page {}",
+                        page.id()
+                    )));
+                }
+
+                let mut cur = offset + INDEX_ENTRY_HEADER_SIZE_V3;
+                if cur + (col_count * 2) + (include_col_count * 2) + name_len > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::CatalogCorruption(format!(
+                        "unexpected end of payload reading index entry on page {}",
+                        page.id()
+                    )));
+                }
+
+                let mut column_indices = Vec::with_capacity(col_count);
+                for _ in 0..col_count {
+                    let c_idx = u16::from_le_bytes([payload[cur], payload[cur + 1]]) as usize;
+                    column_indices.push(c_idx);
+                    cur += 2;
+                }
+
+                let mut include_column_indices = Vec::with_capacity(include_col_count);
+                for _ in 0..include_col_count {
+                    let inc_idx = u16::from_le_bytes([payload[cur], payload[cur + 1]]) as usize;
+                    include_column_indices.push(inc_idx);
+                    cur += 2;
+                }
+
+                let name_bytes = &payload[cur..cur + name_len];
+                let name = std::str::from_utf8(name_bytes)
+                    .map_err(|_| {
+                        Error::CatalogCorruption(format!(
+                            "invalid UTF-8 in index name on page {}",
+                            page.id()
+                        ))
+                    })?
+                    .to_string();
+
+                indexes.push(IndexMetadata::new_covering(
+                    IndexId(index_id),
+                    TableId(table_id),
+                    root_page_id,
+                    name,
+                    column_indices,
+                    include_column_indices,
                     unique,
                 ));
 
@@ -945,6 +1136,25 @@ impl Catalog {
         column_names: &[&str],
         unique: bool,
     ) -> Result<IndexId> {
+        Self::create_covering_index(
+            buffer_pool,
+            table_name,
+            index_name,
+            column_names,
+            &[],
+            unique,
+        )
+    }
+
+    /// Creates a new persistent covering secondary index in the catalog and populates it from existing table data.
+    pub fn create_covering_index(
+        buffer_pool: &mut BufferPool,
+        table_name: &str,
+        index_name: &str,
+        column_names: &[&str],
+        include_column_names: &[&str],
+        unique: bool,
+    ) -> Result<IndexId> {
         validate_index_name(index_name)?;
 
         if column_names.is_empty() {
@@ -961,11 +1171,33 @@ impl Catalog {
             )));
         }
 
+        if include_column_names.len() > crate::index::covering::MAX_INDEX_INCLUDE_COLUMNS {
+            return Err(Error::InvalidIndexDefinition(format!(
+                "index contains {} include columns, which exceeds maximum of {}",
+                include_column_names.len(),
+                crate::index::covering::MAX_INDEX_INCLUDE_COLUMNS
+            )));
+        }
+
         let mut seen_cols = HashSet::new();
         for &col in column_names {
             if !seen_cols.insert(col) {
                 return Err(Error::InvalidIndexDefinition(format!(
                     "duplicate column '{col}' in index definition"
+                )));
+            }
+        }
+
+        let mut seen_inc_cols = HashSet::new();
+        for &inc_col in include_column_names {
+            if seen_cols.contains(inc_col) {
+                return Err(Error::InvalidIndexDefinition(format!(
+                    "column '{inc_col}' cannot be both a key column and an included column"
+                )));
+            }
+            if !seen_inc_cols.insert(inc_col) {
+                return Err(Error::InvalidIndexDefinition(format!(
+                    "duplicate included column '{inc_col}' in index definition"
                 )));
             }
         }
@@ -979,7 +1211,7 @@ impl Catalog {
         let table_meta = Self::get_table(buffer_pool, table_name)?
             .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
 
-        // 3. Resolve column indices
+        // 3. Resolve key and included column indices
         let mut column_indices = Vec::with_capacity(column_names.len());
         for &col_name in column_names {
             let pos = table_meta
@@ -989,6 +1221,17 @@ impl Catalog {
                 .position(|c| c.name == col_name)
                 .ok_or_else(|| Error::IndexColumnNotFound(col_name.to_string()))?;
             column_indices.push(pos);
+        }
+
+        let mut include_column_indices = Vec::with_capacity(include_column_names.len());
+        for &inc_col_name in include_column_names {
+            let pos = table_meta
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == inc_col_name)
+                .ok_or_else(|| Error::IndexColumnNotFound(inc_col_name.to_string()))?;
+            include_column_indices.push(pos);
         }
 
         // 4. Read root catalog page to get and increment next_index_id
@@ -1003,7 +1246,7 @@ impl Catalog {
         let new_index_id = IndexId(root_cat.next_index_id);
         root_cat.next_index_id += 1;
 
-        // 5. Scan table rows to validate uniqueness and populate index entries
+        // 5. Scan table rows to validate uniqueness on key columns and populate index entries with payload
         let tree = BPlusTree::from_root(table_meta.root_page_id);
         let record_store = RecordStore::with_last_page(table_meta.record_page_id);
         let rids = tree.scan(buffer_pool, None, None)?;
@@ -1029,14 +1272,27 @@ impl Catalog {
                         format!("({vals_str})")
                     }));
                 }
-                entries_to_insert.push((idx_key, rid));
+
+                let payload_bytes = if include_column_indices.is_empty() {
+                    Vec::new()
+                } else {
+                    let vals: Vec<crate::engine::types::Value> = include_column_indices
+                        .iter()
+                        .map(|&i| row.values[i].clone())
+                        .collect();
+                    crate::index::covering::CoveredPayload::encode(&vals)?
+                };
+
+                entries_to_insert.push((idx_key, payload_bytes, rid));
             }
         }
 
         // 6. Allocate and populate secondary index B+ Tree
         let mut sec_index = SecondaryIndex::new_empty();
-        for (idx_key, rid) in entries_to_insert {
-            if let Err(e) = sec_index.insert(buffer_pool, &idx_key, rid) {
+        for (idx_key, payload_bytes, rid) in entries_to_insert {
+            if let Err(e) =
+                sec_index.insert_with_payload(buffer_pool, &idx_key, &payload_bytes, rid)
+            {
                 if let Ok(pages) = sec_index.collect_all_pages(buffer_pool) {
                     for pid in pages {
                         let _ = buffer_pool.free_page(pid);
@@ -1064,12 +1320,13 @@ impl Catalog {
             sec_index.root_page_id()
         };
 
-        let index_meta = IndexMetadata::new(
+        let index_meta = IndexMetadata::new_covering(
             new_index_id,
             table_meta.table_id,
             root_page_id,
             index_name.to_string(),
             column_indices,
+            include_column_indices,
             unique,
         );
 

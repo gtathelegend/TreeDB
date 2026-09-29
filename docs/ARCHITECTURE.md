@@ -446,6 +446,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
 * **Zero Pin Leaks:** All buffer pool frames must have `pin_count == 0` after every normal operation, failed recovery, successful recovery, or repeated recovery pass.
 * **Recovery Restartability & Idempotence:** Recovery can be safely interrupted at any point (before/during Redo, during Undo, after CLRs) and restarted. Repeated recovery passes yield identical database states.
+* **Covering Index & Index-Only Invariant:** An `IndexOnlyScan` access path is selected only when all columns referenced across the query projection, residual filters, grouping, order by, window expressions, and join predicates are completely satisfied by the secondary index (key columns + included columns). Genuine index-only scans perform zero `RecordStore` reads (`base_records_fetched == 0`, `base_records_avoided > 0`).
 * **Page Reachability & Reservation Invariant:** Page 0 (Header) and Page 1 (Metadata) are strictly reserved (`is_reserved_page(page_id) == true`) and can never be freed or recycled. Every page ID in the database is either reachable via index/metadata/heap or tracked in the persistent freelist.
 
 ---
@@ -453,8 +454,6 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 ## 8. Intentionally Deferred Items
 
 The following capabilities are intentionally deferred to subsequent phases:
-* Multi-column composite secondary indexes.
-* Index-only covering scans.
 * Merge join physical operator.
 * Generalized outer-join reordering in cost optimizer.
 * DDL statements (`ALTER TABLE`) in SQL grammar.

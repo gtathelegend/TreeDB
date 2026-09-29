@@ -615,6 +615,87 @@ impl<'a> Parser<'a> {
 
         self.advance(); // consume ')'
 
+        let mut include_column_names = Vec::new();
+        if self.peek().kind == TokenKind::Include {
+            self.advance(); // consume INCLUDE
+
+            if self.peek().kind != TokenKind::LParen {
+                let tok = self.peek().clone();
+                return Err(Error::SqlParseError {
+                    message: format!("expected '(' after INCLUDE, found {}", tok.kind),
+                    start: tok.span.start,
+                    end: tok.span.end,
+                });
+            }
+            self.advance(); // consume '('
+
+            loop {
+                let col_tok = self.peek().clone();
+                let col = match &col_tok.kind {
+                    TokenKind::Ident(name) => name.clone(),
+                    _ => {
+                        return Err(Error::SqlParseError {
+                            message: format!(
+                                "expected column name in INCLUDE clause, found {}",
+                                col_tok.kind
+                            ),
+                            start: col_tok.span.start,
+                            end: col_tok.span.end,
+                        });
+                    }
+                };
+                self.advance(); // consume column name
+
+                if include_column_names.contains(&col) {
+                    return Err(Error::SqlParseError {
+                        message: format!("duplicate column '{col}' in INCLUDE clause"),
+                        start: col_tok.span.start,
+                        end: col_tok.span.end,
+                    });
+                }
+
+                include_column_names.push(col);
+
+                if include_column_names.len() > crate::index::covering::MAX_INDEX_INCLUDE_COLUMNS {
+                    return Err(Error::SqlParseError {
+                        message: format!(
+                            "INCLUDE clause exceeds maximum column limit of {}",
+                            crate::index::covering::MAX_INDEX_INCLUDE_COLUMNS
+                        ),
+                        start: col_tok.span.start,
+                        end: col_tok.span.end,
+                    });
+                }
+
+                if self.peek().kind == TokenKind::Comma {
+                    self.advance(); // consume comma
+                    if self.peek().kind == TokenKind::RParen {
+                        let tok = self.peek().clone();
+                        return Err(Error::SqlParseError {
+                            message: "trailing comma in INCLUDE column list is not allowed"
+                                .to_string(),
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        });
+                    }
+                } else if self.peek().kind == TokenKind::RParen {
+                    break;
+                } else {
+                    let tok = self.peek().clone();
+                    return Err(Error::SqlParseError {
+                        message: format!(
+                            "expected ',' or ')' in INCLUDE clause, found {}",
+                            tok.kind
+                        ),
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    });
+                }
+            }
+
+            self.advance(); // consume ')'
+        }
+
         if self.peek().kind == TokenKind::Semicolon {
             self.advance();
         }
@@ -631,10 +712,11 @@ impl<'a> Parser<'a> {
             });
         }
 
-        Ok(CreateIndexStatement::new_composite(
+        Ok(CreateIndexStatement::new_covering(
             name,
             table_name,
             column_names,
+            include_column_names,
             unique,
         ))
     }

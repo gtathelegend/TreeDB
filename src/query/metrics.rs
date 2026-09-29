@@ -138,6 +138,14 @@ pub struct OperatorCounters {
     pub partition_passes: usize,
     /// Peak in-memory bytes used during sort, aggregation, or join operations.
     pub peak_memory_bytes: usize,
+    /// Number of index entries examined during index scan or lookup.
+    pub index_entries_examined: usize,
+    /// Number of base table records fetched from RecordStore.
+    pub base_records_fetched: usize,
+    /// Number of base table record fetches avoided via covering index.
+    pub base_records_avoided: usize,
+    /// Number of covered rows output directly from index without base table access.
+    pub covered_rows_output: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -547,10 +555,41 @@ pub fn format_plan_with_metrics(
         ));
         write_indent(&mut out, indent + 1);
         let actual_rows_str = metrics.total_rows;
-        out.push_str(&format!(
-            "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
-            plan.base_table.cost, plan.base_table.estimated_rows, actual_rows_str
-        ));
+        if let Some(root) = &metrics.root_operator {
+            if let Some(scan_op) =
+                find_operator_metrics(root, &|k| matches!(k, OperatorKind::TableScan { .. }))
+            {
+                if scan_op.counters.base_records_avoided > 0
+                    || scan_op.counters.index_entries_examined > 0
+                {
+                    out.push_str(&format!(
+                        "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, index_entries_examined: {}, base_records_fetched: {}, base_records_avoided: {}, covered_rows_output: {}\n",
+                        plan.base_table.cost,
+                        plan.base_table.estimated_rows,
+                        actual_rows_str,
+                        scan_op.counters.index_entries_examined,
+                        scan_op.counters.base_records_fetched,
+                        scan_op.counters.base_records_avoided,
+                        scan_op.counters.covered_rows_output
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
+                        plan.base_table.cost, plan.base_table.estimated_rows, actual_rows_str
+                    ));
+                }
+            } else {
+                out.push_str(&format!(
+                    "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
+                    plan.base_table.cost, plan.base_table.estimated_rows, actual_rows_str
+                ));
+            }
+        } else {
+            out.push_str(&format!(
+                "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
+                plan.base_table.cost, plan.base_table.estimated_rows, actual_rows_str
+            ));
+        }
     } else {
         for (idx, join) in plan.joins.iter().enumerate() {
             write_indent(&mut out, indent);

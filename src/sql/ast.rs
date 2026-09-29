@@ -137,6 +137,8 @@ pub struct CreateIndexStatement {
     pub column_names: Vec<String>,
     /// Target column name to index (first column, for backwards compatibility).
     pub column_name: String,
+    /// Optional non-key included (covered) column names.
+    pub include_column_names: Vec<String>,
     /// Whether this index enforces uniqueness.
     pub unique: bool,
 }
@@ -155,6 +157,7 @@ impl CreateIndexStatement {
             table_name: table_name.into(),
             column_names: vec![col.clone()],
             column_name: col,
+            include_column_names: Vec::new(),
             unique,
         }
     }
@@ -172,6 +175,26 @@ impl CreateIndexStatement {
             table_name: table_name.into(),
             column_names,
             column_name: col,
+            include_column_names: Vec::new(),
+            unique,
+        }
+    }
+
+    /// Creates a new covering / composite `CreateIndexStatement` with included columns.
+    pub fn new_covering(
+        name: impl Into<String>,
+        table_name: impl Into<String>,
+        column_names: Vec<String>,
+        include_column_names: Vec<String>,
+        unique: bool,
+    ) -> Self {
+        let col = column_names.first().cloned().unwrap_or_default();
+        Self {
+            name: name.into(),
+            table_name: table_name.into(),
+            column_names,
+            column_name: col,
+            include_column_names,
             unique,
         }
     }
@@ -180,17 +203,22 @@ impl CreateIndexStatement {
 impl fmt::Display for CreateIndexStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let cols = self.column_names.join(", ");
+        let include_clause = if self.include_column_names.is_empty() {
+            String::new()
+        } else {
+            format!(" INCLUDE ({})", self.include_column_names.join(", "))
+        };
         if self.unique {
             write!(
                 f,
-                "CREATE UNIQUE INDEX {} ON {} ({})",
-                self.name, self.table_name, cols
+                "CREATE UNIQUE INDEX {} ON {} ({}){}",
+                self.name, self.table_name, cols, include_clause
             )
         } else {
             write!(
                 f,
-                "CREATE INDEX {} ON {} ({})",
-                self.name, self.table_name, cols
+                "CREATE INDEX {} ON {} ({}){}",
+                self.name, self.table_name, cols, include_clause
             )
         }
     }

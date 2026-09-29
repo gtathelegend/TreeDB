@@ -357,6 +357,7 @@ impl<'a> Lexer<'a> {
             "GROUPS" => TokenKind::Groups,
             "INDEX" => TokenKind::Index,
             "UNIQUE" => TokenKind::Unique,
+            "INCLUDE" => TokenKind::Include,
             "EXPLAIN" => TokenKind::Explain,
             "ANALYZE" => TokenKind::Analyze,
             "BOOLEAN" | "BOOL" => TokenKind::BooleanType,
