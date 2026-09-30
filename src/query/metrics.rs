@@ -150,6 +150,18 @@ pub struct OperatorCounters {
     pub distinct_prefix_values: usize,
     /// Number of point lookups / prefix range scans executed across distinct prefix values during skip scan.
     pub skip_scan_probes: usize,
+    /// Number of participating secondary indexes in multi-index scan.
+    pub indexes_used: usize,
+    /// Candidate record count before set intersection or union.
+    pub candidate_rows_before_set_operation: usize,
+    /// Candidate record count surviving set intersection or union.
+    pub candidate_rows_after_set_operation: usize,
+    /// Number of candidate record IDs evaluated during intersection.
+    pub record_ids_intersected: usize,
+    /// Number of candidate record IDs combined during union.
+    pub record_ids_unioned: usize,
+    /// Number of duplicate record IDs eliminated during union deduplication.
+    pub duplicate_record_ids_removed: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -563,7 +575,23 @@ pub fn format_plan_with_metrics(
             if let Some(scan_op) =
                 find_operator_metrics(root, &|k| matches!(k, OperatorKind::TableScan { .. }))
             {
-                if scan_op.counters.skip_scan_probes > 0 {
+                if scan_op.counters.indexes_used > 0 {
+                    out.push_str(&format!(
+                        "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, indexes_used: {}, index_entries_examined: {}, candidate_rows_before_set_operation: {}, candidate_rows_after_set_operation: {}, record_ids_intersected: {}, record_ids_unioned: {}, duplicate_record_ids_removed: {}, base_records_fetched: {}, rows_output: {}\n",
+                        plan.base_table.cost,
+                        plan.base_table.estimated_rows,
+                        actual_rows_str,
+                        scan_op.counters.indexes_used,
+                        scan_op.counters.index_entries_examined,
+                        scan_op.counters.candidate_rows_before_set_operation,
+                        scan_op.counters.candidate_rows_after_set_operation,
+                        scan_op.counters.record_ids_intersected,
+                        scan_op.counters.record_ids_unioned,
+                        scan_op.counters.duplicate_record_ids_removed,
+                        scan_op.counters.base_records_fetched,
+                        actual_rows_str
+                    ));
+                } else if scan_op.counters.skip_scan_probes > 0 {
                     out.push_str(&format!(
                         "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, distinct_prefix_values: {}, skip_scan_prefixes_discovered: {}, skip_scan_prefixes_probed: {}, skip_scan_index_entries_examined: {}, skip_scan_rows_output: {}, skip_scan_base_records_fetched: {}, skip_scan_base_records_avoided: {}, actual_prefix_values: {}, skip_scan_probes: {}, probes: {}, index_entries: {}, index_entries_examined: {}, rows: {}, rows_matched: {}, base_fetched: {}, base_records_fetched: {}, base_avoided: {}, base_records_avoided: {}, covered_rows_output: {}\n",
                         plan.base_table.cost,

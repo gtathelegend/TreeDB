@@ -20,6 +20,33 @@ impl CardinalityEstimator {
             .unwrap_or(DEFAULT_TABLE_ROWS)
     }
 
+    /// Estimates output cardinality for an intersection of multiple index candidate sets.
+    pub fn estimate_intersection_cardinality(table_rows: f64, child_selectivities: &[f64]) -> f64 {
+        let base = table_rows.max(0.0);
+        if child_selectivities.is_empty() {
+            return base;
+        }
+        let mut combined_sel = 1.0;
+        for &s in child_selectivities {
+            combined_sel *= s.clamp(0.0, 1.0);
+        }
+        (base * combined_sel).clamp(0.0, base)
+    }
+
+    /// Estimates output cardinality for a union of multiple index candidate sets.
+    pub fn estimate_union_cardinality(table_rows: f64, child_selectivities: &[f64]) -> f64 {
+        let base = table_rows.max(0.0);
+        if child_selectivities.is_empty() {
+            return 0.0;
+        }
+        let mut complement_product = 1.0;
+        for &s in child_selectivities {
+            complement_product *= 1.0 - s.clamp(0.0, 1.0);
+        }
+        let union_sel = (1.0 - complement_product).clamp(0.0, 1.0);
+        (base * union_sel).clamp(0.0, base)
+    }
+
     /// Estimates the selectivity of an arbitrary boolean expression in `[0.0, 1.0]`.
     pub fn estimate_expr_selectivity(
         expr: &Expr,

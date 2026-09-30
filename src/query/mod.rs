@@ -19,8 +19,8 @@ pub use cardinality::{
 };
 pub use cost::{
     CostModel, PlanCost, AGG_CPU_COST, BPLUS_TREE_HEIGHT_COST, FILTER_CPU_COST, JOIN_CPU_COST,
-    PAGE_READ_COST, PK_LOOKUP_COST, ROW_CPU_COST, SEC_INDEX_FETCH_COST, SEC_INDEX_LOOKUP_COST,
-    SKIP_SCAN_PROBE_COST, SORT_CPU_COST, TUPLE_FETCH_COST, WINDOW_CPU_COST,
+    PAGE_READ_COST, PK_LOOKUP_COST, RECORD_ID_SET_OP_CPU_COST, ROW_CPU_COST, SEC_INDEX_FETCH_COST,
+    SEC_INDEX_LOOKUP_COST, SKIP_SCAN_PROBE_COST, SORT_CPU_COST, TUPLE_FETCH_COST, WINDOW_CPU_COST,
 };
 pub use expr::{
     AggregateExpr, AggregateFunction, BinaryOp, BoundWindowFrame, BoundWindowSpec, Expr, UnaryOp,
@@ -51,8 +51,9 @@ pub use operator::{
     QueryResult, SetOperationOperator, SortDirection, SortKey, SortOperator, WindowOperator,
 };
 pub use optimizer::{
-    AccessPath, JoinStrategy, Optimizer, PhysicalJoin, PhysicalPlan, PhysicalSetOp,
-    PhysicalTableScan, SecondaryScanType, TableOptInfo,
+    recombine_disjunction, split_disjunction, AccessPath, JoinStrategy, MultiIndexChildScan,
+    MultiIndexStrategy, Optimizer, PhysicalJoin, PhysicalPlan, PhysicalSetOp, PhysicalTableScan,
+    SecondaryScanType, TableOptInfo, MAX_MULTI_INDEXES,
 };
 pub use plan_cache::{
     extract_plan_references, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,

@@ -2630,6 +2630,13 @@ impl<'db> Transaction<'db> {
                         rows
                     }
                 },
+                crate::query::optimizer::AccessPath::MultiIndexScan {
+                    strategy,
+                    child_scans,
+                } => {
+                    let (rows, _) = table.multi_index_scan(*strategy, child_scans)?;
+                    rows
+                }
                 crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
             };
 
@@ -2771,6 +2778,13 @@ impl<'db> Transaction<'db> {
                         rows
                     }
                 },
+                crate::query::optimizer::AccessPath::MultiIndexScan {
+                    strategy,
+                    child_scans,
+                } => {
+                    let (rows, _) = table.multi_index_scan(*strategy, child_scans)?;
+                    rows
+                }
                 crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
             };
 
@@ -3178,6 +3192,7 @@ impl<'db> Transaction<'db> {
                 let mut index_lookups = 0;
                 let mut is_index_only = false;
                 let mut skip_scan_stats: Option<crate::engine::table::SkipScanStats> = None;
+                let mut multi_index_stats: Option<crate::engine::table::MultiIndexScanStats> = None;
                 let initial_rows = match &plan.base_table.access_path {
                     crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
                         index_lookups = 1;
@@ -3252,6 +3267,15 @@ impl<'db> Transaction<'db> {
                             }
                         }
                     }
+                    crate::query::optimizer::AccessPath::MultiIndexScan {
+                        strategy,
+                        child_scans,
+                    } => {
+                        let (rows, stats) = table.multi_index_scan(*strategy, child_scans)?;
+                        index_lookups = stats.indexes_used;
+                        multi_index_stats = Some(stats);
+                        rows
+                    }
                     crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
                 };
 
@@ -3272,15 +3296,30 @@ impl<'db> Transaction<'db> {
                     scan_metric.counters.skip_scan_probes = stats.skip_scan_probes;
                     scan_metric.counters.index_entries_examined = stats.index_entries_examined;
                 }
+                if let Some(stats) = &multi_index_stats {
+                    scan_metric.counters.indexes_used = stats.indexes_used;
+                    scan_metric.counters.candidate_rows_before_set_operation =
+                        stats.candidate_rows_before_set_operation;
+                    scan_metric.counters.candidate_rows_after_set_operation =
+                        stats.candidate_rows_after_set_operation;
+                    scan_metric.counters.record_ids_intersected = stats.record_ids_intersected;
+                    scan_metric.counters.record_ids_unioned = stats.record_ids_unioned;
+                    scan_metric.counters.duplicate_record_ids_removed =
+                        stats.duplicate_record_ids_removed;
+                    scan_metric.counters.base_records_fetched = stats.base_records_fetched;
+                    scan_metric.counters.index_entries_examined =
+                        stats.candidate_rows_before_set_operation;
+                    scan_metric.counters.tuples_fetched = stats.base_records_fetched;
+                }
                 if is_index_only {
                     scan_metric.counters.tuples_fetched = 0;
                     scan_metric.counters.base_records_fetched = 0;
                     scan_metric.counters.base_records_avoided = initial_rows.len();
-                    if skip_scan_stats.is_none() {
+                    if skip_scan_stats.is_none() && multi_index_stats.is_none() {
                         scan_metric.counters.index_entries_examined = initial_rows.len();
                     }
                     scan_metric.counters.covered_rows_output = initial_rows.len();
-                } else {
+                } else if multi_index_stats.is_none() {
                     scan_metric.counters.tuples_fetched = initial_rows.len();
                     scan_metric.counters.base_records_fetched = initial_rows.len();
                     scan_metric.counters.base_records_avoided = 0;
@@ -3422,6 +3461,8 @@ impl<'db> Transaction<'db> {
                     let mut index_lookups = 0;
                     let mut is_index_only = false;
                     let mut skip_scan_stats: Option<crate::engine::table::SkipScanStats> = None;
+                    let mut multi_index_stats: Option<crate::engine::table::MultiIndexScanStats> =
+                        None;
                     let initial_rows = match &join.right.access_path {
                         crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
                             index_lookups = 1;
@@ -3503,6 +3544,15 @@ impl<'db> Transaction<'db> {
                                 }
                             }
                         }
+                        crate::query::optimizer::AccessPath::MultiIndexScan {
+                            strategy,
+                            child_scans,
+                        } => {
+                            let (rows, stats) = table.multi_index_scan(*strategy, child_scans)?;
+                            index_lookups = stats.indexes_used;
+                            multi_index_stats = Some(stats);
+                            rows
+                        }
                         crate::query::optimizer::AccessPath::FullTableScan => {
                             table.scan(None, None)?
                         }
@@ -3525,15 +3575,30 @@ impl<'db> Transaction<'db> {
                         scan_metric.counters.skip_scan_probes = stats.skip_scan_probes;
                         scan_metric.counters.index_entries_examined = stats.index_entries_examined;
                     }
+                    if let Some(stats) = &multi_index_stats {
+                        scan_metric.counters.indexes_used = stats.indexes_used;
+                        scan_metric.counters.candidate_rows_before_set_operation =
+                            stats.candidate_rows_before_set_operation;
+                        scan_metric.counters.candidate_rows_after_set_operation =
+                            stats.candidate_rows_after_set_operation;
+                        scan_metric.counters.record_ids_intersected = stats.record_ids_intersected;
+                        scan_metric.counters.record_ids_unioned = stats.record_ids_unioned;
+                        scan_metric.counters.duplicate_record_ids_removed =
+                            stats.duplicate_record_ids_removed;
+                        scan_metric.counters.base_records_fetched = stats.base_records_fetched;
+                        scan_metric.counters.index_entries_examined =
+                            stats.candidate_rows_before_set_operation;
+                        scan_metric.counters.tuples_fetched = stats.base_records_fetched;
+                    }
                     if is_index_only {
                         scan_metric.counters.tuples_fetched = 0;
                         scan_metric.counters.base_records_fetched = 0;
                         scan_metric.counters.base_records_avoided = initial_rows.len();
-                        if skip_scan_stats.is_none() {
+                        if skip_scan_stats.is_none() && multi_index_stats.is_none() {
                             scan_metric.counters.index_entries_examined = initial_rows.len();
                         }
                         scan_metric.counters.covered_rows_output = initial_rows.len();
-                    } else {
+                    } else if multi_index_stats.is_none() {
                         scan_metric.counters.tuples_fetched = initial_rows.len();
                         scan_metric.counters.base_records_fetched = initial_rows.len();
                         scan_metric.counters.base_records_avoided = 0;

@@ -9,10 +9,10 @@ pub mod storage;
 pub mod wal;
 
 pub use engine::{
-    Catalog, CatalogPage, Column, DataType, IndexId, IndexMetadata, Row, Schema, StatementResult,
-    Table, TableId, TableMetadata, Transaction, TreeDb, TxnState, Value, CATALOG_MAGIC,
-    CURRENT_CATALOG_VERSION, MAX_COLUMN_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
-    TUPLE_FORMAT_VERSION,
+    Catalog, CatalogPage, Column, DataType, IndexId, IndexMetadata, MultiIndexScanStats, Row,
+    Schema, StatementResult, Table, TableId, TableMetadata, Transaction, TreeDb, TxnState, Value,
+    CATALOG_MAGIC, CURRENT_CATALOG_VERSION, MAX_COLUMN_NAME_LEN, MAX_INDEX_NAME_LEN,
+    MAX_TABLE_NAME_LEN, TUPLE_FORMAT_VERSION,
 };
 pub use error::{Error, Result};
 pub use index::{
@@ -26,14 +26,16 @@ pub use query::{
     estimate_error_ratio, AggregateConfig, AggregateExecutionMetrics, AggregateOperator,
     AggregateState, BinaryOp, CardinalityEstimator, ColumnStatistics, CostModel, Expr,
     ExternalAggregator, ExternalHashJoiner, ExternalSorter, FilterOperator, IndexStatistics,
-    JoinConfig, JoinExecutionMetrics, JoinKey, OffsetLimitOperator, OperatorCounters, OperatorKind,
-    OperatorMetrics, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,
-    PlanCacheStats, PlanCost, PlanValidity, ProjectOperator, Query, QueryExecutionMetrics,
-    QueryResult, RunReader, SortConfig, SortDirection, SortExecutionMetrics, SortKey, SortOperator,
-    StatisticsProvider, StatsRegistry, TableStatistics, TempAggregateFile, TempJoinFile,
-    TempRunFile, UnaryOp, DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES, DEFAULT_JOIN_MEMORY_BUDGET_BYTES,
+    JoinConfig, JoinExecutionMetrics, JoinKey, MultiIndexChildScan, MultiIndexStrategy,
+    OffsetLimitOperator, OperatorCounters, OperatorKind, OperatorMetrics, ParamPlanningSignature,
+    PlanCache, PlanCacheEntry, PlanCacheKey, PlanCacheStats, PlanCost, PlanValidity,
+    ProjectOperator, Query, QueryExecutionMetrics, QueryResult, RunReader, SortConfig,
+    SortDirection, SortExecutionMetrics, SortKey, SortOperator, StatisticsProvider, StatsRegistry,
+    TableStatistics, TempAggregateFile, TempJoinFile, TempRunFile, UnaryOp,
+    DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES, DEFAULT_JOIN_MEMORY_BUDGET_BYTES,
     DEFAULT_MAX_MERGE_PASSES, DEFAULT_MAX_TEMP_BYTES, DEFAULT_MAX_TEMP_FILES,
-    DEFAULT_PLAN_CACHE_CAPACITY, DEFAULT_SORT_MEMORY_BUDGET_BYTES, SKIP_SCAN_PROBE_COST,
+    DEFAULT_PLAN_CACHE_CAPACITY, DEFAULT_SORT_MEMORY_BUDGET_BYTES, MAX_MULTI_INDEXES,
+    RECORD_ID_SET_OP_CPU_COST, SKIP_SCAN_PROBE_COST,
 };
 
 pub use sql::{

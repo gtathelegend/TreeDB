@@ -5,12 +5,54 @@ use crate::engine::catalog::{IndexId, IndexMetadata};
 use crate::engine::types::{DataType, Schema, Value};
 use crate::error::Result;
 use crate::query::cardinality::CardinalityEstimator;
-use crate::query::cost::CostModel;
+use crate::query::cost::{CostModel, SEC_INDEX_FETCH_COST, SEC_INDEX_LOOKUP_COST};
 use crate::query::expr::{AggregateExpr, BinaryOp, Expr};
 use crate::query::operator::SortKey;
 use crate::query::stats::TableStatistics;
 use crate::sql::ast::JoinType;
 use crate::sql::binder::BoundSelect;
+
+/// Strategy for combining candidate RecordId sets from multiple index scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiIndexStrategy {
+    /// Candidate sets are intersected (AND conjunction).
+    Intersection,
+    /// Candidate sets are unioned with deduplication (OR disjunction).
+    Union,
+}
+
+impl fmt::Display for MultiIndexStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Intersection => write!(f, "INTERSECTION"),
+            Self::Union => write!(f, "UNION"),
+        }
+    }
+}
+
+/// An individual index scan contributing candidate RecordIds to a multi-index scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiIndexChildScan {
+    /// Name of the participating secondary index.
+    pub index_name: String,
+    /// Identifier of the participating secondary index.
+    pub index_id: IndexId,
+    /// Secondary scan mode.
+    pub scan_type: SecondaryScanType,
+    /// Estimated candidate row count produced by this index scan.
+    pub estimated_rows: f64,
+    /// Estimated candidate scan cost for this index scan.
+    pub cost: f64,
+}
+
+impl fmt::Display for MultiIndexChildScan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}({})", self.index_name, self.scan_type)
+    }
+}
+
+/// Bounded limit on the number of secondary indexes combined in a multi-index scan.
+pub const MAX_MULTI_INDEXES: usize = 3;
 
 /// Physical access path for retrieving candidate rows from an individual table relation.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +76,11 @@ pub enum AccessPath {
         index_id: IndexId,
         scan_type: SecondaryScanType,
         covered_columns: Vec<String>,
+    },
+    /// Multi-index candidate generation combining multiple secondary indexes via intersection or union.
+    MultiIndexScan {
+        strategy: MultiIndexStrategy,
+        child_scans: Vec<MultiIndexChildScan>,
     },
     /// Full sequential scan over all tuples.
     FullTableScan,
@@ -183,6 +230,20 @@ impl fmt::Display for AccessPath {
                     }
                 }
             }
+            Self::MultiIndexScan {
+                strategy,
+                child_scans,
+            } => {
+                let scans_str = child_scans
+                    .iter()
+                    .map(|cs| format!("{}({})", cs.index_name, cs.scan_type))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "MultiIndexScan(strategy={strategy}, indexes=[{scans_str}])"
+                )
+            }
             Self::FullTableScan => write!(f, "FullTableScan"),
         }
     }
@@ -207,6 +268,55 @@ pub enum SecondaryScanType {
         skipped_prefix_columns: Vec<String>,
         constrained_columns: Vec<(String, Value)>,
     },
+}
+
+impl fmt::Display for SecondaryScanType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PointLookup(val) => write!(f, "PointLookup({val})"),
+            Self::CompositePointLookup(vals) => {
+                let s = vals
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "PointLookup(({s}))")
+            }
+            Self::PrefixScan(vals) => {
+                let s = vals
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "PrefixScan(({s}))")
+            }
+            Self::RangeScan { start, end } => {
+                write!(
+                    f,
+                    "RangeScan(start={}, end={})",
+                    start
+                        .as_ref()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "None".into()),
+                    end.as_ref()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "None".into())
+                )
+            }
+            Self::SkipScan {
+                skipped_prefix_columns,
+                constrained_columns,
+            } => {
+                let p = skipped_prefix_columns.join(", ");
+                let c = constrained_columns
+                    .iter()
+                    .map(|(col, val)| format!("{col} = {val}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "SkipScan(skipped=[{p}], constrained=[{c}])")
+            }
+        }
+    }
 }
 
 /// Physical table scan node.
@@ -2391,6 +2501,429 @@ fn plan_table_scan(
         }
     }
 
+    // Candidate 5: Multi-Index Scans (Intersection for AND, Union for OR)
+    let table_rows = CardinalityEstimator::estimate_table_rows(table.stats.as_ref());
+
+    // 5a. Extract single-index candidate atoms from unqual_conjuncts
+    #[derive(Debug, Clone)]
+    struct SingleIndexAtom {
+        index_name: String,
+        index_id: IndexId,
+        scan_type: SecondaryScanType,
+        used_conjunct_indices: Vec<usize>,
+        estimated_rows: f64,
+        cost: f64,
+        selectivity: f64,
+    }
+
+    let mut atoms: Vec<SingleIndexAtom> = Vec::new();
+
+    for sec_meta in &table.indexes {
+        if sec_meta.column_indices.len() == 1 {
+            let sec_col = &schema.columns[sec_meta.column_idx];
+            let col_name = &sec_col.name;
+            let col_type = sec_col.data_type;
+
+            // Point lookups
+            for (idx, conj) in unqual_conjuncts.iter().enumerate() {
+                if let Some(val) = extract_col_equality(conj, col_name, col_type) {
+                    if !val.is_null() {
+                        let est_rows = CardinalityEstimator::estimate_sec_point_rows(
+                            table.stats.as_ref(),
+                            sec_meta,
+                        );
+                        let scan_cost = SEC_INDEX_LOOKUP_COST + (SEC_INDEX_FETCH_COST * est_rows);
+                        let sel = (est_rows / table_rows.max(1.0)).clamp(0.0, 1.0);
+                        atoms.push(SingleIndexAtom {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::PointLookup(val),
+                            used_conjunct_indices: vec![idx],
+                            estimated_rows: est_rows,
+                            cost: scan_cost,
+                            selectivity: sel,
+                        });
+                    }
+                }
+            }
+
+            // Range scans
+            let (sec_start, sec_end, used_indices) =
+                extract_col_range_bounds(&unqual_conjuncts, col_name, col_type);
+            if sec_start.is_some() || sec_end.is_some() {
+                let est_rows = CardinalityEstimator::estimate_sec_range_rows(
+                    table.stats.as_ref(),
+                    sec_meta,
+                    sec_start.as_ref(),
+                    sec_end.as_ref(),
+                );
+                let scan_cost = SEC_INDEX_LOOKUP_COST + (SEC_INDEX_FETCH_COST * est_rows);
+                let sel = (est_rows / table_rows.max(1.0)).clamp(0.0, 1.0);
+                atoms.push(SingleIndexAtom {
+                    index_name: sec_meta.name.clone(),
+                    index_id: sec_meta.index_id,
+                    scan_type: SecondaryScanType::RangeScan {
+                        start: sec_start,
+                        end: sec_end,
+                    },
+                    used_conjunct_indices: used_indices.into_iter().collect(),
+                    estimated_rows: est_rows,
+                    cost: scan_cost,
+                    selectivity: sel,
+                });
+            }
+        } else {
+            // Composite index prefix/point lookups
+            let mut prefix_values = Vec::new();
+            let mut prefix_used = HashSet::new();
+            for &col_idx in &sec_meta.column_indices {
+                let col = &schema.columns[col_idx];
+                let mut found_eq = false;
+                for (idx, conj) in unqual_conjuncts.iter().enumerate() {
+                    if prefix_used.contains(&idx) {
+                        continue;
+                    }
+                    if let Some(val) = extract_col_equality(conj, &col.name, col.data_type) {
+                        if !val.is_null() {
+                            prefix_values.push(val);
+                            prefix_used.insert(idx);
+                            found_eq = true;
+                            break;
+                        }
+                    }
+                }
+                if !found_eq {
+                    break;
+                }
+            }
+
+            if prefix_values.len() == sec_meta.column_indices.len() {
+                let est_rows =
+                    CardinalityEstimator::estimate_sec_point_rows(table.stats.as_ref(), sec_meta);
+                let scan_cost = SEC_INDEX_LOOKUP_COST + (SEC_INDEX_FETCH_COST * est_rows);
+                let sel = (est_rows / table_rows.max(1.0)).clamp(0.0, 1.0);
+                atoms.push(SingleIndexAtom {
+                    index_name: sec_meta.name.clone(),
+                    index_id: sec_meta.index_id,
+                    scan_type: SecondaryScanType::CompositePointLookup(prefix_values),
+                    used_conjunct_indices: prefix_used.into_iter().collect(),
+                    estimated_rows: est_rows,
+                    cost: scan_cost,
+                    selectivity: sel,
+                });
+            } else if !prefix_values.is_empty() {
+                let est_rows = CardinalityEstimator::estimate_sec_prefix_rows(
+                    table.stats.as_ref(),
+                    sec_meta,
+                    prefix_values.len(),
+                );
+                let scan_cost = SEC_INDEX_LOOKUP_COST + (SEC_INDEX_FETCH_COST * est_rows);
+                let sel = (est_rows / table_rows.max(1.0)).clamp(0.0, 1.0);
+                atoms.push(SingleIndexAtom {
+                    index_name: sec_meta.name.clone(),
+                    index_id: sec_meta.index_id,
+                    scan_type: SecondaryScanType::PrefixScan(prefix_values),
+                    used_conjunct_indices: prefix_used.into_iter().collect(),
+                    estimated_rows: est_rows,
+                    cost: scan_cost,
+                    selectivity: sel,
+                });
+            }
+        }
+    }
+
+    // Sort candidate atoms by selectivity ascending (most selective first)
+    atoms.sort_by(|a, b| a.selectivity.total_cmp(&b.selectivity));
+    atoms.truncate(6); // Deterministic bounding
+
+    // 5b. Multi-Index Intersection (AND) - Combinations of 2 and 3 indexes
+    if atoms.len() >= 2 {
+        // 2-index combinations
+        for i in 0..atoms.len() {
+            for j in (i + 1)..atoms.len() {
+                let a1 = &atoms[i];
+                let a2 = &atoms[j];
+                if a1.index_id == a2.index_id {
+                    continue;
+                }
+                let mut used_set: HashSet<usize> =
+                    a1.used_conjunct_indices.iter().copied().collect();
+                for &u in &a2.used_conjunct_indices {
+                    used_set.insert(u);
+                }
+                let residual_conjuncts: Vec<Expr> = unqual_conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| !used_set.contains(idx))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                let residual_filter = recombine_conjunction(residual_conjuncts.clone());
+                let est_rows = CardinalityEstimator::estimate_intersection_cardinality(
+                    table_rows,
+                    &[a1.selectivity, a2.selectivity],
+                );
+                let cost = CostModel::multi_index_intersection_cost(
+                    &[a1.cost, a2.cost],
+                    &[a1.estimated_rows, a2.estimated_rows],
+                    est_rows,
+                    residual_conjuncts.len(),
+                );
+                candidates.push(AccessPathCandidate {
+                    access_path: AccessPath::MultiIndexScan {
+                        strategy: MultiIndexStrategy::Intersection,
+                        child_scans: vec![
+                            MultiIndexChildScan {
+                                index_name: a1.index_name.clone(),
+                                index_id: a1.index_id,
+                                scan_type: a1.scan_type.clone(),
+                                estimated_rows: a1.estimated_rows,
+                                cost: a1.cost,
+                            },
+                            MultiIndexChildScan {
+                                index_name: a2.index_name.clone(),
+                                index_id: a2.index_id,
+                                scan_type: a2.scan_type.clone(),
+                                estimated_rows: a2.estimated_rows,
+                                cost: a2.cost,
+                            },
+                        ],
+                    },
+                    residual_filter,
+                    estimated_rows: est_rows,
+                    cost,
+                    priority: 2,
+                    index_id: None,
+                    index_name: None,
+                });
+            }
+        }
+
+        // 3-index combinations
+        if atoms.len() >= 3 && MAX_MULTI_INDEXES >= 3 {
+            for i in 0..atoms.len() {
+                for j in (i + 1)..atoms.len() {
+                    for k in (j + 1)..atoms.len() {
+                        let a1 = &atoms[i];
+                        let a2 = &atoms[j];
+                        let a3 = &atoms[k];
+                        if a1.index_id == a2.index_id
+                            || a1.index_id == a3.index_id
+                            || a2.index_id == a3.index_id
+                        {
+                            continue;
+                        }
+                        let mut used_set: HashSet<usize> =
+                            a1.used_conjunct_indices.iter().copied().collect();
+                        for &u in &a2.used_conjunct_indices {
+                            used_set.insert(u);
+                        }
+                        for &u in &a3.used_conjunct_indices {
+                            used_set.insert(u);
+                        }
+                        let residual_conjuncts: Vec<Expr> = unqual_conjuncts
+                            .iter()
+                            .enumerate()
+                            .filter(|(idx, _)| !used_set.contains(idx))
+                            .map(|(_, c)| c.clone())
+                            .collect();
+                        let residual_filter = recombine_conjunction(residual_conjuncts.clone());
+                        let est_rows = CardinalityEstimator::estimate_intersection_cardinality(
+                            table_rows,
+                            &[a1.selectivity, a2.selectivity, a3.selectivity],
+                        );
+                        let cost = CostModel::multi_index_intersection_cost(
+                            &[a1.cost, a2.cost, a3.cost],
+                            &[a1.estimated_rows, a2.estimated_rows, a3.estimated_rows],
+                            est_rows,
+                            residual_conjuncts.len(),
+                        );
+                        candidates.push(AccessPathCandidate {
+                            access_path: AccessPath::MultiIndexScan {
+                                strategy: MultiIndexStrategy::Intersection,
+                                child_scans: vec![
+                                    MultiIndexChildScan {
+                                        index_name: a1.index_name.clone(),
+                                        index_id: a1.index_id,
+                                        scan_type: a1.scan_type.clone(),
+                                        estimated_rows: a1.estimated_rows,
+                                        cost: a1.cost,
+                                    },
+                                    MultiIndexChildScan {
+                                        index_name: a2.index_name.clone(),
+                                        index_id: a2.index_id,
+                                        scan_type: a2.scan_type.clone(),
+                                        estimated_rows: a2.estimated_rows,
+                                        cost: a2.cost,
+                                    },
+                                    MultiIndexChildScan {
+                                        index_name: a3.index_name.clone(),
+                                        index_id: a3.index_id,
+                                        scan_type: a3.scan_type.clone(),
+                                        estimated_rows: a3.estimated_rows,
+                                        cost: a3.cost,
+                                    },
+                                ],
+                            },
+                            residual_filter,
+                            estimated_rows: est_rows,
+                            cost,
+                            priority: 2,
+                            index_id: None,
+                            index_name: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 5c. Multi-Index Union (OR)
+    for conj in &unqual_conjuncts {
+        let disjuncts = split_disjunction(conj);
+        if disjuncts.len() >= 2 && disjuncts.len() <= MAX_MULTI_INDEXES {
+            let mut branch_scans: Vec<MultiIndexChildScan> = Vec::new();
+            let mut branch_selectivities: Vec<f64> = Vec::new();
+            let mut branch_costs: Vec<f64> = Vec::new();
+            let mut branch_est_rows: Vec<f64> = Vec::new();
+            let mut all_branches_indexed = true;
+
+            for d in &disjuncts {
+                let mut matched_branch = None;
+                // Check single-column equality or range for each index
+                for sec_meta in &table.indexes {
+                    if sec_meta.column_indices.len() == 1 {
+                        let sec_col = &schema.columns[sec_meta.column_idx];
+                        if let Some(val) = extract_col_equality(d, &sec_col.name, sec_col.data_type)
+                        {
+                            if !val.is_null() {
+                                let est_rows = CardinalityEstimator::estimate_sec_point_rows(
+                                    table.stats.as_ref(),
+                                    sec_meta,
+                                );
+                                let scan_cost =
+                                    SEC_INDEX_LOOKUP_COST + (SEC_INDEX_FETCH_COST * est_rows);
+                                let sel = (est_rows / table_rows.max(1.0)).clamp(0.0, 1.0);
+                                matched_branch = Some((
+                                    MultiIndexChildScan {
+                                        index_name: sec_meta.name.clone(),
+                                        index_id: sec_meta.index_id,
+                                        scan_type: SecondaryScanType::PointLookup(val),
+                                        estimated_rows: est_rows,
+                                        cost: scan_cost,
+                                    },
+                                    sel,
+                                    scan_cost,
+                                    est_rows,
+                                ));
+                                break;
+                            }
+                        }
+
+                        let (sec_start, sec_end, _) = extract_col_range_bounds(
+                            std::slice::from_ref(d),
+                            &sec_col.name,
+                            sec_col.data_type,
+                        );
+                        if sec_start.is_some() || sec_end.is_some() {
+                            let est_rows = CardinalityEstimator::estimate_sec_range_rows(
+                                table.stats.as_ref(),
+                                sec_meta,
+                                sec_start.as_ref(),
+                                sec_end.as_ref(),
+                            );
+                            let scan_cost =
+                                SEC_INDEX_LOOKUP_COST + (SEC_INDEX_FETCH_COST * est_rows);
+                            let sel = (est_rows / table_rows.max(1.0)).clamp(0.0, 1.0);
+                            matched_branch = Some((
+                                MultiIndexChildScan {
+                                    index_name: sec_meta.name.clone(),
+                                    index_id: sec_meta.index_id,
+                                    scan_type: SecondaryScanType::RangeScan {
+                                        start: sec_start,
+                                        end: sec_end,
+                                    },
+                                    estimated_rows: est_rows,
+                                    cost: scan_cost,
+                                },
+                                sel,
+                                scan_cost,
+                                est_rows,
+                            ));
+                            break;
+                        }
+                    } else {
+                        // Composite index leading column match
+                        let lead_col = &schema.columns[sec_meta.column_indices[0]];
+                        if let Some(val) =
+                            extract_col_equality(d, &lead_col.name, lead_col.data_type)
+                        {
+                            if !val.is_null() {
+                                let est_rows = CardinalityEstimator::estimate_sec_prefix_rows(
+                                    table.stats.as_ref(),
+                                    sec_meta,
+                                    1,
+                                );
+                                let scan_cost =
+                                    SEC_INDEX_LOOKUP_COST + (SEC_INDEX_FETCH_COST * est_rows);
+                                let sel = (est_rows / table_rows.max(1.0)).clamp(0.0, 1.0);
+                                matched_branch = Some((
+                                    MultiIndexChildScan {
+                                        index_name: sec_meta.name.clone(),
+                                        index_id: sec_meta.index_id,
+                                        scan_type: SecondaryScanType::PrefixScan(vec![val]),
+                                        estimated_rows: est_rows,
+                                        cost: scan_cost,
+                                    },
+                                    sel,
+                                    scan_cost,
+                                    est_rows,
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((child, sel, cost, est_rows)) = matched_branch {
+                    branch_scans.push(child);
+                    branch_selectivities.push(sel);
+                    branch_costs.push(cost);
+                    branch_est_rows.push(est_rows);
+                } else {
+                    all_branches_indexed = false;
+                    break;
+                }
+            }
+
+            if all_branches_indexed && branch_scans.len() == disjuncts.len() {
+                // Keep the full conjunct list in residual filter to ensure 100% 3VL / SQL semantics safety
+                let residual_filter = recombine_conjunction(unqual_conjuncts.clone());
+                let est_rows = CardinalityEstimator::estimate_union_cardinality(
+                    table_rows,
+                    &branch_selectivities,
+                );
+                let cost = CostModel::multi_index_union_cost(
+                    &branch_costs,
+                    &branch_est_rows,
+                    est_rows,
+                    unqual_conjuncts.len(),
+                );
+                candidates.push(AccessPathCandidate {
+                    access_path: AccessPath::MultiIndexScan {
+                        strategy: MultiIndexStrategy::Union,
+                        child_scans: branch_scans,
+                    },
+                    residual_filter,
+                    estimated_rows: est_rows,
+                    cost,
+                    priority: 2,
+                    index_id: None,
+                    index_name: None,
+                });
+            }
+        }
+    }
+
     // Deterministic Candidate Selection
     candidates.sort_by(|a, b| {
         const EPSILON: f64 = 1e-9;
@@ -2807,4 +3340,41 @@ fn extract_col_range_bounds(
     }
 
     (start, end, used)
+}
+
+/// Splits a boolean expression joined by OR operators into a flat vector of disjunct expressions.
+pub fn split_disjunction(expr: &Expr) -> Vec<Expr> {
+    let mut disjuncts = Vec::new();
+    fn collect(e: &Expr, acc: &mut Vec<Expr>) {
+        match e {
+            Expr::Binary {
+                left,
+                op: BinaryOp::Or,
+                right,
+            } => {
+                collect(left, acc);
+                collect(right, acc);
+            }
+            other => acc.push(other.clone()),
+        }
+    }
+    collect(expr, &mut disjuncts);
+    disjuncts
+}
+
+/// Recombines a vector of disjunct expressions into a single boolean OR expression tree.
+pub fn recombine_disjunction(mut disjuncts: Vec<Expr>) -> Option<Expr> {
+    if disjuncts.is_empty() {
+        None
+    } else {
+        let mut expr = disjuncts.remove(0);
+        for d in disjuncts {
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op: BinaryOp::Or,
+                right: Box::new(d),
+            };
+        }
+        Some(expr)
+    }
 }

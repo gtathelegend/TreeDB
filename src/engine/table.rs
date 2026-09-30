@@ -21,6 +21,25 @@ pub struct SkipScanStats {
     pub index_entries_examined: usize,
 }
 
+/// Runtime statistics collected during multi-index scan execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MultiIndexScanStats {
+    /// Number of participating secondary indexes.
+    pub indexes_used: usize,
+    /// Total candidate rows collected across all index scans before set operation.
+    pub candidate_rows_before_set_operation: usize,
+    /// Total candidate rows surviving the set operation (intersection or union).
+    pub candidate_rows_after_set_operation: usize,
+    /// Number of record IDs evaluated during intersection.
+    pub record_ids_intersected: usize,
+    /// Number of record IDs combined during union.
+    pub record_ids_unioned: usize,
+    /// Number of duplicate record IDs eliminated during union deduplication.
+    pub duplicate_record_ids_removed: usize,
+    /// Number of base table records fetched from RecordStore.
+    pub base_records_fetched: usize,
+}
+
 /// High-level relational table handle coordinating schema validation,
 /// canonical primary key indexing in the primary B+ Tree, tuple storage in the RecordStore,
 /// and automatic secondary index maintenance.
@@ -744,6 +763,196 @@ impl<'a> Table<'a> {
                 }
 
                 rows.push(Row::new(row_values));
+            }
+        }
+
+        Ok((rows, stats))
+    }
+
+    /// Performs an index skip scan over a composite secondary index, returning candidate `RecordId`s directly
+    /// and the total count of index entries examined.
+    pub fn index_skip_scan_rids(
+        &mut self,
+        index_name: &str,
+        skipped_prefix_len: usize,
+        constrained_suffix: &[Value],
+    ) -> Result<(Vec<RecordId>, usize)> {
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let key_col_types: Vec<crate::engine::types::DataType> = meta
+            .column_indices
+            .iter()
+            .map(|&i| self.metadata.schema.columns[i].data_type)
+            .collect();
+
+        let distinct_prefixes = sec_idx.distinct_prefix_values(
+            self.buffer_pool,
+            meta.column_indices.len(),
+            skipped_prefix_len,
+            &key_col_types,
+        )?;
+
+        let mut rids = Vec::new();
+        let total_cols = meta.column_indices.len();
+        let mut entries_examined = 0;
+
+        for prefix in distinct_prefixes {
+            let mut probe_values = prefix;
+            probe_values.extend_from_slice(constrained_suffix);
+
+            let entries = if probe_values.len() == total_cols {
+                let key = crate::index::composite::CompositeIndexKey::from_values(&probe_values)
+                    .to_index_key(total_cols);
+                sec_idx.lookup_entries(self.buffer_pool, &key)?
+            } else {
+                let start_bytes = crate::index::composite::CompositeIndexKey::encode_prefix_values(
+                    &probe_values,
+                    total_cols,
+                );
+                let end_bytes =
+                    crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
+                let start_key = IndexKey::new(start_bytes);
+                let end_key = end_bytes.map(IndexKey::new);
+                sec_idx.scan_entries(self.buffer_pool, Some(&start_key), end_key.as_ref())?
+            };
+
+            entries_examined += entries.len();
+            for entry in entries {
+                rids.push(entry.rid);
+            }
+        }
+
+        Ok((rids, entries_examined))
+    }
+
+    /// Scans a secondary index using the specified scan mode, returning candidate `RecordId`s directly
+    /// without fetching base tuples from `RecordStore`.
+    pub fn scan_index_record_ids(
+        &mut self,
+        index_name: &str,
+        scan_type: &crate::query::optimizer::SecondaryScanType,
+    ) -> Result<(Vec<RecordId>, usize)> {
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        match scan_type {
+            crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                if meta.column_indices.len() == 1 {
+                    let key = IndexKey::from_value(val);
+                    let rids = sec_idx.lookup(self.buffer_pool, &key)?;
+                    let count = rids.len();
+                    Ok((rids, count))
+                } else {
+                    let rids =
+                        self.composite_index_lookup_rids(index_name, std::slice::from_ref(val))?;
+                    let count = rids.len();
+                    Ok((rids, count))
+                }
+            }
+            crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals)
+            | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
+                let rids = self.composite_index_lookup_rids(index_name, vals)?;
+                let count = rids.len();
+                Ok((rids, count))
+            }
+            crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
+                let start_key = start.as_ref().map(IndexKey::from_value);
+                let end_key = end.as_ref().map(IndexKey::from_value);
+                let entries =
+                    sec_idx.scan(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?;
+                let count = entries.len();
+                let rids = entries.into_iter().map(|(_k, rid)| rid).collect();
+                Ok((rids, count))
+            }
+            crate::query::optimizer::SecondaryScanType::SkipScan {
+                skipped_prefix_columns,
+                constrained_columns,
+            } => {
+                let constrained_values: Vec<Value> =
+                    constrained_columns.iter().map(|(_, v)| v.clone()).collect();
+                self.index_skip_scan_rids(
+                    index_name,
+                    skipped_prefix_columns.len(),
+                    &constrained_values,
+                )
+            }
+        }
+    }
+
+    /// Executes a multi-index scan combining multiple secondary indexes via Intersection or Union.
+    /// Extracts candidate `RecordId`s directly from index leaves, performs the set operation,
+    /// and fetches raw tuples from `RecordStore` only for surviving candidates.
+    pub fn multi_index_scan(
+        &mut self,
+        strategy: crate::query::optimizer::MultiIndexStrategy,
+        child_scans: &[crate::query::optimizer::MultiIndexChildScan],
+    ) -> Result<(Vec<Row>, MultiIndexScanStats)> {
+        let mut stats = MultiIndexScanStats {
+            indexes_used: child_scans.len(),
+            ..Default::default()
+        };
+
+        if child_scans.is_empty() {
+            return Ok((Vec::new(), stats));
+        }
+
+        let mut child_rid_lists: Vec<Vec<RecordId>> = Vec::with_capacity(child_scans.len());
+        for child in child_scans {
+            let (rids, _examined) =
+                self.scan_index_record_ids(&child.index_name, &child.scan_type)?;
+            stats.candidate_rows_before_set_operation += rids.len();
+            child_rid_lists.push(rids);
+        }
+
+        let final_rids: Vec<RecordId> = match strategy {
+            crate::query::optimizer::MultiIndexStrategy::Intersection => {
+                if child_rid_lists.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut current_set: std::collections::BTreeSet<RecordId> =
+                        child_rid_lists[0].iter().copied().collect();
+                    for next_list in &child_rid_lists[1..] {
+                        let next_set: std::collections::BTreeSet<RecordId> =
+                            next_list.iter().copied().collect();
+                        current_set = current_set.intersection(&next_set).copied().collect();
+                    }
+                    stats.record_ids_intersected = stats.candidate_rows_before_set_operation;
+                    stats.candidate_rows_after_set_operation = current_set.len();
+                    current_set.into_iter().collect()
+                }
+            }
+            crate::query::optimizer::MultiIndexStrategy::Union => {
+                let mut seen = std::collections::BTreeSet::new();
+                let mut union_rids = Vec::new();
+                for rid in child_rid_lists.into_iter().flatten() {
+                    if seen.insert(rid) {
+                        union_rids.push(rid);
+                    } else {
+                        stats.duplicate_record_ids_removed += 1;
+                    }
+                }
+                stats.record_ids_unioned = stats.candidate_rows_before_set_operation;
+                stats.candidate_rows_after_set_operation = union_rids.len();
+                union_rids
+            }
+        };
+
+        // Fetch base records from RecordStore only for surviving candidate RecordIds
+        let mut rows = Vec::with_capacity(final_rids.len());
+        for rid in final_rids {
+            if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+                let row = self.metadata.schema.decode_tuple(&bytes)?;
+                rows.push(row);
+                stats.base_records_fetched += 1;
             }
         }
 

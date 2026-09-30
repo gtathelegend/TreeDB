@@ -7,7 +7,7 @@ pub use catalog::{
     Catalog, CatalogPage, IndexId, IndexMetadata, TableId, TableMetadata, CATALOG_MAGIC,
     CURRENT_CATALOG_VERSION, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
 };
-pub use table::Table;
+pub use table::{MultiIndexScanStats, SkipScanStats, Table};
 pub use transaction::{StatementResult, Transaction, TxnState};
 pub use types::{Column, DataType, Row, Schema, Value, MAX_COLUMN_NAME_LEN, TUPLE_FORMAT_VERSION};
 
