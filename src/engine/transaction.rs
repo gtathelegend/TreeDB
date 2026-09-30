@@ -643,6 +643,7 @@ impl<'db> Transaction<'db> {
             self.db.catalog_generation += 1;
             self.db.index_generation += 1;
             self.db.plan_cache.invalidate_all();
+            self.db.feedback_registry.clear_table(table_name);
         }
         res
     }
@@ -656,6 +657,7 @@ impl<'db> Transaction<'db> {
             self.db.catalog_generation += 1;
             self.db.index_generation += 1;
             self.db.plan_cache.invalidate_all();
+            self.db.feedback_registry.clear_all();
         }
         res
     }
@@ -1217,7 +1219,14 @@ impl<'db> Transaction<'db> {
             params,
         )?;
         bound.ctes = visible_ctes;
-        let mut plan = crate::query::optimizer::Optimizer::optimize(&bound, &table_infos)?;
+        let param_sig = params.map(crate::query::ParamPlanningSignature::from_values);
+        let mut plan = crate::query::optimizer::Optimizer::optimize_with_feedback(
+            &bound,
+            &table_infos,
+            Some(&self.db.feedback_registry),
+            param_sig.as_ref(),
+            self.db.statistics_generation,
+        )?;
         plan.logical_rewrites = rewrite_logs;
         Ok(plan)
     }
@@ -1740,6 +1749,7 @@ impl<'db> Transaction<'db> {
                 let plan_str = if explain_stmt.analyze {
                     let start = std::time::Instant::now();
                     let (res, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                    self.record_plan_execution_feedback(&plan, &root_op, None);
                     let metrics = crate::query::QueryExecutionMetrics::new(
                         start.elapsed(),
                         res.rows.len(),
@@ -1761,12 +1771,14 @@ impl<'db> Transaction<'db> {
             }
             crate::sql::Statement::Select(select_stmt) => {
                 let plan = self.plan_select(&select_stmt)?;
-                let query_result = self.execute_physical_plan(&plan)?;
+                let (query_result, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                self.record_plan_execution_feedback(&plan, &root_op, None);
                 Ok(StatementResult::Query(query_result))
             }
             crate::sql::Statement::SetQuery(set_stmt) => {
                 let plan = self.plan_set_query(&set_stmt)?;
-                let query_result = self.execute_physical_plan(&plan)?;
+                let (query_result, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                self.record_plan_execution_feedback(&plan, &root_op, None);
                 Ok(StatementResult::Query(query_result))
             }
             crate::sql::Statement::CreateTable(create_stmt) => {
@@ -1809,6 +1821,7 @@ impl<'db> Transaction<'db> {
             crate::sql::Statement::Select(select_stmt) => {
                 let plan = self.plan_select(&select_stmt)?;
                 let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                self.record_plan_execution_feedback(&plan, &root_op, None);
                 let metrics = crate::query::QueryExecutionMetrics::new(
                     start.elapsed(),
                     qr.rows.len(),
@@ -1819,6 +1832,7 @@ impl<'db> Transaction<'db> {
             crate::sql::Statement::SetQuery(set_stmt) => {
                 let plan = self.plan_set_query(&set_stmt)?;
                 let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                self.record_plan_execution_feedback(&plan, &root_op, None);
                 let metrics = crate::query::QueryExecutionMetrics::new(
                     start.elapsed(),
                     qr.rows.len(),
@@ -1845,6 +1859,7 @@ impl<'db> Transaction<'db> {
                         };
                         let plan_str = if explain_stmt.analyze {
                             let (res, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                            self.record_plan_execution_feedback(&plan, &root_op, None);
                             let metrics = crate::query::QueryExecutionMetrics::new(
                                 start.elapsed(),
                                 res.rows.len(),
@@ -2054,24 +2069,44 @@ impl<'db> Transaction<'db> {
 
         match &stmt.statement {
             crate::sql::Statement::Select(select_stmt) => {
+                let param_sig = crate::query::ParamPlanningSignature::from_values(params);
                 let plan = if self.has_catalog_mutations {
                     self.plan_select_with_params(select_stmt, Some(params))?
                 } else {
-                    let param_sig = crate::query::ParamPlanningSignature::from_values(params);
                     let key = crate::query::PlanCacheKey::new(
                         &stmt.sql,
-                        param_sig,
+                        param_sig.clone(),
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
                     );
-                    if let Some(cached_plan) = self.db.plan_cache.get(
+                    let maybe_cached = self.db.plan_cache.get(
                         &key,
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
-                    ) {
-                        cached_plan
+                    );
+                    if let Some(cached_plan) = maybe_cached {
+                        if self
+                            .check_plan_cache_should_replan(&cached_plan, Some(param_sig.clone()))
+                        {
+                            self.db.plan_cache.remove(&key);
+                            let new_plan =
+                                self.plan_select_with_params(select_stmt, Some(params))?;
+                            let (tables, indexes) =
+                                crate::query::extract_plan_references(&new_plan);
+                            let validity = crate::query::PlanValidity::new(
+                                self.db.catalog_generation,
+                                self.db.index_generation,
+                                self.db.statistics_generation,
+                                tables,
+                                indexes,
+                            );
+                            self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                            new_plan
+                        } else {
+                            cached_plan
+                        }
                     } else {
                         let new_plan = self.plan_select_with_params(select_stmt, Some(params))?;
                         let (tables, indexes) = crate::query::extract_plan_references(&new_plan);
@@ -2086,28 +2121,49 @@ impl<'db> Transaction<'db> {
                         new_plan
                     }
                 };
-                let query_result = self.execute_physical_plan(&plan)?;
+                let (query_result, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig));
                 Ok(StatementResult::Query(query_result))
             }
             crate::sql::Statement::SetQuery(set_stmt) => {
+                let param_sig = crate::query::ParamPlanningSignature::from_values(params);
                 let plan = if self.has_catalog_mutations {
                     self.plan_set_query_with_params(set_stmt, Some(params))?
                 } else {
-                    let param_sig = crate::query::ParamPlanningSignature::from_values(params);
                     let key = crate::query::PlanCacheKey::new(
                         &stmt.sql,
-                        param_sig,
+                        param_sig.clone(),
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
                     );
-                    if let Some(cached_plan) = self.db.plan_cache.get(
+                    let maybe_cached = self.db.plan_cache.get(
                         &key,
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
-                    ) {
-                        cached_plan
+                    );
+                    if let Some(cached_plan) = maybe_cached {
+                        if self
+                            .check_plan_cache_should_replan(&cached_plan, Some(param_sig.clone()))
+                        {
+                            self.db.plan_cache.remove(&key);
+                            let new_plan =
+                                self.plan_set_query_with_params(set_stmt, Some(params))?;
+                            let (tables, indexes) =
+                                crate::query::extract_plan_references(&new_plan);
+                            let validity = crate::query::PlanValidity::new(
+                                self.db.catalog_generation,
+                                self.db.index_generation,
+                                self.db.statistics_generation,
+                                tables,
+                                indexes,
+                            );
+                            self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                            new_plan
+                        } else {
+                            cached_plan
+                        }
                     } else {
                         let new_plan = self.plan_set_query_with_params(set_stmt, Some(params))?;
                         let (tables, indexes) = crate::query::extract_plan_references(&new_plan);
@@ -2122,7 +2178,8 @@ impl<'db> Transaction<'db> {
                         new_plan
                     }
                 };
-                let query_result = self.execute_physical_plan(&plan)?;
+                let (query_result, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig));
                 Ok(StatementResult::Query(query_result))
             }
             crate::sql::Statement::Insert(insert_stmt) => {
@@ -2152,6 +2209,11 @@ impl<'db> Transaction<'db> {
                 let plan_str = if explain_stmt.analyze {
                     let start = std::time::Instant::now();
                     let (res, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                    self.record_plan_execution_feedback(
+                        &plan,
+                        &root_op,
+                        Some(crate::query::ParamPlanningSignature::from_values(params)),
+                    );
                     let metrics = crate::query::QueryExecutionMetrics::new(
                         start.elapsed(),
                         res.rows.len(),
@@ -2208,27 +2270,47 @@ impl<'db> Transaction<'db> {
 
         match &stmt.statement {
             crate::sql::Statement::Select(select_stmt) => {
+                let param_sig = crate::query::ParamPlanningSignature::from_values(params);
                 let (plan, is_hit) = if self.has_catalog_mutations {
                     (
                         self.plan_select_with_params(select_stmt, Some(params))?,
                         false,
                     )
                 } else {
-                    let param_sig = crate::query::ParamPlanningSignature::from_values(params);
                     let key = crate::query::PlanCacheKey::new(
                         &stmt.sql,
-                        param_sig,
+                        param_sig.clone(),
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
                     );
-                    if let Some(cached_plan) = self.db.plan_cache.get(
+                    let maybe_cached = self.db.plan_cache.get(
                         &key,
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
-                    ) {
-                        (cached_plan, true)
+                    );
+                    if let Some(cached_plan) = maybe_cached {
+                        if self
+                            .check_plan_cache_should_replan(&cached_plan, Some(param_sig.clone()))
+                        {
+                            self.db.plan_cache.remove(&key);
+                            let new_plan =
+                                self.plan_select_with_params(select_stmt, Some(params))?;
+                            let (tables, indexes) =
+                                crate::query::extract_plan_references(&new_plan);
+                            let validity = crate::query::PlanValidity::new(
+                                self.db.catalog_generation,
+                                self.db.index_generation,
+                                self.db.statistics_generation,
+                                tables,
+                                indexes,
+                            );
+                            self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                            (new_plan, false)
+                        } else {
+                            (cached_plan, true)
+                        }
                     } else {
                         let new_plan = self.plan_select_with_params(select_stmt, Some(params))?;
                         let (tables, indexes) = crate::query::extract_plan_references(&new_plan);
@@ -2244,6 +2326,7 @@ impl<'db> Transaction<'db> {
                     }
                 };
                 let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig));
                 let metrics = crate::query::QueryExecutionMetrics::new(
                     start.elapsed(),
                     qr.rows.len(),
@@ -2253,27 +2336,47 @@ impl<'db> Transaction<'db> {
                 Ok((qr, metrics))
             }
             crate::sql::Statement::SetQuery(set_stmt) => {
+                let param_sig = crate::query::ParamPlanningSignature::from_values(params);
                 let (plan, is_hit) = if self.has_catalog_mutations {
                     (
                         self.plan_set_query_with_params(set_stmt, Some(params))?,
                         false,
                     )
                 } else {
-                    let param_sig = crate::query::ParamPlanningSignature::from_values(params);
                     let key = crate::query::PlanCacheKey::new(
                         &stmt.sql,
-                        param_sig,
+                        param_sig.clone(),
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
                     );
-                    if let Some(cached_plan) = self.db.plan_cache.get(
+                    let maybe_cached = self.db.plan_cache.get(
                         &key,
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
-                    ) {
-                        (cached_plan, true)
+                    );
+                    if let Some(cached_plan) = maybe_cached {
+                        if self
+                            .check_plan_cache_should_replan(&cached_plan, Some(param_sig.clone()))
+                        {
+                            self.db.plan_cache.remove(&key);
+                            let new_plan =
+                                self.plan_set_query_with_params(set_stmt, Some(params))?;
+                            let (tables, indexes) =
+                                crate::query::extract_plan_references(&new_plan);
+                            let validity = crate::query::PlanValidity::new(
+                                self.db.catalog_generation,
+                                self.db.index_generation,
+                                self.db.statistics_generation,
+                                tables,
+                                indexes,
+                            );
+                            self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                            (new_plan, false)
+                        } else {
+                            (cached_plan, true)
+                        }
                     } else {
                         let new_plan = self.plan_set_query_with_params(set_stmt, Some(params))?;
                         let (tables, indexes) = crate::query::extract_plan_references(&new_plan);
@@ -2289,6 +2392,7 @@ impl<'db> Transaction<'db> {
                     }
                 };
                 let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
+                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig));
                 let metrics = crate::query::QueryExecutionMetrics::new(
                     start.elapsed(),
                     qr.rows.len(),
@@ -2654,12 +2758,12 @@ impl<'db> Transaction<'db> {
 
         // 4. Update each matching row
         let mut updated_rows = Vec::new();
-        for old_row in candidate_rows {
+        for old_row in &candidate_rows {
             let mut new_values = old_row.values.clone();
 
             for (col_idx, expr) in &col_assignments {
                 let target_col = &schema.columns[*col_idx];
-                let mut val = self.evaluate_expr_with_outer(expr, &old_row, &schema, &[])?;
+                let mut val = self.evaluate_expr_with_outer(expr, old_row, &schema, &[])?;
 
                 val = match (val, target_col.data_type) {
                     (Value::Int64(i), DataType::UInt64) if i >= 0 => Value::UInt64(i as u64),
@@ -2697,6 +2801,25 @@ impl<'db> Transaction<'db> {
             table.update(&new_row)?;
             updated_count += 1;
         }
+
+        // Record scan feedback for DML
+        let param_sig = params.map(crate::query::ParamPlanningSignature::from_values);
+        let scan_key = crate::query::FeedbackKey::scan(
+            &plan.base_table.table_name,
+            plan.base_table.access_path.to_string(),
+            plan.base_table
+                .residual_filter
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_default(),
+            param_sig,
+            self.db.statistics_generation,
+        );
+        let obs = crate::query::FeedbackObservation::new(
+            plan.base_table.estimated_rows,
+            candidate_rows.len() as f64,
+        );
+        self.db.feedback_registry.record(scan_key, obs);
 
         Ok(StatementResult::Updated {
             rows: updated_count,
@@ -2810,12 +2933,31 @@ impl<'db> Transaction<'db> {
         let mut deleted_count = 0;
         let mut table = self.open_table(&stmt.table_name)?;
 
-        for row in candidate_rows {
+        for row in &candidate_rows {
             let pk_val = &row.values[schema.primary_key_idx];
             if table.delete(pk_val)?.is_some() {
                 deleted_count += 1;
             }
         }
+
+        // Record scan feedback for DML
+        let param_sig = params.map(crate::query::ParamPlanningSignature::from_values);
+        let scan_key = crate::query::FeedbackKey::scan(
+            &plan.base_table.table_name,
+            plan.base_table.access_path.to_string(),
+            plan.base_table
+                .residual_filter
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_default(),
+            param_sig,
+            self.db.statistics_generation,
+        );
+        let obs = crate::query::FeedbackObservation::new(
+            plan.base_table.estimated_rows,
+            candidate_rows.len() as f64,
+        );
+        self.db.feedback_registry.record(scan_key, obs);
 
         Ok(StatementResult::Deleted {
             rows: deleted_count,
@@ -4938,6 +5080,267 @@ impl<'db> Transaction<'db> {
     /// Clears all entries from the physical plan cache.
     pub fn clear_plan_cache(&mut self) {
         self.db.clear_plan_cache();
+    }
+
+    /// Returns a reference to the runtime cardinality feedback registry.
+    pub fn feedback_registry(&self) -> &crate::query::FeedbackRegistry {
+        self.db.feedback_registry()
+    }
+
+    /// Returns a mutable reference to the runtime cardinality feedback registry.
+    pub fn feedback_registry_mut(&mut self) -> &mut crate::query::FeedbackRegistry {
+        self.db.feedback_registry_mut()
+    }
+
+    /// Clears all runtime cardinality feedback entries.
+    pub fn clear_feedback(&mut self) {
+        self.db.clear_feedback();
+    }
+
+    /// Clears runtime cardinality feedback entries for the specified table.
+    pub fn clear_table_feedback(&mut self, table_name: &str) {
+        self.db.clear_table_feedback(table_name);
+    }
+
+    /// Checks whether a cached physical plan has accumulated runtime feedback crossing the replan threshold.
+    pub fn check_plan_cache_should_replan(
+        &self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+        param_sig: Option<crate::query::ParamPlanningSignature>,
+    ) -> bool {
+        let stats_gen = self.db.statistics_generation;
+
+        // 1. Check base table scan
+        let scan_key = crate::query::FeedbackKey::scan(
+            &plan.base_table.table_name,
+            plan.base_table.access_path.to_string(),
+            plan.base_table
+                .residual_filter
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_default(),
+            param_sig.clone(),
+            stats_gen,
+        );
+        if let Some(entry) = self.db.feedback_registry.get(&scan_key) {
+            if entry.should_replan() {
+                return true;
+            }
+        }
+
+        // 2. Check joins
+        let mut left_tbl = plan.base_table.table_name.clone();
+        for join in &plan.joins {
+            let join_key = if join.join_type == crate::sql::JoinType::Semi
+                || join.join_type == crate::sql::JoinType::Anti
+            {
+                crate::query::FeedbackKey::semi_anti(
+                    &left_tbl,
+                    &join.right.table_name,
+                    &join.on,
+                    join.join_type,
+                    param_sig.clone(),
+                    stats_gen,
+                )
+            } else {
+                crate::query::FeedbackKey::join(
+                    &left_tbl,
+                    &join.right.table_name,
+                    &join.on,
+                    join.join_type.to_string(),
+                    param_sig.clone(),
+                    stats_gen,
+                )
+            };
+            if let Some(entry) = self.db.feedback_registry.get(&join_key) {
+                if entry.should_replan() {
+                    return true;
+                }
+            }
+            left_tbl = join.right.table_name.clone();
+        }
+
+        false
+    }
+
+    /// Records execution feedback observations for a completed physical plan execution.
+    pub fn record_plan_execution_feedback(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+        root_op: &crate::query::OperatorMetrics,
+        param_sig: Option<crate::query::ParamPlanningSignature>,
+    ) {
+        let stats_gen = self.db.statistics_generation;
+
+        // 1. Base Table Scan
+        let base_scan_metric = root_op.find_first(&|m| match &m.kind {
+            crate::query::OperatorKind::TableScan { table_name, .. } => {
+                table_name == &plan.base_table.table_name
+            }
+            _ => false,
+        });
+
+        if let Some(scan_metric) = base_scan_metric {
+            let key = crate::query::FeedbackKey::scan(
+                &plan.base_table.table_name,
+                plan.base_table.access_path.to_string(),
+                plan.base_table
+                    .residual_filter
+                    .as_ref()
+                    .map(|f| f.to_string())
+                    .unwrap_or_default(),
+                param_sig.clone(),
+                stats_gen,
+            );
+            let mut obs = crate::query::FeedbackObservation::new(
+                plan.base_table.estimated_rows,
+                scan_metric.actual_rows as f64,
+            );
+            obs.estimated_cost = Some(plan.base_table.cost);
+            obs.input_rows = Some(scan_metric.input_rows);
+            obs.output_rows = Some(scan_metric.actual_rows);
+            if scan_metric.counters.distinct_prefix_values > 0 {
+                obs.actual_distinct_prefixes = Some(scan_metric.counters.distinct_prefix_values);
+            }
+            if scan_metric.counters.indexes_used > 0
+                || scan_metric.counters.candidate_rows_after_set_operation > 0
+            {
+                obs.actual_candidates =
+                    Some(scan_metric.counters.candidate_rows_after_set_operation);
+                obs.spill_occurred = Some(
+                    scan_metric.counters.bytes_spilled > 0 || scan_metric.counters.runs_created > 0,
+                );
+            }
+            self.db.feedback_registry.record(key, obs);
+        }
+
+        // 2. Joins
+        let mut left_table_name = plan.base_table.table_name.clone();
+        for join in &plan.joins {
+            let right_table_name = join.right.table_name.clone();
+
+            let right_scan_metric = root_op.find_first(&|m| match &m.kind {
+                crate::query::OperatorKind::TableScan { table_name, .. } => {
+                    table_name == &right_table_name
+                }
+                _ => false,
+            });
+            if let Some(r_metric) = right_scan_metric {
+                let r_key = crate::query::FeedbackKey::scan(
+                    &right_table_name,
+                    join.right.access_path.to_string(),
+                    join.right
+                        .residual_filter
+                        .as_ref()
+                        .map(|f| f.to_string())
+                        .unwrap_or_default(),
+                    param_sig.clone(),
+                    stats_gen,
+                );
+                let mut r_obs = crate::query::FeedbackObservation::new(
+                    join.right.estimated_rows,
+                    r_metric.actual_rows as f64,
+                );
+                r_obs.estimated_cost = Some(join.right.cost);
+                r_obs.input_rows = Some(r_metric.input_rows);
+                r_obs.output_rows = Some(r_metric.actual_rows);
+                self.db.feedback_registry.record(r_key, r_obs);
+            }
+
+            let join_op_metric = root_op.find_first(&|m| {
+                matches!(
+                    &m.kind,
+                    crate::query::OperatorKind::NestedLoopJoin { .. }
+                        | crate::query::OperatorKind::NestedLoopSemiJoin
+                        | crate::query::OperatorKind::NestedLoopAntiJoin
+                        | crate::query::OperatorKind::HashJoin { .. }
+                        | crate::query::OperatorKind::HashSemiJoin
+                        | crate::query::OperatorKind::HashAntiJoin
+                        | crate::query::OperatorKind::ExternalHashJoin { .. }
+                )
+            });
+            if let Some(j_metric) = join_op_metric {
+                let j_key = if join.join_type == crate::sql::JoinType::Semi
+                    || join.join_type == crate::sql::JoinType::Anti
+                {
+                    crate::query::FeedbackKey::semi_anti(
+                        &left_table_name,
+                        &right_table_name,
+                        &join.on,
+                        join.join_type,
+                        param_sig.clone(),
+                        stats_gen,
+                    )
+                } else {
+                    crate::query::FeedbackKey::join(
+                        &left_table_name,
+                        &right_table_name,
+                        &join.on,
+                        join.join_type.to_string(),
+                        param_sig.clone(),
+                        stats_gen,
+                    )
+                };
+                let mut j_obs = crate::query::FeedbackObservation::new(
+                    join.estimated_rows,
+                    j_metric.actual_rows as f64,
+                );
+                j_obs.estimated_cost = Some(join.cost);
+                j_obs.input_rows = Some(j_metric.input_rows);
+                j_obs.output_rows = Some(j_metric.actual_rows);
+                j_obs.left_rows = Some(j_metric.counters.rows_left);
+                j_obs.right_rows = Some(j_metric.counters.rows_right);
+                if j_metric.counters.bytes_spilled > 0 || j_metric.counters.runs_created > 0 {
+                    j_obs.spill_occurred = Some(true);
+                }
+                self.db.feedback_registry.record(j_key, j_obs);
+            }
+
+            left_table_name = right_table_name;
+        }
+
+        // 3. External Sort / Aggregation operators
+        let sort_metric =
+            root_op.find_first(&|m| matches!(&m.kind, crate::query::OperatorKind::Sort));
+        if let Some(s_metric) = sort_metric {
+            if s_metric.counters.runs_created > 0 || s_metric.counters.bytes_spilled > 0 {
+                let sort_key = crate::query::FeedbackKey::external_operator(
+                    &plan.base_table.table_name,
+                    "Sort",
+                    param_sig.clone(),
+                    stats_gen,
+                );
+                let mut s_obs = crate::query::FeedbackObservation::new(
+                    plan.estimated_rows,
+                    s_metric.actual_rows as f64,
+                );
+                s_obs.input_rows = Some(s_metric.input_rows);
+                s_obs.output_rows = Some(s_metric.actual_rows);
+                s_obs.spill_occurred = Some(true);
+                self.db.feedback_registry.record(sort_key, s_obs);
+            }
+        }
+
+        let agg_metric =
+            root_op.find_first(&|m| matches!(&m.kind, crate::query::OperatorKind::Aggregate));
+        if let Some(a_metric) = agg_metric {
+            if a_metric.counters.runs_created > 0 || a_metric.counters.bytes_spilled > 0 {
+                let agg_key = crate::query::FeedbackKey::external_operator(
+                    &plan.base_table.table_name,
+                    "Aggregate",
+                    param_sig.clone(),
+                    stats_gen,
+                );
+                let mut a_obs = crate::query::FeedbackObservation::new(
+                    plan.estimated_rows,
+                    a_metric.actual_rows as f64,
+                );
+                a_obs.input_rows = Some(a_metric.input_rows);
+                a_obs.output_rows = Some(a_metric.actual_rows);
+                a_obs.spill_occurred = Some(true);
+                self.db.feedback_registry.record(agg_key, a_obs);
+            }
+        }
     }
 
     /// Commits all mutations performed in this transaction, flushing the WAL through the commit LSN.

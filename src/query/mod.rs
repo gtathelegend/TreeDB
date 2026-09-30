@@ -6,6 +6,7 @@ pub mod external_aggregate;
 pub mod external_hash_join;
 pub mod external_multi_index;
 pub mod external_sort;
+pub mod feedback;
 pub mod metrics;
 pub mod operator;
 pub mod optimizer;
@@ -50,6 +51,12 @@ pub use external_sort::{
     DEFAULT_MAX_TEMP_FILES, DEFAULT_SORT_MEMORY_BUDGET_BYTES, TEMP_RUN_MAGIC, TEMP_RUN_VERSION,
 };
 
+pub use feedback::{
+    compute_estimation_error, FeedbackAction, FeedbackContext, FeedbackEntry, FeedbackKey,
+    FeedbackObservation, FeedbackRegistry, DEFAULT_FEEDBACK_ALPHA, DEFAULT_FEEDBACK_CAPACITY,
+    DEFAULT_REPLAN_MIN_OBSERVATIONS, DEFAULT_REPLAN_THRESHOLD_RATIO, OUTLIER_MAX_RATIO,
+    OUTLIER_MIN_RATIO,
+};
 pub use metrics::{
     estimate_error_ratio, find_operator_metrics, format_plan_with_metrics, OperatorCounters,
     OperatorKind, OperatorMetrics, QueryExecutionMetrics,

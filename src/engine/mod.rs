@@ -19,6 +19,7 @@ use crate::index::bplus_tree::BPlusTree;
 use crate::query::external_aggregate::AggregateConfig;
 use crate::query::external_hash_join::JoinConfig;
 use crate::query::external_sort::SortConfig;
+use crate::query::feedback::FeedbackRegistry;
 use crate::query::plan_cache::{PlanCache, PlanCacheStats};
 use crate::query::stats::{StatsRegistry, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
@@ -42,6 +43,7 @@ pub struct TreeDb {
     pub(crate) index_generation: u64,
     pub(crate) statistics_generation: u64,
     pub(crate) plan_cache: PlanCache,
+    pub(crate) feedback_registry: FeedbackRegistry,
     pub(crate) sort_config: SortConfig,
     pub(crate) aggregate_config: AggregateConfig,
     pub(crate) join_config: JoinConfig,
@@ -79,6 +81,7 @@ impl TreeDb {
             index_generation: 1,
             statistics_generation: 1,
             plan_cache: PlanCache::new(),
+            feedback_registry: FeedbackRegistry::new(),
             sort_config: SortConfig::default(),
             aggregate_config: AggregateConfig::default(),
             join_config: JoinConfig::default(),
@@ -108,6 +111,7 @@ impl TreeDb {
             index_generation: 1,
             statistics_generation: 1,
             plan_cache: PlanCache::new(),
+            feedback_registry: FeedbackRegistry::new(),
             sort_config: SortConfig::default(),
             aggregate_config: AggregateConfig::default(),
             join_config: JoinConfig::default(),
@@ -131,6 +135,7 @@ impl TreeDb {
             index_generation: 1,
             statistics_generation: 1,
             plan_cache: PlanCache::new(),
+            feedback_registry: FeedbackRegistry::new(),
             sort_config: SortConfig::default(),
             aggregate_config: AggregateConfig::default(),
             join_config: JoinConfig::default(),
@@ -551,6 +556,7 @@ impl TreeDb {
             self.catalog_generation += 1;
             self.index_generation += 1;
             self.plan_cache.invalidate_all();
+            self.feedback_registry.clear_all();
         }
 
         if let Some(tid) = auto_txn {
@@ -578,6 +584,7 @@ impl TreeDb {
             self.catalog_generation += 1;
             self.index_generation += 1;
             self.plan_cache.invalidate_all();
+            self.feedback_registry.clear_all();
         }
 
         if let Some(tid) = auto_txn {
@@ -616,6 +623,7 @@ impl TreeDb {
         if result.is_ok() {
             self.catalog_generation += 1;
             self.plan_cache.invalidate_all();
+            self.feedback_registry.clear_table_feedback(name);
         }
 
         if let Some(tid) = auto_txn {
@@ -656,6 +664,8 @@ impl TreeDb {
         self.stats.set_table_stats(stats.clone());
         self.statistics_generation += 1;
         self.plan_cache.invalidate_statistics(table_name);
+        self.feedback_registry
+            .invalidate_generation(table_name, self.statistics_generation);
         Ok(stats)
     }
 
@@ -670,6 +680,8 @@ impl TreeDb {
         self.stats.set_table_stats(stats);
         self.statistics_generation += 1;
         self.plan_cache.invalidate_statistics(&table_name);
+        self.feedback_registry
+            .invalidate_generation(&table_name, self.statistics_generation);
     }
 
     /// Removes registered statistics for a table.
@@ -677,6 +689,8 @@ impl TreeDb {
         self.stats.remove_table_stats(table_name);
         self.statistics_generation += 1;
         self.plan_cache.invalidate_statistics(table_name);
+        self.feedback_registry
+            .invalidate_generation(table_name, self.statistics_generation);
     }
 
     /// Returns a reference to the database statistics registry.
@@ -687,6 +701,32 @@ impl TreeDb {
     /// Returns a mutable reference to the database statistics registry.
     pub fn statistics_registry_mut(&mut self) -> &mut StatsRegistry {
         &mut self.stats
+    }
+
+    /// Returns a reference to the adaptive runtime cardinality feedback registry.
+    pub fn feedback_registry(&self) -> &FeedbackRegistry {
+        &self.feedback_registry
+    }
+
+    /// Returns a mutable reference to the adaptive runtime cardinality feedback registry.
+    pub fn feedback_registry_mut(&mut self) -> &mut FeedbackRegistry {
+        &mut self.feedback_registry
+    }
+
+    /// Clears all recorded runtime feedback entries.
+    pub fn clear_feedback(&mut self) {
+        self.feedback_registry.clear_all();
+    }
+
+    /// Clears feedback entries associated with a specific table.
+    pub fn clear_table_feedback(&mut self, table_name: &str) {
+        self.feedback_registry.clear_table_feedback(table_name);
+    }
+
+    /// Invalidates feedback entries whose statistics generation no longer matches.
+    pub fn invalidate_feedback_generation(&mut self, table_name: &str, current_stats_gen: u64) {
+        self.feedback_registry
+            .invalidate_generation(table_name, current_stats_gen);
     }
 
     /// Returns a reference to the physical plan cache.

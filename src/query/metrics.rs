@@ -226,6 +226,22 @@ impl OperatorMetrics {
     pub fn add_child(&mut self, child: OperatorMetrics) {
         self.children.push(child);
     }
+
+    /// Finds the first operator metrics node matching the predicate in depth-first search order.
+    pub fn find_first<F: Fn(&OperatorMetrics) -> bool>(
+        &self,
+        predicate: &F,
+    ) -> Option<&OperatorMetrics> {
+        if predicate(self) {
+            return Some(self);
+        }
+        for child in &self.children {
+            if let Some(found) = child.find_first(predicate) {
+                return Some(found);
+            }
+        }
+        None
+    }
 }
 
 /// Aggregate metrics for a complete query execution.

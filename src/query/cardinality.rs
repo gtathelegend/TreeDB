@@ -536,7 +536,8 @@ impl CardinalityEstimator {
                         on_expr,
                         schema,
                     );
-                    (left_rows * p).clamp(if p > 0.0 { 1.0 } else { 0.0 }, left_rows)
+                    let min_bound = if p > 0.0 { 1.0f64.min(left_rows) } else { 0.0 };
+                    (left_rows * p).clamp(min_bound, left_rows)
                 }
             }
             crate::sql::ast::JoinType::Anti => {
@@ -554,8 +555,12 @@ impl CardinalityEstimator {
                         schema,
                     );
                     let non_match_p = 1.0 - p;
-                    (left_rows * non_match_p)
-                        .clamp(if non_match_p > 0.0 { 1.0 } else { 0.0 }, left_rows)
+                    let min_bound = if non_match_p > 0.0 {
+                        1.0f64.min(left_rows)
+                    } else {
+                        0.0
+                    };
+                    (left_rows * non_match_p).clamp(min_bound, left_rows)
                 }
             }
         }

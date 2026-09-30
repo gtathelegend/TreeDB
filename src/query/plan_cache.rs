@@ -238,6 +238,13 @@ impl PlanCache {
         }
     }
 
+    /// Removes an entry from the plan cache.
+    pub fn remove(&mut self, key: &PlanCacheKey) -> Option<PlanCacheEntry> {
+        let entry = self.entries.remove(key);
+        self.stats.entries = self.entries.len();
+        entry
+    }
+
     /// Clears all entries from the plan cache.
     pub fn clear(&mut self) {
         self.entries.clear();

@@ -10,7 +10,9 @@ use crate::query::expr::{AggregateExpr, BinaryOp, Expr};
 use crate::query::external_multi_index::{
     MultiIndexExecutionMode, DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES, RECORD_ID_IN_MEMORY_BYTES,
 };
+use crate::query::feedback::{FeedbackContext, FeedbackKey, FeedbackRegistry};
 use crate::query::operator::SortKey;
+use crate::query::plan_cache::ParamPlanningSignature;
 use crate::query::stats::TableStatistics;
 use crate::sql::ast::JoinType;
 use crate::sql::binder::BoundSelect;
@@ -1030,7 +1032,12 @@ fn is_better_plan(cand: &DPPlan, existing: &DPPlan) -> bool {
 }
 
 /// Optimizes an inner-join region using dynamic programming over subsets ($O(n \cdot 2^n)$).
-fn optimize_inner_join_region_dp(graph: &JoinGraph) -> DPPlan {
+fn optimize_inner_join_region_dp(
+    graph: &JoinGraph,
+    feedback: Option<&FeedbackRegistry>,
+    param_sig: Option<&ParamPlanningSignature>,
+    stats_gen: u64,
+) -> DPPlan {
     let num_rels = graph.relations.len();
     assert!(num_rels > 0 && num_rels <= MAX_ENUMERATED_RELATIONS);
 
@@ -1115,7 +1122,7 @@ fn optimize_inner_join_region_dp(graph: &JoinGraph) -> DPPlan {
                 );
 
                 let base_idx = left_plan.perm[0];
-                let join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
+                let mut join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
                     left_plan.rows,
                     graph.relations[base_idx].table_info.stats.as_ref(),
                     right_scan.estimated_rows,
@@ -1123,6 +1130,18 @@ fn optimize_inner_join_region_dp(graph: &JoinGraph) -> DPPlan {
                     &on_expr,
                     &graph.relations[r].table_info.schema,
                 );
+
+                if let Some(fb_reg) = feedback {
+                    let key = FeedbackKey::join(
+                        "Inner",
+                        &graph.relations[base_idx].table_info.name,
+                        &graph.relations[r].table_info.name,
+                        on_expr.to_string(),
+                        param_sig.cloned(),
+                        stats_gen,
+                    );
+                    join_rows = fb_reg.get_adjusted_cardinality(&key, join_rows);
+                }
 
                 let mut cand_joins = left_plan.joins.clone();
                 cand_joins.push(PhysicalJoin {
@@ -1171,7 +1190,12 @@ fn optimize_inner_join_region_dp(graph: &JoinGraph) -> DPPlan {
 }
 
 /// Optimizes an inner-join region using deterministic greedy search ($O(n^2)$ fallback for large graphs).
-fn optimize_inner_join_region_greedy(graph: &JoinGraph) -> DPPlan {
+fn optimize_inner_join_region_greedy(
+    graph: &JoinGraph,
+    feedback: Option<&FeedbackRegistry>,
+    param_sig: Option<&ParamPlanningSignature>,
+    stats_gen: u64,
+) -> DPPlan {
     let num_rels = graph.relations.len();
     assert!(num_rels > 0);
 
@@ -1257,7 +1281,7 @@ fn optimize_inner_join_region_greedy(graph: &JoinGraph) -> DPPlan {
                 cand_scan.cost,
                 cand_scan.estimated_rows,
             );
-            let join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
+            let mut join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
                 cur_rows,
                 graph.relations[start_idx].table_info.stats.as_ref(),
                 cand_scan.estimated_rows,
@@ -1265,6 +1289,18 @@ fn optimize_inner_join_region_greedy(graph: &JoinGraph) -> DPPlan {
                 &on_expr,
                 &graph.relations[cand].table_info.schema,
             );
+
+            if let Some(fb_reg) = feedback {
+                let key = FeedbackKey::join(
+                    "Inner",
+                    &graph.relations[start_idx].table_info.name,
+                    &graph.relations[cand].table_info.name,
+                    on_expr.to_string(),
+                    param_sig.cloned(),
+                    stats_gen,
+                );
+                join_rows = fb_reg.get_adjusted_cardinality(&key, join_rows);
+            }
 
             let is_better = match &best_cand {
                 None => true,
@@ -1341,6 +1377,9 @@ fn build_join_graph(
     tables: &[TableOptInfo],
     candidate_conjuncts: &[Expr],
     bound: Option<&BoundSelect>,
+    feedback: Option<&FeedbackRegistry>,
+    param_sig: Option<&ParamPlanningSignature>,
+    stats_gen: u64,
 ) -> (JoinGraph, Vec<Vec<Expr>>, Vec<Expr>) {
     let num_rels = region_rel_indices.len();
     let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); num_rels];
@@ -1382,6 +1421,9 @@ fn build_join_graph(
             table_local_conjuncts[local_id].clone(),
             ref_cols.as_ref(),
             true,
+            feedback,
+            param_sig,
+            stats_gen,
         );
         relations.push(JoinGraphRelation {
             id: local_id,
@@ -1441,6 +1483,9 @@ fn optimize_all_inner_joins(
     bound: &BoundSelect,
     tables: &[TableOptInfo],
     where_conjuncts: &[Expr],
+    feedback: Option<&FeedbackRegistry>,
+    param_sig: Option<&ParamPlanningSignature>,
+    stats_gen: u64,
 ) -> Result<PhysicalPlan> {
     let num_tables = tables.len();
     let mut all_conjuncts = where_conjuncts.to_vec();
@@ -1449,13 +1494,20 @@ fn optimize_all_inner_joins(
     }
 
     let region_indices: Vec<usize> = (0..num_tables).collect();
-    let (graph, _table_locals, unhandled) =
-        build_join_graph(&region_indices, tables, &all_conjuncts, Some(bound));
+    let (graph, _table_locals, unhandled) = build_join_graph(
+        &region_indices,
+        tables,
+        &all_conjuncts,
+        Some(bound),
+        feedback,
+        param_sig,
+        stats_gen,
+    );
 
     let best_plan = if num_tables <= MAX_ENUMERATED_RELATIONS {
-        optimize_inner_join_region_dp(&graph)
+        optimize_inner_join_region_dp(&graph, feedback, param_sig, stats_gen)
     } else {
-        optimize_inner_join_region_greedy(&graph)
+        optimize_inner_join_region_greedy(&graph, feedback, param_sig, stats_gen)
     };
 
     let mut remaining_post = unhandled;
@@ -1510,6 +1562,9 @@ fn optimize_with_outer_barriers(
     bound: &BoundSelect,
     tables: &[TableOptInfo],
     where_conjuncts: &[Expr],
+    feedback: Option<&FeedbackRegistry>,
+    param_sig: Option<&ParamPlanningSignature>,
+    stats_gen: u64,
 ) -> Result<PhysicalPlan> {
     let is_multi_table = !bound.joins.is_empty();
     let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); tables.len()];
@@ -1603,6 +1658,9 @@ fn optimize_with_outer_barriers(
         table_local_conjuncts[0].clone(),
         Some(&ref_cols_base),
         is_multi_table,
+        feedback,
+        param_sig,
+        stats_gen,
     );
 
     let mut physical_joins = Vec::new();
@@ -1618,6 +1676,9 @@ fn optimize_with_outer_barriers(
             table_local_conjuncts[right_table_idx].clone(),
             Some(&ref_cols_right),
             is_multi_table,
+            feedback,
+            param_sig,
+            stats_gen,
         );
 
         let join_cost = CostModel::nested_loop_join_cost(
@@ -1626,7 +1687,7 @@ fn optimize_with_outer_barriers(
             right_table_scan.cost,
             right_table_scan.estimated_rows,
         );
-        let join_rows = CardinalityEstimator::estimate_join_cardinality(
+        let mut join_rows = CardinalityEstimator::estimate_join_cardinality(
             join_type,
             cur_rows,
             tables[0].stats.as_ref(),
@@ -1635,6 +1696,33 @@ fn optimize_with_outer_barriers(
             &on_expr,
             &tables[right_table_idx].schema,
         );
+
+        if let Some(fb_reg) = feedback {
+            let left_name = &tables[0].name;
+            let right_name = &tables[right_table_idx].name;
+            let key = if join_type == JoinType::Semi || join_type == JoinType::Anti {
+                FeedbackKey::new(
+                    FeedbackContext::SemiAnti {
+                        strategy: "Default".to_string(),
+                        left_table: left_name.clone(),
+                        right_table: right_name.clone(),
+                        on_clause: on_expr.to_string(),
+                    },
+                    param_sig.cloned(),
+                    stats_gen,
+                )
+            } else {
+                FeedbackKey::join(
+                    format!("{join_type:?}"),
+                    left_name,
+                    right_name,
+                    on_expr.to_string(),
+                    param_sig.cloned(),
+                    stats_gen,
+                )
+            };
+            join_rows = fb_reg.get_adjusted_cardinality(&key, join_rows);
+        }
 
         let (chosen_strategy, chosen_index, chosen_cost) =
             if join_type == JoinType::Semi || join_type == JoinType::Anti {
@@ -1646,6 +1734,9 @@ fn optimize_with_outer_barriers(
                     &right_table_scan,
                     &on_expr,
                     join_type,
+                    feedback,
+                    param_sig,
+                    stats_gen,
                 )
             } else {
                 (JoinStrategy::NestedLoop, None, join_cost)
@@ -1703,6 +1794,7 @@ fn optimize_with_outer_barriers(
 }
 
 /// Evaluates costs of applicable physical strategies for SEMI/ANTI joins and selects the cheapest.
+#[allow(clippy::too_many_arguments)]
 fn plan_semi_anti_strategy(
     left_cost: f64,
     left_rows: f64,
@@ -1711,8 +1803,11 @@ fn plan_semi_anti_strategy(
     right_scan: &PhysicalTableScan,
     on_expr: &Expr,
     join_type: JoinType,
+    feedback: Option<&FeedbackRegistry>,
+    param_sig: Option<&ParamPlanningSignature>,
+    stats_gen: u64,
 ) -> (JoinStrategy, Option<String>, f64) {
-    let match_prob = CardinalityEstimator::estimate_semi_match_probability(
+    let mut match_prob = CardinalityEstimator::estimate_semi_match_probability(
         left_rows,
         left_table.stats.as_ref(),
         right_scan.estimated_rows,
@@ -1720,6 +1815,24 @@ fn plan_semi_anti_strategy(
         on_expr,
         &right_table.schema,
     );
+
+    if let Some(fb_reg) = feedback {
+        let key = FeedbackKey::new(
+            FeedbackContext::SemiAnti {
+                strategy: format!("{join_type:?}"),
+                left_table: left_table.name.clone(),
+                right_table: right_table.name.clone(),
+                on_clause: on_expr.to_string(),
+            },
+            param_sig.cloned(),
+            stats_gen,
+        );
+        if let Some(fb) = fb_reg.get_feedback(&key) {
+            if left_rows > 0.0 {
+                match_prob = (fb.effective_cardinality / left_rows).clamp(0.0, 1.0);
+            }
+        }
+    }
 
     // 1. NestedLoop Strategy
     let nl_cost = if join_type == JoinType::Semi {
@@ -1865,6 +1978,17 @@ pub struct Optimizer;
 impl Optimizer {
     /// Optimizes a bound SQL query (`BoundSelect`) into a deterministic cost-based `PhysicalPlan`.
     pub fn optimize(bound: &BoundSelect, tables: &[TableOptInfo]) -> Result<PhysicalPlan> {
+        Self::optimize_with_feedback(bound, tables, None, None, 0)
+    }
+
+    /// Optimizes a bound SQL query with adaptive runtime cardinality feedback.
+    pub fn optimize_with_feedback(
+        bound: &BoundSelect,
+        tables: &[TableOptInfo],
+        feedback: Option<&FeedbackRegistry>,
+        param_sig: Option<&ParamPlanningSignature>,
+        stats_gen: u64,
+    ) -> Result<PhysicalPlan> {
         let is_multi_table = !bound.joins.is_empty();
 
         let where_conjuncts = match &bound.filter {
@@ -1874,8 +1998,15 @@ impl Optimizer {
 
         if !is_multi_table {
             let ref_cols = collect_table_referenced_columns(&tables[0], bound, &where_conjuncts);
-            let base_table_scan =
-                plan_table_scan(&tables[0], where_conjuncts, Some(&ref_cols), false);
+            let base_table_scan = plan_table_scan(
+                &tables[0],
+                where_conjuncts,
+                Some(&ref_cols),
+                false,
+                feedback,
+                param_sig,
+                stats_gen,
+            );
             let mut cur_cost = base_table_scan.cost;
             let cur_rows = base_table_scan.estimated_rows;
 
@@ -1914,11 +2045,25 @@ impl Optimizer {
         let all_inner = bound.joins.iter().all(|j| j.join_type == JoinType::Inner);
 
         if all_inner && tables.len() >= 2 && has_any_stats {
-            return optimize_all_inner_joins(bound, tables, &where_conjuncts);
+            return optimize_all_inner_joins(
+                bound,
+                tables,
+                &where_conjuncts,
+                feedback,
+                param_sig,
+                stats_gen,
+            );
         }
 
         // Query with OUTER JOIN barriers or unanalyzed default sequential ordering
-        optimize_with_outer_barriers(bound, tables, &where_conjuncts)
+        optimize_with_outer_barriers(
+            bound,
+            tables,
+            &where_conjuncts,
+            feedback,
+            param_sig,
+            stats_gen,
+        )
     }
 }
 
@@ -1940,6 +2085,9 @@ fn plan_table_scan(
     conjuncts: Vec<Expr>,
     referenced_columns: Option<&HashSet<usize>>,
     _is_multi_table: bool,
+    feedback: Option<&FeedbackRegistry>,
+    param_sig: Option<&ParamPlanningSignature>,
+    stats_gen: u64,
 ) -> PhysicalTableScan {
     let qualifier = table.qualifier();
     // 1. Unqualify conjuncts so they match raw table schema column names
@@ -1954,15 +2102,26 @@ fn plan_table_scan(
     // If this is a CTE / in-memory relation, it does not possess a physical B-Tree index or primary key path.
     if table.is_cte {
         let residual_filter = recombine_conjunction(unqual_conjuncts.clone());
-        let estimated_rows = CardinalityEstimator::estimate_scan_cardinality(
+        let mut estimated_rows = CardinalityEstimator::estimate_scan_cardinality(
             table.stats.as_ref(),
             residual_filter.as_ref(),
             &table.schema,
         );
-        let cost = CostModel::table_scan_cost(
-            CardinalityEstimator::estimate_table_rows(table.stats.as_ref()),
-            unqual_conjuncts.len(),
-        );
+        if let Some(fb_reg) = feedback {
+            let filter_repr = residual_filter
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_default();
+            let key = FeedbackKey::scan(
+                &table.name,
+                "FullTableScan",
+                filter_repr,
+                param_sig.cloned(),
+                stats_gen,
+            );
+            estimated_rows = fb_reg.get_adjusted_cardinality(&key, estimated_rows);
+        }
+        let cost = CostModel::table_scan_cost(estimated_rows, unqual_conjuncts.len());
 
         return PhysicalTableScan {
             table_name: table.name.clone(),
@@ -2959,6 +3118,66 @@ fn plan_table_scan(
                     index_id: None,
                     index_name: None,
                 });
+            }
+        }
+    }
+
+    if let Some(fb_reg) = feedback {
+        for cand in &mut candidates {
+            let filter_repr = cand
+                .residual_filter
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_default();
+            let access_repr = match &cand.access_path {
+                AccessPath::FullTableScan => "FullTableScan".to_string(),
+                AccessPath::PrimaryPointLookup { .. } => "PrimaryPointLookup".to_string(),
+                AccessPath::PrimaryRangeScan { .. } => "PrimaryRangeScan".to_string(),
+                AccessPath::SecondaryIndexScan { index_name, .. } => {
+                    format!("SecondaryIndexScan({index_name})")
+                }
+                AccessPath::IndexOnlyScan { index_name, .. } => {
+                    format!("IndexOnlyScan({index_name})")
+                }
+                AccessPath::MultiIndexScan {
+                    strategy,
+                    child_scans,
+                    ..
+                } => {
+                    let s = child_scans
+                        .iter()
+                        .map(|c| c.index_name.clone())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("MultiIndexScan({strategy},{s})")
+                }
+            };
+            let key = FeedbackKey::scan(
+                &table.name,
+                access_repr,
+                filter_repr,
+                param_sig.cloned(),
+                stats_gen,
+            );
+            if fb_reg.get_feedback(&key).is_some() {
+                let adj_rows = fb_reg.get_adjusted_cardinality(&key, cand.estimated_rows);
+                cand.estimated_rows = adj_rows;
+                cand.cost = match &cand.access_path {
+                    AccessPath::FullTableScan => {
+                        CostModel::table_scan_cost(table_rows, unqual_conjuncts.len())
+                    }
+                    AccessPath::PrimaryPointLookup { .. } => CostModel::primary_point_lookup_cost(),
+                    AccessPath::PrimaryRangeScan { .. } => {
+                        CostModel::primary_range_scan_cost(cand.estimated_rows)
+                    }
+                    AccessPath::SecondaryIndexScan { .. } => {
+                        CostModel::secondary_range_scan_cost(cand.estimated_rows)
+                    }
+                    AccessPath::IndexOnlyScan { .. } => {
+                        CostModel::index_only_range_scan_cost(cand.estimated_rows)
+                    }
+                    AccessPath::MultiIndexScan { .. } => cand.cost,
+                };
             }
         }
     }
