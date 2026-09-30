@@ -265,28 +265,37 @@ impl CardinalityEstimator {
     }
 
     /// Estimates the number of distinct prefix combinations for skipped prefix columns.
+    ///
+    /// Uses a bounded heuristic combining individual column NDVs while guarding against
+    /// unsafe multiplication on correlated columns by capping the estimate to table
+    /// cardinality and index entries.
     pub fn estimate_distinct_prefixes(
         stats: Option<&TableStatistics>,
         schema: &Schema,
         skipped_col_indices: &[usize],
     ) -> f64 {
         if let Some(st) = stats {
-            let mut total_distinct = 1.0;
+            let table_rows = (st.row_count as f64).max(1.0);
+            let mut total_distinct = 1.0f64;
             for &idx in skipped_col_indices {
+                if idx >= schema.columns.len() {
+                    continue;
+                }
                 let col_name = &schema.columns[idx].name;
-                if let Some(col_st) = st.column(col_name) {
+                let col_ndv = if let Some(col_st) = st.column(col_name) {
                     if col_st.distinct_count > 0 {
-                        total_distinct *= col_st.distinct_count as f64;
+                        col_st.distinct_count as f64
                     } else {
-                        total_distinct *= 10.0;
+                        10.0f64.min(table_rows)
                     }
                 } else {
-                    total_distinct *= 10.0;
-                }
+                    10.0f64.min(table_rows)
+                };
+                total_distinct = (total_distinct * col_ndv).min(table_rows);
             }
-            total_distinct.min(st.row_count as f64).max(1.0)
+            total_distinct.clamp(1.0, table_rows)
         } else {
-            10.0
+            10.0f64.clamp(1.0, DEFAULT_TABLE_ROWS)
         }
     }
 

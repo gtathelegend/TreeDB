@@ -20,7 +20,7 @@ pub use cardinality::{
 pub use cost::{
     CostModel, PlanCost, AGG_CPU_COST, BPLUS_TREE_HEIGHT_COST, FILTER_CPU_COST, JOIN_CPU_COST,
     PAGE_READ_COST, PK_LOOKUP_COST, ROW_CPU_COST, SEC_INDEX_FETCH_COST, SEC_INDEX_LOOKUP_COST,
-    SORT_CPU_COST, TUPLE_FETCH_COST, WINDOW_CPU_COST,
+    SKIP_SCAN_PROBE_COST, SORT_CPU_COST, TUPLE_FETCH_COST, WINDOW_CPU_COST,
 };
 pub use expr::{
     AggregateExpr, AggregateFunction, BinaryOp, BoundWindowFrame, BoundWindowSpec, Expr, UnaryOp,

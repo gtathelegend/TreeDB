@@ -947,3 +947,420 @@ fn test_r90_randomized_skip_scan_oracle() -> Result<()> {
 
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests R91 – R101 (Hardening & Cost Model Remediation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r91_enumeration_cost_included() -> Result<()> {
+    let ctx = Ctx::new("r91");
+    let mut db = ctx.open();
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("CREATE TABLE big_idx (id INT PRIMARY KEY, grp VARCHAR, val INT);")?;
+    tx.execute_statement("CREATE INDEX idx_grp_val ON big_idx(grp, val);")?;
+
+    for i in 1..=100 {
+        let grp = format!("g_{}", i % 5);
+        tx.execute_statement(&format!("INSERT INTO big_idx VALUES ({i}, '{grp}', {i});"))?;
+    }
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("ANALYZE big_idx;")?;
+    tx.commit()?;
+
+    // Verify enumeration cost is non-zero
+    let enum_cost = treedb::query::CostModel::index_enumeration_cost(100.0, 1.0);
+    assert!(enum_cost > 0.0, "enumeration cost must be non-zero");
+
+    let total_cost = treedb::query::CostModel::skip_scan_cost(enum_cost, 5.0, 1.0, 0);
+    assert!(
+        total_cost > (5.0 * treedb::query::SKIP_SCAN_PROBE_COST) + 0.52,
+        "total cost must include enumeration cost"
+    );
+
+    let mut tx = db.begin_transaction()?;
+    let explain_res = tx.execute_sql("EXPLAIN SELECT id, grp, val FROM big_idx WHERE val = 50;")?;
+    let plan = val_str(&explain_res.rows[0].values[0]);
+    assert!(
+        plan.contains("IndexSkipScan"),
+        "expected IndexSkipScan, got:\n{plan}"
+    );
+    assert!(plan.contains("cost:"), "plan should output cost");
+    tx.commit()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_r92_full_scan_beats_expensive_skip_scan() -> Result<()> {
+    let ctx = Ctx::new("r92");
+    let mut db = ctx.open();
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement(
+        "CREATE TABLE many_prefixes (id INT PRIMARY KEY, unique_pref VARCHAR, code INT);",
+    )?;
+    tx.execute_statement("CREATE INDEX idx_many_p ON many_prefixes(unique_pref, code);")?;
+
+    // 150 distinct prefixes in 150 rows -> skip scan enumeration and probing is much more expensive than full scan
+    for i in 1..=150 {
+        let pref = format!("prefix_{i}");
+        tx.execute_statement(&format!(
+            "INSERT INTO many_prefixes VALUES ({i}, '{pref}', {i});"
+        ))?;
+    }
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("ANALYZE many_prefixes;")?;
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    let explain_res =
+        tx.execute_sql("EXPLAIN SELECT id, unique_pref, code FROM many_prefixes WHERE code = 10;")?;
+    let plan = val_str(&explain_res.rows[0].values[0]);
+    assert!(
+        plan.contains("FullTableScan") && !plan.contains("IndexSkipScan"),
+        "FullTableScan should win over expensive skip scan when prefix NDV is high, got:\n{plan}"
+    );
+    tx.commit()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_r93_skip_scan_remains_viable() -> Result<()> {
+    let ctx = Ctx::new("r93");
+    let mut db = ctx.open();
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("CREATE TABLE viable (id INT PRIMARY KEY, region VARCHAR, tag INT);")?;
+    tx.execute_statement("CREATE INDEX idx_region_tag ON viable(region, tag);")?;
+
+    // 300 rows across only 3 distinct regions, highly selective tag=777
+    let regions = ["north", "south", "east"];
+    for i in 1..=300 {
+        let region = regions[(i % 3) as usize];
+        let tag = if i == 42 { 777 } else { i % 50 };
+        tx.execute_statement(&format!(
+            "INSERT INTO viable VALUES ({i}, '{region}', {tag});"
+        ))?;
+    }
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("ANALYZE viable;")?;
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    let explain_res =
+        tx.execute_sql("EXPLAIN SELECT id, region, tag FROM viable WHERE tag = 777;")?;
+    let plan = val_str(&explain_res.rows[0].values[0]);
+    assert!(
+        plan.contains("IndexSkipScan"),
+        "skip scan should be selected for low prefix cardinality, got:\n{plan}"
+    );
+
+    let qr = tx.execute_sql("SELECT id, region, tag FROM viable WHERE tag = 777;")?;
+    assert_eq!(qr.rows.len(), 1);
+    assert_eq!(val_i64(&qr.rows[0].values[0]), 42);
+    tx.commit()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_r94_ndv_estimate_bounded() -> Result<()> {
+    let schema = Schema::new(
+        vec![
+            Column::new("id", DataType::Int64, false),
+            Column::new("col1", DataType::String, false),
+            Column::new("col2", DataType::String, false),
+            Column::new("val", DataType::Int64, false),
+        ],
+        0,
+    )?;
+
+    let mut stats = treedb::query::TableStatistics::new("t", 100);
+    stats = stats.with_column(
+        "col1",
+        treedb::query::ColumnStatistics::new(100, 0, 50, None, None),
+    );
+    stats = stats.with_column(
+        "col2",
+        treedb::query::ColumnStatistics::new(100, 0, 50, None, None),
+    );
+
+    // Naive NDV multiplication 50 * 50 = 2500, but table has only 100 rows
+    let est = treedb::query::CardinalityEstimator::estimate_distinct_prefixes(
+        Some(&stats),
+        &schema,
+        &[1, 2],
+    );
+    assert!(
+        est <= 100.0,
+        "distinct prefix estimate ({est}) must be capped to table row count (100.0)"
+    );
+    assert!(est >= 1.0, "distinct prefix estimate must be at least 1.0");
+
+    Ok(())
+}
+
+#[test]
+fn test_r95_missing_statistics_fallback() -> Result<()> {
+    let ctx = Ctx::new("r95");
+    let mut db = ctx.open();
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("CREATE TABLE unanalyzed (id INT PRIMARY KEY, cat VARCHAR, num INT);")?;
+    tx.execute_statement("CREATE INDEX idx_cat_num ON unanalyzed(cat, num);")?;
+
+    tx.execute_statement("INSERT INTO unanalyzed VALUES (1, 'c1', 10);")?;
+    tx.execute_statement("INSERT INTO unanalyzed VALUES (2, 'c2', 10);")?;
+    tx.execute_statement("INSERT INTO unanalyzed VALUES (3, 'c1', 20);")?;
+    tx.commit()?;
+
+    // Do NOT run ANALYZE
+    let mut tx = db.begin_transaction()?;
+    let qr = tx.execute_sql("SELECT id, cat, num FROM unanalyzed WHERE num = 10;")?;
+    assert_eq!(qr.rows.len(), 2);
+    let ids: Vec<i64> = qr.rows.iter().map(|r| val_i64(&r.values[0])).collect();
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&2));
+    tx.commit()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_r96_limit_behavior() -> Result<()> {
+    let ctx = Ctx::new("r96");
+    let mut db = ctx.open();
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("CREATE TABLE limits (id INT PRIMARY KEY, dept VARCHAR, lvl INT);")?;
+    tx.execute_statement("CREATE INDEX idx_limits_dept_lvl ON limits(dept, lvl);")?;
+
+    for i in 1..=50 {
+        let dept = format!("dept_{:02}", i);
+        tx.execute_statement(&format!("INSERT INTO limits VALUES ({i}, '{dept}', 5);"))?;
+    }
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    let qr =
+        tx.execute_sql("SELECT dept, lvl FROM limits WHERE lvl = 5 ORDER BY dept ASC LIMIT 2;")?;
+    assert_eq!(qr.rows.len(), 2);
+    assert_eq!(val_str(&qr.rows[0].values[0]), "dept_01");
+    assert_eq!(val_str(&qr.rows[1].values[0]), "dept_02");
+    tx.commit()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_r97_analyze_metrics_complete() -> Result<()> {
+    let ctx = Ctx::new("r97");
+    let mut db = ctx.open();
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("CREATE TABLE staff (id INT PRIMARY KEY, dept VARCHAR, level INT);")?;
+    tx.execute_statement("CREATE INDEX idx_dept_lvl ON staff(dept, level);")?;
+    tx.execute_statement("INSERT INTO staff VALUES (1, 'eng', 3);")?;
+    tx.execute_statement("INSERT INTO staff VALUES (2, 'hr', 3);")?;
+    tx.execute_statement("INSERT INTO staff VALUES (3, 'sales', 2);")?;
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    let res =
+        tx.execute_sql("EXPLAIN ANALYZE SELECT id, dept, level FROM staff WHERE level = 3;")?;
+    let explain_text = val_str(&res.rows[0].values[0]);
+
+    assert!(
+        explain_text.contains("skip_scan_prefixes_discovered:"),
+        "metrics should expose skip_scan_prefixes_discovered, got:\n{explain_text}"
+    );
+    assert!(
+        explain_text.contains("skip_scan_prefixes_probed:"),
+        "metrics should expose skip_scan_prefixes_probed, got:\n{explain_text}"
+    );
+    assert!(
+        explain_text.contains("skip_scan_index_entries_examined:"),
+        "metrics should expose skip_scan_index_entries_examined, got:\n{explain_text}"
+    );
+    assert!(
+        explain_text.contains("skip_scan_rows_output:"),
+        "metrics should expose skip_scan_rows_output, got:\n{explain_text}"
+    );
+    assert!(
+        explain_text.contains("skip_scan_base_records_fetched:"),
+        "metrics should expose skip_scan_base_records_fetched, got:\n{explain_text}"
+    );
+    assert!(
+        explain_text.contains("skip_scan_base_records_avoided:"),
+        "metrics should expose skip_scan_base_records_avoided, got:\n{explain_text}"
+    );
+    tx.commit()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_r98_prepared_statement_multiple_executions() -> Result<()> {
+    let ctx = Ctx::new("r98");
+    let mut db = ctx.open();
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("CREATE TABLE staff (id INT PRIMARY KEY, dept VARCHAR, level INT);")?;
+    tx.execute_statement("CREATE INDEX idx_dept_lvl ON staff(dept, level);")?;
+
+    tx.execute_statement("INSERT INTO staff VALUES (1, 'eng', 10);")?;
+    tx.execute_statement("INSERT INTO staff VALUES (2, 'hr', 10);")?;
+    tx.execute_statement("INSERT INTO staff VALUES (3, 'sales', 20);")?;
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    let prep = tx.prepare_sql("SELECT id, dept, level FROM staff WHERE level = ?;")?;
+
+    let res10 = tx.execute_prepared(&prep, &[Value::Int64(10)])?;
+    if let StatementResult::Query(qr) = res10 {
+        assert_eq!(qr.rows.len(), 2);
+    } else {
+        panic!("expected Query result");
+    }
+
+    let res20 = tx.execute_prepared(&prep, &[Value::Int64(20)])?;
+    if let StatementResult::Query(qr) = res20 {
+        assert_eq!(qr.rows.len(), 1);
+        assert_eq!(val_i64(&qr.rows[0].values[0]), 3);
+    } else {
+        panic!("expected Query result");
+    }
+    tx.commit()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_r99_plan_cache_invalidation_on_drop_index() -> Result<()> {
+    let ctx = Ctx::new("r99");
+    let mut db = ctx.open();
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("CREATE TABLE staff (id INT PRIMARY KEY, dept VARCHAR, level INT);")?;
+    tx.execute_statement("CREATE INDEX idx_dept_lvl ON staff(dept, level);")?;
+    tx.execute_statement("INSERT INTO staff VALUES (1, 'eng', 5);")?;
+    tx.execute_statement("INSERT INTO staff VALUES (2, 'hr', 5);")?;
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    let prep = tx.prepare_sql("SELECT id, dept, level FROM staff WHERE level = ?;")?;
+    let _ = tx.execute_prepared(&prep, &[Value::Int64(5)])?;
+    tx.commit()?;
+
+    // Drop index -> invalidates plan cache
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("DROP INDEX idx_dept_lvl;")?;
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    let prep2 = tx.prepare_sql("SELECT id, dept, level FROM staff WHERE level = ?;")?;
+    let res = tx.execute_prepared(&prep2, &[Value::Int64(5)])?;
+    if let StatementResult::Query(qr) = res {
+        assert_eq!(qr.rows.len(), 2);
+    } else {
+        panic!("expected Query result");
+    }
+    tx.commit()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_r100_persistence_recovery_lifecycle() -> Result<()> {
+    let ctx = Ctx::new("r100");
+    {
+        let mut db = ctx.open();
+        let mut tx = db.begin_transaction()?;
+        tx.execute_statement("CREATE TABLE items (id INT PRIMARY KEY, cat VARCHAR, subcat INT);")?;
+        tx.execute_statement("CREATE INDEX idx_cat_sub ON items(cat, subcat);")?;
+        tx.execute_statement("INSERT INTO items VALUES (1, 'c1', 100);")?;
+        tx.execute_statement("INSERT INTO items VALUES (2, 'c2', 100);")?;
+        tx.execute_statement("INSERT INTO items VALUES (3, 'c3', 200);")?;
+        tx.commit()?;
+
+        db.checkpoint()?;
+    }
+
+    // Reopen after checkpoint and test skip scan
+    {
+        let mut db = ctx.open();
+        let mut tx = db.begin_transaction()?;
+        let qr = tx.execute_sql("SELECT id, cat, subcat FROM items WHERE subcat = 100;")?;
+        assert_eq!(qr.rows.len(), 2);
+        let ids: Vec<i64> = qr.rows.iter().map(|r| val_i64(&r.values[0])).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_r101_randomized_differential_oracle_advanced() -> Result<()> {
+    let ctx = Ctx::new("r101");
+    let mut db = ctx.open();
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement(
+        "CREATE TABLE multi_dim (id INT PRIMARY KEY, cat VARCHAR, tier INT, code INT, rating INT);",
+    )?;
+    tx.execute_statement("CREATE INDEX idx_multi ON multi_dim(cat, tier, code);")?;
+
+    let cats = ["c_alpha", "c_beta", "c_gamma", "c_delta"];
+    for id in 1..=120 {
+        let cat = cats[(id % 4) as usize];
+        let tier = (id % 3) as i64;
+        let code = (id % 10) as i64;
+        let rating = (id % 5) as i64;
+        tx.execute_statement(&format!(
+            "INSERT INTO multi_dim VALUES ({id}, '{cat}', {tier}, {code}, {rating});"
+        ))?;
+    }
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    tx.execute_statement("ANALYZE multi_dim;")?;
+    tx.commit()?;
+
+    let mut tx = db.begin_transaction()?;
+    // Test multiple combinations of tier, code, and rating
+    for target_tier in 0..3 {
+        for target_code in [1, 5, 8] {
+            let qr_skip = tx.execute_sql(&format!(
+                "SELECT id, cat, tier, code, rating FROM multi_dim WHERE tier = {target_tier} AND code = {target_code} AND rating >= 2;"
+            ))?;
+
+            let qr_ref = tx.execute_sql(&format!(
+                "SELECT id, cat, tier, code, rating FROM multi_dim WHERE tier = {target_tier} AND code = {target_code} AND rating >= 2 AND id > 0;"
+            ))?;
+
+            let mut ids_skip: Vec<i64> =
+                qr_skip.rows.iter().map(|r| val_i64(&r.values[0])).collect();
+            let mut ids_ref: Vec<i64> = qr_ref.rows.iter().map(|r| val_i64(&r.values[0])).collect();
+            ids_skip.sort();
+            ids_ref.sort();
+            assert_eq!(
+                ids_skip, ids_ref,
+                "Mismatch for tier={target_tier}, code={target_code}"
+            );
+        }
+    }
+    tx.commit()?;
+
+    Ok(())
+}

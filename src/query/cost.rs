@@ -64,18 +64,43 @@ impl CostModel {
         SEC_INDEX_LOOKUP_COST + ((ROW_CPU_COST + SEC_INDEX_FETCH_COST) * matches)
     }
 
+    /// Computes the cost of enumerating distinct prefix values across secondary index leaf pages.
+    pub fn index_enumeration_cost(total_index_entries: f64, estimated_leaf_pages: f64) -> f64 {
+        let pages = estimated_leaf_pages.max(1.0);
+        let entries = total_index_entries.max(1.0);
+        (BPLUS_TREE_HEIGHT_COST * 0.1)
+            + (pages * PAGE_READ_COST * 0.05)
+            + (entries * ROW_CPU_COST * 0.2)
+    }
+
     /// Computes the cost of a composite index skip scan.
-    pub fn skip_scan_cost(distinct_prefixes: f64, estimated_matches: f64) -> f64 {
+    pub fn skip_scan_cost(
+        enumeration_cost: f64,
+        distinct_prefixes: f64,
+        estimated_matches: f64,
+        num_filter_exprs: usize,
+    ) -> f64 {
         let prefixes = distinct_prefixes.max(1.0);
         let matches = estimated_matches.max(1.0);
-        (prefixes * SKIP_SCAN_PROBE_COST) + ((TUPLE_FETCH_COST + SEC_INDEX_FETCH_COST) * matches)
+        enumeration_cost
+            + (prefixes * SKIP_SCAN_PROBE_COST)
+            + ((TUPLE_FETCH_COST + SEC_INDEX_FETCH_COST) * matches)
+            + (FILTER_CPU_COST * matches * (num_filter_exprs as f64))
     }
 
     /// Computes the cost of a covering composite index skip scan (avoids base-record fetches).
-    pub fn index_only_skip_scan_cost(distinct_prefixes: f64, estimated_matches: f64) -> f64 {
+    pub fn index_only_skip_scan_cost(
+        enumeration_cost: f64,
+        distinct_prefixes: f64,
+        estimated_matches: f64,
+        num_filter_exprs: usize,
+    ) -> f64 {
         let prefixes = distinct_prefixes.max(1.0);
         let matches = estimated_matches.max(1.0);
-        (prefixes * SKIP_SCAN_PROBE_COST) + ((ROW_CPU_COST + SEC_INDEX_FETCH_COST) * matches)
+        enumeration_cost
+            + (prefixes * SKIP_SCAN_PROBE_COST)
+            + ((ROW_CPU_COST + SEC_INDEX_FETCH_COST) * matches)
+            + (FILTER_CPU_COST * matches * (num_filter_exprs as f64))
     }
 
     /// Computes the cost of a nested-loop join.

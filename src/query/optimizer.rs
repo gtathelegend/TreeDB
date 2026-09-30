@@ -2274,7 +2274,33 @@ fn plan_table_scan(
                                 .filter(|(i, _)| !skip_used_conjuncts.contains(i))
                                 .map(|(_, c)| c.clone())
                                 .collect();
+                            let num_residual_filters = residual.len();
                             let residual_filter = recombine_conjunction(residual);
+
+                            let total_index_entries = table
+                                .stats
+                                .as_ref()
+                                .and_then(|s| s.index(&sec_meta.name))
+                                .map(|i| i.indexed_row_count as f64)
+                                .unwrap_or_else(|| {
+                                    table
+                                        .stats
+                                        .as_ref()
+                                        .map(|s| s.row_count as f64)
+                                        .unwrap_or(crate::query::cardinality::DEFAULT_TABLE_ROWS)
+                                });
+
+                            let estimated_leaf_pages = table
+                                .stats
+                                .as_ref()
+                                .and_then(|s| s.index(&sec_meta.name))
+                                .map(|i| i.estimated_leaf_pages as f64)
+                                .unwrap_or_else(|| (total_index_entries / 200.0).ceil().max(1.0));
+
+                            let enumeration_cost = CostModel::index_enumeration_cost(
+                                total_index_entries,
+                                estimated_leaf_pages,
+                            );
 
                             let est_distinct_prefixes =
                                 CardinalityEstimator::estimate_distinct_prefixes(
@@ -2290,8 +2316,10 @@ fn plan_table_scan(
 
                             if is_covering {
                                 let cost = CostModel::index_only_skip_scan_cost(
+                                    enumeration_cost,
                                     est_distinct_prefixes,
                                     est_rows,
+                                    num_residual_filters,
                                 );
                                 candidates.push(AccessPathCandidate {
                                     access_path: AccessPath::IndexOnlyScan {
@@ -2311,8 +2339,12 @@ fn plan_table_scan(
                                     index_name: Some(sec_meta.name.clone()),
                                 });
                             } else {
-                                let cost =
-                                    CostModel::skip_scan_cost(est_distinct_prefixes, est_rows);
+                                let cost = CostModel::skip_scan_cost(
+                                    enumeration_cost,
+                                    est_distinct_prefixes,
+                                    est_rows,
+                                    num_residual_filters,
+                                );
                                 candidates.push(AccessPathCandidate {
                                     access_path: AccessPath::SecondaryIndexScan {
                                         index_name: sec_meta.name.clone(),
