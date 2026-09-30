@@ -2585,6 +2585,7 @@ impl<'db> Transaction<'db> {
             qr.rows
         } else {
             self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
+            let multi_index_config = self.db.multi_index_config.clone();
             let mut table = self.open_table(&stmt.table_name)?;
             let initial_rows = match &plan.base_table.access_path {
                 crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
@@ -2633,8 +2634,13 @@ impl<'db> Transaction<'db> {
                 crate::query::optimizer::AccessPath::MultiIndexScan {
                     strategy,
                     child_scans,
+                    ..
                 } => {
-                    let (rows, _) = table.multi_index_scan(*strategy, child_scans)?;
+                    let (rows, _) = table.multi_index_scan_with_config(
+                        *strategy,
+                        child_scans,
+                        &multi_index_config,
+                    )?;
                     rows
                 }
                 crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
@@ -2733,6 +2739,7 @@ impl<'db> Transaction<'db> {
             qr.rows
         } else {
             self.pre_evaluate_uncorrelated_subqueries(&mut plan, &[])?;
+            let multi_index_config = self.db.multi_index_config.clone();
             let mut table = self.open_table(&stmt.table_name)?;
             let initial_rows = match &plan.base_table.access_path {
                 crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
@@ -2781,8 +2788,13 @@ impl<'db> Transaction<'db> {
                 crate::query::optimizer::AccessPath::MultiIndexScan {
                     strategy,
                     child_scans,
+                    ..
                 } => {
-                    let (rows, _) = table.multi_index_scan(*strategy, child_scans)?;
+                    let (rows, _) = table.multi_index_scan_with_config(
+                        *strategy,
+                        child_scans,
+                        &multi_index_config,
+                    )?;
                     rows
                 }
                 crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
@@ -2881,6 +2893,26 @@ impl<'db> Transaction<'db> {
         config: crate::query::external_aggregate::AggregateConfig,
     ) {
         self.db.set_aggregate_config(config);
+    }
+
+    /// Returns a reference to the active external multi-index candidate configuration.
+    pub fn multi_index_config(&self) -> &crate::query::external_multi_index::MultiIndexConfig {
+        self.db.multi_index_config()
+    }
+
+    /// Returns a mutable reference to the active external multi-index candidate configuration.
+    pub fn multi_index_config_mut(
+        &mut self,
+    ) -> &mut crate::query::external_multi_index::MultiIndexConfig {
+        self.db.multi_index_config_mut()
+    }
+
+    /// Sets the active external multi-index candidate configuration.
+    pub fn set_multi_index_config(
+        &mut self,
+        config: crate::query::external_multi_index::MultiIndexConfig,
+    ) {
+        self.db.set_multi_index_config(config);
     }
 
     /// Executes a fully optimized `PhysicalPlan` against this transaction.
@@ -3187,6 +3219,7 @@ impl<'db> Transaction<'db> {
 
                 (schema, filtered_rows, table_op)
             } else {
+                let multi_index_config = self.db.multi_index_config.clone();
                 let mut table = self.open_table(&plan.base_table.table_name)?;
                 let raw_schema = table.schema().clone();
                 let mut index_lookups = 0;
@@ -3270,8 +3303,14 @@ impl<'db> Transaction<'db> {
                     crate::query::optimizer::AccessPath::MultiIndexScan {
                         strategy,
                         child_scans,
+                        ..
                     } => {
-                        let (rows, stats) = table.multi_index_scan(*strategy, child_scans)?;
+                        let (rows, stats) = table.multi_index_scan_with_config(
+                            *strategy,
+                            child_scans,
+                            &multi_index_config,
+                        )?;
+
                         index_lookups = stats.indexes_used;
                         multi_index_stats = Some(stats);
                         rows
@@ -3310,6 +3349,9 @@ impl<'db> Transaction<'db> {
                     scan_metric.counters.index_entries_examined =
                         stats.candidate_rows_before_set_operation;
                     scan_metric.counters.tuples_fetched = stats.base_records_fetched;
+                    scan_metric.counters.runs_created = stats.spill_runs_created;
+                    scan_metric.counters.bytes_spilled = stats.spill_bytes_written;
+                    scan_metric.counters.peak_memory_bytes = stats.peak_candidate_memory;
                 }
                 if is_index_only {
                     scan_metric.counters.tuples_fetched = 0;
@@ -3456,6 +3498,7 @@ impl<'db> Transaction<'db> {
                         table_op,
                     )
                 } else {
+                    let multi_index_config = self.db.multi_index_config.clone();
                     let mut table = self.open_table(&join.right.table_name)?;
                     let raw_schema = table.schema().clone();
                     let mut index_lookups = 0;
@@ -3547,12 +3590,18 @@ impl<'db> Transaction<'db> {
                         crate::query::optimizer::AccessPath::MultiIndexScan {
                             strategy,
                             child_scans,
+                            ..
                         } => {
-                            let (rows, stats) = table.multi_index_scan(*strategy, child_scans)?;
+                            let (rows, stats) = table.multi_index_scan_with_config(
+                                *strategy,
+                                child_scans,
+                                &multi_index_config,
+                            )?;
                             index_lookups = stats.indexes_used;
                             multi_index_stats = Some(stats);
                             rows
                         }
+
                         crate::query::optimizer::AccessPath::FullTableScan => {
                             table.scan(None, None)?
                         }
@@ -3589,6 +3638,9 @@ impl<'db> Transaction<'db> {
                         scan_metric.counters.index_entries_examined =
                             stats.candidate_rows_before_set_operation;
                         scan_metric.counters.tuples_fetched = stats.base_records_fetched;
+                        scan_metric.counters.runs_created = stats.spill_runs_created;
+                        scan_metric.counters.bytes_spilled = stats.spill_bytes_written;
+                        scan_metric.counters.peak_memory_bytes = stats.peak_candidate_memory;
                     }
                     if is_index_only {
                         scan_metric.counters.tuples_fetched = 0;

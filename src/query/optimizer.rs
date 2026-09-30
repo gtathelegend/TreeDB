@@ -7,6 +7,9 @@ use crate::error::Result;
 use crate::query::cardinality::CardinalityEstimator;
 use crate::query::cost::{CostModel, SEC_INDEX_FETCH_COST, SEC_INDEX_LOOKUP_COST};
 use crate::query::expr::{AggregateExpr, BinaryOp, Expr};
+use crate::query::external_multi_index::{
+    MultiIndexExecutionMode, DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES, RECORD_ID_IN_MEMORY_BYTES,
+};
 use crate::query::operator::SortKey;
 use crate::query::stats::TableStatistics;
 use crate::sql::ast::JoinType;
@@ -81,6 +84,7 @@ pub enum AccessPath {
     MultiIndexScan {
         strategy: MultiIndexStrategy,
         child_scans: Vec<MultiIndexChildScan>,
+        execution_mode: MultiIndexExecutionMode,
     },
     /// Full sequential scan over all tuples.
     FullTableScan,
@@ -233,6 +237,7 @@ impl fmt::Display for AccessPath {
             Self::MultiIndexScan {
                 strategy,
                 child_scans,
+                execution_mode,
             } => {
                 let scans_str = child_scans
                     .iter()
@@ -241,7 +246,7 @@ impl fmt::Display for AccessPath {
                     .join(", ");
                 write!(
                     f,
-                    "MultiIndexScan(strategy={strategy}, indexes=[{scans_str}])"
+                    "MultiIndexScan(strategy={strategy}, execution={execution_mode}, indexes=[{scans_str}])"
                 )
             }
             Self::FullTableScan => write!(f, "FullTableScan"),
@@ -2662,11 +2667,21 @@ fn plan_table_scan(
                     table_rows,
                     &[a1.selectivity, a2.selectivity],
                 );
+                let total_cand_bytes = ((a1.estimated_rows + a2.estimated_rows)
+                    * (RECORD_ID_IN_MEMORY_BYTES as f64))
+                    as usize;
+                let is_ext = total_cand_bytes > DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES;
+                let exec_mode = if is_ext {
+                    MultiIndexExecutionMode::External
+                } else {
+                    MultiIndexExecutionMode::InMemory
+                };
                 let cost = CostModel::multi_index_intersection_cost(
                     &[a1.cost, a2.cost],
                     &[a1.estimated_rows, a2.estimated_rows],
                     est_rows,
                     residual_conjuncts.len(),
+                    is_ext,
                 );
                 candidates.push(AccessPathCandidate {
                     access_path: AccessPath::MultiIndexScan {
@@ -2687,6 +2702,7 @@ fn plan_table_scan(
                                 cost: a2.cost,
                             },
                         ],
+                        execution_mode: exec_mode,
                     },
                     residual_filter,
                     estimated_rows: est_rows,
@@ -2731,11 +2747,22 @@ fn plan_table_scan(
                             table_rows,
                             &[a1.selectivity, a2.selectivity, a3.selectivity],
                         );
+                        let total_cand_bytes =
+                            ((a1.estimated_rows + a2.estimated_rows + a3.estimated_rows)
+                                * (RECORD_ID_IN_MEMORY_BYTES as f64))
+                                as usize;
+                        let is_ext = total_cand_bytes > DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES;
+                        let exec_mode = if is_ext {
+                            MultiIndexExecutionMode::External
+                        } else {
+                            MultiIndexExecutionMode::InMemory
+                        };
                         let cost = CostModel::multi_index_intersection_cost(
                             &[a1.cost, a2.cost, a3.cost],
                             &[a1.estimated_rows, a2.estimated_rows, a3.estimated_rows],
                             est_rows,
                             residual_conjuncts.len(),
+                            is_ext,
                         );
                         candidates.push(AccessPathCandidate {
                             access_path: AccessPath::MultiIndexScan {
@@ -2763,6 +2790,7 @@ fn plan_table_scan(
                                         cost: a3.cost,
                                     },
                                 ],
+                                execution_mode: exec_mode,
                             },
                             residual_filter,
                             estimated_rows: est_rows,
@@ -2902,16 +2930,27 @@ fn plan_table_scan(
                     table_rows,
                     &branch_selectivities,
                 );
+                let total_cand_bytes = (branch_est_rows.iter().sum::<f64>()
+                    * (RECORD_ID_IN_MEMORY_BYTES as f64))
+                    as usize;
+                let is_ext = total_cand_bytes > DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES;
+                let exec_mode = if is_ext {
+                    MultiIndexExecutionMode::External
+                } else {
+                    MultiIndexExecutionMode::InMemory
+                };
                 let cost = CostModel::multi_index_union_cost(
                     &branch_costs,
                     &branch_est_rows,
                     est_rows,
                     unqual_conjuncts.len(),
+                    is_ext,
                 );
                 candidates.push(AccessPathCandidate {
                     access_path: AccessPath::MultiIndexScan {
                         strategy: MultiIndexStrategy::Union,
                         child_scans: branch_scans,
+                        execution_mode: exec_mode,
                     },
                     residual_filter,
                     estimated_rows: est_rows,

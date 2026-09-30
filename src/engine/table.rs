@@ -22,8 +22,10 @@ pub struct SkipScanStats {
 }
 
 /// Runtime statistics collected during multi-index scan execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultiIndexScanStats {
+    /// Execution mode (InMemory vs External).
+    pub execution_mode: crate::query::external_multi_index::MultiIndexExecutionMode,
     /// Number of participating secondary indexes.
     pub indexes_used: usize,
     /// Total candidate rows collected across all index scans before set operation.
@@ -38,6 +40,39 @@ pub struct MultiIndexScanStats {
     pub duplicate_record_ids_removed: usize,
     /// Number of base table records fetched from RecordStore.
     pub base_records_fetched: usize,
+    /// Number of temporary runs created during external spilling.
+    pub spill_runs_created: usize,
+    /// Total bytes written to spill files.
+    pub spill_bytes_written: usize,
+    /// Total bytes read from spill files.
+    pub spill_bytes_read: usize,
+    /// Total candidate RecordIds spilled.
+    pub candidate_rows_spilled: usize,
+    /// Total candidate RecordIds merged.
+    pub candidate_rows_merged: usize,
+    /// Peak in-memory byte footprint during candidate processing.
+    pub peak_candidate_memory: usize,
+}
+
+impl Default for MultiIndexScanStats {
+    fn default() -> Self {
+        Self {
+            execution_mode: crate::query::external_multi_index::MultiIndexExecutionMode::InMemory,
+            indexes_used: 0,
+            candidate_rows_before_set_operation: 0,
+            candidate_rows_after_set_operation: 0,
+            record_ids_intersected: 0,
+            record_ids_unioned: 0,
+            duplicate_record_ids_removed: 0,
+            base_records_fetched: 0,
+            spill_runs_created: 0,
+            spill_bytes_written: 0,
+            spill_bytes_read: 0,
+            candidate_rows_spilled: 0,
+            candidate_rows_merged: 0,
+            peak_candidate_memory: 0,
+        }
+    }
 }
 
 /// High-level relational table handle coordinating schema validation,
@@ -888,13 +923,26 @@ impl<'a> Table<'a> {
         }
     }
 
-    /// Executes a multi-index scan combining multiple secondary indexes via Intersection or Union.
-    /// Extracts candidate `RecordId`s directly from index leaves, performs the set operation,
-    /// and fetches raw tuples from `RecordStore` only for surviving candidates.
+    /// Executes a multi-index scan combining multiple secondary indexes via Intersection or Union with default config.
     pub fn multi_index_scan(
         &mut self,
         strategy: crate::query::optimizer::MultiIndexStrategy,
         child_scans: &[crate::query::optimizer::MultiIndexChildScan],
+    ) -> Result<(Vec<Row>, MultiIndexScanStats)> {
+        self.multi_index_scan_with_config(
+            strategy,
+            child_scans,
+            &crate::query::external_multi_index::MultiIndexConfig::default(),
+        )
+    }
+
+    /// Executes a multi-index scan combining multiple secondary indexes via Intersection or Union
+    /// using the specified `MultiIndexConfig` (supporting both in-memory fast-path and external disk spilling).
+    pub fn multi_index_scan_with_config(
+        &mut self,
+        strategy: crate::query::optimizer::MultiIndexStrategy,
+        child_scans: &[crate::query::optimizer::MultiIndexChildScan],
+        config: &crate::query::external_multi_index::MultiIndexConfig,
     ) -> Result<(Vec<Row>, MultiIndexScanStats)> {
         let mut stats = MultiIndexScanStats {
             indexes_used: child_scans.len(),
@@ -913,36 +961,137 @@ impl<'a> Table<'a> {
             child_rid_lists.push(rids);
         }
 
-        let final_rids: Vec<RecordId> = match strategy {
-            crate::query::optimizer::MultiIndexStrategy::Intersection => {
-                if child_rid_lists.is_empty() {
-                    Vec::new()
-                } else {
-                    let mut current_set: std::collections::BTreeSet<RecordId> =
-                        child_rid_lists[0].iter().copied().collect();
-                    for next_list in &child_rid_lists[1..] {
-                        let next_set: std::collections::BTreeSet<RecordId> =
-                            next_list.iter().copied().collect();
-                        current_set = current_set.intersection(&next_set).copied().collect();
+        let total_candidate_bytes = stats.candidate_rows_before_set_operation
+            * crate::query::external_multi_index::RECORD_ID_IN_MEMORY_BYTES;
+        stats.peak_candidate_memory = total_candidate_bytes;
+
+        let final_rids: Vec<RecordId> = if total_candidate_bytes <= config.memory_budget_bytes {
+            // In-Memory fast path
+            stats.execution_mode =
+                crate::query::external_multi_index::MultiIndexExecutionMode::InMemory;
+            match strategy {
+                crate::query::optimizer::MultiIndexStrategy::Intersection => {
+                    if child_rid_lists.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut current_set: std::collections::BTreeSet<RecordId> =
+                            child_rid_lists[0].iter().copied().collect();
+                        for next_list in &child_rid_lists[1..] {
+                            let next_set: std::collections::BTreeSet<RecordId> =
+                                next_list.iter().copied().collect();
+                            current_set = current_set.intersection(&next_set).copied().collect();
+                        }
+                        stats.record_ids_intersected = stats.candidate_rows_before_set_operation;
+                        stats.candidate_rows_after_set_operation = current_set.len();
+                        current_set.into_iter().collect()
                     }
-                    stats.record_ids_intersected = stats.candidate_rows_before_set_operation;
-                    stats.candidate_rows_after_set_operation = current_set.len();
-                    current_set.into_iter().collect()
+                }
+                crate::query::optimizer::MultiIndexStrategy::Union => {
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut union_rids = Vec::new();
+                    for rid in child_rid_lists.into_iter().flatten() {
+                        if seen.insert(rid) {
+                            union_rids.push(rid);
+                        } else {
+                            stats.duplicate_record_ids_removed += 1;
+                        }
+                    }
+                    stats.record_ids_unioned = stats.candidate_rows_before_set_operation;
+                    stats.candidate_rows_after_set_operation = union_rids.len();
+                    union_rids
                 }
             }
-            crate::query::optimizer::MultiIndexStrategy::Union => {
-                let mut seen = std::collections::BTreeSet::new();
-                let mut union_rids = Vec::new();
-                for rid in child_rid_lists.into_iter().flatten() {
-                    if seen.insert(rid) {
-                        union_rids.push(rid);
+        } else {
+            // External spill path
+            stats.execution_mode =
+                crate::query::external_multi_index::MultiIndexExecutionMode::External;
+            let temp_dir = config.effective_temp_dir();
+            let per_child_budget = (config.memory_budget_bytes / child_scans.len().max(1)).max(1);
+            let mut spill_metrics =
+                crate::query::external_multi_index::MultiIndexSpillMetrics::default();
+
+            let mut streams: Vec<crate::query::external_multi_index::RecordIdStream> =
+                Vec::with_capacity(child_rid_lists.len());
+            // Keep RAII run files alive until the end of function
+            let mut all_run_files: Vec<crate::query::external_multi_index::TempMultiIndexRunFile> =
+                Vec::new();
+
+            for rids in child_rid_lists {
+                let (in_mem, run_files) =
+                    crate::query::external_multi_index::prepare_child_candidate_stream(
+                        rids,
+                        per_child_budget,
+                        &temp_dir,
+                        &mut spill_metrics,
+                    )?;
+                if let Some(mem_rids) = in_mem {
+                    streams.push(
+                        crate::query::external_multi_index::RecordIdStream::from_vec(mem_rids),
+                    );
+                } else if !run_files.is_empty() {
+                    if run_files.len() == 1 {
+                        let reader = crate::query::external_multi_index::RecordIdRunReader::open(
+                            run_files[0].path(),
+                        )?;
+                        streams.push(
+                            crate::query::external_multi_index::RecordIdStream::SpillReader(reader),
+                        );
                     } else {
-                        stats.duplicate_record_ids_removed += 1;
+                        let mut readers = Vec::with_capacity(run_files.len());
+                        for rf in &run_files {
+                            readers.push(
+                                crate::query::external_multi_index::RecordIdRunReader::open(
+                                    rf.path(),
+                                )?,
+                            );
+                        }
+                        let merger =
+                            crate::query::external_multi_index::KWayRecordIdMerger::new(readers)?;
+                        streams.push(
+                            crate::query::external_multi_index::RecordIdStream::KWayMerger(merger),
+                        );
                     }
+                    all_run_files.extend(run_files);
                 }
-                stats.record_ids_unioned = stats.candidate_rows_before_set_operation;
-                stats.candidate_rows_after_set_operation = union_rids.len();
-                union_rids
+            }
+
+            match strategy {
+                crate::query::optimizer::MultiIndexStrategy::Intersection => {
+                    let (res, duplicates) =
+                        crate::query::external_multi_index::execute_multi_index_intersection_streams(
+                            streams,
+                        )?;
+                    stats.record_ids_intersected = stats.candidate_rows_before_set_operation;
+                    stats.candidate_rows_after_set_operation = res.len();
+                    stats.duplicate_record_ids_removed = duplicates;
+                    stats.spill_runs_created = spill_metrics.runs_created;
+                    stats.spill_bytes_written = spill_metrics.bytes_written;
+                    stats.spill_bytes_read = spill_metrics.bytes_read;
+                    stats.candidate_rows_spilled = spill_metrics.rows_spilled;
+                    stats.candidate_rows_merged = spill_metrics.rows_merged;
+                    stats.peak_candidate_memory = stats
+                        .peak_candidate_memory
+                        .max(spill_metrics.peak_memory_bytes);
+                    res
+                }
+                crate::query::optimizer::MultiIndexStrategy::Union => {
+                    let (res, duplicates) =
+                        crate::query::external_multi_index::execute_multi_index_union_streams(
+                            streams,
+                        )?;
+                    stats.record_ids_unioned = stats.candidate_rows_before_set_operation;
+                    stats.candidate_rows_after_set_operation = res.len();
+                    stats.duplicate_record_ids_removed = duplicates;
+                    stats.spill_runs_created = spill_metrics.runs_created;
+                    stats.spill_bytes_written = spill_metrics.bytes_written;
+                    stats.spill_bytes_read = spill_metrics.bytes_read;
+                    stats.candidate_rows_spilled = spill_metrics.rows_spilled;
+                    stats.candidate_rows_merged = spill_metrics.rows_merged;
+                    stats.peak_candidate_memory = stats
+                        .peak_candidate_memory
+                        .max(spill_metrics.peak_memory_bytes);
+                    res
+                }
             }
         };
 

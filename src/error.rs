@@ -528,4 +528,22 @@ pub enum Error {
     /// Corrupted or truncated temporary join partition file.
     #[error("External join partition corruption detected: {0}")]
     ExternalJoinRunCorrupted(String),
+
+    /// External multi-index candidate temporary file I/O or directory error.
+    #[error("External multi-index I/O error: {0}")]
+    ExternalMultiIndexIo(String),
+
+    /// External multi-index temporary disk quota exceeded.
+    #[error(
+        "External multi-index disk quota exceeded: spilled {bytes_spilled} bytes, limit is {limit} bytes"
+    )]
+    ExternalMultiIndexQuotaExceeded { bytes_spilled: usize, limit: usize },
+
+    /// External multi-index maximum merge passes exceeded.
+    #[error("External multi-index max passes exceeded: reached {passes}, limit is {limit}")]
+    ExternalMultiIndexMaxPassesExceeded { passes: usize, limit: usize },
+
+    /// Corrupted or truncated temporary multi-index spill run file.
+    #[error("External multi-index run corruption detected: {0}")]
+    ExternalMultiIndexRunCorrupted(String),
 }

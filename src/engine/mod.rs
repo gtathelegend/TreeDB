@@ -3,6 +3,7 @@ pub mod table;
 pub mod transaction;
 pub mod types;
 
+pub use crate::query::external_multi_index::{MultiIndexConfig, MultiIndexExecutionMode};
 pub use catalog::{
     Catalog, CatalogPage, IndexId, IndexMetadata, TableId, TableMetadata, CATALOG_MAGIC,
     CURRENT_CATALOG_VERSION, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
@@ -44,6 +45,7 @@ pub struct TreeDb {
     pub(crate) sort_config: SortConfig,
     pub(crate) aggregate_config: AggregateConfig,
     pub(crate) join_config: JoinConfig,
+    pub(crate) multi_index_config: MultiIndexConfig,
 }
 
 impl TreeDb {
@@ -80,6 +82,7 @@ impl TreeDb {
             sort_config: SortConfig::default(),
             aggregate_config: AggregateConfig::default(),
             join_config: JoinConfig::default(),
+            multi_index_config: MultiIndexConfig::default(),
         })
     }
 
@@ -108,6 +111,7 @@ impl TreeDb {
             sort_config: SortConfig::default(),
             aggregate_config: AggregateConfig::default(),
             join_config: JoinConfig::default(),
+            multi_index_config: MultiIndexConfig::default(),
         })
     }
 
@@ -130,6 +134,7 @@ impl TreeDb {
             sort_config: SortConfig::default(),
             aggregate_config: AggregateConfig::default(),
             join_config: JoinConfig::default(),
+            multi_index_config: MultiIndexConfig::default(),
         }
     }
 
@@ -767,5 +772,20 @@ impl TreeDb {
     /// Sets the active external hash join configuration.
     pub fn set_join_config(&mut self, config: JoinConfig) {
         self.join_config = config;
+    }
+
+    /// Returns a reference to the active external multi-index candidate configuration.
+    pub fn multi_index_config(&self) -> &MultiIndexConfig {
+        &self.multi_index_config
+    }
+
+    /// Returns a mutable reference to the active external multi-index candidate configuration.
+    pub fn multi_index_config_mut(&mut self) -> &mut MultiIndexConfig {
+        &mut self.multi_index_config
+    }
+
+    /// Sets the active external multi-index candidate configuration.
+    pub fn set_multi_index_config(&mut self, config: MultiIndexConfig) {
+        self.multi_index_config = config;
     }
 }

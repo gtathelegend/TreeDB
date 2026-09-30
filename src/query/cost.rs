@@ -18,6 +18,7 @@ pub const HASH_PROBE_CPU_COST: f64 = 0.005;
 
 pub const SKIP_SCAN_PROBE_COST: f64 = 0.05;
 pub const RECORD_ID_SET_OP_CPU_COST: f64 = 0.001;
+pub const SPILL_RECORD_ID_IO_COST: f64 = 0.005;
 
 /// Centralized, deterministic cost model estimating execution effort for physical plans.
 pub struct CostModel;
@@ -29,10 +30,15 @@ impl CostModel {
         child_estimated_rows: &[f64],
         surviving_candidates: f64,
         num_residual_filters: usize,
+        is_external: bool,
     ) -> f64 {
         let scan_cost_sum: f64 = child_scan_costs.iter().sum();
         let total_candidates: f64 = child_estimated_rows.iter().sum();
-        let set_op_cost = total_candidates * RECORD_ID_SET_OP_CPU_COST;
+        let set_op_cost = if is_external {
+            total_candidates * (RECORD_ID_SET_OP_CPU_COST * 2.0 + SPILL_RECORD_ID_IO_COST)
+        } else {
+            total_candidates * RECORD_ID_SET_OP_CPU_COST
+        };
         let fetch_cost = surviving_candidates.max(0.0) * TUPLE_FETCH_COST;
         let residual_cost =
             FILTER_CPU_COST * surviving_candidates.max(0.0) * (num_residual_filters as f64);
@@ -45,15 +51,21 @@ impl CostModel {
         child_estimated_rows: &[f64],
         surviving_candidates: f64,
         num_residual_filters: usize,
+        is_external: bool,
     ) -> f64 {
         let scan_cost_sum: f64 = child_scan_costs.iter().sum();
         let total_candidates: f64 = child_estimated_rows.iter().sum();
-        let set_op_cost = total_candidates * RECORD_ID_SET_OP_CPU_COST * 1.5;
+        let set_op_cost = if is_external {
+            total_candidates * (RECORD_ID_SET_OP_CPU_COST * 3.0 + SPILL_RECORD_ID_IO_COST)
+        } else {
+            total_candidates * RECORD_ID_SET_OP_CPU_COST * 1.5
+        };
         let fetch_cost = surviving_candidates.max(0.0) * TUPLE_FETCH_COST;
         let residual_cost =
             FILTER_CPU_COST * surviving_candidates.max(0.0) * (num_residual_filters as f64);
         scan_cost_sum + set_op_cost + fetch_cost + residual_cost
     }
+
     /// Computes the cost of a full sequential table scan.
     pub fn table_scan_cost(table_rows: f64, num_filter_exprs: usize) -> f64 {
         PAGE_READ_COST

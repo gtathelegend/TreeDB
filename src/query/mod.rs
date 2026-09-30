@@ -4,6 +4,7 @@ pub mod cost;
 pub mod expr;
 pub mod external_aggregate;
 pub mod external_hash_join;
+pub mod external_multi_index;
 pub mod external_sort;
 pub mod metrics;
 pub mod operator;
@@ -36,11 +37,19 @@ pub use external_hash_join::{
     JoinExecutionMetrics, JoinKey, TempJoinFile, DEFAULT_JOIN_MEMORY_BUDGET_BYTES, TEMP_JOIN_MAGIC,
     TEMP_JOIN_VERSION,
 };
+pub use external_multi_index::{
+    execute_multi_index_intersection_streams, execute_multi_index_union_streams,
+    prepare_child_candidate_stream, KWayRecordIdMerger, MultiIndexConfig, MultiIndexExecutionMode,
+    MultiIndexSpillMetrics, RecordIdRunReader, RecordIdRunWriter, RecordIdStream, SpillOpType,
+    TempMultiIndexRunFile, DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES, RECORD_ID_IN_MEMORY_BYTES,
+    RECORD_ID_PAYLOAD_BYTES, TEMP_MULTI_INDEX_MAGIC, TEMP_MULTI_INDEX_VERSION,
+};
 pub use external_sort::{
     estimate_row_memory, write_sorted_run, ExternalSorter, RunReader, SortConfig,
     SortExecutionMetrics, TempRunFile, DEFAULT_MAX_MERGE_PASSES, DEFAULT_MAX_TEMP_BYTES,
     DEFAULT_MAX_TEMP_FILES, DEFAULT_SORT_MEMORY_BUDGET_BYTES, TEMP_RUN_MAGIC, TEMP_RUN_VERSION,
 };
+
 pub use metrics::{
     estimate_error_ratio, find_operator_metrics, format_plan_with_metrics, OperatorCounters,
     OperatorKind, OperatorMetrics, QueryExecutionMetrics,
