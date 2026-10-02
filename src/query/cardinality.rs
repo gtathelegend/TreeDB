@@ -1,9 +1,8 @@
 use crate::engine::catalog::IndexMetadata;
 use crate::engine::types::{Schema, Value};
 use crate::query::expr::{BinaryOp, Expr, UnaryOp};
-use crate::query::stats::TableStatistics;
+use crate::query::stats::{ColumnGroupKey, TableStatistics};
 
-/// Fallback defaults when statistics are unavailable.
 pub const DEFAULT_TABLE_ROWS: f64 = 1000.0;
 pub const DEFAULT_EQ_SELECTIVITY: f64 = 0.1;
 pub const DEFAULT_RANGE_SELECTIVITY: f64 = 0.3333333333333333;
@@ -11,6 +10,50 @@ pub const DEFAULT_NULL_FRACTION: f64 = 0.05;
 
 type RangeBound = Option<(Value, bool)>;
 type ColumnRangeSpec = (RangeBound, RangeBound, Vec<usize>);
+
+/// Source classification for a multi-column correlation selectivity estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrelationSource {
+    /// Exact joint match in Top-K statistics.
+    JointTopK,
+    /// Bounded joint frequency estimate from column group statistics.
+    JointFrequency,
+    /// All-NULL joint combination match.
+    AllNull,
+    /// Safe fallback to single-column marginals / independence.
+    MarginalFallback,
+}
+
+impl std::fmt::Display for CorrelationSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JointTopK => write!(f, "joint-top-k"),
+            Self::JointFrequency => write!(f, "joint-frequency"),
+            Self::AllNull => write!(f, "all-null"),
+            Self::MarginalFallback => write!(f, "marginal fallback"),
+        }
+    }
+}
+
+/// Result of evaluating multi-column correlation selectivity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrelationSelectivity {
+    /// Column names involved in the correlation estimate.
+    pub columns: Vec<String>,
+    /// Underlying statistical source.
+    pub source: CorrelationSource,
+    /// Estimated joint selectivity in [0.0, 1.0].
+    pub selectivity: f64,
+}
+
+#[derive(Debug, Clone)]
+struct CandidatePair {
+    col_indices: [usize; 2],
+    conj_indices: Vec<usize>,
+    sel: f64,
+    rank: u8,
+    source: CorrelationSource,
+}
 
 /// Deterministic cardinality and selectivity estimator.
 pub struct CardinalityEstimator;
@@ -101,15 +144,7 @@ impl CardinalityEstimator {
                 op: UnaryOp::Not,
                 expr: inner,
             } => {
-                let null_frac = if let Expr::Column(col_name) = inner.as_ref() {
-                    let col_raw = col_name.split('.').next_back().unwrap_or(col_name);
-                    stats
-                        .and_then(|st| st.column(col_raw))
-                        .map(|c| c.null_fraction())
-                        .unwrap_or(0.0)
-                } else {
-                    0.0
-                };
+                let null_frac = extract_inner_column_null_fraction(inner, stats);
                 let inner_sel = Self::estimate_expr_selectivity(inner, stats, schema);
                 ((1.0 - null_frac) - inner_sel).clamp(0.0, 1.0)
             }
@@ -151,8 +186,7 @@ impl CardinalityEstimator {
                                     }
                                 }
                                 if col_st.distinct_count > 0 {
-                                    (1.0 / (col_st.distinct_count as f64))
-                                        .clamp(0.0, 1.0 - col_st.null_fraction())
+                                    (1.0 / (col_st.distinct_count as f64)).clamp(0.0, 1.0)
                                 } else {
                                     DEFAULT_EQ_SELECTIVITY
                                 }
@@ -314,6 +348,11 @@ impl CardinalityEstimator {
                     (crate::query::CanonicalValue, usize),
                 > = std::collections::HashMap::new();
 
+                let mut col_in_constraints: std::collections::HashMap<
+                    usize,
+                    (Vec<crate::query::CanonicalValue>, usize),
+                > = std::collections::HashMap::new();
+
                 for (idx, &conj) in conjuncts.iter().enumerate() {
                     match conj {
                         Expr::Binary {
@@ -345,79 +384,225 @@ impl CardinalityEstimator {
                                 }
                             }
                         }
+                        Expr::InList {
+                            expr: inner,
+                            list,
+                            negated: false,
+                        } => {
+                            if let Expr::Column(col_name) = inner.as_ref() {
+                                let col_raw = col_name.split('.').next_back().unwrap_or(col_name);
+                                if let Some(col_idx) =
+                                    schema.columns.iter().position(|c| c.name == col_raw)
+                                {
+                                    let mut unique_vals = Vec::new();
+                                    let mut seen = std::collections::HashSet::new();
+                                    for l in list {
+                                        if let Expr::Literal(v) = l {
+                                            let c = crate::query::CanonicalValue::from_value(v);
+                                            if seen.insert(c.clone()) {
+                                                unique_vals.push(c);
+                                            }
+                                        }
+                                    }
+                                    if !unique_vals.is_empty() {
+                                        col_in_constraints.insert(col_idx, (unique_vals, idx));
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
 
-                // Check available column groups for matching multi-column constraints
-                for (group_key, group_stats) in &st.column_groups {
-                    let cols = &group_key.column_indices;
-                    if cols.iter().all(|c_idx| col_constraints.contains_key(c_idx))
-                        && cols.iter().all(|c_idx| {
-                            let (_, c_conj_idx) = col_constraints[c_idx];
-                            !handled[c_conj_idx]
-                        })
-                    {
-                        // All columns in this group are constrained by unhandled conjuncts!
-                        let target_vals: Vec<crate::query::CanonicalValue> = cols
-                            .iter()
-                            .map(|c_idx| col_constraints[c_idx].0.clone())
-                            .collect();
+                let mut candidates: Vec<CandidatePair> = Vec::new();
 
-                        // Try finding target_vals in Top-K
-                        let mut joint_sel_opt: Option<f64> = None;
+                for (group_key, group_stats) in &st.column_groups {
+                    if group_key.column_indices.len() != 2 {
+                        continue;
+                    }
+                    let c0 = group_key.column_indices[0];
+                    let c1 = group_key.column_indices[1];
+
+                    // Case 1: Both columns have equality or IS NULL constraints
+                    if let (Some((v0, conj0)), Some((v1, conj1))) =
+                        (col_constraints.get(&c0), col_constraints.get(&c1))
+                    {
+                        let target_vals = vec![v0.clone(), v1.clone()];
+                        let mut top_k_sel = None;
                         for entry in &group_stats.top_k {
                             if entry.values == target_vals {
-                                joint_sel_opt =
-                                    Some((entry.frequency as f64) / (st.row_count as f64));
+                                top_k_sel = Some((entry.frequency as f64) / (st.row_count as f64));
                                 break;
                             }
                         }
 
-                        let joint_sel = match joint_sel_opt {
-                            Some(s) => s,
-                            None => {
-                                // Not in top-k
-                                let is_all_null = target_vals
-                                    .iter()
-                                    .all(|v| matches!(v, crate::query::CanonicalValue::Null));
-                                if is_all_null && group_stats.all_null_count > 0 {
-                                    (group_stats.all_null_count as f64) / (st.row_count as f64)
+                        if let Some(sel) = top_k_sel {
+                            candidates.push(CandidatePair {
+                                col_indices: [c0, c1],
+                                conj_indices: vec![*conj0, *conj1],
+                                sel: sel.clamp(0.0, 1.0),
+                                rank: 1,
+                                source: CorrelationSource::JointTopK,
+                            });
+                        } else {
+                            let is_all_null = target_vals
+                                .iter()
+                                .all(|v| matches!(v, crate::query::CanonicalValue::Null));
+                            if is_all_null && group_stats.all_null_count > 0 {
+                                candidates.push(CandidatePair {
+                                    col_indices: [c0, c1],
+                                    conj_indices: vec![*conj0, *conj1],
+                                    sel: ((group_stats.all_null_count as f64)
+                                        / (st.row_count as f64))
+                                        .clamp(0.0, 1.0),
+                                    rank: 2,
+                                    source: CorrelationSource::AllNull,
+                                });
+                            } else {
+                                let top_k_sum_freq: usize =
+                                    group_stats.top_k.iter().map(|e| e.frequency).sum();
+                                let rem_freq = st.row_count.saturating_sub(top_k_sum_freq);
+                                let rem_distinct = group_stats
+                                    .distinct_count
+                                    .saturating_sub(group_stats.top_k.len());
+                                let freq_sel = if rem_distinct > 0 && rem_freq > 0 {
+                                    let est_freq = (rem_freq as f64) / (rem_distinct as f64);
+                                    (est_freq / (st.row_count as f64)).clamp(0.0, 1.0)
+                                } else if group_stats.distinct_count > 0 {
+                                    (1.0 / (group_stats.distinct_count as f64)).clamp(0.0, 1.0)
                                 } else {
+                                    1.0
+                                };
+                                candidates.push(CandidatePair {
+                                    col_indices: [c0, c1],
+                                    conj_indices: vec![*conj0, *conj1],
+                                    sel: freq_sel,
+                                    rank: 3,
+                                    source: CorrelationSource::JointFrequency,
+                                });
+                            }
+                        }
+                    } else if let (Some((v0, conj0)), Some((in_vals1, conj1))) =
+                        (col_constraints.get(&c0), col_in_constraints.get(&c1))
+                    {
+                        // Case 2: c0 equality, c1 IN-list
+                        let mut sum_sel = 0.0;
+                        for v1 in in_vals1 {
+                            let target_vals = vec![v0.clone(), v1.clone()];
+                            let mut match_sel = None;
+                            for entry in &group_stats.top_k {
+                                if entry.values == target_vals {
+                                    match_sel =
+                                        Some((entry.frequency as f64) / (st.row_count as f64));
+                                    break;
+                                }
+                            }
+                            let val_sel = match match_sel {
+                                Some(s) => s,
+                                None => {
                                     let top_k_sum_freq: usize =
                                         group_stats.top_k.iter().map(|e| e.frequency).sum();
                                     let rem_freq = st.row_count.saturating_sub(top_k_sum_freq);
                                     let rem_distinct = group_stats
                                         .distinct_count
                                         .saturating_sub(group_stats.top_k.len());
-
                                     if rem_distinct > 0 && rem_freq > 0 {
                                         let est_freq = (rem_freq as f64) / (rem_distinct as f64);
-                                        (est_freq / (st.row_count as f64)).clamp(0.0, 1.0)
+                                        est_freq / (st.row_count as f64)
                                     } else if group_stats.distinct_count > 0 {
                                         1.0 / (group_stats.distinct_count as f64)
                                     } else {
-                                        // Fallback to product of single-column selectivities
-                                        let mut fallback_prod = 1.0;
-                                        for c_idx in cols {
-                                            let (_, c_conj_idx) = col_constraints[c_idx];
-                                            fallback_prod *= Self::estimate_single_expr_selectivity(
-                                                conjuncts[c_conj_idx],
-                                                stats,
-                                                schema,
-                                            );
-                                        }
-                                        fallback_prod
+                                        DEFAULT_EQ_SELECTIVITY
                                     }
                                 }
-                            }
-                        };
-
-                        combined_sel *= joint_sel.clamp(0.0, 1.0);
-                        for c_idx in cols {
-                            let (_, c_conj_idx) = col_constraints[c_idx];
-                            handled[c_conj_idx] = true;
+                            };
+                            sum_sel += val_sel;
                         }
+                        candidates.push(CandidatePair {
+                            col_indices: [c0, c1],
+                            conj_indices: vec![*conj0, *conj1],
+                            sel: sum_sel.clamp(0.0, 1.0),
+                            rank: 3,
+                            source: CorrelationSource::JointFrequency,
+                        });
+                    } else if let (Some((in_vals0, conj0)), Some((v1, conj1))) =
+                        (col_in_constraints.get(&c0), col_constraints.get(&c1))
+                    {
+                        // Case 3: c0 IN-list, c1 equality
+                        let mut sum_sel = 0.0;
+                        for v0 in in_vals0 {
+                            let target_vals = vec![v0.clone(), v1.clone()];
+                            let mut match_sel = None;
+                            for entry in &group_stats.top_k {
+                                if entry.values == target_vals {
+                                    match_sel =
+                                        Some((entry.frequency as f64) / (st.row_count as f64));
+                                    break;
+                                }
+                            }
+                            let val_sel = match match_sel {
+                                Some(s) => s,
+                                None => {
+                                    let top_k_sum_freq: usize =
+                                        group_stats.top_k.iter().map(|e| e.frequency).sum();
+                                    let rem_freq = st.row_count.saturating_sub(top_k_sum_freq);
+                                    let rem_distinct = group_stats
+                                        .distinct_count
+                                        .saturating_sub(group_stats.top_k.len());
+                                    if rem_distinct > 0 && rem_freq > 0 {
+                                        let est_freq = (rem_freq as f64) / (rem_distinct as f64);
+                                        est_freq / (st.row_count as f64)
+                                    } else if group_stats.distinct_count > 0 {
+                                        1.0 / (group_stats.distinct_count as f64)
+                                    } else {
+                                        DEFAULT_EQ_SELECTIVITY
+                                    }
+                                }
+                            };
+                            sum_sel += val_sel;
+                        }
+                        candidates.push(CandidatePair {
+                            col_indices: [c0, c1],
+                            conj_indices: vec![*conj0, *conj1],
+                            sel: sum_sel.clamp(0.0, 1.0),
+                            rank: 3,
+                            source: CorrelationSource::JointFrequency,
+                        });
+                    }
+                }
+
+                // Deterministic sort: rank ASC -> sel ASC -> col_indices ASC
+                candidates.sort_by(|a, b| {
+                    a.rank
+                        .cmp(&b.rank)
+                        .then_with(|| {
+                            a.sel
+                                .partial_cmp(&b.sel)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .then_with(|| a.col_indices.cmp(&b.col_indices))
+                });
+
+                let mut handled_cols = std::collections::HashSet::new();
+
+                for candidate in candidates {
+                    let c0 = candidate.col_indices[0];
+                    let c1 = candidate.col_indices[1];
+
+                    // Check if both columns and conjuncts are still unhandled
+                    if handled_cols.contains(&c0) || handled_cols.contains(&c1) {
+                        // Overlapping pair! One column already constrained by primary correlated pair.
+                        continue;
+                    }
+                    if candidate.conj_indices.iter().any(|&idx| handled[idx]) {
+                        continue;
+                    }
+
+                    combined_sel *= candidate.sel;
+                    handled_cols.insert(c0);
+                    handled_cols.insert(c1);
+                    for &idx in &candidate.conj_indices {
+                        handled[idx] = true;
                     }
                 }
             }
@@ -598,14 +783,24 @@ impl CardinalityEstimator {
     /// Estimates output cardinality for a composite secondary index prefix scan.
     pub fn estimate_sec_prefix_rows(
         stats: Option<&TableStatistics>,
-        _index_meta: &IndexMetadata,
+        index_meta: &IndexMetadata,
         prefix_len: usize,
     ) -> f64 {
-        let p_len = prefix_len.max(1) as i32;
+        let p_len = prefix_len.max(1);
         if let Some(st) = stats {
             let base_rows = st.row_count as f64;
             if base_rows <= 0.0 {
                 return 0.0;
+            }
+            if p_len >= 2 && index_meta.column_indices.len() >= 2 {
+                let c0_idx = index_meta.column_indices[0];
+                let c1_idx = index_meta.column_indices[1];
+                let grp_key = ColumnGroupKey::new(vec![c0_idx, c1_idx]);
+                if let Some(grp) = st.column_groups.get(&grp_key) {
+                    if grp.distinct_count > 0 {
+                        return (base_rows / (grp.distinct_count as f64)).max(1.0);
+                    }
+                }
             }
             let sel = DEFAULT_RANGE_SELECTIVITY / (p_len as f64);
             return (base_rows * sel).max(1.0);
@@ -722,8 +917,64 @@ impl CardinalityEstimator {
         }
 
         let mut total_selectivity = 1.0;
+        let mut handled = vec![false; conjuncts.len()];
 
-        for conj in &conjuncts {
+        // Check if multiple equi-join conditions match a column group on both sides
+        let mut equi_pairs: Vec<(usize, usize, usize)> = Vec::new();
+        for (idx, conj) in conjuncts.iter().enumerate() {
+            if let Expr::Binary {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            } = conj
+            {
+                if let (Expr::Column(col_a), Expr::Column(col_b)) = (left.as_ref(), right.as_ref())
+                {
+                    let name_a = col_a.split('.').next_back().unwrap_or(col_a);
+                    let name_b = col_b.split('.').next_back().unwrap_or(col_b);
+                    if let (Some(l_st), Some(r_st)) = (left_stats, right_stats) {
+                        if let (Some(idx_a), Some(idx_b)) = (
+                            l_st.columns.iter().position(|(n, _)| n == name_a),
+                            r_st.columns.iter().position(|(n, _)| n == name_b),
+                        ) {
+                            equi_pairs.push((idx_a, idx_b, idx));
+                        }
+                    }
+                }
+            }
+        }
+
+        if equi_pairs.len() >= 2 {
+            if let (Some(l_st), Some(r_st)) = (left_stats, right_stats) {
+                for i in 0..equi_pairs.len() {
+                    for j in (i + 1)..equi_pairs.len() {
+                        let (l_a, r_a, idx_a) = equi_pairs[i];
+                        let (l_b, r_b, idx_b) = equi_pairs[j];
+                        if handled[idx_a] || handled[idx_b] {
+                            continue;
+                        }
+                        let l_key = ColumnGroupKey::new(vec![l_a, l_b]);
+                        let r_key = ColumnGroupKey::new(vec![r_a, r_b]);
+                        if let (Some(l_grp), Some(r_grp)) = (
+                            l_st.column_groups.get(&l_key),
+                            r_st.column_groups.get(&r_key),
+                        ) {
+                            let max_ndv = (l_grp.distinct_count as f64)
+                                .max(r_grp.distinct_count as f64)
+                                .max(1.0);
+                            total_selectivity *= 1.0 / max_ndv;
+                            handled[idx_a] = true;
+                            handled[idx_b] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (idx, conj) in conjuncts.iter().enumerate() {
+            if handled[idx] {
+                continue;
+            }
             if let Expr::Binary {
                 left,
                 op: BinaryOp::Eq,
@@ -747,16 +998,174 @@ impl CardinalityEstimator {
 
                     let max_ndv = ndv_a.max(ndv_b).max(1.0);
                     total_selectivity *= 1.0 / max_ndv;
+                    handled[idx] = true;
                     continue;
                 }
             }
 
             let sel = Self::estimate_expr_selectivity(conj, None, schema);
             total_selectivity *= sel;
+            handled[idx] = true;
         }
 
         let rows = left_rows * right_rows * total_selectivity;
         rows.max(1.0)
+    }
+
+    /// Extracts correlation diagnostics for an expression, if pairwise correlation was utilized.
+    pub fn diagnose_correlation_selectivity(
+        expr: &Expr,
+        stats: Option<&TableStatistics>,
+        schema: &Schema,
+    ) -> Option<CorrelationSelectivity> {
+        let mut conjuncts = Vec::new();
+        flatten_conjunction(expr, &mut conjuncts);
+        if conjuncts.len() < 2 {
+            return None;
+        }
+
+        let st = stats?;
+        if st.row_count == 0 || st.column_groups.is_empty() {
+            return None;
+        }
+
+        let mut col_constraints: std::collections::HashMap<
+            usize,
+            (crate::query::CanonicalValue, usize),
+        > = std::collections::HashMap::new();
+
+        for (idx, &conj) in conjuncts.iter().enumerate() {
+            match conj {
+                Expr::Binary {
+                    left,
+                    op: BinaryOp::Eq,
+                    right,
+                } => {
+                    let (col_opt, val_opt) = extract_col_and_val(left, right);
+                    if let (Some(col_name), Some(val)) = (col_opt, val_opt) {
+                        let col_raw = col_name.split('.').next_back().unwrap_or(&col_name);
+                        if let Some(col_idx) = schema.columns.iter().position(|c| c.name == col_raw)
+                        {
+                            col_constraints.insert(
+                                col_idx,
+                                (crate::query::CanonicalValue::from_value(&val), idx),
+                            );
+                        }
+                    }
+                }
+                Expr::IsNull(inner) => {
+                    if let Expr::Column(col_name) = inner.as_ref() {
+                        let col_raw = col_name.split('.').next_back().unwrap_or(col_name);
+                        if let Some(col_idx) = schema.columns.iter().position(|c| c.name == col_raw)
+                        {
+                            col_constraints
+                                .insert(col_idx, (crate::query::CanonicalValue::Null, idx));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut candidates: Vec<CandidatePair> = Vec::new();
+
+        for (group_key, group_stats) in &st.column_groups {
+            if group_key.column_indices.len() != 2 {
+                continue;
+            }
+            let c0 = group_key.column_indices[0];
+            let c1 = group_key.column_indices[1];
+
+            if let (Some((v0, conj0)), Some((v1, conj1))) =
+                (col_constraints.get(&c0), col_constraints.get(&c1))
+            {
+                let target_vals = vec![v0.clone(), v1.clone()];
+                let mut top_k_sel = None;
+                for entry in &group_stats.top_k {
+                    if entry.values == target_vals {
+                        top_k_sel = Some((entry.frequency as f64) / (st.row_count as f64));
+                        break;
+                    }
+                }
+
+                if let Some(sel) = top_k_sel {
+                    candidates.push(CandidatePair {
+                        col_indices: [c0, c1],
+                        conj_indices: vec![*conj0, *conj1],
+                        sel: sel.clamp(0.0, 1.0),
+                        rank: 1,
+                        source: CorrelationSource::JointTopK,
+                    });
+                } else {
+                    let is_all_null = target_vals
+                        .iter()
+                        .all(|v| matches!(v, crate::query::CanonicalValue::Null));
+                    if is_all_null && group_stats.all_null_count > 0 {
+                        candidates.push(CandidatePair {
+                            col_indices: [c0, c1],
+                            conj_indices: vec![*conj0, *conj1],
+                            sel: ((group_stats.all_null_count as f64) / (st.row_count as f64))
+                                .clamp(0.0, 1.0),
+                            rank: 2,
+                            source: CorrelationSource::AllNull,
+                        });
+                    } else {
+                        let top_k_sum_freq: usize =
+                            group_stats.top_k.iter().map(|e| e.frequency).sum();
+                        let rem_freq = st.row_count.saturating_sub(top_k_sum_freq);
+                        let rem_distinct = group_stats
+                            .distinct_count
+                            .saturating_sub(group_stats.top_k.len());
+                        let freq_sel = if rem_distinct > 0 && rem_freq > 0 {
+                            let est_freq = (rem_freq as f64) / (rem_distinct as f64);
+                            (est_freq / (st.row_count as f64)).clamp(0.0, 1.0)
+                        } else if group_stats.distinct_count > 0 {
+                            (1.0 / (group_stats.distinct_count as f64)).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        candidates.push(CandidatePair {
+                            col_indices: [c0, c1],
+                            conj_indices: vec![*conj0, *conj1],
+                            sel: freq_sel,
+                            rank: 3,
+                            source: CorrelationSource::JointFrequency,
+                        });
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            a.rank
+                .cmp(&b.rank)
+                .then_with(|| {
+                    a.sel
+                        .partial_cmp(&b.sel)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.col_indices.cmp(&b.col_indices))
+        });
+
+        if let Some(best) = candidates.first() {
+            let col0_name = schema
+                .columns
+                .get(best.col_indices[0])
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            let col1_name = schema
+                .columns
+                .get(best.col_indices[1])
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            Some(CorrelationSelectivity {
+                columns: vec![col0_name, col1_name],
+                source: best.source,
+                selectivity: best.sel,
+            })
+        } else {
+            None
+        }
     }
 
     /// Estimates the probability that an individual outer row has at least one matching row in the inner relation.
@@ -1199,5 +1608,37 @@ fn flatten_conjunction<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         flatten_conjunction(right, out);
     } else {
         out.push(expr);
+    }
+}
+
+fn extract_inner_column_null_fraction(expr: &Expr, stats: Option<&TableStatistics>) -> f64 {
+    let col_name_opt = match expr {
+        Expr::Column(c) => Some(c.as_str()),
+        Expr::Binary { left, right, .. } => {
+            if let Expr::Column(c) = left.as_ref() {
+                Some(c.as_str())
+            } else if let Expr::Column(c) = right.as_ref() {
+                Some(c.as_str())
+            } else {
+                None
+            }
+        }
+        Expr::InList { expr: inner, .. } => {
+            if let Expr::Column(c) = inner.as_ref() {
+                Some(c.as_str())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(col_name) = col_name_opt {
+        let col_raw = col_name.split('.').next_back().unwrap_or(col_name);
+        stats
+            .and_then(|st| st.column(col_raw))
+            .map(|c| c.null_fraction())
+            .unwrap_or(0.0)
+    } else {
+        0.0
     }
 }
