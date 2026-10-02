@@ -7,12 +7,18 @@ pub mod external_hash_join;
 pub mod external_multi_index;
 pub mod external_sort;
 pub mod feedback;
+pub mod inference;
 pub mod metrics;
 pub mod operator;
 pub mod optimizer;
 pub mod plan_cache;
 pub mod rewrite;
 pub mod stats;
+
+pub use inference::{
+    ColumnConstraint, ColumnRange, ConstraintSet, InferenceMetrics, InferenceSource,
+    InferredPredicate, RangeBound, RuleSafety, MAX_PROPAGATION_ROUNDS,
+};
 
 pub use builder::Query;
 pub use cardinality::{

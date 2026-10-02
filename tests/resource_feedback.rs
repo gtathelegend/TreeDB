@@ -409,6 +409,7 @@ fn test_r195_plan_cache_does_not_reuse_incompatible_resource_plans() -> Result<(
         set_op: None,
         ctes: vec![],
         logical_rewrites: vec![],
+        inferred_predicates: vec![],
     };
 
     let validity = PlanValidity::new(1, 1, 1, vec!["t".to_string()], vec![])

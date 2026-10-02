@@ -14,6 +14,9 @@ use crate::query::external_multi_index::{
 };
 use crate::query::external_sort::DEFAULT_SORT_MEMORY_BUDGET_BYTES;
 use crate::query::feedback::{FeedbackContext, FeedbackKey, FeedbackRegistry, SpillStatus};
+use crate::query::inference::{
+    ColumnConstraint, ConstraintSet, InferenceMetrics, InferredPredicate,
+};
 use crate::query::operator::SortKey;
 use crate::query::plan_cache::{ParamPlanningSignature, ResourcePlanningSignature};
 use crate::query::stats::TableStatistics;
@@ -93,6 +96,8 @@ pub enum AccessPath {
     },
     /// Full sequential scan over all tuples.
     FullTableScan,
+    /// Direct zero-row result for proven contradictory / unsatisfiable constraints.
+    EmptyResult,
 }
 
 impl fmt::Display for AccessPath {
@@ -255,6 +260,7 @@ impl fmt::Display for AccessPath {
                 )
             }
             Self::FullTableScan => write!(f, "FullTableScan"),
+            Self::EmptyResult => write!(f, "EmptyResult"),
         }
     }
 }
@@ -437,6 +443,8 @@ pub struct PhysicalPlan {
     pub set_op: Option<PhysicalSetOp>,
     /// Logical transformations applied during the query rewrite phase.
     pub logical_rewrites: Vec<String>,
+    /// Inferred predicates and constraint diagnostics.
+    pub inferred_predicates: Vec<InferredPredicate>,
     /// Total estimated execution cost of this physical plan.
     pub total_cost: f64,
     /// Total estimated output row count of this physical plan.
@@ -473,6 +481,7 @@ impl PhysicalPlan {
             limit: None,
             set_op: Some(set_op),
             logical_rewrites: Vec::new(),
+            inferred_predicates: Vec::new(),
             total_cost,
             estimated_rows,
         }
@@ -496,6 +505,28 @@ impl fmt::Display for PhysicalPlan {
                 write_indent(f, indent + 1)?;
                 writeln!(f, "{rw}")?;
             }
+        }
+
+        if !self.inferred_predicates.is_empty() {
+            write_indent(f, indent)?;
+            writeln!(f, "Predicate Inference")?;
+            for inf in &self.inferred_predicates {
+                write_indent(f, indent + 1)?;
+                writeln!(f, "original:\n    {}", inf.original)?;
+                write_indent(f, indent + 1)?;
+                writeln!(f, "inferred:\n    {}", inf.inferred)?;
+                write_indent(f, indent + 1)?;
+                writeln!(f, "source:\n    {}", inf.source)?;
+            }
+        }
+
+        if matches!(self.base_table.access_path, AccessPath::EmptyResult) {
+            write_indent(f, indent)?;
+            writeln!(f, "Predicate Inference")?;
+            write_indent(f, indent + 1)?;
+            writeln!(f, "contradiction:\n    unsatisfiable constraint")?;
+            write_indent(f, indent + 1)?;
+            writeln!(f, "result:\n    EmptyResult")?;
         }
 
         if !self.ctes.is_empty() {
@@ -1421,9 +1452,22 @@ fn build_join_graph(
         }
     }
 
+    let mut metrics = InferenceMetrics::default();
+    let mut constraint_set =
+        ConstraintSet::extract_from_conjuncts(candidate_conjuncts, &mut metrics);
+    constraint_set.propagate_inner_joins(candidate_conjuncts, &mut metrics);
+
     let mut relations = Vec::with_capacity(num_rels);
     for (local_id, &global_idx) in region_rel_indices.iter().enumerate() {
         let t = &tables[global_idx];
+        let qual = t.qualifier();
+        let inferred_for_t = constraint_set.to_conjuncts(Some(qual));
+        for inf_expr in inferred_for_t {
+            if !table_local_conjuncts[local_id].contains(&inf_expr) {
+                table_local_conjuncts[local_id].push(inf_expr);
+            }
+        }
+
         let ref_cols = bound.map(|b| collect_table_referenced_columns(t, b, candidate_conjuncts));
         let base_scan = plan_table_scan(
             t,
@@ -1502,6 +1546,41 @@ fn optimize_all_inner_joins(
     let mut all_conjuncts = where_conjuncts.to_vec();
     for j in &bound.joins {
         all_conjuncts.extend(split_conjunction(&j.on));
+    }
+
+    let mut metrics = InferenceMetrics::default();
+    let mut constraint_set = ConstraintSet::extract_from_conjuncts(&all_conjuncts, &mut metrics);
+    let join_on_clauses: Vec<Expr> = bound.joins.iter().map(|j| j.on.clone()).collect();
+    constraint_set.propagate_inner_joins(&join_on_clauses, &mut metrics);
+
+    if constraint_set.is_unsatisfiable() {
+        let empty_scan = PhysicalTableScan {
+            table_name: tables[0].name.clone(),
+            table_alias: tables[0].alias.clone(),
+            access_path: AccessPath::EmptyResult,
+            residual_filter: None,
+            estimated_rows: 0.0,
+            cost: 0.0,
+        };
+        return Ok(PhysicalPlan {
+            ctes: bound.ctes.clone(),
+            base_table: empty_scan,
+            joins: Vec::new(),
+            post_join_filter: None,
+            group_by: bound.group_by.clone(),
+            aggregates: bound.aggregates.clone(),
+            having: bound.having.clone(),
+            window_exprs: bound.window_exprs.clone(),
+            projections: bound.projections.clone(),
+            order_by: bound.order_by.clone(),
+            offset: bound.offset,
+            limit: bound.limit,
+            set_op: None,
+            logical_rewrites: Vec::new(),
+            inferred_predicates: constraint_set.inferences,
+            total_cost: 0.0,
+            estimated_rows: 0.0,
+        });
     }
 
     let region_indices: Vec<usize> = (0..num_tables).collect();
@@ -1616,6 +1695,7 @@ fn optimize_all_inner_joins(
         limit: bound.limit,
         set_op: None,
         logical_rewrites: Vec::new(),
+        inferred_predicates: constraint_set.inferences,
         total_cost: cur_cost,
         estimated_rows: cur_rows,
     })
@@ -1634,6 +1714,46 @@ fn optimize_with_outer_barriers(
     let is_multi_table = !bound.joins.is_empty();
     let mut table_local_conjuncts: Vec<Vec<Expr>> = vec![Vec::new(); tables.len()];
     let mut post_join_conjuncts: Vec<Expr> = Vec::new();
+
+    let mut metrics = InferenceMetrics::default();
+    let mut constraint_set = ConstraintSet::extract_from_conjuncts(where_conjuncts, &mut metrics);
+    let inner_on_clauses: Vec<Expr> = bound
+        .joins
+        .iter()
+        .filter(|j| j.join_type == JoinType::Inner)
+        .map(|j| j.on.clone())
+        .collect();
+    constraint_set.propagate_inner_joins(&inner_on_clauses, &mut metrics);
+
+    if constraint_set.is_unsatisfiable() {
+        let empty_scan = PhysicalTableScan {
+            table_name: tables[0].name.clone(),
+            table_alias: tables[0].alias.clone(),
+            access_path: AccessPath::EmptyResult,
+            residual_filter: None,
+            estimated_rows: 0.0,
+            cost: 0.0,
+        };
+        return Ok(PhysicalPlan {
+            ctes: bound.ctes.clone(),
+            base_table: empty_scan,
+            joins: Vec::new(),
+            post_join_filter: None,
+            group_by: bound.group_by.clone(),
+            aggregates: bound.aggregates.clone(),
+            having: bound.having.clone(),
+            window_exprs: bound.window_exprs.clone(),
+            projections: bound.projections.clone(),
+            order_by: bound.order_by.clone(),
+            offset: bound.offset,
+            limit: bound.limit,
+            set_op: None,
+            logical_rewrites: Vec::new(),
+            inferred_predicates: constraint_set.inferences,
+            total_cost: 0.0,
+            estimated_rows: 0.0,
+        });
+    }
 
     // 1. Classify WHERE conjuncts per table with outer join pushdown safety
     for conjunct in where_conjuncts {
@@ -1672,6 +1792,14 @@ fn optimize_with_outer_barriers(
             }
         } else {
             post_join_conjuncts.push(conjunct.clone());
+        }
+    }
+
+    // Add inferred constraints for table 0 if any
+    let inferred_for_base = constraint_set.to_conjuncts(Some(tables[0].qualifier()));
+    for inf_expr in inferred_for_base {
+        if !table_local_conjuncts[0].contains(&inf_expr) {
+            table_local_conjuncts[0].push(inf_expr);
         }
     }
 
@@ -1735,6 +1863,15 @@ fn optimize_with_outer_barriers(
 
     for (join_idx, (join_type, on_expr)) in optimized_joins.into_iter().enumerate() {
         let right_table_idx = join_idx + 1;
+        let right_qual = tables[right_table_idx].qualifier();
+        if join_type == JoinType::Inner {
+            let inferred_for_right = constraint_set.to_conjuncts(Some(right_qual));
+            for inf_expr in inferred_for_right {
+                if !table_local_conjuncts[right_table_idx].contains(&inf_expr) {
+                    table_local_conjuncts[right_table_idx].push(inf_expr);
+                }
+            }
+        }
         let ref_cols_right =
             collect_table_referenced_columns(&tables[right_table_idx], bound, where_conjuncts);
         let right_table_scan = plan_table_scan(
@@ -1910,6 +2047,7 @@ fn optimize_with_outer_barriers(
         limit: bound.limit,
         set_op: None,
         logical_rewrites: Vec::new(),
+        inferred_predicates: constraint_set.inferences,
         total_cost: cur_cost,
         estimated_rows: cur_rows,
     })
@@ -2136,6 +2274,9 @@ impl Optimizer {
         };
 
         if !is_multi_table {
+            let mut metrics = InferenceMetrics::default();
+            let constraint_set =
+                ConstraintSet::extract_from_conjuncts(&where_conjuncts, &mut metrics);
             let ref_cols = collect_table_referenced_columns(&tables[0], bound, &where_conjuncts);
             let base_table_scan = plan_table_scan(
                 &tables[0],
@@ -2237,6 +2378,7 @@ impl Optimizer {
                 limit: bound.limit,
                 set_op: None,
                 logical_rewrites: Vec::new(),
+                inferred_predicates: constraint_set.inferences,
                 total_cost: cur_cost,
                 estimated_rows: cur_rows,
             });
@@ -2304,6 +2446,19 @@ fn plan_table_scan(
             unqualify_expr(&unqual, &table.name)
         })
         .collect();
+
+    let mut metrics = InferenceMetrics::default();
+    let constraint_set = ConstraintSet::extract_from_conjuncts(&unqual_conjuncts, &mut metrics);
+    if constraint_set.is_unsatisfiable() {
+        return PhysicalTableScan {
+            table_name: table.name.clone(),
+            table_alias: table.alias.clone(),
+            access_path: AccessPath::EmptyResult,
+            residual_filter: None,
+            estimated_rows: 0.0,
+            cost: 0.0,
+        };
+    }
 
     // If this is a CTE / in-memory relation, it does not possess a physical B-Tree index or primary key path.
     if table.is_cte {
@@ -2373,15 +2528,37 @@ fn plan_table_scan(
     });
 
     // Candidate 2: Primary Key Point Lookup
+    let mut pk_found = false;
     for (idx, conj) in unqual_conjuncts.iter().enumerate() {
         if let Some(val) = extract_col_equality(conj, pk_name, pk_type) {
             if !val.is_null() {
+                pk_found = true;
                 let mut residual = unqual_conjuncts.clone();
                 residual.remove(idx);
                 let residual_filter = recombine_conjunction(residual);
                 let cost = CostModel::primary_point_lookup_cost();
                 candidates.push(AccessPathCandidate {
                     access_path: AccessPath::PrimaryPointLookup { key: val },
+                    residual_filter,
+                    estimated_rows: 1.0,
+                    cost,
+                    priority: 0,
+                    index_id: None,
+                    index_name: None,
+                });
+            }
+        }
+    }
+    if !pk_found {
+        if let Some(ColumnConstraint::Exact(val)) = constraint_set.constraints.get(pk_name) {
+            if !val.is_null() {
+                let mut residual = unqual_conjuncts.clone();
+                residual
+                    .retain(|c| extract_col_equality(c, pk_name, pk_type).as_ref() != Some(val));
+                let residual_filter = recombine_conjunction(residual);
+                let cost = CostModel::primary_point_lookup_cost();
+                candidates.push(AccessPathCandidate {
+                    access_path: AccessPath::PrimaryPointLookup { key: val.clone() },
                     residual_filter,
                     estimated_rows: 1.0,
                     cost,
@@ -3382,6 +3559,7 @@ fn plan_table_scan(
                 AccessPath::IndexOnlyScan { index_name, .. } => {
                     format!("IndexOnlyScan({index_name})")
                 }
+                AccessPath::EmptyResult => "EmptyResult".to_string(),
                 AccessPath::MultiIndexScan {
                     strategy,
                     child_scans,
@@ -3407,6 +3585,9 @@ fn plan_table_scan(
                 let adj_rows = fb_reg.get_adjusted_cardinality(&key, cand.estimated_rows);
                 cand.estimated_rows = adj_rows;
                 match &mut cand.access_path {
+                    AccessPath::EmptyResult => {
+                        cand.cost = 0.0;
+                    }
                     AccessPath::FullTableScan => {
                         cand.cost = CostModel::table_scan_cost(table_rows, unqual_conjuncts.len());
                     }

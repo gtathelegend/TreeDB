@@ -2766,6 +2766,7 @@ impl<'db> Transaction<'db> {
                     rows
                 }
                 crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
+                crate::query::optimizer::AccessPath::EmptyResult => Vec::new(),
             };
 
             match &plan.base_table.residual_filter {
@@ -2939,6 +2940,7 @@ impl<'db> Transaction<'db> {
                     rows
                 }
                 crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
+                crate::query::optimizer::AccessPath::EmptyResult => Vec::new(),
             };
 
             match &plan.base_table.residual_filter {
@@ -3476,6 +3478,7 @@ impl<'db> Transaction<'db> {
                         rows
                     }
                     crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
+                    crate::query::optimizer::AccessPath::EmptyResult => Vec::new(),
                 };
 
                 let mut scan_metric = crate::query::OperatorMetrics::new(
@@ -3765,6 +3768,7 @@ impl<'db> Transaction<'db> {
                         crate::query::optimizer::AccessPath::FullTableScan => {
                             table.scan(None, None)?
                         }
+                        crate::query::optimizer::AccessPath::EmptyResult => Vec::new(),
                     };
 
                     let mut scan_metric = crate::query::OperatorMetrics::new(

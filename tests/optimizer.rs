@@ -991,6 +991,7 @@ fn baseline_execute(
         total_cost: 0.0,
         estimated_rows: 0.0,
         logical_rewrites: Vec::new(),
+        inferred_predicates: Vec::new(),
     };
 
     txn.execute_physical_plan(&unoptimized_plan)
