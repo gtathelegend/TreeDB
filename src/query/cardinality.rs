@@ -9,6 +9,9 @@ pub const DEFAULT_EQ_SELECTIVITY: f64 = 0.1;
 pub const DEFAULT_RANGE_SELECTIVITY: f64 = 0.3333333333333333;
 pub const DEFAULT_NULL_FRACTION: f64 = 0.05;
 
+type RangeBound = Option<(Value, bool)>;
+type ColumnRangeSpec = (RangeBound, RangeBound, Vec<usize>);
+
 /// Deterministic cardinality and selectivity estimator.
 pub struct CardinalityEstimator;
 
@@ -98,8 +101,17 @@ impl CardinalityEstimator {
                 op: UnaryOp::Not,
                 expr: inner,
             } => {
+                let null_frac = if let Expr::Column(col_name) = inner.as_ref() {
+                    let col_raw = col_name.split('.').next_back().unwrap_or(col_name);
+                    stats
+                        .and_then(|st| st.column(col_raw))
+                        .map(|c| c.null_fraction())
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
                 let inner_sel = Self::estimate_expr_selectivity(inner, stats, schema);
-                1.0 - inner_sel
+                ((1.0 - null_frac) - inner_sel).clamp(0.0, 1.0)
             }
             Expr::Binary { left, op, right } => match op {
                 BinaryOp::And => Self::estimate_conjunction_selectivity(expr, stats, schema),
@@ -109,13 +121,38 @@ impl CardinalityEstimator {
                     s_left + s_right - (s_left * s_right)
                 }
                 BinaryOp::Eq => {
-                    let (col_opt, _val_opt) = extract_col_and_val(left, right);
-                    if let Some(col_name) = col_opt {
+                    let (col_opt, val_opt) = extract_col_and_val(left, right);
+                    if let (Some(col_name), Some(val)) = (col_opt, val_opt) {
                         let col_raw = col_name.split('.').next_back().unwrap_or(&col_name);
                         if let Some(st) = stats {
                             if let Some(col_st) = st.column(col_raw) {
+                                // Try histogram estimation if available
+                                if let Some(hist) = &col_st.histogram {
+                                    if !hist.buckets.is_empty() && col_st.row_count > 0 {
+                                        let mut total_eq_rows = 0.0;
+                                        let mut match_found = false;
+                                        for bucket in &hist.buckets {
+                                            if is_val_in_bucket(
+                                                &val,
+                                                &bucket.lower_bound,
+                                                &bucket.upper_bound,
+                                            ) {
+                                                match_found = true;
+                                                if bucket.distinct_count > 0 {
+                                                    total_eq_rows += (bucket.row_count as f64)
+                                                        / (bucket.distinct_count as f64);
+                                                }
+                                            }
+                                        }
+                                        if match_found {
+                                            return (total_eq_rows / (col_st.row_count as f64))
+                                                .clamp(0.0, 1.0 - col_st.null_fraction());
+                                        }
+                                    }
+                                }
                                 if col_st.distinct_count > 0 {
-                                    1.0 / (col_st.distinct_count as f64)
+                                    (1.0 / (col_st.distinct_count as f64))
+                                        .clamp(0.0, 1.0 - col_st.null_fraction())
                                 } else {
                                     DEFAULT_EQ_SELECTIVITY
                                 }
@@ -139,7 +176,16 @@ impl CardinalityEstimator {
                         stats,
                         schema,
                     );
-                    1.0 - eq_sel
+                    let null_frac = if let Expr::Column(col_name) = left.as_ref() {
+                        let col_raw = col_name.split('.').next_back().unwrap_or(col_name);
+                        stats
+                            .and_then(|st| st.column(col_raw))
+                            .map(|c| c.null_fraction())
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    ((1.0 - null_frac) - eq_sel).clamp(0.0, 1.0)
                 }
                 BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
                     let (col_opt, val_opt) = extract_col_and_val(left, right);
@@ -147,16 +193,31 @@ impl CardinalityEstimator {
                         let col_raw = col_name.split('.').next_back().unwrap_or(&col_name);
                         if let Some(st) = stats {
                             if let Some(col_st) = st.column(col_raw) {
+                                // Try histogram range estimation
+                                if let Some(hist) = &col_st.histogram {
+                                    if !hist.buckets.is_empty() && col_st.row_count > 0 {
+                                        let (min_b, max_b) = range_op_to_bounds(*op, &val);
+                                        let sel = estimate_histogram_range(
+                                            hist,
+                                            col_st.row_count,
+                                            min_b,
+                                            max_b,
+                                        );
+                                        return sel;
+                                    }
+                                }
                                 if let (Some(min_v), Some(max_v)) = (&col_st.min, &col_st.max) {
                                     if let Some(frac) =
                                         estimate_range_fraction(min_v, max_v, &val, *op)
                                     {
-                                        frac
+                                        return frac * (1.0 - col_st.null_fraction());
                                     } else {
-                                        DEFAULT_RANGE_SELECTIVITY
+                                        return DEFAULT_RANGE_SELECTIVITY
+                                            * (1.0 - col_st.null_fraction());
                                     }
                                 } else {
-                                    DEFAULT_RANGE_SELECTIVITY
+                                    return DEFAULT_RANGE_SELECTIVITY
+                                        * (1.0 - col_st.null_fraction());
                                 }
                             } else {
                                 DEFAULT_RANGE_SELECTIVITY
@@ -175,20 +236,46 @@ impl CardinalityEstimator {
                 list,
                 negated,
             } => {
-                let single_sel = Self::estimate_expr_selectivity(
-                    &Expr::Binary {
-                        left: inner.clone(),
-                        op: BinaryOp::Eq,
-                        right: Box::new(
-                            list.first().cloned().unwrap_or(Expr::Literal(Value::Null)),
-                        ),
-                    },
-                    stats,
-                    schema,
-                );
-                let list_sel = (single_sel * (list.len() as f64)).clamp(0.0, 1.0);
+                // Deduplicate literals using CanonicalValue
+                let mut unique_vals = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for l in list {
+                    if let Expr::Literal(v) = l {
+                        let c = crate::query::CanonicalValue::from_value(v);
+                        if seen.insert(c) {
+                            unique_vals.push(v.clone());
+                        }
+                    }
+                }
+                if unique_vals.is_empty() {
+                    return if *negated { 1.0 } else { 0.0 };
+                }
+
+                let mut total_in_sel = 0.0;
+                for v in &unique_vals {
+                    let single_sel = Self::estimate_expr_selectivity(
+                        &Expr::Binary {
+                            left: inner.clone(),
+                            op: BinaryOp::Eq,
+                            right: Box::new(Expr::Literal(v.clone())),
+                        },
+                        stats,
+                        schema,
+                    );
+                    total_in_sel += single_sel;
+                }
+                let null_frac = if let Expr::Column(col_name) = inner.as_ref() {
+                    let col_raw = col_name.split('.').next_back().unwrap_or(col_name);
+                    stats
+                        .and_then(|st| st.column(col_raw))
+                        .map(|c| c.null_fraction())
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let list_sel = total_in_sel.clamp(0.0, (1.0 - null_frac).max(0.0));
                 if *negated {
-                    1.0 - list_sel
+                    ((1.0 - null_frac) - list_sel).clamp(0.0, 1.0)
                 } else {
                     list_sel
                 }
@@ -334,6 +421,96 @@ impl CardinalityEstimator {
                     }
                 }
             }
+
+            // Group same-column range constraints for single-column range intersection
+            let mut col_range_map: std::collections::HashMap<String, ColumnRangeSpec> =
+                std::collections::HashMap::new();
+
+            for (idx, &conj) in conjuncts.iter().enumerate() {
+                if handled[idx] {
+                    continue;
+                }
+                if let Expr::Binary { left, op, right } = conj {
+                    if matches!(
+                        op,
+                        BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+                    ) {
+                        let (col_opt, val_opt) = extract_col_and_val(left, right);
+                        if let (Some(col_name), Some(val)) = (col_opt, val_opt) {
+                            let col_raw = col_name
+                                .split('.')
+                                .next_back()
+                                .unwrap_or(&col_name)
+                                .to_string();
+                            let (new_min, new_max) = range_op_to_bounds(*op, &val);
+                            let entry =
+                                col_range_map
+                                    .entry(col_raw)
+                                    .or_insert((None, None, Vec::new()));
+                            entry.2.push(idx);
+
+                            if let Some(min_b) = new_min {
+                                entry.0 = match &entry.0 {
+                                    None => Some(min_b),
+                                    Some((cur_v, cur_inc)) => {
+                                        let ord = crate::query::compare_values_for_sort(
+                                            &min_b.0,
+                                            cur_v,
+                                            crate::query::SortDirection::Ascending,
+                                            None,
+                                        )
+                                        .unwrap_or(std::cmp::Ordering::Equal);
+                                        match ord {
+                                            std::cmp::Ordering::Greater => Some(min_b),
+                                            std::cmp::Ordering::Equal => {
+                                                Some((min_b.0, *cur_inc && min_b.1))
+                                            }
+                                            _ => Some((cur_v.clone(), *cur_inc)),
+                                        }
+                                    }
+                                };
+                            }
+
+                            if let Some(max_b) = new_max {
+                                entry.1 = match &entry.1 {
+                                    None => Some(max_b),
+                                    Some((cur_v, cur_inc)) => {
+                                        let ord = crate::query::compare_values_for_sort(
+                                            &max_b.0,
+                                            cur_v,
+                                            crate::query::SortDirection::Ascending,
+                                            None,
+                                        )
+                                        .unwrap_or(std::cmp::Ordering::Equal);
+                                        match ord {
+                                            std::cmp::Ordering::Less => Some(max_b),
+                                            std::cmp::Ordering::Equal => {
+                                                Some((max_b.0, *cur_inc && max_b.1))
+                                            }
+                                            _ => Some((cur_v.clone(), *cur_inc)),
+                                        }
+                                    }
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (col_raw, (min_b, max_b, conj_indices)) in col_range_map {
+                if let Some(col_st) = st.column(&col_raw) {
+                    if let Some(hist) = &col_st.histogram {
+                        if !hist.buckets.is_empty() && col_st.row_count > 0 {
+                            let range_sel =
+                                estimate_histogram_range(hist, col_st.row_count, min_b, max_b);
+                            combined_sel *= range_sel;
+                            for conj_idx in conj_indices {
+                                handled[conj_idx] = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Multiply remaining unhandled conjunct selectivities
@@ -382,6 +559,14 @@ impl CardinalityEstimator {
             }
             if start.is_none() && end.is_none() {
                 return base_rows;
+            }
+            for col_st in st.columns.values() {
+                if let Some(hist) = &col_st.histogram {
+                    let min_b = start.cloned().map(|v| (v, true));
+                    let max_b = end.cloned().map(|v| (v, true));
+                    let sel = estimate_histogram_range(hist, st.row_count, min_b, max_b);
+                    return (base_rows * sel).max(1.0);
+                }
             }
             return (base_rows * DEFAULT_RANGE_SELECTIVITY).max(1.0);
         }
@@ -442,6 +627,14 @@ impl CardinalityEstimator {
             }
             if start.is_none() && end.is_none() {
                 return base_rows;
+            }
+            for col_st in st.columns.values() {
+                if let Some(hist) = &col_st.histogram {
+                    let min_b = start.cloned().map(|v| (v, true));
+                    let max_b = end.cloned().map(|v| (v, true));
+                    let sel = estimate_histogram_range(hist, st.row_count, min_b, max_b);
+                    return (base_rows * sel).max(1.0);
+                }
             }
             return (base_rows * DEFAULT_RANGE_SELECTIVITY).max(1.0);
         }
@@ -736,6 +929,218 @@ fn extract_col_and_val(left: &Expr, right: &Expr) -> (Option<String>, Option<Val
         }
         _ => (None, None),
     }
+}
+
+fn is_val_in_bucket(val: &Value, lower: &Value, upper: &Value) -> bool {
+    let ge_lower = crate::query::compare_values_for_sort(
+        val,
+        lower,
+        crate::query::SortDirection::Ascending,
+        None,
+    )
+    .map(|o| o != std::cmp::Ordering::Less)
+    .unwrap_or(false);
+
+    let le_upper = crate::query::compare_values_for_sort(
+        val,
+        upper,
+        crate::query::SortDirection::Ascending,
+        None,
+    )
+    .map(|o| o != std::cmp::Ordering::Greater)
+    .unwrap_or(false);
+
+    ge_lower && le_upper
+}
+
+fn range_op_to_bounds(op: BinaryOp, val: &Value) -> (RangeBound, RangeBound) {
+    match op {
+        BinaryOp::Lt => (None, Some((val.clone(), false))),
+        BinaryOp::LtEq => (None, Some((val.clone(), true))),
+        BinaryOp::Gt => (Some((val.clone(), false)), None),
+        BinaryOp::GtEq => (Some((val.clone(), true)), None),
+        _ => (None, None),
+    }
+}
+
+fn calculate_numeric_overlap_fraction(
+    b_low: &Value,
+    b_high: &Value,
+    q_start: &Value,
+    q_end: &Value,
+) -> f64 {
+    match (b_low, b_high, q_start, q_end) {
+        (Value::Int64(bl), Value::Int64(bh), Value::Int64(qs), Value::Int64(qe)) => {
+            let b_range = (*bh as i128) - (*bl as i128);
+            if b_range <= 0 {
+                return 1.0;
+            }
+            let q_range = (*qe as i128) - (*qs as i128);
+            if q_range <= 0 {
+                return 0.0;
+            }
+            ((q_range as f64) / (b_range as f64)).clamp(0.0, 1.0)
+        }
+        (Value::UInt64(bl), Value::UInt64(bh), Value::UInt64(qs), Value::UInt64(qe)) => {
+            let b_range = (*bh as u128) - (*bl as u128);
+            if b_range == 0 {
+                return 1.0;
+            }
+            let q_range = (*qe as u128) - (*qs as u128);
+            ((q_range as f64) / (b_range as f64)).clamp(0.0, 1.0)
+        }
+        (Value::Float64(bl), Value::Float64(bh), Value::Float64(qs), Value::Float64(qe)) => {
+            if bl.is_nan() || bh.is_nan() || bh <= bl {
+                return 0.5;
+            }
+            let b_range = *bh - *bl;
+            let q_range = *qe - *qs;
+            if b_range <= 0.0 {
+                return 1.0;
+            }
+            (q_range / b_range).clamp(0.0, 1.0)
+        }
+        _ => 0.5,
+    }
+}
+
+fn estimate_histogram_range(
+    hist: &crate::query::stats::Histogram,
+    total_table_rows: usize,
+    min_bound: Option<(Value, bool)>,
+    max_bound: Option<(Value, bool)>,
+) -> f64 {
+    if total_table_rows == 0 || hist.buckets.is_empty() {
+        return 0.0;
+    }
+
+    if let (Some((ref min_v, ref min_inc)), Some((ref max_v, ref max_inc))) =
+        (&min_bound, &max_bound)
+    {
+        if let Ok(ord) = crate::query::compare_values_for_sort(
+            min_v,
+            max_v,
+            crate::query::SortDirection::Ascending,
+            None,
+        ) {
+            match ord {
+                std::cmp::Ordering::Greater => return 0.0,
+                std::cmp::Ordering::Equal if !min_inc || !max_inc => return 0.0,
+                _ => {}
+            }
+        }
+    }
+
+    let mut total_matching_rows = 0.0;
+
+    for bucket in &hist.buckets {
+        let b_low = &bucket.lower_bound;
+        let b_high = &bucket.upper_bound;
+
+        if let Some((ref min_v, ref min_inc)) = min_bound {
+            if let Ok(ord) = crate::query::compare_values_for_sort(
+                min_v,
+                b_high,
+                crate::query::SortDirection::Ascending,
+                None,
+            ) {
+                if ord == std::cmp::Ordering::Greater
+                    || (ord == std::cmp::Ordering::Equal && !min_inc)
+                {
+                    continue;
+                }
+            }
+        }
+
+        if let Some((ref max_v, ref max_inc)) = max_bound {
+            if let Ok(ord) = crate::query::compare_values_for_sort(
+                max_v,
+                b_low,
+                crate::query::SortDirection::Ascending,
+                None,
+            ) {
+                if ord == std::cmp::Ordering::Less || (ord == std::cmp::Ordering::Equal && !max_inc)
+                {
+                    continue;
+                }
+            }
+        }
+
+        let min_covers = match min_bound {
+            None => true,
+            Some((ref min_v, ref min_inc)) => {
+                match crate::query::compare_values_for_sort(
+                    min_v,
+                    b_low,
+                    crate::query::SortDirection::Ascending,
+                    None,
+                ) {
+                    Ok(std::cmp::Ordering::Less) => true,
+                    Ok(std::cmp::Ordering::Equal) => *min_inc,
+                    _ => false,
+                }
+            }
+        };
+
+        let max_covers = match max_bound {
+            None => true,
+            Some((ref max_v, ref max_inc)) => {
+                match crate::query::compare_values_for_sort(
+                    max_v,
+                    b_high,
+                    crate::query::SortDirection::Ascending,
+                    None,
+                ) {
+                    Ok(std::cmp::Ordering::Greater) => true,
+                    Ok(std::cmp::Ordering::Equal) => *max_inc,
+                    _ => false,
+                }
+            }
+        };
+
+        if min_covers && max_covers {
+            total_matching_rows += bucket.row_count as f64;
+        } else {
+            let q_start = match min_bound {
+                None => b_low,
+                Some((ref min_v, _)) => {
+                    if let Ok(std::cmp::Ordering::Greater) = crate::query::compare_values_for_sort(
+                        min_v,
+                        b_low,
+                        crate::query::SortDirection::Ascending,
+                        None,
+                    ) {
+                        min_v
+                    } else {
+                        b_low
+                    }
+                }
+            };
+
+            let q_end = match max_bound {
+                None => b_high,
+                Some((ref max_v, _)) => {
+                    if let Ok(std::cmp::Ordering::Less) = crate::query::compare_values_for_sort(
+                        max_v,
+                        b_high,
+                        crate::query::SortDirection::Ascending,
+                        None,
+                    ) {
+                        max_v
+                    } else {
+                        b_high
+                    }
+                }
+            };
+
+            let frac = calculate_numeric_overlap_fraction(b_low, b_high, q_start, q_end);
+            total_matching_rows += (bucket.row_count as f64) * frac;
+        }
+    }
+
+    let non_null_count = (total_table_rows.saturating_sub(hist.null_count)) as f64;
+    let clamped_matching = total_matching_rows.clamp(0.0, non_null_count);
+    (clamped_matching / (total_table_rows as f64)).clamp(0.0, 1.0)
 }
 
 fn estimate_range_fraction(min_v: &Value, max_v: &Value, val: &Value, op: BinaryOp) -> Option<f64> {

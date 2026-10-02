@@ -10,6 +10,69 @@ pub const MAX_COLUMN_GROUP_WIDTH: usize = 2;
 pub const MAX_COLUMN_GROUPS_PER_TABLE: usize = 16;
 /// Maximum number of Top-K joint value combinations retained per column group.
 pub const MAX_TOP_K_PER_GROUP: usize = 50;
+/// Maximum number of equi-depth buckets retained per column histogram.
+pub const MAX_HISTOGRAM_BUCKETS: usize = 32;
+/// Maximum memory byte limit per column histogram.
+pub const MAX_HISTOGRAM_MEMORY_BYTES: usize = 4096;
+
+/// Functional classification of a histogram algorithm strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistogramKind {
+    /// Equi-depth (equal row frequency per bucket) histogram.
+    EquiDepth,
+}
+
+/// A single bucket within a column histogram.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramBucket {
+    /// Lower bound (inclusive) of non-null values in this bucket.
+    pub lower_bound: Value,
+    /// Upper bound of non-null values in this bucket.
+    pub upper_bound: Value,
+    /// Total number of rows falling inside this bucket.
+    pub row_count: usize,
+    /// Estimated or actual distinct non-null values inside this bucket.
+    pub distinct_count: usize,
+}
+
+impl HistogramBucket {
+    /// Creates a new `HistogramBucket` record.
+    pub fn new(
+        lower_bound: Value,
+        upper_bound: Value,
+        row_count: usize,
+        distinct_count: usize,
+    ) -> Self {
+        Self {
+            lower_bound,
+            upper_bound,
+            row_count,
+            distinct_count,
+        }
+    }
+}
+
+/// Bounded single-column histogram statistics for distribution-aware range estimation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Histogram {
+    /// Histogram strategy kind.
+    pub kind: HistogramKind,
+    /// Bounded sequence of histogram buckets ordered by value.
+    pub buckets: Vec<HistogramBucket>,
+    /// Total number of NULL values excluded from the histogram.
+    pub null_count: usize,
+}
+
+impl Histogram {
+    /// Creates a new equi-depth `Histogram`.
+    pub fn new(buckets: Vec<HistogramBucket>, null_count: usize) -> Self {
+        Self {
+            kind: HistogramKind::EquiDepth,
+            buckets,
+            null_count,
+        }
+    }
+}
 
 /// Key representing a bounded group of columns in a table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -89,6 +152,8 @@ pub struct ColumnStatistics {
     pub min: Option<Value>,
     /// Maximum non-null value observed.
     pub max: Option<Value>,
+    /// Distribution histogram statistics for range estimation, if available.
+    pub histogram: Option<Histogram>,
 }
 
 impl ColumnStatistics {
@@ -106,7 +171,14 @@ impl ColumnStatistics {
             distinct_count,
             min,
             max,
+            histogram: None,
         }
+    }
+
+    /// Attaches histogram statistics to this column record.
+    pub fn with_histogram(mut self, histogram: Histogram) -> Self {
+        self.histogram = Some(histogram);
+        self
     }
 
     /// Computes the fraction of rows containing `NULL` values in `[0.0, 1.0]`.

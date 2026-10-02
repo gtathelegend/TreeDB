@@ -216,6 +216,7 @@ fn test_cardinality_estimation_formulas() {
             distinct_count: 1000,
             min: Some(Value::Int64(1)),
             max: Some(Value::Int64(1000)),
+            histogram: None,
         },
     );
     col_stats.insert(
@@ -226,6 +227,7 @@ fn test_cardinality_estimation_formulas() {
             distinct_count: 50,
             min: Some(Value::Int64(1)),
             max: Some(Value::Int64(100)),
+            histogram: None,
         },
     );
     col_stats.insert(
@@ -236,6 +238,7 @@ fn test_cardinality_estimation_formulas() {
             distinct_count: 10,
             min: Some(Value::String("a".into())),
             max: Some(Value::String("j".into())),
+            histogram: None,
         },
     );
 

@@ -1230,13 +1230,78 @@ impl<'a> Table<'a> {
         let mut table_stats = TableStatistics::new(self.name(), row_count);
 
         for (idx, col) in schema.columns.iter().enumerate() {
-            let col_stats = ColumnStatistics::new(
+            let mut col_stats = ColumnStatistics::new(
                 row_count,
                 null_counts[idx],
                 distinct_sets[idx].len(),
                 mins[idx].clone(),
                 maxs[idx].clone(),
             );
+
+            if matches!(
+                col.data_type,
+                crate::engine::types::DataType::Int64
+                    | crate::engine::types::DataType::UInt64
+                    | crate::engine::types::DataType::Float64
+                    | crate::engine::types::DataType::String
+                    | crate::engine::types::DataType::Bytes
+            ) {
+                let mut non_null_vals: Vec<Value> = rows
+                    .iter()
+                    .map(|r| &r.values[idx])
+                    .filter(|v| !v.is_null())
+                    .filter(|v| match v {
+                        Value::Float64(f) => !f.is_nan(),
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect();
+
+                if !non_null_vals.is_empty() {
+                    non_null_vals.sort_by(|a, b| {
+                        crate::query::compare_values_for_sort(
+                            a,
+                            b,
+                            crate::query::SortDirection::Ascending,
+                            None,
+                        )
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    let total_vals = non_null_vals.len();
+                    let num_buckets = crate::query::stats::MAX_HISTOGRAM_BUCKETS
+                        .min(total_vals)
+                        .max(1);
+                    let chunk_size = total_vals.div_ceil(num_buckets);
+
+                    let mut buckets = Vec::with_capacity(num_buckets);
+                    for chunk in non_null_vals.chunks(chunk_size) {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        let lower_bound = chunk[0].clone();
+                        let upper_bound = chunk.last().unwrap().clone();
+                        let row_c = chunk.len();
+                        let mut dist_set = HashSet::new();
+                        for v in chunk {
+                            dist_set.insert(crate::query::CanonicalValue::from_value(v));
+                        }
+                        let dist_c = dist_set.len();
+                        buckets.push(crate::query::stats::HistogramBucket::new(
+                            lower_bound,
+                            upper_bound,
+                            row_c,
+                            dist_c,
+                        ));
+                    }
+
+                    if !buckets.is_empty() {
+                        let hist = crate::query::stats::Histogram::new(buckets, null_counts[idx]);
+                        col_stats = col_stats.with_histogram(hist);
+                    }
+                }
+            }
+
             table_stats = table_stats.with_column(&col.name, col_stats);
         }
 

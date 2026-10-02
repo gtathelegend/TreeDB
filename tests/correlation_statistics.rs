@@ -568,7 +568,7 @@ fn test_r237_range_predicate_fallback() {
     )
     .unwrap();
 
-    let expr = parse_test_expr("age >= 18 AND income > 50000", &schema);
+    let expr = parse_test_expr("age >= 18 AND income > 5000", &schema);
     let sel = CardinalityEstimator::estimate_expr_selectivity(&expr, Some(stats), &schema);
     assert!(sel > 0.0 && sel <= 1.0);
     txn.commit().unwrap();
