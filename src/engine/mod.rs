@@ -828,4 +828,14 @@ impl TreeDb {
     pub fn set_multi_index_config(&mut self, config: MultiIndexConfig) {
         self.multi_index_config = config;
     }
+
+    /// Returns the deterministic resource planning signature for current memory configurations.
+    pub fn resource_planning_signature(&self) -> crate::query::ResourcePlanningSignature {
+        crate::query::ResourcePlanningSignature::from_configs(
+            &self.sort_config,
+            &self.aggregate_config,
+            &self.join_config,
+            &self.multi_index_config,
+        )
+    }
 }

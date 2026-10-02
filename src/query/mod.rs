@@ -53,9 +53,9 @@ pub use external_sort::{
 
 pub use feedback::{
     compute_estimation_error, FeedbackAction, FeedbackContext, FeedbackEntry, FeedbackKey,
-    FeedbackObservation, FeedbackRegistry, DEFAULT_FEEDBACK_ALPHA, DEFAULT_FEEDBACK_CAPACITY,
-    DEFAULT_REPLAN_MIN_OBSERVATIONS, DEFAULT_REPLAN_THRESHOLD_RATIO, OUTLIER_MAX_RATIO,
-    OUTLIER_MIN_RATIO,
+    FeedbackObservation, FeedbackRegistry, ResourceFeedback, ResourceObservation, SpillStatus,
+    DEFAULT_FEEDBACK_ALPHA, DEFAULT_FEEDBACK_CAPACITY, DEFAULT_REPLAN_MIN_OBSERVATIONS,
+    DEFAULT_REPLAN_THRESHOLD_RATIO, OUTLIER_MAX_RATIO, OUTLIER_MIN_RATIO,
 };
 pub use metrics::{
     estimate_error_ratio, find_operator_metrics, format_plan_with_metrics, OperatorCounters,
@@ -73,7 +73,7 @@ pub use optimizer::{
 };
 pub use plan_cache::{
     extract_plan_references, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,
-    PlanCacheStats, PlanValidity, DEFAULT_PLAN_CACHE_CAPACITY,
+    PlanCacheStats, PlanValidity, ResourcePlanningSignature, DEFAULT_PLAN_CACHE_CAPACITY,
 };
 pub use rewrite::{QueryRewriter, RewriteResult};
 pub use stats::{

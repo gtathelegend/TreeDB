@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use crate::query::feedback::SpillStatus;
+
 /// Canonical cost parameters for TreeDB's centralized cost model.
 pub const PAGE_READ_COST: f64 = 1.0;
 pub const ROW_CPU_COST: f64 = 0.01;
@@ -278,9 +280,91 @@ impl CostModel {
         }
     }
 
-    /// Computes the cost of aggregation.
+    /// Computes the cost of external disk sorting with run creation and multi-pass merging.
+    pub fn external_sort_cost(
+        input_rows: f64,
+        estimated_row_bytes: f64,
+        memory_budget_bytes: usize,
+    ) -> f64 {
+        let rows = input_rows.max(0.0);
+        if rows <= 1.0 {
+            return 0.0;
+        }
+        let in_mem_cost = SORT_CPU_COST * rows * rows.log2();
+        let total_data_bytes = rows * estimated_row_bytes.max(16.0);
+        let budget = (memory_budget_bytes as f64).max(4096.0);
+        let runs = (total_data_bytes / budget).ceil().max(2.0);
+        let fan_in = 16.0f64;
+        let merge_passes = (runs.log2() / fan_in.log2()).ceil().max(1.0);
+        let page_size = 4096.0;
+        let io_cost = 2.0 * PAGE_READ_COST * (total_data_bytes / page_size) * merge_passes;
+        in_mem_cost + io_cost + (runs * ROW_CPU_COST)
+    }
+
+    /// Computes sort cost taking memory budget and historical spill feedback into account.
+    pub fn sort_cost_with_budget(
+        input_rows: f64,
+        estimated_row_bytes: f64,
+        memory_budget_bytes: usize,
+        spill_status: SpillStatus,
+    ) -> f64 {
+        let rows = input_rows.max(0.0);
+        if rows <= 1.0 {
+            return 0.0;
+        }
+        let total_data_bytes = rows * estimated_row_bytes.max(16.0);
+        let will_spill = match spill_status {
+            SpillStatus::Spilled => true,
+            SpillStatus::NeverSpilled => false,
+            SpillStatus::Unknown => total_data_bytes > (memory_budget_bytes as f64),
+        };
+        if will_spill {
+            Self::external_sort_cost(rows, estimated_row_bytes, memory_budget_bytes)
+        } else {
+            Self::sort_cost(rows)
+        }
+    }
+
+    /// Computes the cost of in-memory aggregation.
     pub fn aggregate_cost(input_rows: f64) -> f64 {
         AGG_CPU_COST * input_rows.max(0.0)
+    }
+
+    /// Computes the cost of external disk aggregation with partitioning and spilling.
+    pub fn external_aggregate_cost(
+        input_rows: f64,
+        estimated_group_bytes: f64,
+        memory_budget_bytes: usize,
+    ) -> f64 {
+        let rows = input_rows.max(0.0);
+        let base_agg = AGG_CPU_COST * rows;
+        let total_bytes = rows * estimated_group_bytes.max(32.0);
+        let budget = (memory_budget_bytes as f64).max(4096.0);
+        let partitions = (total_bytes / budget).ceil().max(2.0);
+        let page_size = 4096.0;
+        let io_cost = 2.0 * PAGE_READ_COST * (total_bytes / page_size);
+        base_agg + io_cost + (partitions * ROW_CPU_COST)
+    }
+
+    /// Computes aggregate cost taking memory budget and historical spill feedback into account.
+    pub fn aggregate_cost_with_budget(
+        input_rows: f64,
+        estimated_group_bytes: f64,
+        memory_budget_bytes: usize,
+        spill_status: SpillStatus,
+    ) -> f64 {
+        let rows = input_rows.max(0.0);
+        let total_bytes = rows * estimated_group_bytes.max(32.0);
+        let will_spill = match spill_status {
+            SpillStatus::Spilled => true,
+            SpillStatus::NeverSpilled => false,
+            SpillStatus::Unknown => total_bytes > (memory_budget_bytes as f64),
+        };
+        if will_spill {
+            Self::external_aggregate_cost(rows, estimated_group_bytes, memory_budget_bytes)
+        } else {
+            Self::aggregate_cost(rows)
+        }
     }
 
     /// Computes the cost of window function evaluation.

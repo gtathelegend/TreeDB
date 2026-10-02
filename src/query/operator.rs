@@ -100,6 +100,29 @@ impl SortKey {
     }
 }
 
+impl std::fmt::Display for SortDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SortDirection::Ascending => write!(f, "ASC"),
+            SortDirection::Descending => write!(f, "DESC"),
+        }
+    }
+}
+
+impl std::fmt::Display for SortKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} {}", self.expression, self.direction)?;
+        if let Some(nf) = self.nulls_first {
+            if nf {
+                write!(f, " NULLS FIRST")?;
+            } else {
+                write!(f, " NULLS LAST")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Compares two rows sequentially across multiple sort keys.
 pub fn compare_rows_by_sort_keys(
     a: &Row,

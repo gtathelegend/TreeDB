@@ -1220,11 +1220,13 @@ impl<'db> Transaction<'db> {
         )?;
         bound.ctes = visible_ctes;
         let param_sig = params.map(crate::query::ParamPlanningSignature::from_values);
-        let mut plan = crate::query::optimizer::Optimizer::optimize_with_feedback(
+        let res_sig = self.resource_planning_signature();
+        let mut plan = crate::query::optimizer::Optimizer::optimize_with_resource_feedback(
             &bound,
             &table_infos,
             Some(&self.db.feedback_registry),
             param_sig.as_ref(),
+            Some(&res_sig),
             self.db.statistics_generation,
         )?;
         plan.logical_rewrites = rewrite_logs;
@@ -2070,6 +2072,7 @@ impl<'db> Transaction<'db> {
         match &stmt.statement {
             crate::sql::Statement::Select(select_stmt) => {
                 let param_sig = crate::query::ParamPlanningSignature::from_values(params);
+                let res_sig = self.resource_planning_signature();
                 let plan = if self.has_catalog_mutations {
                     self.plan_select_with_params(select_stmt, Some(params))?
                 } else {
@@ -2079,7 +2082,8 @@ impl<'db> Transaction<'db> {
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
-                    );
+                    )
+                    .with_resource_signature(Some(res_sig.clone()));
                     let maybe_cached = self.db.plan_cache.get(
                         &key,
                         self.db.catalog_generation,
@@ -2101,7 +2105,8 @@ impl<'db> Transaction<'db> {
                                 self.db.statistics_generation,
                                 tables,
                                 indexes,
-                            );
+                            )
+                            .with_resource_signature(Some(res_sig.clone()));
                             self.db.plan_cache.insert(key, new_plan.clone(), validity);
                             new_plan
                         } else {
@@ -2116,7 +2121,8 @@ impl<'db> Transaction<'db> {
                             self.db.statistics_generation,
                             tables,
                             indexes,
-                        );
+                        )
+                        .with_resource_signature(Some(res_sig.clone()));
                         self.db.plan_cache.insert(key, new_plan.clone(), validity);
                         new_plan
                     }
@@ -2127,6 +2133,7 @@ impl<'db> Transaction<'db> {
             }
             crate::sql::Statement::SetQuery(set_stmt) => {
                 let param_sig = crate::query::ParamPlanningSignature::from_values(params);
+                let res_sig = self.resource_planning_signature();
                 let plan = if self.has_catalog_mutations {
                     self.plan_set_query_with_params(set_stmt, Some(params))?
                 } else {
@@ -2136,7 +2143,8 @@ impl<'db> Transaction<'db> {
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
-                    );
+                    )
+                    .with_resource_signature(Some(res_sig.clone()));
                     let maybe_cached = self.db.plan_cache.get(
                         &key,
                         self.db.catalog_generation,
@@ -2158,7 +2166,8 @@ impl<'db> Transaction<'db> {
                                 self.db.statistics_generation,
                                 tables,
                                 indexes,
-                            );
+                            )
+                            .with_resource_signature(Some(res_sig.clone()));
                             self.db.plan_cache.insert(key, new_plan.clone(), validity);
                             new_plan
                         } else {
@@ -2173,7 +2182,8 @@ impl<'db> Transaction<'db> {
                             self.db.statistics_generation,
                             tables,
                             indexes,
-                        );
+                        )
+                        .with_resource_signature(Some(res_sig.clone()));
                         self.db.plan_cache.insert(key, new_plan.clone(), validity);
                         new_plan
                     }
@@ -2271,6 +2281,7 @@ impl<'db> Transaction<'db> {
         match &stmt.statement {
             crate::sql::Statement::Select(select_stmt) => {
                 let param_sig = crate::query::ParamPlanningSignature::from_values(params);
+                let res_sig = self.resource_planning_signature();
                 let (plan, is_hit) = if self.has_catalog_mutations {
                     (
                         self.plan_select_with_params(select_stmt, Some(params))?,
@@ -2283,7 +2294,8 @@ impl<'db> Transaction<'db> {
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
-                    );
+                    )
+                    .with_resource_signature(Some(res_sig.clone()));
                     let maybe_cached = self.db.plan_cache.get(
                         &key,
                         self.db.catalog_generation,
@@ -2305,7 +2317,8 @@ impl<'db> Transaction<'db> {
                                 self.db.statistics_generation,
                                 tables,
                                 indexes,
-                            );
+                            )
+                            .with_resource_signature(Some(res_sig.clone()));
                             self.db.plan_cache.insert(key, new_plan.clone(), validity);
                             (new_plan, false)
                         } else {
@@ -2320,7 +2333,8 @@ impl<'db> Transaction<'db> {
                             self.db.statistics_generation,
                             tables,
                             indexes,
-                        );
+                        )
+                        .with_resource_signature(Some(res_sig.clone()));
                         self.db.plan_cache.insert(key, new_plan.clone(), validity);
                         (new_plan, false)
                     }
@@ -2337,6 +2351,7 @@ impl<'db> Transaction<'db> {
             }
             crate::sql::Statement::SetQuery(set_stmt) => {
                 let param_sig = crate::query::ParamPlanningSignature::from_values(params);
+                let res_sig = self.resource_planning_signature();
                 let (plan, is_hit) = if self.has_catalog_mutations {
                     (
                         self.plan_set_query_with_params(set_stmt, Some(params))?,
@@ -2349,7 +2364,8 @@ impl<'db> Transaction<'db> {
                         self.db.catalog_generation,
                         self.db.index_generation,
                         self.db.statistics_generation,
-                    );
+                    )
+                    .with_resource_signature(Some(res_sig.clone()));
                     let maybe_cached = self.db.plan_cache.get(
                         &key,
                         self.db.catalog_generation,
@@ -2371,7 +2387,8 @@ impl<'db> Transaction<'db> {
                                 self.db.statistics_generation,
                                 tables,
                                 indexes,
-                            );
+                            )
+                            .with_resource_signature(Some(res_sig.clone()));
                             self.db.plan_cache.insert(key, new_plan.clone(), validity);
                             (new_plan, false)
                         } else {
@@ -2386,7 +2403,8 @@ impl<'db> Transaction<'db> {
                             self.db.statistics_generation,
                             tables,
                             indexes,
-                        );
+                        )
+                        .with_resource_signature(Some(res_sig.clone()));
                         self.db.plan_cache.insert(key, new_plan.clone(), validity);
                         (new_plan, false)
                     }
@@ -5092,6 +5110,11 @@ impl<'db> Transaction<'db> {
         self.db.feedback_registry_mut()
     }
 
+    /// Returns the deterministic resource planning signature for current memory configurations.
+    pub fn resource_planning_signature(&self) -> crate::query::ResourcePlanningSignature {
+        self.db.resource_planning_signature()
+    }
+
     /// Clears all runtime cardinality feedback entries.
     pub fn clear_feedback(&mut self) {
         self.db.clear_feedback();
@@ -5109,6 +5132,7 @@ impl<'db> Transaction<'db> {
         param_sig: Option<crate::query::ParamPlanningSignature>,
     ) -> bool {
         let stats_gen = self.db.statistics_generation;
+        let res_sig = self.resource_planning_signature();
 
         // 1. Check base table scan
         let scan_key = crate::query::FeedbackKey::scan(
@@ -5121,7 +5145,8 @@ impl<'db> Transaction<'db> {
                 .unwrap_or_default(),
             param_sig.clone(),
             stats_gen,
-        );
+        )
+        .with_resource_signature(Some(res_sig.clone()));
         if let Some(entry) = self.db.feedback_registry.get(&scan_key) {
             if entry.should_replan() {
                 return true;
@@ -5142,6 +5167,7 @@ impl<'db> Transaction<'db> {
                     param_sig.clone(),
                     stats_gen,
                 )
+                .with_resource_signature(Some(res_sig.clone()))
             } else {
                 crate::query::FeedbackKey::join(
                     &left_tbl,
@@ -5151,6 +5177,7 @@ impl<'db> Transaction<'db> {
                     param_sig.clone(),
                     stats_gen,
                 )
+                .with_resource_signature(Some(res_sig.clone()))
             };
             if let Some(entry) = self.db.feedback_registry.get(&join_key) {
                 if entry.should_replan() {
@@ -5158,6 +5185,56 @@ impl<'db> Transaction<'db> {
                 }
             }
             left_tbl = join.right.table_name.clone();
+        }
+
+        // 3. Check sort
+        if !plan.order_by.is_empty() {
+            let sort_key = crate::query::FeedbackKey::new(
+                crate::query::FeedbackContext::Sort {
+                    order_by: plan
+                        .order_by
+                        .iter()
+                        .map(|k| k.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                },
+                param_sig.clone(),
+                stats_gen,
+            )
+            .with_resource_signature(Some(res_sig.clone()));
+            if let Some(entry) = self.db.feedback_registry.get(&sort_key) {
+                if entry.should_replan() {
+                    return true;
+                }
+            }
+        }
+
+        // 4. Check aggregation
+        if !plan.group_by.is_empty() || !plan.aggregates.is_empty() {
+            let agg_key = crate::query::FeedbackKey::new(
+                crate::query::FeedbackContext::Aggregate {
+                    group_by: plan
+                        .group_by
+                        .iter()
+                        .map(|g| g.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    aggregates: plan
+                        .aggregates
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                },
+                param_sig.clone(),
+                stats_gen,
+            )
+            .with_resource_signature(Some(res_sig.clone()));
+            if let Some(entry) = self.db.feedback_registry.get(&agg_key) {
+                if entry.should_replan() {
+                    return true;
+                }
+            }
         }
 
         false
@@ -5171,6 +5248,7 @@ impl<'db> Transaction<'db> {
         param_sig: Option<crate::query::ParamPlanningSignature>,
     ) {
         let stats_gen = self.db.statistics_generation;
+        let res_sig = self.resource_planning_signature();
 
         // 1. Base Table Scan
         let base_scan_metric = root_op.find_first(&|m| match &m.kind {
@@ -5191,7 +5269,8 @@ impl<'db> Transaction<'db> {
                     .unwrap_or_default(),
                 param_sig.clone(),
                 stats_gen,
-            );
+            )
+            .with_resource_signature(Some(res_sig.clone()));
             let mut obs = crate::query::FeedbackObservation::new(
                 plan.base_table.estimated_rows,
                 scan_metric.actual_rows as f64,
@@ -5202,15 +5281,31 @@ impl<'db> Transaction<'db> {
             if scan_metric.counters.distinct_prefix_values > 0 {
                 obs.actual_distinct_prefixes = Some(scan_metric.counters.distinct_prefix_values);
             }
+            let did_spill =
+                scan_metric.counters.bytes_spilled > 0 || scan_metric.counters.runs_created > 0;
             if scan_metric.counters.indexes_used > 0
                 || scan_metric.counters.candidate_rows_after_set_operation > 0
+                || did_spill
+                || scan_metric.counters.peak_memory_bytes > 0
             {
                 obs.actual_candidates =
                     Some(scan_metric.counters.candidate_rows_after_set_operation);
-                obs.spill_occurred = Some(
-                    scan_metric.counters.bytes_spilled > 0 || scan_metric.counters.runs_created > 0,
-                );
+                obs.spill_occurred = Some(did_spill);
             }
+            let scan_res_obs = crate::query::ResourceObservation {
+                memory_budget_bytes: res_sig.multi_index_budget,
+                estimated_peak_memory_bytes: 0,
+                actual_peak_memory_bytes: scan_metric.counters.peak_memory_bytes,
+                estimated_spill_bytes: 0,
+                actual_spill_bytes: scan_metric.counters.bytes_spilled,
+                spill_runs: scan_metric.counters.runs_created,
+                temporary_bytes: scan_metric.counters.bytes_spilled,
+                temporary_files: scan_metric.counters.runs_created,
+                execution_time_us: scan_metric.execution_time.as_micros() as u64,
+                did_spill,
+                is_clamped: false,
+            };
+            obs.resource = Some(scan_res_obs);
             self.db.feedback_registry.record(key, obs);
         }
 
@@ -5236,7 +5331,8 @@ impl<'db> Transaction<'db> {
                         .unwrap_or_default(),
                     param_sig.clone(),
                     stats_gen,
-                );
+                )
+                .with_resource_signature(Some(res_sig.clone()));
                 let mut r_obs = crate::query::FeedbackObservation::new(
                     join.right.estimated_rows,
                     r_metric.actual_rows as f64,
@@ -5244,6 +5340,22 @@ impl<'db> Transaction<'db> {
                 r_obs.estimated_cost = Some(join.right.cost);
                 r_obs.input_rows = Some(r_metric.input_rows);
                 r_obs.output_rows = Some(r_metric.actual_rows);
+                let did_spill =
+                    r_metric.counters.bytes_spilled > 0 || r_metric.counters.runs_created > 0;
+                let r_res_obs = crate::query::ResourceObservation {
+                    memory_budget_bytes: res_sig.multi_index_budget,
+                    estimated_peak_memory_bytes: 0,
+                    actual_peak_memory_bytes: r_metric.counters.peak_memory_bytes,
+                    estimated_spill_bytes: 0,
+                    actual_spill_bytes: r_metric.counters.bytes_spilled,
+                    spill_runs: r_metric.counters.runs_created,
+                    temporary_bytes: r_metric.counters.bytes_spilled,
+                    temporary_files: r_metric.counters.runs_created,
+                    execution_time_us: r_metric.execution_time.as_micros() as u64,
+                    did_spill,
+                    is_clamped: false,
+                };
+                r_obs.resource = Some(r_res_obs);
                 self.db.feedback_registry.record(r_key, r_obs);
             }
 
@@ -5271,6 +5383,7 @@ impl<'db> Transaction<'db> {
                         param_sig.clone(),
                         stats_gen,
                     )
+                    .with_resource_signature(Some(res_sig.clone()))
                 } else {
                     crate::query::FeedbackKey::join(
                         &left_table_name,
@@ -5280,6 +5393,7 @@ impl<'db> Transaction<'db> {
                         param_sig.clone(),
                         stats_gen,
                     )
+                    .with_resource_signature(Some(res_sig.clone()))
                 };
                 let mut j_obs = crate::query::FeedbackObservation::new(
                     join.estimated_rows,
@@ -5290,54 +5404,123 @@ impl<'db> Transaction<'db> {
                 j_obs.output_rows = Some(j_metric.actual_rows);
                 j_obs.left_rows = Some(j_metric.counters.rows_left);
                 j_obs.right_rows = Some(j_metric.counters.rows_right);
-                if j_metric.counters.bytes_spilled > 0 || j_metric.counters.runs_created > 0 {
+                let did_spill =
+                    j_metric.counters.bytes_spilled > 0 || j_metric.counters.runs_created > 0;
+                if did_spill {
                     j_obs.spill_occurred = Some(true);
                 }
+                let join_res_obs = crate::query::ResourceObservation {
+                    memory_budget_bytes: res_sig.join_budget,
+                    estimated_peak_memory_bytes: 0,
+                    actual_peak_memory_bytes: j_metric.counters.peak_memory_bytes,
+                    estimated_spill_bytes: 0,
+                    actual_spill_bytes: j_metric.counters.bytes_spilled,
+                    spill_runs: j_metric.counters.runs_created,
+                    temporary_bytes: j_metric.counters.bytes_spilled,
+                    temporary_files: j_metric.counters.runs_created,
+                    execution_time_us: j_metric.execution_time.as_micros() as u64,
+                    did_spill,
+                    is_clamped: false,
+                };
+                j_obs.resource = Some(join_res_obs);
                 self.db.feedback_registry.record(j_key, j_obs);
             }
 
             left_table_name = right_table_name;
         }
 
-        // 3. External Sort / Aggregation operators
+        // 3. Sort
         let sort_metric =
             root_op.find_first(&|m| matches!(&m.kind, crate::query::OperatorKind::Sort));
         if let Some(s_metric) = sort_metric {
-            if s_metric.counters.runs_created > 0 || s_metric.counters.bytes_spilled > 0 {
-                let sort_key = crate::query::FeedbackKey::external_operator(
-                    &plan.base_table.table_name,
-                    "Sort",
+            if !plan.order_by.is_empty() {
+                let sort_key = crate::query::FeedbackKey::new(
+                    crate::query::FeedbackContext::Sort {
+                        order_by: plan
+                            .order_by
+                            .iter()
+                            .map(|k| k.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    },
                     param_sig.clone(),
                     stats_gen,
-                );
+                )
+                .with_resource_signature(Some(res_sig.clone()));
                 let mut s_obs = crate::query::FeedbackObservation::new(
                     plan.estimated_rows,
                     s_metric.actual_rows as f64,
                 );
                 s_obs.input_rows = Some(s_metric.input_rows);
                 s_obs.output_rows = Some(s_metric.actual_rows);
-                s_obs.spill_occurred = Some(true);
+                let did_spill =
+                    s_metric.counters.runs_created > 0 || s_metric.counters.bytes_spilled > 0;
+                s_obs.spill_occurred = Some(did_spill);
+                let sort_res_obs = crate::query::ResourceObservation {
+                    memory_budget_bytes: res_sig.sort_budget,
+                    estimated_peak_memory_bytes: 0,
+                    actual_peak_memory_bytes: s_metric.counters.peak_memory_bytes,
+                    estimated_spill_bytes: 0,
+                    actual_spill_bytes: s_metric.counters.bytes_spilled,
+                    spill_runs: s_metric.counters.runs_created,
+                    temporary_bytes: s_metric.counters.bytes_spilled,
+                    temporary_files: s_metric.counters.runs_created,
+                    execution_time_us: s_metric.execution_time.as_micros() as u64,
+                    did_spill,
+                    is_clamped: false,
+                };
+                s_obs.resource = Some(sort_res_obs);
                 self.db.feedback_registry.record(sort_key, s_obs);
             }
         }
 
+        // 4. Aggregation
         let agg_metric =
             root_op.find_first(&|m| matches!(&m.kind, crate::query::OperatorKind::Aggregate));
         if let Some(a_metric) = agg_metric {
-            if a_metric.counters.runs_created > 0 || a_metric.counters.bytes_spilled > 0 {
-                let agg_key = crate::query::FeedbackKey::external_operator(
-                    &plan.base_table.table_name,
-                    "Aggregate",
+            if !plan.group_by.is_empty() || !plan.aggregates.is_empty() {
+                let agg_key = crate::query::FeedbackKey::new(
+                    crate::query::FeedbackContext::Aggregate {
+                        group_by: plan
+                            .group_by
+                            .iter()
+                            .map(|g| g.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        aggregates: plan
+                            .aggregates
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    },
                     param_sig.clone(),
                     stats_gen,
-                );
+                )
+                .with_resource_signature(Some(res_sig.clone()));
                 let mut a_obs = crate::query::FeedbackObservation::new(
                     plan.estimated_rows,
                     a_metric.actual_rows as f64,
                 );
                 a_obs.input_rows = Some(a_metric.input_rows);
                 a_obs.output_rows = Some(a_metric.actual_rows);
-                a_obs.spill_occurred = Some(true);
+                let did_spill =
+                    a_metric.counters.runs_created > 0 || a_metric.counters.bytes_spilled > 0;
+                a_obs.spill_occurred = Some(did_spill);
+                let agg_res_obs = crate::query::ResourceObservation {
+                    memory_budget_bytes: res_sig.agg_budget,
+                    estimated_peak_memory_bytes: 0,
+                    actual_peak_memory_bytes: a_metric.counters.peak_memory_bytes,
+                    estimated_spill_bytes: 0,
+                    actual_spill_bytes: a_metric.counters.bytes_spilled,
+                    spill_runs: a_metric.counters.runs_created,
+                    temporary_bytes: a_metric.counters.bytes_spilled,
+                    temporary_files: a_metric.counters.runs_created,
+                    execution_time_us: a_metric.execution_time.as_micros() as u64,
+                    did_spill,
+                    is_clamped: false,
+                };
+                a_obs.resource = Some(agg_res_obs);
                 self.db.feedback_registry.record(agg_key, a_obs);
             }
         }

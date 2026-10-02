@@ -7,12 +7,15 @@ use crate::error::Result;
 use crate::query::cardinality::CardinalityEstimator;
 use crate::query::cost::{CostModel, SEC_INDEX_FETCH_COST, SEC_INDEX_LOOKUP_COST};
 use crate::query::expr::{AggregateExpr, BinaryOp, Expr};
+use crate::query::external_aggregate::DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES;
+use crate::query::external_hash_join::DEFAULT_JOIN_MEMORY_BUDGET_BYTES;
 use crate::query::external_multi_index::{
     MultiIndexExecutionMode, DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES, RECORD_ID_IN_MEMORY_BYTES,
 };
-use crate::query::feedback::{FeedbackContext, FeedbackKey, FeedbackRegistry};
+use crate::query::external_sort::DEFAULT_SORT_MEMORY_BUDGET_BYTES;
+use crate::query::feedback::{FeedbackContext, FeedbackKey, FeedbackRegistry, SpillStatus};
 use crate::query::operator::SortKey;
-use crate::query::plan_cache::ParamPlanningSignature;
+use crate::query::plan_cache::{ParamPlanningSignature, ResourcePlanningSignature};
 use crate::query::stats::TableStatistics;
 use crate::sql::ast::JoinType;
 use crate::sql::binder::BoundSelect;
@@ -1036,6 +1039,7 @@ fn optimize_inner_join_region_dp(
     graph: &JoinGraph,
     feedback: Option<&FeedbackRegistry>,
     param_sig: Option<&ParamPlanningSignature>,
+    resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
 ) -> DPPlan {
     let num_rels = graph.relations.len();
@@ -1139,7 +1143,8 @@ fn optimize_inner_join_region_dp(
                         on_expr.to_string(),
                         param_sig.cloned(),
                         stats_gen,
-                    );
+                    )
+                    .with_resource_signature(resource_sig.cloned());
                     join_rows = fb_reg.get_adjusted_cardinality(&key, join_rows);
                 }
 
@@ -1194,6 +1199,7 @@ fn optimize_inner_join_region_greedy(
     graph: &JoinGraph,
     feedback: Option<&FeedbackRegistry>,
     param_sig: Option<&ParamPlanningSignature>,
+    resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
 ) -> DPPlan {
     let num_rels = graph.relations.len();
@@ -1298,7 +1304,8 @@ fn optimize_inner_join_region_greedy(
                     on_expr.to_string(),
                     param_sig.cloned(),
                     stats_gen,
-                );
+                )
+                .with_resource_signature(resource_sig.cloned());
                 join_rows = fb_reg.get_adjusted_cardinality(&key, join_rows);
             }
 
@@ -1372,6 +1379,7 @@ fn optimize_inner_join_region_greedy(
 }
 
 /// Builds a `JoinGraph` for the given relations and candidate conjuncts.
+#[allow(clippy::too_many_arguments)]
 fn build_join_graph(
     region_rel_indices: &[usize],
     tables: &[TableOptInfo],
@@ -1379,6 +1387,7 @@ fn build_join_graph(
     bound: Option<&BoundSelect>,
     feedback: Option<&FeedbackRegistry>,
     param_sig: Option<&ParamPlanningSignature>,
+    resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
 ) -> (JoinGraph, Vec<Vec<Expr>>, Vec<Expr>) {
     let num_rels = region_rel_indices.len();
@@ -1423,6 +1432,7 @@ fn build_join_graph(
             true,
             feedback,
             param_sig,
+            resource_sig,
             stats_gen,
         );
         relations.push(JoinGraphRelation {
@@ -1485,6 +1495,7 @@ fn optimize_all_inner_joins(
     where_conjuncts: &[Expr],
     feedback: Option<&FeedbackRegistry>,
     param_sig: Option<&ParamPlanningSignature>,
+    resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
 ) -> Result<PhysicalPlan> {
     let num_tables = tables.len();
@@ -1501,13 +1512,14 @@ fn optimize_all_inner_joins(
         Some(bound),
         feedback,
         param_sig,
+        resource_sig,
         stats_gen,
     );
 
     let best_plan = if num_tables <= MAX_ENUMERATED_RELATIONS {
-        optimize_inner_join_region_dp(&graph, feedback, param_sig, stats_gen)
+        optimize_inner_join_region_dp(&graph, feedback, param_sig, resource_sig, stats_gen)
     } else {
-        optimize_inner_join_region_greedy(&graph, feedback, param_sig, stats_gen)
+        optimize_inner_join_region_greedy(&graph, feedback, param_sig, resource_sig, stats_gen)
     };
 
     let mut remaining_post = unhandled;
@@ -1528,10 +1540,62 @@ fn optimize_all_inner_joins(
     }
 
     if !bound.order_by.is_empty() {
-        cur_cost += CostModel::sort_cost(cur_rows);
+        let sort_budget = resource_sig
+            .map(|r| r.sort_budget)
+            .unwrap_or(DEFAULT_SORT_MEMORY_BUDGET_BYTES);
+        let key = FeedbackKey::new(
+            FeedbackContext::Sort {
+                order_by: bound
+                    .order_by
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            },
+            param_sig.cloned(),
+            stats_gen,
+        )
+        .with_resource_signature(resource_sig.cloned());
+        let sort_cost = if let Some(fb_reg) = feedback {
+            let spill_status = fb_reg.get_spill_status(&key);
+            let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
+            CostModel::sort_cost_with_budget(adj_rows, 64.0, sort_budget, spill_status)
+        } else {
+            CostModel::sort_cost_with_budget(cur_rows, 64.0, sort_budget, SpillStatus::Unknown)
+        };
+        cur_cost += sort_cost;
     }
     if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
-        cur_cost += CostModel::aggregate_cost(cur_rows);
+        let agg_budget = resource_sig
+            .map(|r| r.agg_budget)
+            .unwrap_or(DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES);
+        let key = FeedbackKey::new(
+            FeedbackContext::Aggregate {
+                group_by: bound
+                    .group_by
+                    .iter()
+                    .map(|g| g.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                aggregates: bound
+                    .aggregates
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            },
+            param_sig.cloned(),
+            stats_gen,
+        )
+        .with_resource_signature(resource_sig.cloned());
+        let agg_cost = if let Some(fb_reg) = feedback {
+            let spill_status = fb_reg.get_spill_status(&key);
+            let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
+            CostModel::aggregate_cost_with_budget(adj_rows, 64.0, agg_budget, spill_status)
+        } else {
+            CostModel::aggregate_cost_with_budget(cur_rows, 64.0, agg_budget, SpillStatus::Unknown)
+        };
+        cur_cost += agg_cost;
     }
     if !bound.window_exprs.is_empty() {
         cur_cost += CostModel::window_cost(cur_rows);
@@ -1564,6 +1628,7 @@ fn optimize_with_outer_barriers(
     where_conjuncts: &[Expr],
     feedback: Option<&FeedbackRegistry>,
     param_sig: Option<&ParamPlanningSignature>,
+    resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
 ) -> Result<PhysicalPlan> {
     let is_multi_table = !bound.joins.is_empty();
@@ -1660,6 +1725,7 @@ fn optimize_with_outer_barriers(
         is_multi_table,
         feedback,
         param_sig,
+        resource_sig,
         stats_gen,
     );
 
@@ -1678,6 +1744,7 @@ fn optimize_with_outer_barriers(
             is_multi_table,
             feedback,
             param_sig,
+            resource_sig,
             stats_gen,
         );
 
@@ -1711,6 +1778,7 @@ fn optimize_with_outer_barriers(
                     param_sig.cloned(),
                     stats_gen,
                 )
+                .with_resource_signature(resource_sig.cloned())
             } else {
                 FeedbackKey::join(
                     format!("{join_type:?}"),
@@ -1720,6 +1788,7 @@ fn optimize_with_outer_barriers(
                     param_sig.cloned(),
                     stats_gen,
                 )
+                .with_resource_signature(resource_sig.cloned())
             };
             join_rows = fb_reg.get_adjusted_cardinality(&key, join_rows);
         }
@@ -1736,6 +1805,7 @@ fn optimize_with_outer_barriers(
                     join_type,
                     feedback,
                     param_sig,
+                    resource_sig,
                     stats_gen,
                 )
             } else {
@@ -1764,10 +1834,62 @@ fn optimize_with_outer_barriers(
     }
 
     if !bound.order_by.is_empty() {
-        cur_cost += CostModel::sort_cost(cur_rows);
+        let sort_budget = resource_sig
+            .map(|r| r.sort_budget)
+            .unwrap_or(DEFAULT_SORT_MEMORY_BUDGET_BYTES);
+        let key = FeedbackKey::new(
+            FeedbackContext::Sort {
+                order_by: bound
+                    .order_by
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            },
+            param_sig.cloned(),
+            stats_gen,
+        )
+        .with_resource_signature(resource_sig.cloned());
+        let sort_cost = if let Some(fb_reg) = feedback {
+            let spill_status = fb_reg.get_spill_status(&key);
+            let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
+            CostModel::sort_cost_with_budget(adj_rows, 64.0, sort_budget, spill_status)
+        } else {
+            CostModel::sort_cost_with_budget(cur_rows, 64.0, sort_budget, SpillStatus::Unknown)
+        };
+        cur_cost += sort_cost;
     }
     if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
-        cur_cost += CostModel::aggregate_cost(cur_rows);
+        let agg_budget = resource_sig
+            .map(|r| r.agg_budget)
+            .unwrap_or(DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES);
+        let key = FeedbackKey::new(
+            FeedbackContext::Aggregate {
+                group_by: bound
+                    .group_by
+                    .iter()
+                    .map(|g| g.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                aggregates: bound
+                    .aggregates
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            },
+            param_sig.cloned(),
+            stats_gen,
+        )
+        .with_resource_signature(resource_sig.cloned());
+        let agg_cost = if let Some(fb_reg) = feedback {
+            let spill_status = fb_reg.get_spill_status(&key);
+            let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
+            CostModel::aggregate_cost_with_budget(adj_rows, 64.0, agg_budget, spill_status)
+        } else {
+            CostModel::aggregate_cost_with_budget(cur_rows, 64.0, agg_budget, SpillStatus::Unknown)
+        };
+        cur_cost += agg_cost;
     }
     if !bound.window_exprs.is_empty() {
         cur_cost += CostModel::window_cost(cur_rows);
@@ -1805,6 +1927,7 @@ fn plan_semi_anti_strategy(
     join_type: JoinType,
     feedback: Option<&FeedbackRegistry>,
     param_sig: Option<&ParamPlanningSignature>,
+    resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
 ) -> (JoinStrategy, Option<String>, f64) {
     let mut match_prob = CardinalityEstimator::estimate_semi_match_probability(
@@ -1826,7 +1949,8 @@ fn plan_semi_anti_strategy(
             },
             param_sig.cloned(),
             stats_gen,
-        );
+        )
+        .with_resource_signature(resource_sig.cloned());
         if let Some(fb) = fb_reg.get_feedback(&key) {
             if left_rows > 0.0 {
                 match_prob = (fb.effective_cardinality / left_rows).clamp(0.0, 1.0);
@@ -1901,13 +2025,16 @@ fn plan_semi_anti_strategy(
 
     // 2. Hash Join Strategy (if equi-join condition exists)
     if equi_pair.is_some() {
+        let join_budget = resource_sig
+            .map(|r| r.join_budget)
+            .unwrap_or(DEFAULT_JOIN_MEMORY_BUDGET_BYTES);
         let hash_cost = if join_type == JoinType::Semi {
             CostModel::hash_semi_cost(
                 left_cost,
                 left_rows,
                 right_scan.cost,
                 right_scan.estimated_rows,
-                crate::query::DEFAULT_JOIN_MEMORY_BUDGET_BYTES,
+                join_budget,
             )
         } else {
             CostModel::hash_anti_cost(
@@ -1915,7 +2042,7 @@ fn plan_semi_anti_strategy(
                 left_rows,
                 right_scan.cost,
                 right_scan.estimated_rows,
-                crate::query::DEFAULT_JOIN_MEMORY_BUDGET_BYTES,
+                join_budget,
             )
         };
 
@@ -1989,6 +2116,18 @@ impl Optimizer {
         param_sig: Option<&ParamPlanningSignature>,
         stats_gen: u64,
     ) -> Result<PhysicalPlan> {
+        Self::optimize_with_resource_feedback(bound, tables, feedback, param_sig, None, stats_gen)
+    }
+
+    /// Optimizes a bound SQL query with adaptive runtime cardinality and resource feedback.
+    pub fn optimize_with_resource_feedback(
+        bound: &BoundSelect,
+        tables: &[TableOptInfo],
+        feedback: Option<&FeedbackRegistry>,
+        param_sig: Option<&ParamPlanningSignature>,
+        resource_sig: Option<&ResourcePlanningSignature>,
+        stats_gen: u64,
+    ) -> Result<PhysicalPlan> {
         let is_multi_table = !bound.joins.is_empty();
 
         let where_conjuncts = match &bound.filter {
@@ -2005,16 +2144,79 @@ impl Optimizer {
                 false,
                 feedback,
                 param_sig,
+                resource_sig,
                 stats_gen,
             );
             let mut cur_cost = base_table_scan.cost;
             let cur_rows = base_table_scan.estimated_rows;
 
             if !bound.order_by.is_empty() {
-                cur_cost += CostModel::sort_cost(cur_rows);
+                let sort_budget = resource_sig
+                    .map(|r| r.sort_budget)
+                    .unwrap_or(DEFAULT_SORT_MEMORY_BUDGET_BYTES);
+                let key = FeedbackKey::new(
+                    FeedbackContext::Sort {
+                        order_by: bound
+                            .order_by
+                            .iter()
+                            .map(|k| k.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    },
+                    param_sig.cloned(),
+                    stats_gen,
+                )
+                .with_resource_signature(resource_sig.cloned());
+                let sort_cost = if let Some(fb_reg) = feedback {
+                    let spill_status = fb_reg.get_spill_status(&key);
+                    let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
+                    CostModel::sort_cost_with_budget(adj_rows, 64.0, sort_budget, spill_status)
+                } else {
+                    CostModel::sort_cost_with_budget(
+                        cur_rows,
+                        64.0,
+                        sort_budget,
+                        SpillStatus::Unknown,
+                    )
+                };
+                cur_cost += sort_cost;
             }
             if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
-                cur_cost += CostModel::aggregate_cost(cur_rows);
+                let agg_budget = resource_sig
+                    .map(|r| r.agg_budget)
+                    .unwrap_or(DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES);
+                let key = FeedbackKey::new(
+                    FeedbackContext::Aggregate {
+                        group_by: bound
+                            .group_by
+                            .iter()
+                            .map(|g| g.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        aggregates: bound
+                            .aggregates
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    },
+                    param_sig.cloned(),
+                    stats_gen,
+                )
+                .with_resource_signature(resource_sig.cloned());
+                let agg_cost = if let Some(fb_reg) = feedback {
+                    let spill_status = fb_reg.get_spill_status(&key);
+                    let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
+                    CostModel::aggregate_cost_with_budget(adj_rows, 64.0, agg_budget, spill_status)
+                } else {
+                    CostModel::aggregate_cost_with_budget(
+                        cur_rows,
+                        64.0,
+                        agg_budget,
+                        SpillStatus::Unknown,
+                    )
+                };
+                cur_cost += agg_cost;
             }
             if !bound.window_exprs.is_empty() {
                 cur_cost += CostModel::window_cost(cur_rows);
@@ -2051,6 +2253,7 @@ impl Optimizer {
                 &where_conjuncts,
                 feedback,
                 param_sig,
+                resource_sig,
                 stats_gen,
             );
         }
@@ -2062,6 +2265,7 @@ impl Optimizer {
             &where_conjuncts,
             feedback,
             param_sig,
+            resource_sig,
             stats_gen,
         )
     }
@@ -2080,6 +2284,7 @@ struct AccessPathCandidate {
 }
 
 /// Analyzes local predicates for a single table and selects the optimal cost-based access path.
+#[allow(clippy::too_many_arguments)]
 fn plan_table_scan(
     table: &TableOptInfo,
     conjuncts: Vec<Expr>,
@@ -2087,6 +2292,7 @@ fn plan_table_scan(
     _is_multi_table: bool,
     feedback: Option<&FeedbackRegistry>,
     param_sig: Option<&ParamPlanningSignature>,
+    resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
 ) -> PhysicalTableScan {
     let qualifier = table.qualifier();
@@ -2118,7 +2324,8 @@ fn plan_table_scan(
                 filter_repr,
                 param_sig.cloned(),
                 stats_gen,
-            );
+            )
+            .with_resource_signature(resource_sig.cloned());
             estimated_rows = fb_reg.get_adjusted_cardinality(&key, estimated_rows);
         }
         let cost = CostModel::table_scan_cost(estimated_rows, unqual_conjuncts.len());
@@ -2132,6 +2339,10 @@ fn plan_table_scan(
             cost,
         };
     }
+
+    let multi_index_budget = resource_sig
+        .map(|r| r.multi_index_budget)
+        .unwrap_or(DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES);
 
     let schema = &table.schema;
     let pk_col = schema.primary_key_column();
@@ -2829,7 +3040,7 @@ fn plan_table_scan(
                 let total_cand_bytes = ((a1.estimated_rows + a2.estimated_rows)
                     * (RECORD_ID_IN_MEMORY_BYTES as f64))
                     as usize;
-                let is_ext = total_cand_bytes > DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES;
+                let is_ext = total_cand_bytes > multi_index_budget;
                 let exec_mode = if is_ext {
                     MultiIndexExecutionMode::External
                 } else {
@@ -2910,7 +3121,7 @@ fn plan_table_scan(
                             ((a1.estimated_rows + a2.estimated_rows + a3.estimated_rows)
                                 * (RECORD_ID_IN_MEMORY_BYTES as f64))
                                 as usize;
-                        let is_ext = total_cand_bytes > DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES;
+                        let is_ext = total_cand_bytes > multi_index_budget;
                         let exec_mode = if is_ext {
                             MultiIndexExecutionMode::External
                         } else {
@@ -3092,7 +3303,7 @@ fn plan_table_scan(
                 let total_cand_bytes = (branch_est_rows.iter().sum::<f64>()
                     * (RECORD_ID_IN_MEMORY_BYTES as f64))
                     as usize;
-                let is_ext = total_cand_bytes > DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES;
+                let is_ext = total_cand_bytes > multi_index_budget;
                 let exec_mode = if is_ext {
                     MultiIndexExecutionMode::External
                 } else {
@@ -3158,25 +3369,78 @@ fn plan_table_scan(
                 filter_repr,
                 param_sig.cloned(),
                 stats_gen,
-            );
+            )
+            .with_resource_signature(resource_sig.cloned());
             if fb_reg.get_feedback(&key).is_some() {
                 let adj_rows = fb_reg.get_adjusted_cardinality(&key, cand.estimated_rows);
                 cand.estimated_rows = adj_rows;
-                cand.cost = match &cand.access_path {
+                match &mut cand.access_path {
                     AccessPath::FullTableScan => {
-                        CostModel::table_scan_cost(table_rows, unqual_conjuncts.len())
+                        cand.cost = CostModel::table_scan_cost(table_rows, unqual_conjuncts.len());
                     }
-                    AccessPath::PrimaryPointLookup { .. } => CostModel::primary_point_lookup_cost(),
+                    AccessPath::PrimaryPointLookup { .. } => {
+                        cand.cost = CostModel::primary_point_lookup_cost();
+                    }
                     AccessPath::PrimaryRangeScan { .. } => {
-                        CostModel::primary_range_scan_cost(cand.estimated_rows)
+                        cand.cost = CostModel::primary_range_scan_cost(cand.estimated_rows);
                     }
                     AccessPath::SecondaryIndexScan { .. } => {
-                        CostModel::secondary_range_scan_cost(cand.estimated_rows)
+                        cand.cost = CostModel::secondary_range_scan_cost(cand.estimated_rows);
                     }
                     AccessPath::IndexOnlyScan { .. } => {
-                        CostModel::index_only_range_scan_cost(cand.estimated_rows)
+                        cand.cost = CostModel::index_only_range_scan_cost(cand.estimated_rows);
                     }
-                    AccessPath::MultiIndexScan { .. } => cand.cost,
+                    AccessPath::MultiIndexScan {
+                        strategy,
+                        child_scans,
+                        execution_mode,
+                    } => {
+                        let spill_status = fb_reg.get_spill_status(&key);
+                        let total_cand_rows: f64 =
+                            child_scans.iter().map(|c| c.estimated_rows).sum();
+                        let total_cand_bytes = total_cand_rows * (RECORD_ID_IN_MEMORY_BYTES as f64);
+                        let adj_peak_mem = fb_reg.get_adjusted_peak_memory(&key, total_cand_bytes);
+                        let should_spill = match spill_status {
+                            SpillStatus::Spilled => true,
+                            SpillStatus::NeverSpilled => false,
+                            SpillStatus::Unknown => adj_peak_mem > multi_index_budget as f64,
+                        };
+                        *execution_mode = if should_spill {
+                            MultiIndexExecutionMode::External
+                        } else {
+                            MultiIndexExecutionMode::InMemory
+                        };
+                        cand.cost = match strategy {
+                            MultiIndexStrategy::Intersection => {
+                                CostModel::multi_index_intersection_cost(
+                                    &child_scans.iter().map(|c| c.cost).collect::<Vec<_>>(),
+                                    &child_scans
+                                        .iter()
+                                        .map(|c| c.estimated_rows)
+                                        .collect::<Vec<_>>(),
+                                    cand.estimated_rows,
+                                    cand.residual_filter
+                                        .as_ref()
+                                        .map(|f| split_conjunction(f).len())
+                                        .unwrap_or(0),
+                                    should_spill,
+                                )
+                            }
+                            MultiIndexStrategy::Union => CostModel::multi_index_union_cost(
+                                &child_scans.iter().map(|c| c.cost).collect::<Vec<_>>(),
+                                &child_scans
+                                    .iter()
+                                    .map(|c| c.estimated_rows)
+                                    .collect::<Vec<_>>(),
+                                cand.estimated_rows,
+                                cand.residual_filter
+                                    .as_ref()
+                                    .map(|f| split_conjunction(f).len())
+                                    .unwrap_or(0),
+                                should_spill,
+                            ),
+                        };
+                    }
                 };
             }
         }

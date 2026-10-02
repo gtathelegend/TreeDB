@@ -33,6 +33,72 @@ impl ParamPlanningSignature {
     }
 }
 
+/// Normalized resource planning signature capturing execution-memory and spill configurations.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourcePlanningSignature {
+    /// In-memory execution budget in bytes.
+    pub memory_budget_bytes: usize,
+    /// Maximum number of temporary files open simultaneously.
+    pub max_temp_files: usize,
+    /// Maximum disk space in bytes for temporary runs.
+    pub max_temp_bytes: usize,
+    /// Maximum number of merge/partition passes allowed.
+    pub max_merge_passes: usize,
+    /// Specific sort buffer budget in bytes.
+    pub sort_budget: usize,
+    /// Specific aggregation buffer budget in bytes.
+    pub agg_budget: usize,
+    /// Specific hash join buffer budget in bytes.
+    pub join_budget: usize,
+    /// Specific multi-index buffer budget in bytes.
+    pub multi_index_budget: usize,
+}
+
+impl ResourcePlanningSignature {
+    /// Creates a uniform resource planning signature.
+    pub const fn new(
+        memory_budget_bytes: usize,
+        max_temp_files: usize,
+        max_temp_bytes: usize,
+        max_merge_passes: usize,
+    ) -> Self {
+        Self {
+            memory_budget_bytes,
+            max_temp_files,
+            max_temp_bytes,
+            max_merge_passes,
+            sort_budget: memory_budget_bytes,
+            agg_budget: memory_budget_bytes,
+            join_budget: memory_budget_bytes,
+            multi_index_budget: memory_budget_bytes,
+        }
+    }
+
+    /// Constructs a resource planning signature from specific subsystem configurations.
+    pub fn from_configs(
+        sort_cfg: &crate::query::external_sort::SortConfig,
+        agg_cfg: &crate::query::external_aggregate::AggregateConfig,
+        join_cfg: &crate::query::external_hash_join::JoinConfig,
+        multi_idx_cfg: &crate::query::external_multi_index::MultiIndexConfig,
+    ) -> Self {
+        let min_budget = sort_cfg
+            .memory_budget_bytes
+            .min(agg_cfg.memory_budget_bytes)
+            .min(join_cfg.memory_budget_bytes)
+            .min(multi_idx_cfg.memory_budget_bytes);
+        Self {
+            memory_budget_bytes: min_budget,
+            max_temp_files: sort_cfg.max_temp_files,
+            max_temp_bytes: sort_cfg.max_temp_bytes,
+            max_merge_passes: sort_cfg.max_merge_passes,
+            sort_budget: sort_cfg.memory_budget_bytes,
+            agg_budget: agg_cfg.memory_budget_bytes,
+            join_budget: join_cfg.memory_budget_bytes,
+            multi_index_budget: multi_idx_cfg.memory_budget_bytes,
+        }
+    }
+}
+
 /// Strongly typed, deterministic cache key for prepared statement physical execution plans.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PlanCacheKey {
@@ -46,6 +112,8 @@ pub struct PlanCacheKey {
     pub index_generation: u64,
     /// Statistics registry generation at plan compile time.
     pub statistics_generation: u64,
+    /// Resource planning signature (isolating memory-budget and spill configurations).
+    pub resource_signature: Option<ResourcePlanningSignature>,
 }
 
 impl PlanCacheKey {
@@ -63,7 +131,17 @@ impl PlanCacheKey {
             catalog_generation,
             index_generation,
             statistics_generation,
+            resource_signature: None,
         }
+    }
+
+    /// Sets the resource planning signature for this cache key.
+    pub fn with_resource_signature(
+        mut self,
+        resource_signature: Option<ResourcePlanningSignature>,
+    ) -> Self {
+        self.resource_signature = resource_signature;
+        self
     }
 }
 
@@ -80,6 +158,8 @@ pub struct PlanValidity {
     pub referenced_tables: Vec<String>,
     /// Secondary indexes referenced by the physical plan.
     pub referenced_indexes: Vec<String>,
+    /// Resource planning signature valid for this plan.
+    pub resource_signature: Option<ResourcePlanningSignature>,
 }
 
 impl PlanValidity {
@@ -97,7 +177,17 @@ impl PlanValidity {
             statistics_generation,
             referenced_tables,
             referenced_indexes,
+            resource_signature: None,
         }
+    }
+
+    /// Sets the resource planning signature for this validity descriptor.
+    pub fn with_resource_signature(
+        mut self,
+        resource_signature: Option<ResourcePlanningSignature>,
+    ) -> Self {
+        self.resource_signature = resource_signature;
+        self
     }
 
     /// Validates whether this cached plan remains valid against the active database generations.
@@ -110,6 +200,25 @@ impl PlanValidity {
         self.catalog_generation == current_catalog_gen
             && self.index_generation == current_index_gen
             && self.statistics_generation == current_stats_gen
+    }
+
+    /// Validates whether this cached plan remains valid against active generations and resource configuration.
+    pub fn is_valid_with_resources(
+        &self,
+        current_catalog_gen: u64,
+        current_index_gen: u64,
+        current_stats_gen: u64,
+        current_resource_sig: Option<&ResourcePlanningSignature>,
+    ) -> bool {
+        if !self.is_valid(current_catalog_gen, current_index_gen, current_stats_gen) {
+            return false;
+        }
+        match (&self.resource_signature, current_resource_sig) {
+            (Some(expected), Some(actual)) => expected == actual,
+            (None, None) => true,
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+        }
     }
 }
 
@@ -189,10 +298,12 @@ impl PlanCache {
         let counter = self.access_counter;
 
         if let Some(entry) = self.entries.get_mut(key) {
-            if entry
-                .validity
-                .is_valid(current_catalog_gen, current_index_gen, current_stats_gen)
-            {
+            if entry.validity.is_valid_with_resources(
+                current_catalog_gen,
+                current_index_gen,
+                current_stats_gen,
+                key.resource_signature.as_ref(),
+            ) {
                 entry.last_accessed = counter;
                 self.stats.hits += 1;
                 return Some(entry.plan.clone());
