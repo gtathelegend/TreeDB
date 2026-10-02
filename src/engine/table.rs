@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::engine::catalog::{Catalog, IndexMetadata, TableId, TableMetadata};
 use crate::engine::types::{Row, Schema, Value};
@@ -1278,6 +1278,105 @@ impl<'a> Table<'a> {
                 );
                 table_stats = table_stats.with_index(&meta.name, idx_stats);
             }
+        }
+
+        // Collect column group correlation statistics
+        let mut group_keys: Vec<crate::query::stats::ColumnGroupKey> = Vec::new();
+        for (meta, _) in &self.indexes {
+            if meta.column_indices.len() >= 2 {
+                for window in meta.column_indices.windows(2) {
+                    let key = crate::query::stats::ColumnGroupKey::new(window.to_vec());
+                    if !group_keys.contains(&key) && key.column_indices.len() == 2 {
+                        group_keys.push(key);
+                    }
+                }
+            }
+        }
+        if num_cols >= 2 {
+            for i in 0..num_cols {
+                for j in (i + 1)..num_cols {
+                    if group_keys.len() >= crate::query::stats::MAX_COLUMN_GROUPS_PER_TABLE {
+                        break;
+                    }
+                    let key = crate::query::stats::ColumnGroupKey::new(vec![i, j]);
+                    if !group_keys.contains(&key) {
+                        group_keys.push(key);
+                    }
+                }
+                if group_keys.len() >= crate::query::stats::MAX_COLUMN_GROUPS_PER_TABLE {
+                    break;
+                }
+            }
+        }
+        group_keys.truncate(crate::query::stats::MAX_COLUMN_GROUPS_PER_TABLE);
+
+        for group_key in group_keys {
+            let cols = &group_key.column_indices;
+            let col_names: Vec<String> = cols
+                .iter()
+                .map(|&i| schema.columns[i].name.clone())
+                .collect();
+            let mut counts: HashMap<Vec<crate::query::CanonicalValue>, usize> = HashMap::new();
+            let mut all_null_count = 0usize;
+            let mut any_null_count = 0usize;
+
+            for row in &rows {
+                let mut vals = Vec::with_capacity(cols.len());
+                let mut all_null = true;
+                let mut any_null = false;
+
+                for &idx in cols {
+                    if idx < row.values.len() {
+                        let v = &row.values[idx];
+                        if v.is_null() {
+                            any_null = true;
+                        } else {
+                            all_null = false;
+                        }
+                        vals.push(crate::query::CanonicalValue::from_value(v));
+                    } else {
+                        any_null = true;
+                        vals.push(crate::query::CanonicalValue::Null);
+                    }
+                }
+
+                if all_null {
+                    all_null_count += 1;
+                }
+                if any_null {
+                    any_null_count += 1;
+                }
+
+                *counts.entry(vals).or_insert(0) += 1;
+            }
+
+            let distinct_count = counts.len();
+            let mut combo_vec: Vec<crate::query::stats::TopKCombination> = counts
+                .into_iter()
+                .map(|(values, frequency)| crate::query::stats::TopKCombination {
+                    values,
+                    frequency,
+                })
+                .collect();
+
+            combo_vec.sort_unstable_by(|a, b| {
+                b.frequency
+                    .cmp(&a.frequency)
+                    .then_with(|| a.values.cmp(&b.values))
+            });
+
+            combo_vec.truncate(crate::query::stats::MAX_TOP_K_PER_GROUP);
+
+            let group_stats = crate::query::stats::ColumnGroupStatistics::new(
+                cols.clone(),
+                col_names,
+                distinct_count,
+                all_null_count,
+                any_null_count,
+                combo_vec,
+            );
+
+            table_stats = table_stats.with_column_group(group_stats);
         }
 
         Ok(table_stats)

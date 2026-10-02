@@ -51,7 +51,20 @@ impl CardinalityEstimator {
     pub fn estimate_expr_selectivity(
         expr: &Expr,
         stats: Option<&TableStatistics>,
-        _schema: &Schema,
+        schema: &Schema,
+    ) -> f64 {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::And, ..
+            } => Self::estimate_conjunction_selectivity(expr, stats, schema),
+            _ => Self::estimate_single_expr_selectivity(expr, stats, schema),
+        }
+    }
+
+    fn estimate_single_expr_selectivity(
+        expr: &Expr,
+        stats: Option<&TableStatistics>,
+        schema: &Schema,
     ) -> f64 {
         let sel = match expr {
             Expr::Literal(Value::Boolean(b))
@@ -78,25 +91,21 @@ impl CardinalityEstimator {
             }
             Expr::IsNotNull(inner) => {
                 let null_sel =
-                    Self::estimate_expr_selectivity(&Expr::IsNull(inner.clone()), stats, _schema);
+                    Self::estimate_expr_selectivity(&Expr::IsNull(inner.clone()), stats, schema);
                 1.0 - null_sel
             }
             Expr::Unary {
                 op: UnaryOp::Not,
                 expr: inner,
             } => {
-                let inner_sel = Self::estimate_expr_selectivity(inner, stats, _schema);
+                let inner_sel = Self::estimate_expr_selectivity(inner, stats, schema);
                 1.0 - inner_sel
             }
             Expr::Binary { left, op, right } => match op {
-                BinaryOp::And => {
-                    let s_left = Self::estimate_expr_selectivity(left, stats, _schema);
-                    let s_right = Self::estimate_expr_selectivity(right, stats, _schema);
-                    s_left * s_right
-                }
+                BinaryOp::And => Self::estimate_conjunction_selectivity(expr, stats, schema),
                 BinaryOp::Or => {
-                    let s_left = Self::estimate_expr_selectivity(left, stats, _schema);
-                    let s_right = Self::estimate_expr_selectivity(right, stats, _schema);
+                    let s_left = Self::estimate_expr_selectivity(left, stats, schema);
+                    let s_right = Self::estimate_expr_selectivity(right, stats, schema);
                     s_left + s_right - (s_left * s_right)
                 }
                 BinaryOp::Eq => {
@@ -128,7 +137,7 @@ impl CardinalityEstimator {
                             right: right.clone(),
                         },
                         stats,
-                        _schema,
+                        schema,
                     );
                     1.0 - eq_sel
                 }
@@ -175,7 +184,7 @@ impl CardinalityEstimator {
                         ),
                     },
                     stats,
-                    _schema,
+                    schema,
                 );
                 let list_sel = (single_sel * (list.len() as f64)).clamp(0.0, 1.0);
                 if *negated {
@@ -188,6 +197,154 @@ impl CardinalityEstimator {
         };
 
         sel.clamp(0.0, 1.0)
+    }
+
+    /// Helper to evaluate conjunction selectivity using column-group correlation statistics where available.
+    fn estimate_conjunction_selectivity(
+        expr: &Expr,
+        stats: Option<&TableStatistics>,
+        schema: &Schema,
+    ) -> f64 {
+        let mut conjuncts = Vec::new();
+        flatten_conjunction(expr, &mut conjuncts);
+
+        if conjuncts.is_empty() {
+            return 1.0;
+        }
+        if conjuncts.len() == 1 {
+            return Self::estimate_single_expr_selectivity(conjuncts[0], stats, schema);
+        }
+
+        let mut handled = vec![false; conjuncts.len()];
+        let mut combined_sel = 1.0;
+
+        if let Some(st) = stats {
+            if st.row_count > 0 && !st.column_groups.is_empty() {
+                // Extract column equality and IsNull constraints
+                // Maps col_idx -> (CanonicalValue, conjunct_index)
+                let mut col_constraints: std::collections::HashMap<
+                    usize,
+                    (crate::query::CanonicalValue, usize),
+                > = std::collections::HashMap::new();
+
+                for (idx, &conj) in conjuncts.iter().enumerate() {
+                    match conj {
+                        Expr::Binary {
+                            left,
+                            op: BinaryOp::Eq,
+                            right,
+                        } => {
+                            let (col_opt, val_opt) = extract_col_and_val(left, right);
+                            if let (Some(col_name), Some(val)) = (col_opt, val_opt) {
+                                let col_raw = col_name.split('.').next_back().unwrap_or(&col_name);
+                                if let Some(col_idx) =
+                                    schema.columns.iter().position(|c| c.name == col_raw)
+                                {
+                                    col_constraints.insert(
+                                        col_idx,
+                                        (crate::query::CanonicalValue::from_value(&val), idx),
+                                    );
+                                }
+                            }
+                        }
+                        Expr::IsNull(inner) => {
+                            if let Expr::Column(col_name) = inner.as_ref() {
+                                let col_raw = col_name.split('.').next_back().unwrap_or(col_name);
+                                if let Some(col_idx) =
+                                    schema.columns.iter().position(|c| c.name == col_raw)
+                                {
+                                    col_constraints
+                                        .insert(col_idx, (crate::query::CanonicalValue::Null, idx));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Check available column groups for matching multi-column constraints
+                for (group_key, group_stats) in &st.column_groups {
+                    let cols = &group_key.column_indices;
+                    if cols.iter().all(|c_idx| col_constraints.contains_key(c_idx))
+                        && cols.iter().all(|c_idx| {
+                            let (_, c_conj_idx) = col_constraints[c_idx];
+                            !handled[c_conj_idx]
+                        })
+                    {
+                        // All columns in this group are constrained by unhandled conjuncts!
+                        let target_vals: Vec<crate::query::CanonicalValue> = cols
+                            .iter()
+                            .map(|c_idx| col_constraints[c_idx].0.clone())
+                            .collect();
+
+                        // Try finding target_vals in Top-K
+                        let mut joint_sel_opt: Option<f64> = None;
+                        for entry in &group_stats.top_k {
+                            if entry.values == target_vals {
+                                joint_sel_opt =
+                                    Some((entry.frequency as f64) / (st.row_count as f64));
+                                break;
+                            }
+                        }
+
+                        let joint_sel = match joint_sel_opt {
+                            Some(s) => s,
+                            None => {
+                                // Not in top-k
+                                let is_all_null = target_vals
+                                    .iter()
+                                    .all(|v| matches!(v, crate::query::CanonicalValue::Null));
+                                if is_all_null && group_stats.all_null_count > 0 {
+                                    (group_stats.all_null_count as f64) / (st.row_count as f64)
+                                } else {
+                                    let top_k_sum_freq: usize =
+                                        group_stats.top_k.iter().map(|e| e.frequency).sum();
+                                    let rem_freq = st.row_count.saturating_sub(top_k_sum_freq);
+                                    let rem_distinct = group_stats
+                                        .distinct_count
+                                        .saturating_sub(group_stats.top_k.len());
+
+                                    if rem_distinct > 0 && rem_freq > 0 {
+                                        let est_freq = (rem_freq as f64) / (rem_distinct as f64);
+                                        (est_freq / (st.row_count as f64)).clamp(0.0, 1.0)
+                                    } else if group_stats.distinct_count > 0 {
+                                        1.0 / (group_stats.distinct_count as f64)
+                                    } else {
+                                        // Fallback to product of single-column selectivities
+                                        let mut fallback_prod = 1.0;
+                                        for c_idx in cols {
+                                            let (_, c_conj_idx) = col_constraints[c_idx];
+                                            fallback_prod *= Self::estimate_single_expr_selectivity(
+                                                conjuncts[c_conj_idx],
+                                                stats,
+                                                schema,
+                                            );
+                                        }
+                                        fallback_prod
+                                    }
+                                }
+                            }
+                        };
+
+                        combined_sel *= joint_sel.clamp(0.0, 1.0);
+                        for c_idx in cols {
+                            let (_, c_conj_idx) = col_constraints[c_idx];
+                            handled[c_conj_idx] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Multiply remaining unhandled conjunct selectivities
+        for (idx, &conj) in conjuncts.iter().enumerate() {
+            if !handled[idx] {
+                let s = Self::estimate_single_expr_selectivity(conj, stats, schema);
+                combined_sel *= s;
+            }
+        }
+
+        combined_sel.clamp(0.0, 1.0)
     }
 
     /// Estimates the output cardinality for a table scan with optional residual filter.
@@ -623,5 +780,19 @@ fn estimate_range_fraction(min_v: &Value, max_v: &Value, val: &Value, op: Binary
             Some(frac.clamp(0.001, 1.0))
         }
         _ => None,
+    }
+}
+
+fn flatten_conjunction<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::Binary {
+        left,
+        op: BinaryOp::And,
+        right,
+    } = expr
+    {
+        flatten_conjunction(left, out);
+        flatten_conjunction(right, out);
+    } else {
+        out.push(expr);
     }
 }

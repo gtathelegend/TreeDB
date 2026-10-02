@@ -3033,10 +3033,26 @@ fn plan_table_scan(
                     .map(|(_, c)| c.clone())
                     .collect();
                 let residual_filter = recombine_conjunction(residual_conjuncts.clone());
-                let est_rows = CardinalityEstimator::estimate_intersection_cardinality(
-                    table_rows,
-                    &[a1.selectivity, a2.selectivity],
-                );
+                let used_conjuncts: Vec<Expr> = unqual_conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| used_set.contains(idx))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                let combined_used_expr = recombine_conjunction(used_conjuncts);
+                let est_rows = if let Some(comb_expr) = &combined_used_expr {
+                    let sel = CardinalityEstimator::estimate_expr_selectivity(
+                        comb_expr,
+                        table.stats.as_ref(),
+                        &table.schema,
+                    );
+                    (table_rows * sel).clamp(0.0, table_rows)
+                } else {
+                    CardinalityEstimator::estimate_intersection_cardinality(
+                        table_rows,
+                        &[a1.selectivity, a2.selectivity],
+                    )
+                };
                 let total_cand_bytes = ((a1.estimated_rows + a2.estimated_rows)
                     * (RECORD_ID_IN_MEMORY_BYTES as f64))
                     as usize;
@@ -3113,10 +3129,26 @@ fn plan_table_scan(
                             .map(|(_, c)| c.clone())
                             .collect();
                         let residual_filter = recombine_conjunction(residual_conjuncts.clone());
-                        let est_rows = CardinalityEstimator::estimate_intersection_cardinality(
-                            table_rows,
-                            &[a1.selectivity, a2.selectivity, a3.selectivity],
-                        );
+                        let used_conjuncts: Vec<Expr> = unqual_conjuncts
+                            .iter()
+                            .enumerate()
+                            .filter(|(idx, _)| used_set.contains(idx))
+                            .map(|(_, c)| c.clone())
+                            .collect();
+                        let combined_used_expr = recombine_conjunction(used_conjuncts);
+                        let est_rows = if let Some(comb_expr) = &combined_used_expr {
+                            let sel = CardinalityEstimator::estimate_expr_selectivity(
+                                comb_expr,
+                                table.stats.as_ref(),
+                                &table.schema,
+                            );
+                            (table_rows * sel).clamp(0.0, table_rows)
+                        } else {
+                            CardinalityEstimator::estimate_intersection_cardinality(
+                                table_rows,
+                                &[a1.selectivity, a2.selectivity, a3.selectivity],
+                            )
+                        };
                         let total_cand_bytes =
                             ((a1.estimated_rows + a2.estimated_rows + a3.estimated_rows)
                                 * (RECORD_ID_IN_MEMORY_BYTES as f64))

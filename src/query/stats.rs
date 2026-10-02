@@ -1,7 +1,80 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::engine::types::Value;
+use crate::engine::types::{Schema, Value};
+use crate::query::operator::CanonicalValue;
+
+/// Maximum number of columns in a correlated column group.
+pub const MAX_COLUMN_GROUP_WIDTH: usize = 2;
+/// Maximum number of column groups collected per table.
+pub const MAX_COLUMN_GROUPS_PER_TABLE: usize = 16;
+/// Maximum number of Top-K joint value combinations retained per column group.
+pub const MAX_TOP_K_PER_GROUP: usize = 50;
+
+/// Key representing a bounded group of columns in a table.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ColumnGroupKey {
+    /// Sorted 0-based column indices in the table schema.
+    pub column_indices: Vec<usize>,
+}
+
+impl ColumnGroupKey {
+    /// Creates a new `ColumnGroupKey` with sorted, deduplicated column indices.
+    pub fn new(mut indices: Vec<usize>) -> Self {
+        indices.sort_unstable();
+        indices.dedup();
+        Self {
+            column_indices: indices,
+        }
+    }
+}
+
+/// A frequent joint combination of canonical values for a column group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopKCombination {
+    /// Canonical values for each column in the group (in order of `ColumnGroupKey.column_indices`).
+    pub values: Vec<CanonicalValue>,
+    /// Number of rows matching this exact joint combination.
+    pub frequency: usize,
+}
+
+/// Bounded multi-column statistics for a column group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnGroupStatistics {
+    /// Column indices included in this group (sorted).
+    pub column_indices: Vec<usize>,
+    /// Column names corresponding to `column_indices` in the same order.
+    pub column_names: Vec<String>,
+    /// Total number of distinct joint value combinations observed.
+    pub distinct_count: usize,
+    /// Number of rows where ALL columns in the group are NULL.
+    pub all_null_count: usize,
+    /// Number of rows where ANY column in the group is NULL.
+    pub any_null_count: usize,
+    /// Top-K most frequent canonical value combinations, sorted deterministically.
+    pub top_k: Vec<TopKCombination>,
+}
+
+impl ColumnGroupStatistics {
+    /// Creates a new `ColumnGroupStatistics` record.
+    pub fn new(
+        column_indices: Vec<usize>,
+        column_names: Vec<String>,
+        distinct_count: usize,
+        all_null_count: usize,
+        any_null_count: usize,
+        top_k: Vec<TopKCombination>,
+    ) -> Self {
+        Self {
+            column_indices,
+            column_names,
+            distinct_count,
+            all_null_count,
+            any_null_count,
+            top_k,
+        }
+    }
+}
 
 /// Summary statistics for an individual table column.
 #[derive(Debug, Clone, PartialEq)]
@@ -117,6 +190,8 @@ pub struct TableStatistics {
     pub columns: HashMap<String, ColumnStatistics>,
     /// Per-index statistics keyed by index name.
     pub indexes: HashMap<String, IndexStatistics>,
+    /// Column group statistics keyed by ColumnGroupKey.
+    pub column_groups: HashMap<ColumnGroupKey, ColumnGroupStatistics>,
 }
 
 impl TableStatistics {
@@ -127,6 +202,7 @@ impl TableStatistics {
             row_count,
             columns: HashMap::new(),
             indexes: HashMap::new(),
+            column_groups: HashMap::new(),
         }
     }
 
@@ -142,6 +218,13 @@ impl TableStatistics {
         self
     }
 
+    /// Adds column group statistics.
+    pub fn with_column_group(mut self, stats: ColumnGroupStatistics) -> Self {
+        let key = ColumnGroupKey::new(stats.column_indices.clone());
+        self.column_groups.insert(key, stats);
+        self
+    }
+
     /// Retrieves statistics for a specific column.
     pub fn column(&self, name: &str) -> Option<&ColumnStatistics> {
         self.columns.get(name)
@@ -150,6 +233,35 @@ impl TableStatistics {
     /// Retrieves statistics for a specific secondary index.
     pub fn index(&self, name: &str) -> Option<&IndexStatistics> {
         self.indexes.get(name)
+    }
+
+    /// Retrieves statistics for a specific column group key.
+    pub fn column_group(&self, key: &ColumnGroupKey) -> Option<&ColumnGroupStatistics> {
+        self.column_groups.get(key)
+    }
+
+    /// Retrieves column group statistics matching the given column indices.
+    pub fn find_column_group_for_indices(
+        &self,
+        indices: &[usize],
+    ) -> Option<&ColumnGroupStatistics> {
+        let key = ColumnGroupKey::new(indices.to_vec());
+        self.column_groups.get(&key)
+    }
+
+    /// Retrieves column group statistics matching the given column names within a schema.
+    pub fn find_column_group_for_names(
+        &self,
+        names: &[&str],
+        schema: &Schema,
+    ) -> Option<&ColumnGroupStatistics> {
+        let mut indices = Vec::with_capacity(names.len());
+        for &name in names {
+            let col_raw = name.split('.').next_back().unwrap_or(name);
+            let idx = schema.columns.iter().position(|c| c.name == col_raw)?;
+            indices.push(idx);
+        }
+        self.find_column_group_for_indices(&indices)
     }
 }
 

@@ -244,6 +244,7 @@ fn test_cardinality_estimation_formulas() {
         row_count: 1000,
         columns: col_stats,
         indexes: HashMap::new(),
+        column_groups: HashMap::new(),
     };
 
     // 1. Full scan cardinality

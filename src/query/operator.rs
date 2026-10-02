@@ -546,7 +546,7 @@ impl OffsetLimitOperator {
 }
 
 /// Canonical typed representation of a scalar value suitable for robust in-memory grouping keys.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CanonicalValue {
     Null,
     Boolean(bool),
@@ -576,6 +576,19 @@ impl CanonicalValue {
             }
             Value::String(s) => CanonicalValue::String(s.clone()),
             Value::Bytes(b) => CanonicalValue::Bytes(b.clone()),
+        }
+    }
+
+    /// Converts this canonical representation back to a scalar `Value`.
+    pub fn to_value(&self) -> Value {
+        match self {
+            CanonicalValue::Null => Value::Null,
+            CanonicalValue::Boolean(b) => Value::Boolean(*b),
+            CanonicalValue::Int64(i) => Value::Int64(*i),
+            CanonicalValue::UInt64(u) => Value::UInt64(*u),
+            CanonicalValue::Float64(bits) => Value::Float64(f64::from_bits(*bits)),
+            CanonicalValue::String(s) => Value::String(s.clone()),
+            CanonicalValue::Bytes(b) => Value::Bytes(b.clone()),
         }
     }
 }
