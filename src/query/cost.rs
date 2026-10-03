@@ -371,6 +371,33 @@ impl CostModel {
     pub fn window_cost(input_rows: f64) -> f64 {
         WINDOW_CPU_COST * input_rows.max(0.0)
     }
+
+    /// Computes the build cost for an exact runtime join filter.
+    pub fn runtime_filter_exact_build_cost(build_rows: f64) -> f64 {
+        build_rows.max(0.0) * HASH_BUILD_CPU_COST
+    }
+
+    /// Computes the probe evaluation cost for an exact runtime join filter.
+    pub fn runtime_filter_exact_probe_cost(probe_rows: f64) -> f64 {
+        probe_rows.max(0.0) * HASH_PROBE_CPU_COST
+    }
+
+    /// Computes the build cost for a probabilistic Bloom runtime join filter.
+    pub fn runtime_filter_bloom_build_cost(build_rows: f64) -> f64 {
+        build_rows.max(0.0) * (HASH_BUILD_CPU_COST * 0.5)
+    }
+
+    /// Computes the probe evaluation cost for a probabilistic Bloom runtime join filter.
+    pub fn runtime_filter_bloom_probe_cost(probe_rows: f64) -> f64 {
+        probe_rows.max(0.0) * (HASH_PROBE_CPU_COST * 0.3)
+    }
+
+    /// Computes expected cost savings from rejected probe rows avoiding downstream hash lookup and tuple fetching.
+    pub fn runtime_filter_expected_savings(probe_rows: f64, rejection_ratio: f64) -> f64 {
+        probe_rows.max(0.0)
+            * rejection_ratio.clamp(0.0, 1.0)
+            * (TUPLE_FETCH_COST + HASH_PROBE_CPU_COST * 2.0)
+    }
 }
 
 /// Composite cost and row estimate tuple with deterministic comparison helpers.

@@ -468,6 +468,16 @@ impl<'db> Transaction<'db> {
         self.state
     }
 
+    /// Returns a reference to the underlying database.
+    pub fn db(&self) -> &TreeDb {
+        self.db
+    }
+
+    /// Returns a mutable reference to the underlying database.
+    pub fn db_mut(&mut self) -> &mut TreeDb {
+        self.db
+    }
+
     /// Returns true if the transaction is in the active state.
     pub const fn is_active(&self) -> bool {
         matches!(self.state, TxnState::Active)
@@ -3961,6 +3971,24 @@ impl<'db> Transaction<'db> {
             join_metric.counters.bytes_spilled = join_exec_metrics.bytes_spilled;
             join_metric.counters.partition_passes = join_exec_metrics.partition_passes;
             join_metric.counters.peak_memory_bytes = join_exec_metrics.peak_memory_bytes;
+            join_metric.counters.runtime_filter_enabled = join_exec_metrics.runtime_filter_enabled;
+            join_metric.counters.runtime_filter_type = join_exec_metrics.runtime_filter_type;
+            join_metric.counters.runtime_filter_build_rows =
+                join_exec_metrics.runtime_filter_build_rows;
+            join_metric.counters.runtime_filter_distinct_keys =
+                join_exec_metrics.runtime_filter_distinct_keys;
+            join_metric.counters.runtime_filter_memory_bytes =
+                join_exec_metrics.runtime_filter_memory_bytes;
+            join_metric.counters.runtime_filter_probe_rows =
+                join_exec_metrics.runtime_filter_probe_rows;
+            join_metric.counters.runtime_filter_rejected_rows =
+                join_exec_metrics.runtime_filter_rejected_rows;
+            join_metric.counters.runtime_filter_passed_rows =
+                join_exec_metrics.runtime_filter_passed_rows;
+            join_metric.counters.runtime_filter_null_probe_rows =
+                join_exec_metrics.runtime_filter_null_probe_rows;
+            join_metric.counters.runtime_filter_false_positive_rows =
+                join_exec_metrics.runtime_filter_false_positive_rows;
             join_metric.add_child(current_op);
             join_metric.add_child(right_op);
 
@@ -5428,6 +5456,39 @@ impl<'db> Transaction<'db> {
                 };
                 j_obs.resource = Some(join_res_obs);
                 self.db.feedback_registry.record(j_key, j_obs);
+
+                if j_metric.counters.runtime_filter_enabled {
+                    let rf_key = crate::query::FeedbackKey::runtime_filter(
+                        &left_table_name,
+                        &right_table_name,
+                        &join.on,
+                        join.join_type.to_string(),
+                        param_sig.clone(),
+                        stats_gen,
+                    )
+                    .with_resource_signature(Some(res_sig.clone()));
+                    let mut rf_obs = crate::query::FeedbackObservation::new(
+                        j_metric.counters.runtime_filter_probe_rows as f64,
+                        j_metric.counters.runtime_filter_passed_rows as f64,
+                    );
+                    rf_obs.input_rows = Some(j_metric.counters.runtime_filter_probe_rows);
+                    rf_obs.output_rows = Some(j_metric.counters.runtime_filter_passed_rows);
+                    let rf_res = crate::query::ResourceObservation {
+                        memory_budget_bytes: res_sig.join_budget,
+                        estimated_peak_memory_bytes: 0,
+                        actual_peak_memory_bytes: j_metric.counters.runtime_filter_memory_bytes,
+                        estimated_spill_bytes: 0,
+                        actual_spill_bytes: 0,
+                        spill_runs: 0,
+                        temporary_bytes: 0,
+                        temporary_files: 0,
+                        execution_time_us: 0,
+                        did_spill: false,
+                        is_clamped: false,
+                    };
+                    rf_obs.resource = Some(rf_res);
+                    self.db.feedback_registry.record(rf_key, rf_obs);
+                }
             }
 
             left_table_name = right_table_name;

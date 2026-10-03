@@ -336,13 +336,7 @@ impl JoinOperator {
                     matched_rows,
                     matched_outer_rows,
                     unmatched_outer_rows,
-                    hash_build_rows: 0,
-                    hash_probe_rows: 0,
-                    spill_partitions: 0,
-                    runs_created: 0,
-                    bytes_spilled: 0,
-                    partition_passes: 0,
-                    peak_memory_bytes: 0,
+                    ..Default::default()
                 };
 
                 return Ok((left_schema.clone(), out_rows, metrics));
@@ -421,17 +415,9 @@ impl JoinOperator {
                 rows_left: left_rows.len(),
                 rows_right: right_rows.len(),
                 rows_output: out_rows.len(),
-                spill_partitions: 0,
-                runs_created: 0,
-                bytes_spilled: 0,
-                partition_passes: 0,
-                peak_memory_bytes: 0,
                 candidate_pairs,
                 matched_rows,
-                matched_outer_rows: 0,
-                unmatched_outer_rows: 0,
-                hash_build_rows: 0,
-                hash_probe_rows: 0,
+                ..Default::default()
             };
 
             Ok((joined_schema, out_rows, metrics))

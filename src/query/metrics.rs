@@ -162,6 +162,26 @@ pub struct OperatorCounters {
     pub record_ids_unioned: usize,
     /// Number of duplicate record IDs eliminated during union deduplication.
     pub duplicate_record_ids_removed: usize,
+    /// Whether a runtime join filter was actively constructed and evaluated.
+    pub runtime_filter_enabled: bool,
+    /// Semantic type of the active runtime filter (ExactSet or Bloom).
+    pub runtime_filter_type: Option<String>,
+    /// Number of build-side rows inserted into the runtime filter.
+    pub runtime_filter_build_rows: usize,
+    /// Number of distinct keys stored in the runtime filter.
+    pub runtime_filter_distinct_keys: usize,
+    /// In-memory byte footprint of the runtime filter.
+    pub runtime_filter_memory_bytes: usize,
+    /// Number of probe-side rows evaluated against the runtime filter.
+    pub runtime_filter_probe_rows: usize,
+    /// Number of probe-side rows rejected by the runtime filter before hash lookup.
+    pub runtime_filter_rejected_rows: usize,
+    /// Number of probe-side rows passing the runtime filter into hash lookup.
+    pub runtime_filter_passed_rows: usize,
+    /// Number of probe-side rows with NULL keys skipped before runtime filter evaluation.
+    pub runtime_filter_null_probe_rows: usize,
+    /// Number of false positives observed (passed filter but produced zero join hash matches).
+    pub runtime_filter_false_positive_rows: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -787,6 +807,26 @@ pub fn format_plan_with_metrics(
                         out.push_str(&format!(
                             "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
                             join.cost, join.estimated_rows, metrics.total_rows
+                        ));
+                    }
+                    if jm.counters.runtime_filter_enabled {
+                        write_indent(&mut out, indent + 1);
+                        let rf_type = jm
+                            .counters
+                            .runtime_filter_type
+                            .as_deref()
+                            .unwrap_or("ExactSet");
+                        out.push_str(&format!(
+                            "Runtime Filter: type: {}, build_rows: {}, distinct_keys: {}, memory_bytes: {}, probe_rows: {}, rejected_rows: {}, passed_rows: {}, null_probe_rows: {}, false_positive_rows: {}\n",
+                            rf_type,
+                            jm.counters.runtime_filter_build_rows,
+                            jm.counters.runtime_filter_distinct_keys,
+                            jm.counters.runtime_filter_memory_bytes,
+                            jm.counters.runtime_filter_probe_rows,
+                            jm.counters.runtime_filter_rejected_rows,
+                            jm.counters.runtime_filter_passed_rows,
+                            jm.counters.runtime_filter_null_probe_rows,
+                            jm.counters.runtime_filter_false_positive_rows
                         ));
                     }
                 } else {

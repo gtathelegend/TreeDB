@@ -397,6 +397,8 @@ pub struct PhysicalJoin {
     pub strategy: JoinStrategy,
     /// Optional index name utilized when strategy is `IndexProbe`.
     pub index_name: Option<String>,
+    /// Optional runtime join filter planned for dynamic probe filtering.
+    pub runtime_filter: Option<crate::query::runtime_filter::RuntimeFilterPlan>,
 }
 
 /// Physical relational set operation node.
@@ -777,6 +779,22 @@ impl fmt::Display for PhysicalPlan {
                         "cost: {:.2}, estimated_rows: {:.0}",
                         join.cost, join.estimated_rows
                     )?;
+                }
+                if let Some(rf) = &join.runtime_filter {
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "Runtime Filter:")?;
+                    write_indent(f, indent + 2)?;
+                    writeln!(f, "Type: {}", rf.filter_type)?;
+                    write_indent(f, indent + 2)?;
+                    writeln!(f, "Scope: {}", rf.scope)?;
+                    write_indent(f, indent + 2)?;
+                    let keys_str = rf
+                        .key_exprs
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    writeln!(f, "Key: [{keys_str}]")?;
                 }
                 format_subqueries_in_expr(&join.on, f, indent + 1)?;
                 indent += 1;
@@ -1179,6 +1197,23 @@ fn optimize_inner_join_region_dp(
                     join_rows = fb_reg.get_adjusted_cardinality(&key, join_rows);
                 }
 
+                let mut left_cols = Vec::new();
+                for &idx in &left_plan.perm {
+                    left_cols.extend(graph.relations[idx].table_info.schema.columns.clone());
+                }
+                let left_accum_schema = Schema::new_projected(left_cols);
+
+                let rf = plan_runtime_filter_for_join(
+                    JoinType::Inner,
+                    &on_expr,
+                    &left_accum_schema,
+                    &graph.relations[r].table_info.schema,
+                    right_scan.estimated_rows,
+                    left_plan.rows,
+                    graph.relations[r].table_info.stats.as_ref(),
+                    resource_sig,
+                );
+
                 let mut cand_joins = left_plan.joins.clone();
                 cand_joins.push(PhysicalJoin {
                     join_type: JoinType::Inner,
@@ -1188,6 +1223,7 @@ fn optimize_inner_join_region_dp(
                     cost: join_cost,
                     strategy: JoinStrategy::NestedLoop,
                     index_name: None,
+                    runtime_filter: rf,
                 });
 
                 let mut cand_perm = left_plan.perm.clone();
@@ -1384,6 +1420,23 @@ fn optimize_inner_join_region_greedy(
             .unwrap_or(Expr::Literal(Value::Boolean(true)));
 
         let right_scan = graph.relations[chosen.cand].base_scan.clone();
+        let mut left_cols = Vec::new();
+        for &idx in &perm {
+            left_cols.extend(graph.relations[idx].table_info.schema.columns.clone());
+        }
+        let left_accum_schema = Schema::new_projected(left_cols);
+
+        let rf = plan_runtime_filter_for_join(
+            JoinType::Inner,
+            &on_expr,
+            &left_accum_schema,
+            &graph.relations[chosen.cand].table_info.schema,
+            right_scan.estimated_rows,
+            cur_rows,
+            graph.relations[chosen.cand].table_info.stats.as_ref(),
+            resource_sig,
+        );
+
         joins.push(PhysicalJoin {
             join_type: JoinType::Inner,
             right: right_scan,
@@ -1392,6 +1445,7 @@ fn optimize_inner_join_region_greedy(
             cost: chosen.join_cost,
             strategy: JoinStrategy::NestedLoop,
             index_name: None,
+            runtime_filter: rf,
         });
 
         cur_cost = chosen.join_cost;
@@ -1860,6 +1914,7 @@ fn optimize_with_outer_barriers(
     let mut physical_joins = Vec::new();
     let mut cur_cost = base_table_scan.cost;
     let mut cur_rows = base_table_scan.estimated_rows;
+    let mut accum_schema = tables[0].schema.clone();
 
     for (join_idx, (join_type, on_expr)) in optimized_joins.into_iter().enumerate() {
         let right_table_idx = join_idx + 1;
@@ -1949,6 +2004,21 @@ fn optimize_with_outer_barriers(
                 (JoinStrategy::NestedLoop, None, join_cost)
             };
 
+        let rf = plan_runtime_filter_for_join(
+            join_type,
+            &on_expr,
+            &accum_schema,
+            &tables[right_table_idx].schema,
+            right_table_scan.estimated_rows,
+            cur_rows,
+            tables[right_table_idx].stats.as_ref(),
+            resource_sig,
+        );
+
+        let mut next_cols = accum_schema.columns.clone();
+        next_cols.extend(tables[right_table_idx].schema.columns.clone());
+        accum_schema = Schema::new_projected(next_cols);
+
         cur_cost = chosen_cost;
         cur_rows = join_rows;
 
@@ -1960,6 +2030,7 @@ fn optimize_with_outer_barriers(
             cost: chosen_cost,
             strategy: chosen_strategy,
             index_name: chosen_index,
+            runtime_filter: rf,
         });
     }
 
@@ -2051,6 +2122,54 @@ fn optimize_with_outer_barriers(
         total_cost: cur_cost,
         estimated_rows: cur_rows,
     })
+}
+
+/// Plans an optimal runtime join filter for eligible inner/semi joins.
+#[allow(clippy::too_many_arguments)]
+fn plan_runtime_filter_for_join(
+    join_type: JoinType,
+    on_expr: &Expr,
+    left_schema: &Schema,
+    right_schema: &Schema,
+    build_rows: f64,
+    probe_rows: f64,
+    build_stats: Option<&TableStatistics>,
+    resource_sig: Option<&ResourcePlanningSignature>,
+) -> Option<crate::query::runtime_filter::RuntimeFilterPlan> {
+    if join_type != JoinType::Inner && join_type != JoinType::Semi {
+        return None;
+    }
+    let join_budget = resource_sig
+        .map(|r| r.join_budget)
+        .unwrap_or(crate::query::external_hash_join::DEFAULT_JOIN_MEMORY_BUDGET_BYTES);
+
+    let equi_plan =
+        crate::query::external_hash_join::analyze_equi_join(on_expr, left_schema, right_schema)?;
+
+    let mut build_ndv = None;
+    if let Some(stats) = build_stats {
+        if equi_plan.right_keys.len() == 1 {
+            if let Expr::Column(col_name) = &equi_plan.right_keys[0] {
+                let bare_col = col_name.split('.').next_back().unwrap_or(col_name);
+                if let Some(col_stats) = stats.column(bare_col) {
+                    build_ndv = Some(col_stats.distinct_count.max(1) as f64);
+                }
+            }
+        }
+    }
+
+    let config =
+        crate::query::external_hash_join::JoinConfig::new().with_memory_budget_bytes(join_budget);
+
+    crate::query::runtime_filter::should_build_runtime_filter(
+        join_type,
+        &equi_plan.right_keys,
+        build_rows,
+        probe_rows,
+        build_ndv,
+        join_budget,
+        &config,
+    )
 }
 
 /// Evaluates costs of applicable physical strategies for SEMI/ANTI joins and selects the cheapest.

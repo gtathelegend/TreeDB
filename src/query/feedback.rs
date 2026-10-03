@@ -220,6 +220,13 @@ pub enum FeedbackContext {
         group_by: String,
         aggregates: String,
     },
+    /// Runtime join filter execution context.
+    RuntimeFilter {
+        join_type: String,
+        left_table: String,
+        right_table: String,
+        on_clause: String,
+    },
 }
 
 impl fmt::Display for FeedbackContext {
@@ -286,6 +293,15 @@ impl fmt::Display for FeedbackContext {
             } => write!(
                 f,
                 "Aggregate(group_by=[{group_by}], aggs=[{aggregates}])"
+            ),
+            Self::RuntimeFilter {
+                join_type,
+                left_table,
+                right_table,
+                on_clause,
+            } => write!(
+                f,
+                "RuntimeFilter(type={join_type}, left={left_table}, right={right_table}, on={on_clause})"
             ),
         }
     }
@@ -358,6 +374,27 @@ impl FeedbackKey {
     ) -> Self {
         Self::new(
             FeedbackContext::Join {
+                join_type: join_type.to_string(),
+                left_table: left_table.into(),
+                right_table: right_table.into(),
+                on_clause: on_clause.to_string(),
+            },
+            param_signature,
+            statistics_generation,
+        )
+    }
+
+    /// Helper to create a runtime filter feedback key.
+    pub fn runtime_filter(
+        left_table: impl Into<String>,
+        right_table: impl Into<String>,
+        on_clause: impl fmt::Display,
+        join_type: impl fmt::Display,
+        param_signature: Option<ParamPlanningSignature>,
+        statistics_generation: u64,
+    ) -> Self {
+        Self::new(
+            FeedbackContext::RuntimeFilter {
                 join_type: join_type.to_string(),
                 left_table: left_table.into(),
                 right_table: right_table.into(),
@@ -467,7 +504,8 @@ impl FeedbackKey {
             | FeedbackContext::MultiIndex { table_name, .. }
             | FeedbackContext::SkipScan { table_name, .. } => Some(table_name.as_str()),
             FeedbackContext::Join { left_table, .. }
-            | FeedbackContext::SemiAnti { left_table, .. } => Some(left_table.as_str()),
+            | FeedbackContext::SemiAnti { left_table, .. }
+            | FeedbackContext::RuntimeFilter { left_table, .. } => Some(left_table.as_str()),
             FeedbackContext::ExternalOp { relation_name, .. } => Some(relation_name.as_str()),
             FeedbackContext::Sort { .. } | FeedbackContext::Aggregate { .. } => None,
         }

@@ -971,6 +971,7 @@ fn baseline_execute(
             cost: 0.0,
             strategy: treedb::query::JoinStrategy::NestedLoop,
             index_name: None,
+            runtime_filter: None,
         });
     }
 

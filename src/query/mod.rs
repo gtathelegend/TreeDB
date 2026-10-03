@@ -13,7 +13,13 @@ pub mod operator;
 pub mod optimizer;
 pub mod plan_cache;
 pub mod rewrite;
+pub mod runtime_filter;
 pub mod stats;
+
+pub use runtime_filter::{
+    should_build_runtime_filter, BloomRuntimeFilter, ExactRuntimeFilter, RuntimeFilter,
+    RuntimeFilterPlan, RuntimeFilterScope, RuntimeFilterType,
+};
 
 pub use inference::{
     ColumnConstraint, ColumnRange, ConstraintSet, InferenceMetrics, InferenceSource,

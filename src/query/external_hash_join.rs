@@ -45,6 +45,10 @@ pub struct JoinConfig {
     pub max_partition_passes: usize,
     /// Custom directory for temporary partition files. If `None`, `std::env::temp_dir()` is used.
     pub temp_dir: Option<PathBuf>,
+    /// Whether to build and apply runtime join filters during join execution.
+    pub enable_runtime_filter: bool,
+    /// Strategy type for runtime join filters (ExactSet or Bloom).
+    pub runtime_filter_type: crate::query::runtime_filter::RuntimeFilterType,
 }
 
 impl Default for JoinConfig {
@@ -55,6 +59,8 @@ impl Default for JoinConfig {
             max_temp_bytes: DEFAULT_MAX_TEMP_BYTES,
             max_partition_passes: DEFAULT_MAX_PARTITION_PASSES,
             temp_dir: None,
+            enable_runtime_filter: true,
+            runtime_filter_type: crate::query::runtime_filter::RuntimeFilterType::ExactSet,
         }
     }
 }
@@ -95,6 +101,21 @@ impl JoinConfig {
         self
     }
 
+    /// Enables or disables runtime join filtering.
+    pub fn with_enable_runtime_filter(mut self, enabled: bool) -> Self {
+        self.enable_runtime_filter = enabled;
+        self
+    }
+
+    /// Sets the runtime filter representation type.
+    pub fn with_runtime_filter_type(
+        mut self,
+        filter_type: crate::query::runtime_filter::RuntimeFilterType,
+    ) -> Self {
+        self.runtime_filter_type = filter_type;
+        self
+    }
+
     /// Returns the effective temporary directory path.
     pub fn effective_temp_dir(&self) -> PathBuf {
         self.temp_dir.clone().unwrap_or_else(std::env::temp_dir)
@@ -132,6 +153,26 @@ pub struct JoinExecutionMetrics {
     pub hash_build_rows: usize,
     /// Number of rows probed against the hash table.
     pub hash_probe_rows: usize,
+    /// Whether a runtime join filter was actively constructed and evaluated.
+    pub runtime_filter_enabled: bool,
+    /// Semantic type of the active runtime filter (ExactSet or Bloom).
+    pub runtime_filter_type: Option<String>,
+    /// Number of build-side rows inserted into the runtime filter.
+    pub runtime_filter_build_rows: usize,
+    /// Number of distinct keys stored in the runtime filter.
+    pub runtime_filter_distinct_keys: usize,
+    /// In-memory byte footprint of the runtime filter.
+    pub runtime_filter_memory_bytes: usize,
+    /// Number of probe-side rows evaluated against the runtime filter.
+    pub runtime_filter_probe_rows: usize,
+    /// Number of probe-side rows rejected by the runtime filter before hash lookup.
+    pub runtime_filter_rejected_rows: usize,
+    /// Number of probe-side rows passing the runtime filter into hash lookup.
+    pub runtime_filter_passed_rows: usize,
+    /// Number of probe-side rows with NULL keys skipped before runtime filter evaluation.
+    pub runtime_filter_null_probe_rows: usize,
+    /// Number of false positives observed (passed filter but produced zero join hash matches).
+    pub runtime_filter_false_positive_rows: usize,
 }
 
 /// Composite join key constructed from evaluated equi-join expressions.
@@ -689,18 +730,7 @@ impl<'a> ExternalHashJoiner<'a> {
         let mut metrics = JoinExecutionMetrics {
             rows_left: left_rows.len(),
             rows_right: right_rows.len(),
-            rows_output: 0,
-            spill_partitions: 0,
-            runs_created: 0,
-            bytes_spilled: 0,
-            partition_passes: 0,
-            peak_memory_bytes: 0,
-            candidate_pairs: 0,
-            matched_rows: 0,
-            matched_outer_rows: 0,
-            unmatched_outer_rows: 0,
-            hash_build_rows: 0,
-            hash_probe_rows: 0,
+            ..Default::default()
         };
 
         if left_rows.is_empty() {
@@ -752,8 +782,13 @@ impl<'a> ExternalHashJoiner<'a> {
 
         // In-memory fast path: Build side fits in memory
         if estimated_build_mem < self.config.memory_budget_bytes {
-            let (out_rows, peak_mem) =
-                self.join_in_memory(&left_rows, &right_rows, &joined_schema, &mut metrics)?;
+            let (out_rows, peak_mem) = self.join_in_memory(
+                &left_rows,
+                &right_rows,
+                &joined_schema,
+                crate::query::runtime_filter::RuntimeFilterScope::Global,
+                &mut metrics,
+            )?;
             metrics.rows_output = out_rows.len();
             metrics.peak_memory_bytes = peak_mem;
             return Ok((joined_schema, out_rows, metrics));
@@ -776,12 +811,30 @@ impl<'a> ExternalHashJoiner<'a> {
         left_rows: &[Row],
         right_rows: &[Row],
         joined_schema: &Schema,
+        scope: crate::query::runtime_filter::RuntimeFilterScope,
         metrics: &mut JoinExecutionMetrics,
     ) -> Result<(Vec<Row>, usize)> {
         let mut build_map: HashMap<JoinKey, Vec<(usize, Row)>> = HashMap::new();
         let mut build_mem = 0;
         let mut peak_mem = 0;
         let mut right_matched = vec![false; right_rows.len()];
+
+        let mut runtime_filter = if self.config.enable_runtime_filter
+            && (self.join_type == JoinType::Inner || self.join_type == JoinType::Semi)
+        {
+            metrics.runtime_filter_enabled = true;
+            metrics.runtime_filter_type = Some(self.config.runtime_filter_type.to_string());
+            match self.config.runtime_filter_type {
+                crate::query::runtime_filter::RuntimeFilterType::ExactSet => {
+                    Some(crate::query::runtime_filter::RuntimeFilter::exact(scope))
+                }
+                crate::query::runtime_filter::RuntimeFilterType::Bloom => Some(
+                    crate::query::runtime_filter::RuntimeFilter::bloom(right_rows.len(), scope),
+                ),
+            }
+        } else {
+            None
+        };
 
         for (r_idx, r_row) in right_rows.iter().enumerate() {
             let key = JoinKey::from_row(r_row, self.right_schema, &self.right_keys)?;
@@ -791,6 +844,13 @@ impl<'a> ExternalHashJoiner<'a> {
             }
 
             metrics.hash_build_rows += 1;
+            if let Some(rf) = &mut runtime_filter {
+                metrics.runtime_filter_build_rows += 1;
+                if rf.insert(key.clone()) {
+                    metrics.runtime_filter_distinct_keys += 1;
+                }
+            }
+
             let row_mem = estimate_row_memory(r_row);
             build_mem += row_mem;
             if build_mem > peak_mem {
@@ -803,6 +863,10 @@ impl<'a> ExternalHashJoiner<'a> {
                 .push((r_idx, r_row.clone()));
         }
 
+        if let Some(rf) = &runtime_filter {
+            metrics.runtime_filter_memory_bytes += rf.memory_bytes();
+        }
+
         let left_nulls = vec![Value::Null; self.left_schema.columns.len()];
         let right_nulls = vec![Value::Null; self.right_schema.columns.len()];
         let mut out_rows = Vec::new();
@@ -810,6 +874,9 @@ impl<'a> ExternalHashJoiner<'a> {
         for l_row in left_rows {
             let key = JoinKey::from_row(l_row, self.left_schema, &self.left_keys)?;
             if key.has_null() {
+                if runtime_filter.is_some() {
+                    metrics.runtime_filter_null_probe_rows += 1;
+                }
                 if self.join_type == JoinType::Anti {
                     metrics.unmatched_outer_rows += 1;
                     out_rows.push(l_row.clone());
@@ -822,6 +889,16 @@ impl<'a> ExternalHashJoiner<'a> {
                     out_rows.push(Row::new(combined));
                 }
                 continue;
+            }
+
+            if let Some(rf) = &runtime_filter {
+                metrics.runtime_filter_probe_rows += 1;
+                if !rf.contains(&key) {
+                    metrics.runtime_filter_rejected_rows += 1;
+                    metrics.unmatched_outer_rows += 1;
+                    continue;
+                }
+                metrics.runtime_filter_passed_rows += 1;
             }
 
             metrics.hash_probe_rows += 1;
@@ -863,6 +940,10 @@ impl<'a> ExternalHashJoiner<'a> {
                             break;
                         }
                     }
+                }
+            } else if let Some(rf) = &runtime_filter {
+                if rf.filter_type() == crate::query::runtime_filter::RuntimeFilterType::Bloom {
+                    metrics.runtime_filter_false_positive_rows += 1;
                 }
             }
 
@@ -1079,8 +1160,13 @@ impl<'a> ExternalHashJoiner<'a> {
             }
 
             if part_build_mem < self.config.memory_budget_bytes {
-                let (part_out, p_mem) =
-                    self.join_in_memory(&left_part, &right_part, joined_schema, metrics)?;
+                let (part_out, p_mem) = self.join_in_memory(
+                    &left_part,
+                    &right_part,
+                    joined_schema,
+                    crate::query::runtime_filter::RuntimeFilterScope::Partition(i as u32),
+                    metrics,
+                )?;
                 if p_mem > peak_mem {
                     peak_mem = p_mem;
                 }
@@ -1098,8 +1184,13 @@ impl<'a> ExternalHashJoiner<'a> {
                 if all_same {
                     // All keys are identical; further partitioning won't split them.
                     // Join in-memory with atomic memory accommodation for this single skewed group.
-                    let (part_out, p_mem) =
-                        self.join_in_memory(&left_part, &right_part, joined_schema, metrics)?;
+                    let (part_out, p_mem) = self.join_in_memory(
+                        &left_part,
+                        &right_part,
+                        joined_schema,
+                        crate::query::runtime_filter::RuntimeFilterScope::Partition(i as u32),
+                        metrics,
+                    )?;
                     if p_mem > peak_mem {
                         peak_mem = p_mem;
                     }
