@@ -809,7 +809,10 @@ fn test_optimizer_plan_inspection_and_explain() {
     assert!(explain.contains("LimitOffset (limit: Some(5), offset: None)"));
     assert!(explain.contains("Projection [u.name AS name, o.amount AS amount]"));
     assert!(explain.contains("Sort [o.amount Descending]"));
-    assert!(explain.contains("NestedLoopJoin (Inner, on: [(u.id = o.user_id)])"));
+    assert!(
+        explain.contains("Join (Inner, on: [(u.id = o.user_id)])")
+            || explain.contains("(Inner, on: [(u.id = o.user_id)])")
+    );
     assert!(explain.contains("SecondaryIndexScan(idx_email, PointLookup(\"alice@example.com\"))"));
     assert!(explain.contains(
         "TableScan (table: orders AS o, access: FullTableScan, filter: [(amount > 10)])"
@@ -972,6 +975,8 @@ fn baseline_execute(
             strategy: treedb::query::JoinStrategy::NestedLoop,
             index_name: None,
             runtime_filter: None,
+            left_sort: false,
+            right_sort: false,
         });
     }
 

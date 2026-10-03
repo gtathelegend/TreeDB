@@ -241,7 +241,10 @@ fn test_explain_joins() {
     let plan_inner = txn
         .explain_sql("SELECT u.name, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.total > 50;")
         .unwrap();
-    assert!(plan_inner.contains("NestedLoopJoin (Inner, on: [(u.id = o.user_id)])"));
+    assert!(
+        plan_inner.contains("Join (Inner, on: [(u.id = o.user_id)])")
+            || plan_inner.contains("(Inner, on: [(u.id = o.user_id)])")
+    );
     assert!(plan_inner.contains("Left: TableScan (table: users AS u, access: FullTableScan)"));
     assert!(plan_inner.contains("Right: TableScan (table: orders AS o, access: FullTableScan"));
 
@@ -255,7 +258,10 @@ fn test_explain_joins() {
     let plan_left = txn
         .explain_sql("SELECT u.name, o.total FROM users u LEFT JOIN orders o ON u.id = o.user_id;")
         .unwrap();
-    assert!(plan_left.contains("NestedLoopJoin (Left, on: [(u.id = o.user_id)])"));
+    assert!(
+        plan_left.contains("Join (Left, on: [(u.id = o.user_id)])")
+            || plan_left.contains("(Left, on: [(u.id = o.user_id)])")
+    );
 }
 
 #[test]

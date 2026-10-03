@@ -368,6 +368,8 @@ pub enum JoinStrategy {
     Hash,
     /// Existence probe against an inner index (primary key or secondary index).
     IndexProbe,
+    /// Cost-based merge join over ordered or sorted inputs.
+    Merge,
 }
 
 impl fmt::Display for JoinStrategy {
@@ -376,6 +378,7 @@ impl fmt::Display for JoinStrategy {
             Self::NestedLoop => write!(f, "NestedLoop"),
             Self::Hash => write!(f, "Hash"),
             Self::IndexProbe => write!(f, "IndexProbe"),
+            Self::Merge => write!(f, "Merge"),
         }
     }
 }
@@ -399,6 +402,10 @@ pub struct PhysicalJoin {
     pub index_name: Option<String>,
     /// Optional runtime join filter planned for dynamic probe filtering.
     pub runtime_filter: Option<crate::query::runtime_filter::RuntimeFilterPlan>,
+    /// Whether the left input needs explicit sorting for Merge Join.
+    pub left_sort: bool,
+    /// Whether the right input needs explicit sorting for Merge Join.
+    pub right_sort: bool,
 }
 
 /// Physical relational set operation node.
@@ -767,6 +774,29 @@ impl fmt::Display for PhysicalPlan {
                         write_indent(f, indent + 1)?;
                         writeln!(f, "index={idx_name}")?;
                     }
+                } else if join.strategy == JoinStrategy::Merge {
+                    writeln!(f, "MergeJoin ({:?}, on: [{}])", join.join_type, join.on)?;
+                    write_indent(f, indent + 1)?;
+                    writeln!(
+                        f,
+                        "Left Sort: {}, Right Sort: {}",
+                        if join.left_sort { "Yes" } else { "No" },
+                        if join.right_sort { "Yes" } else { "No" }
+                    )?;
+                    write_indent(f, indent + 1)?;
+                    writeln!(
+                        f,
+                        "cost: {:.2}, estimated_rows: {:.0}",
+                        join.cost, join.estimated_rows
+                    )?;
+                } else if join.strategy == JoinStrategy::Hash {
+                    writeln!(f, "HashJoin ({:?}, on: [{}])", join.join_type, join.on)?;
+                    write_indent(f, indent + 1)?;
+                    writeln!(
+                        f,
+                        "cost: {:.2}, estimated_rows: {:.0}",
+                        join.cost, join.estimated_rows
+                    )?;
                 } else {
                     writeln!(
                         f,
@@ -1167,13 +1197,6 @@ fn optimize_inner_join_region_dp(
                 let on_expr = recombine_conjunction(step_conjuncts)
                     .unwrap_or(Expr::Literal(Value::Boolean(true)));
 
-                let join_cost = CostModel::nested_loop_join_cost(
-                    left_plan.cost,
-                    left_plan.rows,
-                    right_scan.cost,
-                    right_scan.estimated_rows,
-                );
-
                 let base_idx = left_plan.perm[0];
                 let mut join_rows = CardinalityEstimator::estimate_inner_join_cardinality(
                     left_plan.rows,
@@ -1214,16 +1237,40 @@ fn optimize_inner_join_region_dp(
                     resource_sig,
                 );
 
+                let left_ord = if left_plan.perm.len() == 1 {
+                    let first = left_plan.perm[0];
+                    Some(crate::query::merge_join::ordering_property_for_table_scan(
+                        &graph.relations[first].table_info,
+                        &graph.relations[first].base_scan,
+                    ))
+                } else {
+                    None
+                };
+
+                let choice = plan_general_join_strategy(
+                    left_plan.cost,
+                    left_plan.rows,
+                    left_ord.as_ref(),
+                    &graph.relations[r].table_info,
+                    right_scan,
+                    &on_expr,
+                    JoinType::Inner,
+                    &left_accum_schema,
+                    resource_sig,
+                );
+
                 let mut cand_joins = left_plan.joins.clone();
                 cand_joins.push(PhysicalJoin {
                     join_type: JoinType::Inner,
                     right: right_scan.clone(),
                     on: on_expr,
                     estimated_rows: join_rows,
-                    cost: join_cost,
-                    strategy: JoinStrategy::NestedLoop,
-                    index_name: None,
+                    cost: choice.cost,
+                    strategy: choice.strategy,
+                    index_name: choice.index_name,
                     runtime_filter: rf,
+                    left_sort: choice.left_sort,
+                    right_sort: choice.right_sort,
                 });
 
                 let mut cand_perm = left_plan.perm.clone();
@@ -1231,7 +1278,7 @@ fn optimize_inner_join_region_dp(
 
                 let cand_plan = DPPlan {
                     perm: cand_perm,
-                    cost: join_cost,
+                    cost: choice.cost,
                     rows: join_rows,
                     base_scan: left_plan.base_scan.clone(),
                     joins: cand_joins,
@@ -1437,18 +1484,42 @@ fn optimize_inner_join_region_greedy(
             resource_sig,
         );
 
+        let left_ord = if perm.len() == 1 {
+            let first = perm[0];
+            Some(crate::query::merge_join::ordering_property_for_table_scan(
+                &graph.relations[first].table_info,
+                &graph.relations[first].base_scan,
+            ))
+        } else {
+            None
+        };
+
+        let choice = plan_general_join_strategy(
+            cur_cost,
+            cur_rows,
+            left_ord.as_ref(),
+            &graph.relations[chosen.cand].table_info,
+            &right_scan,
+            &on_expr,
+            JoinType::Inner,
+            &left_accum_schema,
+            resource_sig,
+        );
+
         joins.push(PhysicalJoin {
             join_type: JoinType::Inner,
             right: right_scan,
             on: on_expr,
             estimated_rows: chosen.join_rows,
-            cost: chosen.join_cost,
-            strategy: JoinStrategy::NestedLoop,
-            index_name: None,
+            cost: choice.cost,
+            strategy: choice.strategy,
+            index_name: choice.index_name,
             runtime_filter: rf,
+            left_sort: choice.left_sort,
+            right_sort: choice.right_sort,
         });
 
-        cur_cost = chosen.join_cost;
+        cur_cost = choice.cost;
         cur_rows = chosen.join_rows;
     }
 
@@ -1940,12 +2011,6 @@ fn optimize_with_outer_barriers(
             stats_gen,
         );
 
-        let join_cost = CostModel::nested_loop_join_cost(
-            cur_cost,
-            cur_rows,
-            right_table_scan.cost,
-            right_table_scan.estimated_rows,
-        );
         let mut join_rows = CardinalityEstimator::estimate_join_cardinality(
             join_type,
             cur_rows,
@@ -1985,9 +2050,9 @@ fn optimize_with_outer_barriers(
             join_rows = fb_reg.get_adjusted_cardinality(&key, join_rows);
         }
 
-        let (chosen_strategy, chosen_index, chosen_cost) =
+        let (chosen_strategy, chosen_index, chosen_cost, chosen_left_sort, chosen_right_sort) =
             if join_type == JoinType::Semi || join_type == JoinType::Anti {
-                plan_semi_anti_strategy(
+                let (strat, idx, c) = plan_semi_anti_strategy(
                     cur_cost,
                     cur_rows,
                     &tables[0],
@@ -1999,9 +2064,35 @@ fn optimize_with_outer_barriers(
                     param_sig,
                     resource_sig,
                     stats_gen,
-                )
+                );
+                (strat, idx, c, false, false)
             } else {
-                (JoinStrategy::NestedLoop, None, join_cost)
+                let left_ord = if physical_joins.is_empty() {
+                    Some(crate::query::merge_join::ordering_property_for_table_scan(
+                        &tables[0],
+                        &base_table_scan,
+                    ))
+                } else {
+                    None
+                };
+                let choice = plan_general_join_strategy(
+                    cur_cost,
+                    cur_rows,
+                    left_ord.as_ref(),
+                    &tables[right_table_idx],
+                    &right_table_scan,
+                    &on_expr,
+                    join_type,
+                    &accum_schema,
+                    resource_sig,
+                );
+                (
+                    choice.strategy,
+                    choice.index_name,
+                    choice.cost,
+                    choice.left_sort,
+                    choice.right_sort,
+                )
             };
 
         let rf = plan_runtime_filter_for_join(
@@ -2031,6 +2122,8 @@ fn optimize_with_outer_barriers(
             strategy: chosen_strategy,
             index_name: chosen_index,
             runtime_filter: rf,
+            left_sort: chosen_left_sort,
+            right_sort: chosen_right_sort,
         });
     }
 
@@ -2170,6 +2263,109 @@ fn plan_runtime_filter_for_join(
         join_budget,
         &config,
     )
+}
+
+/// Selected physical join algorithm and computed cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedJoinChoice {
+    pub strategy: JoinStrategy,
+    pub index_name: Option<String>,
+    pub cost: f64,
+    pub left_sort: bool,
+    pub right_sort: bool,
+}
+
+/// Evaluates candidate physical join strategies (NestedLoop, HashJoin, MergeJoin)
+/// and selects the cheapest valid strategy based on the cost model.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_general_join_strategy(
+    left_cost: f64,
+    left_rows: f64,
+    left_ordering: Option<&crate::query::merge_join::OrderingProperty>,
+    right_table: &TableOptInfo,
+    right_scan: &PhysicalTableScan,
+    on: &Expr,
+    _join_type: JoinType,
+    left_schema: &Schema,
+    resource_sig: Option<&ResourcePlanningSignature>,
+) -> PlannedJoinChoice {
+    let join_budget = resource_sig
+        .map(|r| r.join_budget)
+        .unwrap_or(crate::query::external_hash_join::DEFAULT_JOIN_MEMORY_BUDGET_BYTES);
+    let sort_budget = resource_sig
+        .map(|r| r.sort_budget)
+        .unwrap_or(crate::query::external_sort::DEFAULT_SORT_MEMORY_BUDGET_BYTES);
+
+    // 1. Always evaluate NestedLoop as baseline
+    let cost_nl = CostModel::nested_loop_join_cost(
+        left_cost,
+        left_rows,
+        right_scan.cost,
+        right_scan.estimated_rows,
+    );
+
+    let mut best_strategy = JoinStrategy::NestedLoop;
+    let mut best_cost = cost_nl;
+    let mut best_left_sort = false;
+    let mut best_right_sort = false;
+
+    // 2. If equi-join conjuncts exist, evaluate Hash and Merge
+    if let Some(equi_plan) =
+        crate::query::external_hash_join::analyze_equi_join(on, left_schema, &right_table.schema)
+    {
+        // Hash Join candidate
+        let cost_hash = CostModel::hash_join_cost(
+            left_cost,
+            left_rows,
+            right_scan.cost,
+            right_scan.estimated_rows,
+            join_budget,
+        );
+        if cost_hash < best_cost {
+            best_strategy = JoinStrategy::Hash;
+            best_cost = cost_hash;
+            best_left_sort = false;
+            best_right_sort = false;
+        }
+
+        // Merge Join candidate
+        let right_ord =
+            crate::query::merge_join::ordering_property_for_table_scan(right_table, right_scan);
+        let right_has_order =
+            right_ord.satisfies_join_keys(&equi_plan.right_keys, Some(right_scan.qualifier()));
+        let right_needs_sort = !right_has_order;
+
+        let left_has_order = left_ordering
+            .map(|ord| ord.satisfies_join_keys(&equi_plan.left_keys, None))
+            .unwrap_or(false);
+        let left_needs_sort = !left_has_order;
+
+        let cost_merge = CostModel::merge_join_cost(
+            left_cost,
+            left_rows,
+            left_needs_sort,
+            right_scan.cost,
+            right_scan.estimated_rows,
+            right_needs_sort,
+            equi_plan.residual_predicate.is_some(),
+            sort_budget,
+        );
+
+        if cost_merge < best_cost {
+            best_strategy = JoinStrategy::Merge;
+            best_cost = cost_merge;
+            best_left_sort = left_needs_sort;
+            best_right_sort = right_needs_sort;
+        }
+    }
+
+    PlannedJoinChoice {
+        strategy: best_strategy,
+        index_name: None,
+        cost: best_cost,
+        left_sort: best_left_sort,
+        right_sort: best_right_sort,
+    }
 }
 
 /// Evaluates costs of applicable physical strategies for SEMI/ANTI joins and selects the cheapest.

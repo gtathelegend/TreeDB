@@ -261,7 +261,7 @@ fn test_explain_analyze_inner_and_left_joins() -> Result<()> {
         Value::String(s) => s.clone(),
         _ => panic!("expected string"),
     };
-    assert!(plan_inner.contains("NestedLoopJoin (Inner"));
+    assert!(plan_inner.contains("Join (Inner") || plan_inner.contains("(Inner"));
     assert!(plan_inner.contains("actual_rows: 5"));
 
     // Left outer join
@@ -279,7 +279,7 @@ fn test_explain_analyze_inner_and_left_joins() -> Result<()> {
         Value::String(s) => s.clone(),
         _ => panic!("expected string"),
     };
-    assert!(plan_left.contains("NestedLoopJoin (Left"));
+    assert!(plan_left.contains("Join (Left") || plan_left.contains("(Left"));
     assert!(plan_left.contains("actual_rows: 5"));
 
     txn.commit()?;

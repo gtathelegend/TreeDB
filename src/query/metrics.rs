@@ -47,6 +47,8 @@ pub enum OperatorKind {
     RecursiveCte { name: String, iterations: usize },
     /// Relational set operation (UNION, INTERSECT, EXCEPT).
     SetOperation { op: String },
+    /// Cost-based equality Merge Join.
+    MergeJoin { join_type: String },
 }
 
 impl fmt::Display for OperatorKind {
@@ -63,6 +65,7 @@ impl fmt::Display for OperatorKind {
             Self::NestedLoopJoin { join_type } => write!(f, "NestedLoopJoin ({join_type})"),
             Self::HashJoin { join_type } => write!(f, "HashJoin ({join_type})"),
             Self::ExternalHashJoin { join_type } => write!(f, "ExternalHashJoin ({join_type})"),
+            Self::MergeJoin { join_type } => write!(f, "MergeJoin ({join_type})"),
             Self::IndexSemiProbe { index_name } => {
                 write!(f, "IndexSemiProbe (index: {index_name})")
             }
@@ -182,6 +185,36 @@ pub struct OperatorCounters {
     pub runtime_filter_null_probe_rows: usize,
     /// Number of false positives observed (passed filter but produced zero join hash matches).
     pub runtime_filter_false_positive_rows: usize,
+    /// Merge join specific: Left rows consumed
+    pub merge_join_left_rows: usize,
+    /// Merge join specific: Right rows consumed
+    pub merge_join_right_rows: usize,
+    /// Merge join specific: Total key comparisons performed
+    pub merge_join_comparisons: usize,
+    /// Merge join specific: Total key matches
+    pub merge_join_key_matches: usize,
+    /// Merge join specific: Duplicate left rows encountered
+    pub merge_join_duplicate_left_rows: usize,
+    /// Merge join specific: Duplicate right rows encountered
+    pub merge_join_duplicate_right_rows: usize,
+    /// Merge join specific: Total rows emitted
+    pub merge_join_output_rows: usize,
+    /// Merge join specific: Unmatched left rows emitted
+    pub merge_join_unmatched_left_rows: usize,
+    /// Merge join specific: Unmatched right rows emitted
+    pub merge_join_unmatched_right_rows: usize,
+    /// Merge join specific: Left keys containing NULL
+    pub merge_join_null_left_keys: usize,
+    /// Merge join specific: Right keys containing NULL
+    pub merge_join_null_right_keys: usize,
+    /// Merge join specific: Residual predicate evaluations
+    pub merge_join_residual_evaluations: usize,
+    /// Merge join specific: Residual predicate rejections
+    pub merge_join_residual_rejections: usize,
+    /// Merge join specific: Whether left input required sort
+    pub merge_join_sort_left: bool,
+    /// Merge join specific: Whether right input required sort
+    pub merge_join_sort_right: bool,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -749,6 +782,12 @@ pub fn format_plan_with_metrics(
                     write_indent(&mut out, indent + 1);
                     out.push_str(&format!("index={idx_name}\n"));
                 }
+            } else if join.strategy == crate::query::optimizer::JoinStrategy::Merge {
+                out.push_str(&format!(
+                    "MergeJoin ({:?}, on: [{proper_on}])\n",
+                    join.join_type,
+                    proper_on = join.on
+                ));
             } else {
                 out.push_str(&format!(
                     "NestedLoopJoin ({:?}, on: [{proper_on}])\n",
@@ -764,6 +803,7 @@ pub fn format_plan_with_metrics(
                         OperatorKind::NestedLoopJoin { .. }
                             | OperatorKind::HashJoin { .. }
                             | OperatorKind::ExternalHashJoin { .. }
+                            | OperatorKind::MergeJoin { .. }
                             | OperatorKind::IndexSemiProbe { .. }
                             | OperatorKind::IndexAntiProbe { .. }
                             | OperatorKind::HashSemiJoin
@@ -791,6 +831,27 @@ pub fn format_plan_with_metrics(
                             jm.counters.hash_probe_rows,
                             jm.counters.bytes_spilled,
                             jm.counters.runs_created
+                        ));
+                    } else if matches!(jm.kind, OperatorKind::MergeJoin { .. }) {
+                        out.push_str(&format!(
+                            "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, left_rows: {}, right_rows: {}, comparisons: {}, key_matches: {}, duplicate_left: {}, duplicate_right: {}, unmatched_left: {}, unmatched_right: {}, null_left_keys: {}, null_right_keys: {}, residual_evals: {}, residual_rejections: {}, sort_left: {}, sort_right: {}\n",
+                            join.cost,
+                            join.estimated_rows,
+                            metrics.total_rows,
+                            jm.counters.merge_join_left_rows,
+                            jm.counters.merge_join_right_rows,
+                            jm.counters.merge_join_comparisons,
+                            jm.counters.merge_join_key_matches,
+                            jm.counters.merge_join_duplicate_left_rows,
+                            jm.counters.merge_join_duplicate_right_rows,
+                            jm.counters.merge_join_unmatched_left_rows,
+                            jm.counters.merge_join_unmatched_right_rows,
+                            jm.counters.merge_join_null_left_keys,
+                            jm.counters.merge_join_null_right_keys,
+                            jm.counters.merge_join_residual_evaluations,
+                            jm.counters.merge_join_residual_rejections,
+                            jm.counters.merge_join_sort_left,
+                            jm.counters.merge_join_sort_right,
                         ));
                     } else if jm.counters.runs_created > 0 || jm.counters.bytes_spilled > 0 {
                         out.push_str(&format!(

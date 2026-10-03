@@ -139,6 +139,8 @@ pub struct JoinExecutionMetrics {
     pub bytes_spilled: usize,
     /// Total partition passes executed (0 for in-memory, >= 1 for spilled join).
     pub partition_passes: usize,
+    /// Total sort merge passes executed if external sorting was required.
+    pub merge_passes: usize,
     /// Peak in-memory byte footprint estimated during join execution.
     pub peak_memory_bytes: usize,
     /// Candidate cross-product pairs examined during join evaluation.
@@ -173,10 +175,40 @@ pub struct JoinExecutionMetrics {
     pub runtime_filter_null_probe_rows: usize,
     /// Number of false positives observed (passed filter but produced zero join hash matches).
     pub runtime_filter_false_positive_rows: usize,
+    /// Merge join specific: Left rows consumed
+    pub merge_join_left_rows: usize,
+    /// Merge join specific: Right rows consumed
+    pub merge_join_right_rows: usize,
+    /// Merge join specific: Total key comparisons performed
+    pub merge_join_comparisons: usize,
+    /// Merge join specific: Total key matches
+    pub merge_join_key_matches: usize,
+    /// Merge join specific: Duplicate left rows encountered
+    pub merge_join_duplicate_left_rows: usize,
+    /// Merge join specific: Duplicate right rows encountered
+    pub merge_join_duplicate_right_rows: usize,
+    /// Merge join specific: Total rows emitted
+    pub merge_join_output_rows: usize,
+    /// Merge join specific: Unmatched left rows emitted
+    pub merge_join_unmatched_left_rows: usize,
+    /// Merge join specific: Unmatched right rows emitted
+    pub merge_join_unmatched_right_rows: usize,
+    /// Merge join specific: Left keys containing NULL
+    pub merge_join_null_left_keys: usize,
+    /// Merge join specific: Right keys containing NULL
+    pub merge_join_null_right_keys: usize,
+    /// Merge join specific: Residual predicate evaluations
+    pub merge_join_residual_evaluations: usize,
+    /// Merge join specific: Residual predicate rejections
+    pub merge_join_residual_rejections: usize,
+    /// Merge join specific: Whether left input required sort
+    pub merge_join_sort_left: bool,
+    /// Merge join specific: Whether right input required sort
+    pub merge_join_sort_right: bool,
 }
 
 /// Composite join key constructed from evaluated equi-join expressions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JoinKey(pub Vec<CanonicalValue>);
 
 impl JoinKey {

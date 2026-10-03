@@ -422,7 +422,14 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Index Probing:** For each discovered distinct prefix, constructs a probe key `(prefix, suffix)` and performs an index lookup/prefix range scan to collect matching records.
   * **Cost-Based Optimization:** Compares the cost of skip scanning ($\text{distinct\_prefixes} \times \text{probe\_cost} + \text{matches} \times \text{fetch\_cost}$) against full table scan and other index access paths using table and column statistics. High cardinality skipped prefixes fall back to full table scan.
   * **Covering & Index-Only Execution:** Integrates with covering indexes (`IndexOnlySkipScan`), reconstructing all query columns from index keys and included payloads without fetching base records from `RecordStore`.
-  * **Ordering & Pagination:** Preserves leading-prefix index ordering when requested by `ORDER BY` and supports safe early-termination for `LIMIT` / `OFFSET`.
+* **Cost-Based Merge Join & Ordered Join Execution (`MergeJoinOperator`, `OrderingProperty`, `OrderingColumn`):**
+  * **Physical Execution Strategy:** First-class physical join operator for `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, and `FULL OUTER JOIN` equi-joins on single and composite keys. Preserves exact SQL semantics with zero change to persistent storage formats.
+  * **Ordering Properties & Index Reuse:** Analyzes access path ordering guarantees (`PrimaryRangeScan`, `SecondaryIndexScan` range/prefix scans, `IndexOnlyScan`) using `OrderingProperty` with prefix reasoning. Multi-index scans and skip scans do not advertise false global ordering.
+  * **Sort Insertion & External Sorter Reuse:** When an input is not already ordered by required join keys, automatically inserts sort stages reusing `ExternalSorter` with configured memory budgets and disk spilling.
+  * **Duplicate Runs & 3VL NULL Semantics:** Exact duplicate multiplicity ($N \times M$ Cartesian product) across duplicate key runs. SQL 3VL NULL keys never match equi-join conditions and are emitted as NULL-padded rows strictly according to outer join semantics.
+  * **Residual Predicates:** Non-equi residual join predicates are evaluated on candidate matched pairs after merge key matching.
+  * **Cost-Based Selection:** Optimizer compares costs of `NestedLoop`, `HashJoin` / `ExternalHashJoin`, and `MergeJoin`, choosing the cheapest physical strategy based on input ordering and statistics.
+  * **EXPLAIN & Telemetry:** Full visibility in `EXPLAIN` (indicating ordering and sort requirements) and comprehensive `EXPLAIN ANALYZE` metrics tracking comparisons, key matches, duplicate runs, and unmatched rows.
 
 ---
 
@@ -448,6 +455,7 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 * **External Aggregation Non-Persistence & Equivalence Invariant:** Temporary aggregation partition runs are strictly runtime external artifacts excluded from WAL and persistent database pages. Spilling decisions produce results 100% mathematically and semantically identical to in-memory aggregation.
 * **External Hash Join Non-Persistence & Equivalence Invariant:** Temporary join partition runs are strictly runtime external artifacts excluded from WAL and persistent database pages. Spilling decisions produce results 100% mathematically and semantically identical to in-memory join execution.
 * **Outer Join Output & Multiplicity Invariant:** Outer joins (`LEFT`, `RIGHT`, `FULL`) preserve all unmatched rows with NULL padding for opposing relation columns, maintain $N \times M$ Cartesian product multiplicity for duplicate matching keys, and evaluate residual predicates before recording match participation.
+* **Merge Join Physical Equivalence Invariant:** Merge Join is a physical execution strategy that does not alter SQL semantics. For all queries with equi-join predicates, execution via `MergeJoinOperator` produces output multiset results identical to `HashJoin` and `NestedLoopJoin`.
 * **Join Reordering & Outer Join Barrier Invariant:** TreeDB performs cost-based join reordering exclusively inside semantically safe `INNER JOIN` regions using bounded DP subset enumeration ($N \le 8$) and deterministic greedy fallback ($N > 8$). `LEFT JOIN`, `RIGHT JOIN`, and `FULL JOIN` are impenetrable optimization barriers across which join orders are never permuted.
 * **Query Rewriting & Subquery Decorrelation Invariant:** Logical query rewriting safely flattens derived tables with predicate pushdown and decorrelates `EXISTS`, `NOT EXISTS`, and `IN` subqueries into `SEMI` / `ANTI` joins without altering result cardinalities, duplicates, or NULL semantics. `NOT IN` subqueries are preserved for exact SQL three-valued logic (3VL) evaluation.
 * **WAL Corruption Policy:** Valid log prefixes are recovered. Incomplete trailing crash tails are safely ignored. Corruptions in the middle of durable log records return `Error::WalCorruption`.
@@ -462,7 +470,6 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
 ## 8. Intentionally Deferred Items
 
 The following capabilities are intentionally deferred to subsequent phases:
-* Merge join physical operator.
 * Generalized outer-join reordering in cost optimizer.
 * DDL statements (`ALTER TABLE`) in SQL grammar.
 * Recursive CTE `UNION DISTINCT`, `SEARCH`, `CYCLE` clauses, and mutual recursion.

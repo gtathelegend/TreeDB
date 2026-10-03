@@ -3889,15 +3889,44 @@ impl<'db> Transaction<'db> {
             let candidate_pairs = left_count * right_count;
 
             let (next_schema, next_rows, join_exec_metrics) = if outer_contexts.is_empty() {
-                crate::query::operator::JoinOperator::apply_with_config(
-                    current_rows,
-                    &current_schema,
-                    &right_rows,
-                    &right_schema,
-                    join.join_type,
-                    &join.on,
-                    &self.db.join_config,
-                )?
+                if join.strategy == crate::query::optimizer::JoinStrategy::Merge {
+                    if let Some(equi_plan) = crate::query::external_hash_join::analyze_equi_join(
+                        &join.on,
+                        &current_schema,
+                        &right_schema,
+                    ) {
+                        let merge_op = crate::query::merge_join::MergeJoinOperator::new(
+                            &current_schema,
+                            &right_schema,
+                            join.join_type,
+                            equi_plan,
+                            !join.left_sort,
+                            !join.right_sort,
+                            self.db.join_config.clone(),
+                        );
+                        merge_op.execute(current_rows, right_rows)?
+                    } else {
+                        crate::query::operator::JoinOperator::apply_with_config(
+                            current_rows,
+                            &current_schema,
+                            &right_rows,
+                            &right_schema,
+                            join.join_type,
+                            &join.on,
+                            &self.db.join_config,
+                        )?
+                    }
+                } else {
+                    crate::query::operator::JoinOperator::apply_with_config(
+                        current_rows,
+                        &current_schema,
+                        &right_rows,
+                        &right_schema,
+                        join.join_type,
+                        &join.on,
+                        &self.db.join_config,
+                    )?
+                }
             } else {
                 let (ns, nr) = self.join_rows_with_outer_internal(
                     current_rows,
@@ -3920,9 +3949,11 @@ impl<'db> Transaction<'db> {
                 (ns, nr, metrics)
             };
 
-            let op_kind = if join_exec_metrics.runs_created > 0
-                || join_exec_metrics.bytes_spilled > 0
-            {
+            let op_kind = if join.strategy == crate::query::optimizer::JoinStrategy::Merge {
+                crate::query::OperatorKind::MergeJoin {
+                    join_type: format!("{:?}", join.join_type),
+                }
+            } else if join_exec_metrics.runs_created > 0 || join_exec_metrics.bytes_spilled > 0 {
                 crate::query::OperatorKind::ExternalHashJoin {
                     join_type: format!("{:?}", join.join_type),
                 }
@@ -3989,6 +4020,29 @@ impl<'db> Transaction<'db> {
                 join_exec_metrics.runtime_filter_null_probe_rows;
             join_metric.counters.runtime_filter_false_positive_rows =
                 join_exec_metrics.runtime_filter_false_positive_rows;
+            join_metric.counters.merge_join_left_rows = join_exec_metrics.merge_join_left_rows;
+            join_metric.counters.merge_join_right_rows = join_exec_metrics.merge_join_right_rows;
+            join_metric.counters.merge_join_comparisons = join_exec_metrics.merge_join_comparisons;
+            join_metric.counters.merge_join_key_matches = join_exec_metrics.merge_join_key_matches;
+            join_metric.counters.merge_join_duplicate_left_rows =
+                join_exec_metrics.merge_join_duplicate_left_rows;
+            join_metric.counters.merge_join_duplicate_right_rows =
+                join_exec_metrics.merge_join_duplicate_right_rows;
+            join_metric.counters.merge_join_output_rows = join_exec_metrics.merge_join_output_rows;
+            join_metric.counters.merge_join_unmatched_left_rows =
+                join_exec_metrics.merge_join_unmatched_left_rows;
+            join_metric.counters.merge_join_unmatched_right_rows =
+                join_exec_metrics.merge_join_unmatched_right_rows;
+            join_metric.counters.merge_join_null_left_keys =
+                join_exec_metrics.merge_join_null_left_keys;
+            join_metric.counters.merge_join_null_right_keys =
+                join_exec_metrics.merge_join_null_right_keys;
+            join_metric.counters.merge_join_residual_evaluations =
+                join_exec_metrics.merge_join_residual_evaluations;
+            join_metric.counters.merge_join_residual_rejections =
+                join_exec_metrics.merge_join_residual_rejections;
+            join_metric.counters.merge_join_sort_left = join_exec_metrics.merge_join_sort_left;
+            join_metric.counters.merge_join_sort_right = join_exec_metrics.merge_join_sort_right;
             join_metric.add_child(current_op);
             join_metric.add_child(right_op);
 

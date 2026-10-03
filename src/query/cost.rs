@@ -265,6 +265,67 @@ impl CostModel {
         )
     }
 
+    /// Computes the cost of a full hash join (in-memory or external spilled).
+    pub fn hash_join_cost(
+        left_cost: f64,
+        left_rows: f64,
+        right_cost: f64,
+        right_rows: f64,
+        memory_budget_bytes: usize,
+    ) -> f64 {
+        let left_r = left_rows.max(1.0);
+        let right_r = right_rows.max(1.0);
+        let estimated_row_bytes = 64.0;
+        let estimated_build_bytes = right_r * estimated_row_bytes;
+
+        let build_cost = right_cost + (right_r * (ROW_CPU_COST + HASH_BUILD_CPU_COST));
+        let probe_cost = left_r * (ROW_CPU_COST + HASH_PROBE_CPU_COST);
+
+        let spill_cost = if estimated_build_bytes > (memory_budget_bytes as f64) {
+            let page_size = 4096.0;
+            let left_pages = (left_r * estimated_row_bytes / page_size).ceil();
+            let right_pages = (estimated_build_bytes / page_size).ceil();
+            2.0 * PAGE_READ_COST * (left_pages + right_pages)
+        } else {
+            0.0
+        };
+
+        left_cost + build_cost + probe_cost + spill_cost
+    }
+
+    /// Computes the cost of a merge join over ordered or sorted inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn merge_join_cost(
+        left_cost: f64,
+        left_rows: f64,
+        left_needs_sort: bool,
+        right_cost: f64,
+        right_rows: f64,
+        right_needs_sort: bool,
+        has_residual_filter: bool,
+        memory_budget_bytes: usize,
+    ) -> f64 {
+        let left_r = left_rows.max(0.0);
+        let right_r = right_rows.max(0.0);
+        let sort_left_cost = if left_needs_sort {
+            Self::sort_cost_with_budget(left_r, 64.0, memory_budget_bytes, SpillStatus::Unknown)
+        } else {
+            0.0
+        };
+        let sort_right_cost = if right_needs_sort {
+            Self::sort_cost_with_budget(right_r, 64.0, memory_budget_bytes, SpillStatus::Unknown)
+        } else {
+            0.0
+        };
+        let merge_cpu_cost = (left_r + right_r) * (ROW_CPU_COST * 0.5 + JOIN_CPU_COST * 0.25);
+        let residual_cost = if has_residual_filter {
+            FILTER_CPU_COST * (left_r.min(right_r) + 1.0)
+        } else {
+            0.0
+        };
+        left_cost + right_cost + sort_left_cost + sort_right_cost + merge_cpu_cost + residual_cost
+    }
+
     /// Computes the cost of evaluating residual filter expressions.
     pub fn filter_cost(input_rows: f64) -> f64 {
         FILTER_CPU_COST * input_rows.max(0.0)
