@@ -994,6 +994,7 @@ fn baseline_execute(
         projections: bound.projections.clone(),
         order_by: bound.order_by.clone(),
         order_by_sort_required: !bound.order_by.is_empty(),
+        order_by_top_n: false,
         provided_ordering: None,
         offset: bound.offset,
         limit: bound.limit,

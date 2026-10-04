@@ -215,6 +215,12 @@ pub enum FeedbackContext {
     },
     /// Sort operator with ordering keys representation.
     Sort { order_by: String },
+    /// Top-N bounded sort operator.
+    TopN {
+        order_by: String,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
     /// Aggregation operator with group-by and aggregate expressions.
     Aggregate {
         group_by: String,
@@ -287,6 +293,14 @@ impl fmt::Display for FeedbackContext {
                 "ExternalOp(kind={op_kind}, relation={relation_name})"
             ),
             Self::Sort { order_by } => write!(f, "Sort(order_by=[{order_by}])"),
+            Self::TopN {
+                order_by,
+                limit,
+                offset,
+            } => write!(
+                f,
+                "TopN(order_by=[{order_by}], limit={limit:?}, offset={offset:?})"
+            ),
             Self::Aggregate {
                 group_by,
                 aggregates,
@@ -507,7 +521,9 @@ impl FeedbackKey {
             | FeedbackContext::SemiAnti { left_table, .. }
             | FeedbackContext::RuntimeFilter { left_table, .. } => Some(left_table.as_str()),
             FeedbackContext::ExternalOp { relation_name, .. } => Some(relation_name.as_str()),
-            FeedbackContext::Sort { .. } | FeedbackContext::Aggregate { .. } => None,
+            FeedbackContext::Sort { .. }
+            | FeedbackContext::TopN { .. }
+            | FeedbackContext::Aggregate { .. } => None,
         }
     }
 }

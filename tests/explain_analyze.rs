@@ -218,7 +218,8 @@ fn test_explain_analyze_sort_limit_offset() -> Result<()> {
 
     let root = metrics.root_operator.unwrap();
     assert_eq!(root.actual_rows, 2);
-    assert_eq!(root.kind, treedb::query::OperatorKind::LimitOffset);
+    assert_eq!(root.kind, treedb::query::OperatorKind::Project);
+    assert_eq!(root.children[0].kind, treedb::query::OperatorKind::TopN);
 
     let plan_text = match &txn
         .execute_sql("EXPLAIN ANALYZE SELECT id, name, age FROM users ORDER BY age DESC, id ASC LIMIT 2 OFFSET 1;")?
@@ -228,8 +229,17 @@ fn test_explain_analyze_sort_limit_offset() -> Result<()> {
         Value::String(s) => s.clone(),
         _ => panic!("expected string"),
     };
-    assert!(plan_text.contains("LimitOffset (limit: Some(2), offset: Some(1))"));
-    assert!(plan_text.contains("Sort [age Descending, id Ascending]"));
+    assert!(
+        plan_text.contains("TopN (limit: Some(2), offset: Some(1)) [age Descending, id Ascending]")
+    );
+
+    let (_, metrics_full) =
+        txn.execute_sql_with_metrics("SELECT id, name, age FROM users ORDER BY age DESC, id ASC;")?;
+    let root_full = metrics_full.root_operator.unwrap();
+    assert_eq!(
+        root_full.children[0].kind,
+        treedb::query::OperatorKind::Sort
+    );
 
     txn.commit()?;
     Ok(())

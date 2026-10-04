@@ -387,6 +387,18 @@ impl CostModel {
         }
     }
 
+    /// Computes the CPU and memory cost of a Top-N bounded sort operator.
+    pub fn top_n_cost(input_rows: f64, candidate_bound: usize, _estimated_row_bytes: f64) -> f64 {
+        let rows = input_rows.max(0.0);
+        if rows <= 1.0 || candidate_bound == 0 {
+            return 0.0;
+        }
+        let k = (candidate_bound as f64).min(rows).max(1.0);
+        let heap_cpu_cost = SORT_CPU_COST * rows * k.log2().max(1.0);
+        let final_sort_cost = SORT_CPU_COST * k * k.log2();
+        heap_cpu_cost + final_sort_cost
+    }
+
     /// Computes the cost of in-memory aggregation.
     pub fn aggregate_cost(input_rows: f64) -> f64 {
         AGG_CPU_COST * input_rows.max(0.0)

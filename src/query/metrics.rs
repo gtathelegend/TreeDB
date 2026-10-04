@@ -51,6 +51,8 @@ pub enum OperatorKind {
     SetOperation { op: String },
     /// Cost-based equality Merge Join.
     MergeJoin { join_type: String },
+    /// Bounded priority queue Top-N sort.
+    TopN,
 }
 
 impl fmt::Display for OperatorKind {
@@ -63,6 +65,7 @@ impl fmt::Display for OperatorKind {
             Self::Filter => write!(f, "Filter"),
             Self::Project => write!(f, "Project"),
             Self::Sort => write!(f, "Sort"),
+            Self::TopN => write!(f, "TopN"),
             Self::LimitOffset => write!(f, "LimitOffset"),
             Self::NestedLoopJoin { join_type } => write!(f, "NestedLoopJoin ({join_type})"),
             Self::HashJoin { join_type } => write!(f, "HashJoin ({join_type})"),
@@ -238,6 +241,20 @@ pub struct OperatorCounters {
     pub sort_required: bool,
     /// Global Physical Properties / Sort Elimination: Whether sort was eliminated
     pub sort_eliminated: bool,
+    /// Top-N specific: candidate capacity (offset + limit)
+    pub top_n_candidate_capacity: usize,
+    /// Top-N specific: candidate rows retained
+    pub top_n_rows_retained: usize,
+    /// Top-N specific: candidate rows discarded
+    pub top_n_rows_discarded: usize,
+    /// Top-N specific: whether early termination occurred
+    pub top_n_early_terminated: bool,
+    /// Top-N specific: configured limit
+    pub top_n_limit: usize,
+    /// Top-N specific: configured offset
+    pub top_n_offset: usize,
+    /// General scan / operator early termination flag
+    pub early_terminated: bool,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -470,8 +487,10 @@ pub fn format_plan_with_metrics(
         indent += 1;
     }
 
-    // 2. Limit / Offset
-    if plan.limit.is_some() || plan.offset.is_some() {
+    // 2. Limit / Offset (if not handled by TopN)
+    if (plan.limit.is_some() || plan.offset.is_some())
+        && !(plan.order_by_top_n && plan.order_by_sort_required)
+    {
         write_indent(&mut out, indent);
         out.push_str(&format!(
             "LimitOffset (limit: {:?}, offset: {:?})\n",
@@ -495,7 +514,7 @@ pub fn format_plan_with_metrics(
         indent += 1;
     }
 
-    // 4. Sort
+    // 4. Sort / TopN
     if !plan.order_by.is_empty() && plan.order_by_sort_required {
         write_indent(&mut out, indent);
         let keys: Vec<String> = plan
@@ -503,21 +522,46 @@ pub fn format_plan_with_metrics(
             .iter()
             .map(|k| format!("{} {:?}", k.expression, k.direction))
             .collect();
-        out.push_str(&format!("Sort [{}]\n", keys.join(", ")));
-        if let Some(root) = &metrics.root_operator {
-            if let Some(sort_op) = find_operator_metrics(root, &|k| matches!(k, OperatorKind::Sort))
-            {
-                write_indent(&mut out, indent + 1);
-                if sort_op.counters.runs_created > 0 {
+        if plan.order_by_top_n {
+            out.push_str(&format!(
+                "TopN (limit: {:?}, offset: {:?}) [{}]\n",
+                plan.limit,
+                plan.offset,
+                keys.join(", ")
+            ));
+            if let Some(root) = &metrics.root_operator {
+                if let Some(top_op) =
+                    find_operator_metrics(root, &|k| matches!(k, OperatorKind::TopN))
+                {
+                    write_indent(&mut out, indent + 1);
                     out.push_str(&format!(
-                        "actual_rows: {}, runs_created: {}, bytes_spilled: {}, merge_passes: {}\n",
-                        sort_op.actual_rows,
-                        sort_op.counters.runs_created,
-                        sort_op.counters.bytes_spilled,
-                        sort_op.counters.merge_passes
+                        "actual_rows: {}, candidate_capacity: {}, rows_retained: {}, rows_discarded: {}, peak_memory_bytes: {}\n",
+                        top_op.actual_rows,
+                        top_op.counters.top_n_candidate_capacity,
+                        top_op.counters.top_n_rows_retained,
+                        top_op.counters.top_n_rows_discarded,
+                        top_op.counters.peak_memory_bytes
                     ));
-                } else {
-                    out.push_str(&format!("actual_rows: {}\n", sort_op.actual_rows));
+                }
+            }
+        } else {
+            out.push_str(&format!("Sort [{}]\n", keys.join(", ")));
+            if let Some(root) = &metrics.root_operator {
+                if let Some(sort_op) =
+                    find_operator_metrics(root, &|k| matches!(k, OperatorKind::Sort))
+                {
+                    write_indent(&mut out, indent + 1);
+                    if sort_op.counters.runs_created > 0 {
+                        out.push_str(&format!(
+                            "actual_rows: {}, runs_created: {}, bytes_spilled: {}, merge_passes: {}\n",
+                            sort_op.actual_rows,
+                            sort_op.counters.runs_created,
+                            sort_op.counters.bytes_spilled,
+                            sort_op.counters.merge_passes
+                        ));
+                    } else {
+                        out.push_str(&format!("actual_rows: {}\n", sort_op.actual_rows));
+                    }
                 }
             }
         }

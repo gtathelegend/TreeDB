@@ -3404,6 +3404,34 @@ impl<'db> Transaction<'db> {
                 let mut is_index_only = false;
                 let mut skip_scan_stats: Option<crate::engine::table::SkipScanStats> = None;
                 let mut multi_index_stats: Option<crate::engine::table::MultiIndexScanStats> = None;
+
+                let can_early_stop = !plan.order_by.is_empty()
+                    && !plan.order_by_sort_required
+                    && plan.group_by.is_empty()
+                    && plan.aggregates.is_empty()
+                    && plan.window_exprs.is_empty()
+                    && plan.joins.is_empty()
+                    && plan.limit.is_some()
+                    && !matches!(
+                        plan.base_table.access_path,
+                        crate::query::optimizer::AccessPath::MultiIndexScan { .. }
+                            | crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                                scan_type: crate::query::optimizer::SecondaryScanType::SkipScan { .. },
+                                ..
+                            }
+                            | crate::query::optimizer::AccessPath::IndexOnlyScan {
+                                scan_type: crate::query::optimizer::SecondaryScanType::SkipScan { .. },
+                                ..
+                            }
+                    );
+                let early_stop_bound = if can_early_stop {
+                    Some(plan.offset.unwrap_or(0) + plan.limit.unwrap())
+                } else {
+                    None
+                };
+                let mut early_terminated = false;
+                let mut early_index_entries = 0;
+
                 let initial_rows = match &plan.base_table.access_path {
                     crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
                         index_lookups = 1;
@@ -3414,7 +3442,39 @@ impl<'db> Transaction<'db> {
                     }
                     crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
                         index_lookups = 1;
-                        table.scan(start.as_ref(), end.as_ref())?
+                        if let Some(k) = early_stop_bound {
+                            let mut rows = Vec::new();
+                            let all_rows = table.scan(start.as_ref(), end.as_ref())?;
+                            for row in all_rows {
+                                early_index_entries += 1;
+                                let keep = match &plan.base_table.residual_filter {
+                                    Some(f) => {
+                                        let res = self.evaluate_expr_with_outer_internal(
+                                            f,
+                                            &row,
+                                            &raw_schema,
+                                            outer_contexts,
+                                            cte_store,
+                                        )?;
+                                        match res {
+                                            Value::Boolean(b) => b,
+                                            _ => false,
+                                        }
+                                    }
+                                    None => true,
+                                };
+                                if keep {
+                                    rows.push(row);
+                                    if rows.len() >= k {
+                                        early_terminated = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            rows
+                        } else {
+                            table.scan(start.as_ref(), end.as_ref())?
+                        }
                     }
                     crate::query::optimizer::AccessPath::SecondaryIndexScan {
                         index_name,
@@ -3432,7 +3492,40 @@ impl<'db> Transaction<'db> {
                         }
                         crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
                             index_lookups = 1;
-                            table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                            if let Some(k) = early_stop_bound {
+                                let all_rows =
+                                    table.index_scan(index_name, start.as_ref(), end.as_ref())?;
+                                let mut rows = Vec::new();
+                                for row in all_rows {
+                                    early_index_entries += 1;
+                                    let keep = match &plan.base_table.residual_filter {
+                                        Some(f) => {
+                                            let res = self.evaluate_expr_with_outer_internal(
+                                                f,
+                                                &row,
+                                                &raw_schema,
+                                                outer_contexts,
+                                                cte_store,
+                                            )?;
+                                            match res {
+                                                Value::Boolean(b) => b,
+                                                _ => false,
+                                            }
+                                        }
+                                        None => true,
+                                    };
+                                    if keep {
+                                        rows.push(row);
+                                        if rows.len() >= k {
+                                            early_terminated = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                rows
+                            } else {
+                                table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                            }
                         }
                         crate::query::optimizer::SecondaryScanType::SkipScan {
                             skipped_prefix_columns,
@@ -3474,7 +3567,39 @@ impl<'db> Transaction<'db> {
                             }
                             _ => {
                                 index_lookups = 1;
-                                table.index_only_scan(index_name, scan_type)?
+                                if let Some(k) = early_stop_bound {
+                                    let all_rows = table.index_only_scan(index_name, scan_type)?;
+                                    let mut rows = Vec::new();
+                                    for row in all_rows {
+                                        early_index_entries += 1;
+                                        let keep = match &plan.base_table.residual_filter {
+                                            Some(f) => {
+                                                let res = self.evaluate_expr_with_outer_internal(
+                                                    f,
+                                                    &row,
+                                                    &raw_schema,
+                                                    outer_contexts,
+                                                    cte_store,
+                                                )?;
+                                                match res {
+                                                    Value::Boolean(b) => b,
+                                                    _ => false,
+                                                }
+                                            }
+                                            None => true,
+                                        };
+                                        if keep {
+                                            rows.push(row);
+                                            if rows.len() >= k {
+                                                early_terminated = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    rows
+                                } else {
+                                    table.index_only_scan(index_name, scan_type)?
+                                }
                             }
                         }
                     }
@@ -3493,7 +3618,41 @@ impl<'db> Transaction<'db> {
                         multi_index_stats = Some(stats);
                         rows
                     }
-                    crate::query::optimizer::AccessPath::FullTableScan => table.scan(None, None)?,
+                    crate::query::optimizer::AccessPath::FullTableScan => {
+                        if let Some(k) = early_stop_bound {
+                            let all_rows = table.scan(None, None)?;
+                            let mut rows = Vec::new();
+                            for row in all_rows {
+                                early_index_entries += 1;
+                                let keep = match &plan.base_table.residual_filter {
+                                    Some(f) => {
+                                        let res = self.evaluate_expr_with_outer_internal(
+                                            f,
+                                            &row,
+                                            &raw_schema,
+                                            outer_contexts,
+                                            cte_store,
+                                        )?;
+                                        match res {
+                                            Value::Boolean(b) => b,
+                                            _ => false,
+                                        }
+                                    }
+                                    None => true,
+                                };
+                                if keep {
+                                    rows.push(row);
+                                    if rows.len() >= k {
+                                        early_terminated = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            rows
+                        } else {
+                            table.scan(None, None)?
+                        }
+                    }
                     crate::query::optimizer::AccessPath::EmptyResult => Vec::new(),
                 };
 
@@ -3509,6 +3668,7 @@ impl<'db> Transaction<'db> {
                 scan_metric.actual_rows = initial_rows.len();
                 scan_metric.counters.index_lookups = index_lookups;
                 scan_metric.counters.rows_evaluated = initial_rows.len();
+                scan_metric.counters.early_terminated = early_terminated;
                 if let Some(stats) = &skip_scan_stats {
                     scan_metric.counters.distinct_prefix_values = stats.distinct_prefix_values;
                     scan_metric.counters.skip_scan_probes = stats.skip_scan_probes;
@@ -3537,7 +3697,11 @@ impl<'db> Transaction<'db> {
                     scan_metric.counters.base_records_fetched = 0;
                     scan_metric.counters.base_records_avoided = initial_rows.len();
                     if skip_scan_stats.is_none() && multi_index_stats.is_none() {
-                        scan_metric.counters.index_entries_examined = initial_rows.len();
+                        scan_metric.counters.index_entries_examined = if early_index_entries > 0 {
+                            early_index_entries
+                        } else {
+                            initial_rows.len()
+                        };
                     }
                     scan_metric.counters.covered_rows_output = initial_rows.len();
                 } else if multi_index_stats.is_none() {
@@ -3545,7 +3709,9 @@ impl<'db> Transaction<'db> {
                     scan_metric.counters.base_records_fetched = initial_rows.len();
                     scan_metric.counters.base_records_avoided = 0;
                     if skip_scan_stats.is_none() {
-                        scan_metric.counters.index_entries_examined = if index_lookups > 0 {
+                        scan_metric.counters.index_entries_examined = if early_index_entries > 0 {
+                            early_index_entries
+                        } else if index_lookups > 0 {
                             initial_rows.len()
                         } else {
                             0
@@ -3555,7 +3721,7 @@ impl<'db> Transaction<'db> {
                 }
 
                 let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
-                    Some(filter) => {
+                    Some(filter) if early_stop_bound.is_none() => {
                         let filtered = self.filter_rows_with_outer_internal(
                             initial_rows.clone(),
                             &raw_schema,
@@ -3576,6 +3742,23 @@ impl<'db> Transaction<'db> {
                             initial_rows.len().saturating_sub(filtered.len());
                         filter_metric.add_child(scan_metric);
                         (filtered, filter_metric)
+                    }
+                    Some(_) => {
+                        let mut filter_metric = crate::query::OperatorMetrics::new(
+                            crate::query::OperatorKind::Filter,
+                            Some(plan.base_table.estimated_rows),
+                            Some(plan.base_table.cost),
+                        );
+                        let eval_count = early_index_entries.max(initial_rows.len());
+                        filter_metric.input_rows = eval_count;
+                        filter_metric.actual_rows = initial_rows.len();
+                        filter_metric.counters.rows_evaluated = eval_count;
+                        filter_metric.counters.rows_passed = initial_rows.len();
+                        filter_metric.counters.rows_rejected =
+                            eval_count.saturating_sub(initial_rows.len());
+                        filter_metric.counters.early_terminated = early_terminated;
+                        filter_metric.add_child(scan_metric);
+                        (initial_rows, filter_metric)
                     }
                     None => (initial_rows, scan_metric),
                 };
@@ -4211,36 +4394,69 @@ impl<'db> Transaction<'db> {
             working_rows = win_rows;
         }
 
-        // 6. Sort Operator (ORDER BY)
-        let sorted_rows = if !plan.order_by.is_empty() && plan.order_by_sort_required {
-            let (sorted, sort_metrics) = crate::query::SortOperator::apply_with_config(
-                working_rows,
-                &working_schema,
-                &plan.order_by,
-                &self.db.sort_config,
-            )?;
-            let mut sort_metric = crate::query::OperatorMetrics::new(
-                crate::query::OperatorKind::Sort,
-                Some(plan.estimated_rows),
-                Some(plan.total_cost),
-            );
-            sort_metric.input_rows = sort_metrics.rows_input;
-            sort_metric.actual_rows = sorted.len();
-            sort_metric.counters.runs_created = sort_metrics.runs_created;
-            sort_metric.counters.bytes_spilled = sort_metrics.bytes_spilled;
-            sort_metric.counters.merge_passes = sort_metrics.merge_passes;
-            sort_metric.counters.peak_memory_bytes = sort_metrics.peak_memory_bytes;
-            sort_metric.counters.sort_required = true;
-            sort_metric.counters.sort_eliminated = false;
-            sort_metric.add_child(current_op);
-            current_op = sort_metric;
-            sorted
+        // 6. Sort / Top-N Operator (ORDER BY)
+        let (sorted_rows, top_n_executed) = if !plan.order_by.is_empty()
+            && plan.order_by_sort_required
+        {
+            if plan.order_by_top_n {
+                let (top_n_rows, top_n_metrics) = crate::query::TopNOperator::apply_with_config(
+                    working_rows,
+                    &working_schema,
+                    &plan.order_by,
+                    plan.limit,
+                    plan.offset,
+                    &self.db.sort_config,
+                )?;
+                let mut top_n_metric = crate::query::OperatorMetrics::new(
+                    crate::query::OperatorKind::TopN,
+                    Some(plan.estimated_rows),
+                    Some(plan.total_cost),
+                );
+                top_n_metric.input_rows = top_n_metrics.rows_input;
+                top_n_metric.actual_rows = top_n_rows.len();
+                top_n_metric.counters.top_n_candidate_capacity = top_n_metrics.candidate_capacity;
+                top_n_metric.counters.top_n_rows_retained = top_n_metrics.rows_retained;
+                top_n_metric.counters.top_n_rows_discarded = top_n_metrics.rows_discarded;
+                top_n_metric.counters.top_n_early_terminated = top_n_metrics.early_terminated;
+                top_n_metric.counters.early_terminated = top_n_metrics.early_terminated;
+                top_n_metric.counters.peak_memory_bytes = top_n_metrics.peak_memory_bytes;
+                top_n_metric.counters.top_n_limit = top_n_metrics.limit.unwrap_or(0);
+                top_n_metric.counters.top_n_offset = top_n_metrics.offset.unwrap_or(0);
+                top_n_metric.counters.sort_required = true;
+                top_n_metric.counters.sort_eliminated = false;
+                top_n_metric.add_child(current_op);
+                current_op = top_n_metric;
+                (top_n_rows, true)
+            } else {
+                let (sorted, sort_metrics) = crate::query::SortOperator::apply_with_config(
+                    working_rows,
+                    &working_schema,
+                    &plan.order_by,
+                    &self.db.sort_config,
+                )?;
+                let mut sort_metric = crate::query::OperatorMetrics::new(
+                    crate::query::OperatorKind::Sort,
+                    Some(plan.estimated_rows),
+                    Some(plan.total_cost),
+                );
+                sort_metric.input_rows = sort_metrics.rows_input;
+                sort_metric.actual_rows = sorted.len();
+                sort_metric.counters.runs_created = sort_metrics.runs_created;
+                sort_metric.counters.bytes_spilled = sort_metrics.bytes_spilled;
+                sort_metric.counters.merge_passes = sort_metrics.merge_passes;
+                sort_metric.counters.peak_memory_bytes = sort_metrics.peak_memory_bytes;
+                sort_metric.counters.sort_required = true;
+                sort_metric.counters.sort_eliminated = false;
+                sort_metric.add_child(current_op);
+                current_op = sort_metric;
+                (sorted, false)
+            }
         } else {
             if !plan.order_by.is_empty() {
                 current_op.counters.sort_eliminated = true;
                 current_op.counters.sort_required = false;
             }
-            working_rows
+            (working_rows, false)
         };
 
         // 7. Projection
@@ -4261,7 +4477,7 @@ impl<'db> Transaction<'db> {
         current_op = proj_metric;
 
         // 8. Pagination (OFFSET / LIMIT)
-        let paginated_rows = if plan.offset.is_some() || plan.limit.is_some() {
+        let paginated_rows = if !top_n_executed && (plan.offset.is_some() || plan.limit.is_some()) {
             let pre_limit_count = projected_rows.len();
             let paginated =
                 crate::query::OffsetLimitOperator::apply(projected_rows, plan.offset, plan.limit);

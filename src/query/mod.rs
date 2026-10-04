@@ -18,6 +18,7 @@ pub mod rewrite;
 pub mod runtime_filter;
 pub mod stats;
 pub mod streaming_aggregate;
+pub mod top_n;
 
 pub use optimizer::AggregateStrategy;
 pub use physical_properties::{
@@ -25,6 +26,7 @@ pub use physical_properties::{
     RequiredOrdering,
 };
 pub use streaming_aggregate::{StreamingAggregateMetrics, StreamingAggregateOperator};
+pub use top_n::{TopNExecutionMetrics, TopNOperator};
 
 pub use merge_join::MergeJoinOperator;
 

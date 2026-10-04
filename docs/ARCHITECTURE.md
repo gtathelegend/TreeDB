@@ -476,12 +476,20 @@ Transactional Execution (Scan, Joins, Aggregation, 3VL Filters, Subqueries)
   * **Duplicate Runs & 3VL NULL Semantics:** Exact duplicate multiplicity ($N \times M$ Cartesian product) across duplicate key runs. SQL 3VL NULL keys never match equi-join conditions and are emitted as NULL-padded rows strictly according to outer join semantics.
   * **Residual Predicates:** Non-equi residual join predicates are evaluated on candidate matched pairs after merge key matching.
   * **Cost-Based Selection:** Optimizer compares costs of `NestedLoop`, `HashJoin` / `ExternalHashJoin`, and `MergeJoin`, choosing the cheapest physical strategy based on input ordering and statistics.
-  * **EXPLAIN & Telemetry:** Full visibility in `EXPLAIN` (indicating ordering and sort requirements) and comprehensive `EXPLAIN ANALYZE` metrics tracking comparisons, key matches, duplicate runs, and unmatched rows.
+* **Cost-Based Top-N & Bounded Sort Execution (`TopNOperator`, `TopNExecutionMetrics`):**
+  * **Bounded Priority Queue (Max-Heap):** Implements an in-memory priority queue of bounded capacity $K = \text{OFFSET} + \text{LIMIT}$. Streams input rows through a max-heap of size $K$, maintaining the top-$K$ candidates in $O(N \log K)$ time and $O(K)$ space instead of materializing and fully sorting the entire $N$-row input stream ($O(N \log N)$).
+  * **Authoritative Ordering Semantics:** Reuses canonical comparator (`compare_rows_by_sort_keys`), preserving exact SQL semantics across `ASC`/`DESC`, `NULLS FIRST`/`LAST`, IEEE-754 `f64::total_cmp` float ordering, composite keys, and monotonic arrival sequence tie-breaking.
+  * **Early-Stop Optimization on Ordered Physical Paths:** When physical properties (`OrderingProperty`) confirm that an underlying access path (`PrimaryRangeScan`, `SecondaryIndexScan`, `IndexOnlyScan`, `FullTableScan`) already satisfies the required `ORDER BY` ordering, sorting is eliminated and the scan loop terminates immediately once $K = M + N$ qualifying rows satisfy all residual filter predicates.
+  * **Cost-Based Optimizer Selection:** The optimizer compares `CostModel::top_n_cost(rows, K, row_bytes)` against `CostModel::sort_cost_with_budget(rows, row_bytes, budget, spill_status)`. For bounded queries with $K \ll N$, `TopN` is selected over `Sort`. Ordered scans scale their estimated I/O and CPU costs by the early-termination fraction $(K / \text{total\_rows})$.
+  * **Memory Budgeting & External Sorter Fallback:** Candidate memory is tracked against `SortConfig.memory_budget_bytes`. If candidates exceed memory limits, execution safely falls back to `ExternalSorter` with disk spilling and quota enforcement, preventing unbounded memory consumption.
+  * **EXPLAIN & Telemetry:** Full distinction between `TopN` and `Sort` in `EXPLAIN` and comprehensive `EXPLAIN ANALYZE` metrics reporting `candidate_capacity`, `rows_retained`, `rows_discarded`, `peak_memory_bytes`, `top_n_limit`, `top_n_offset`, and `early_terminated`.
 
 ---
 
 ## 7. Critical Invariants
 
+* **Top-N Bounded Execution & Equivalence Invariant:** Top-N execution is a physical optimization that never alters SQL query results, row ordering, tie-breaking stability, or NULL placement compared to full sorting followed by pagination (`LIMIT`/`OFFSET`).
+* **Ordered Scan Early Termination Invariant:** Early stopping during ordered table/index scans strictly accounts for residual filters, terminating only after the requested $K = \text{OFFSET} + \text{LIMIT}$ qualifying rows have passed all residual predicates.
 * **Write-Ahead Invariant:** `append WAL record -> WAL durable -> page modification -> page flush`. A dirty page with `page_lsn > wal.flushed_lsn` cannot reach disk without its WAL records first being flushed.
 * **PageLSN Semantics:** Every page modification stamps the page with its corresponding LSN. During Redo:
   * `page.lsn() < log_record.lsn()` => Redo applied.

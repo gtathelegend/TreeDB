@@ -216,12 +216,18 @@ fn test_explain_filter_projection_sort_limit_offset() {
         .explain_sql("SELECT id, name AS item_name FROM items WHERE price > 100 ORDER BY price DESC, id ASC LIMIT 10 OFFSET 5;")
         .unwrap();
 
-    assert!(plan.contains("LimitOffset (limit: Some(10), offset: Some(5))"));
+    assert!(
+        plan.contains("TopN (limit: Some(10), offset: Some(5)) [price Descending, id Ascending]")
+    );
     assert!(plan.contains("Projection [id AS id, name AS item_name]"));
-    assert!(plan.contains("Sort [price Descending, id Ascending]"));
     assert!(
         plan.contains("TableScan (table: items, access: FullTableScan, filter: [(price > 100)])")
     );
+
+    let plan_no_limit = txn
+        .explain_sql("SELECT id, name AS item_name FROM items WHERE price > 100 ORDER BY price DESC, id ASC;")
+        .unwrap();
+    assert!(plan_no_limit.contains("Sort [price Descending, id Ascending]"));
 }
 
 #[test]
