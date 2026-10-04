@@ -1886,12 +1886,16 @@ impl<'a> Parser<'a> {
             } else {
                 let query_expr = self.parse_query_expression()?;
                 match query_expr.body {
-                    SetQueryBody::Select(select_stmt)
-                        if query_expr.with.is_none()
-                            && query_expr.order_by.is_empty()
-                            && query_expr.limit.is_none()
-                            && query_expr.offset.is_none() =>
-                    {
+                    SetQueryBody::Select(mut select_stmt) if query_expr.with.is_none() => {
+                        if !query_expr.order_by.is_empty() {
+                            select_stmt.order_by = query_expr.order_by;
+                        }
+                        if query_expr.limit.is_some() {
+                            select_stmt.limit = query_expr.limit;
+                        }
+                        if query_expr.offset.is_some() {
+                            select_stmt.offset = query_expr.offset;
+                        }
                         CteQuery::NonRecursive(select_stmt)
                     }
                     _ => CteQuery::SetOperation(Box::new(query_expr)),

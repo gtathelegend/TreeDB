@@ -532,7 +532,12 @@ fn test_cte_order_by_limit_inside_and_outside() {
     ORDER BY balance ASC
     LIMIT 1;";
 
+    let inner_plan = txn.plan_sql("SELECT id, name, balance FROM users WHERE balance IS NOT NULL ORDER BY balance DESC LIMIT 2;").unwrap();
+    eprintln!("Inner plan:\n{inner_plan:?}");
+    let explain = txn.explain_sql(sql).unwrap();
+    eprintln!("Explain:\n{explain}");
     let res = txn.execute_sql(sql).unwrap();
+    eprintln!("Res: {:?}", res.rows);
     assert_eq!(res.rows.len(), 1);
     // top 2 by balance DESC: David (200.0), Alice (100.0)
     // ordered by balance ASC LIMIT 1: Alice (100.0)

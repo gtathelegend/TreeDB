@@ -1322,6 +1322,7 @@ impl<'db> Transaction<'db> {
                 bound_order_by.push(crate::query::SortKey::new(bound_expr, direction));
             }
             plan.order_by = bound_order_by;
+            plan.order_by_sort_required = true;
         }
 
         if let Some(limit) = ast.limit {
@@ -3282,7 +3283,7 @@ impl<'db> Transaction<'db> {
             let mut current_op = set_metric;
             let mut current_rows = set_rows;
 
-            if !plan.order_by.is_empty() {
+            if !plan.order_by.is_empty() && plan.order_by_sort_required {
                 let (sorted_rows, sort_metrics) = crate::query::SortOperator::apply_with_config(
                     current_rows,
                     &set_op.schema,
@@ -3300,9 +3301,14 @@ impl<'db> Transaction<'db> {
                 sort_metric.counters.bytes_spilled = sort_metrics.bytes_spilled;
                 sort_metric.counters.merge_passes = sort_metrics.merge_passes;
                 sort_metric.counters.peak_memory_bytes = sort_metrics.peak_memory_bytes;
+                sort_metric.counters.sort_required = true;
+                sort_metric.counters.sort_eliminated = false;
                 sort_metric.add_child(current_op);
                 current_op = sort_metric;
                 current_rows = sorted_rows;
+            } else if !plan.order_by.is_empty() {
+                current_op.counters.sort_eliminated = true;
+                current_op.counters.sort_required = false;
             }
 
             if plan.offset.is_some() || plan.limit.is_some() {
@@ -4206,7 +4212,7 @@ impl<'db> Transaction<'db> {
         }
 
         // 6. Sort Operator (ORDER BY)
-        let sorted_rows = if !plan.order_by.is_empty() {
+        let sorted_rows = if !plan.order_by.is_empty() && plan.order_by_sort_required {
             let (sorted, sort_metrics) = crate::query::SortOperator::apply_with_config(
                 working_rows,
                 &working_schema,
@@ -4224,10 +4230,16 @@ impl<'db> Transaction<'db> {
             sort_metric.counters.bytes_spilled = sort_metrics.bytes_spilled;
             sort_metric.counters.merge_passes = sort_metrics.merge_passes;
             sort_metric.counters.peak_memory_bytes = sort_metrics.peak_memory_bytes;
+            sort_metric.counters.sort_required = true;
+            sort_metric.counters.sort_eliminated = false;
             sort_metric.add_child(current_op);
             current_op = sort_metric;
             sorted
         } else {
+            if !plan.order_by.is_empty() {
+                current_op.counters.sort_eliminated = true;
+                current_op.counters.sort_required = false;
+            }
             working_rows
         };
 

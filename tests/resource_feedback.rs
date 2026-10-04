@@ -396,6 +396,8 @@ fn test_r195_plan_cache_does_not_reuse_incompatible_resource_plans() -> Result<(
         },
         joins: vec![],
         order_by: vec![],
+        order_by_sort_required: false,
+        provided_ordering: None,
         limit: None,
         offset: None,
         projections: vec![],

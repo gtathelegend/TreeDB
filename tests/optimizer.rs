@@ -993,6 +993,8 @@ fn baseline_execute(
         window_exprs: bound.window_exprs.clone(),
         projections: bound.projections.clone(),
         order_by: bound.order_by.clone(),
+        order_by_sort_required: !bound.order_by.is_empty(),
+        provided_ordering: None,
         offset: bound.offset,
         limit: bound.limit,
         total_cost: 0.0,

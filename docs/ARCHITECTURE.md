@@ -176,6 +176,53 @@ v                                                             v
   * **Residual Filter Preservation:** Always retains unconsumed predicate components in `PhysicalTableScan.residual_filter` and post-join filters to ensure full semantic equivalence.
   * **Deterministic Plan Inspection:** Exposes `cost: {:.2}, estimated_rows: {:.0}` in `PhysicalPlan::Display` and `EXPLAIN <query>;` with strict zero-execution and zero-persistence guarantees.
 
+### `PhysicalProperties`, `OrderingProperty`, `RequiredOrdering` & Global Sort Elimination (`src/query/physical_properties.rs`, `src/query/optimizer.rs`)
+* **Role:** Global physical property and ordering reasoning framework enabling property-aware query planning, access path selection, and safe elimination of redundant `Sort` operators across physical operator pipelines.
+* **Core Abstractions:**
+  * **`OrderingColumn`:** Represents an ordered attribute `(column, direction, null_order)`. Enforces strict compatibility across ascending/descending directions and NULL placement (`NullOrder::First` vs `NullOrder::Last`).
+  * **`OrderingProperty`:** Ordered list of `OrderingColumn`s representing physical data stream order. Supports prefix satisfaction (stronger ordering satisfies weaker prefix requirements), alias projection, and qualification stripping.
+  * **`RequiredOrdering`:** Target ordering requirements demanded by downstream operators (e.g. `ORDER BY`, `StreamingAggregate`, `MergeJoin`, `Window`).
+  * **`PhysicalProperties`:** Extensible container for physical properties (`pub ordering: Option<OrderingProperty>`).
+* **Ordering Propagation Rules:**
+  * **Access Paths:** Primary key scans provide `PK ASC`. Single-table secondary index scans (Point/Range/Prefix) provide indexed key ordering. Multi-index scans, Skip-scans, and CTE/Derived table scans conservatively advertise `NoOrdering`.
+  * **Filters:** Row-level predicate filtering removes rows but preserves input row ordering.
+  * **Projection & Aliasing:** Preserves ordering when ordered columns remain available in output projections and maps direct column aliases (`user_id -> users.id`). Dropped or non-trivial computed expressions (`id + 1`) lose ordering.
+  * **Limit & Offset:** Retain the physical stream ordering of surviving rows.
+  * **StreamingAggregate:** Emits groups in exact `GROUP BY` key order.
+  * **HashAggregate & ExternalAggregate:** Hash bucket traversal and external spill partitions destroy stream order; advertise `NoOrdering`.
+  * **MergeJoin:** Preserves join key ordering conditionally when both inner and outer input streams are ordered.
+  * **Joins (HashJoin, ExternalHashJoin, NestedLoop, Outer Joins):** Conservatively advertise `NoOrdering` unless ordering across both matched and unmatched rows can be proven.
+  * **Window Functions:** Window operators internally sort/partition; expose provided ordering matching `(PARTITION BY, ORDER BY)` if guaranteed by execution.
+  * **Set Operations & CTE Barriers:** `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`, and CTE materialization boundaries conservatively produce `NoOrdering`.
+* **Sort Elimination & Cost-Based Selection:**
+  * The optimizer queries `child.satisfies_order_by(order_by, schema, aliases)`. If satisfied, `order_by_sort_required` is set to `false` and the physical `Sort` operator is completely omitted.
+  * Access path selection evaluates both direct ordered index paths (zero sort cost) vs unordered table scan + external sort cost, choosing the globally cheaper physical plan.
+  * `EXPLAIN` explicitly displays `Provided Ordering: ...` and `Required Ordering: ...` diagnostics, omitting redundant sort nodes.
+
+#### Operator Physical Ordering Matrix
+
+| Operator | Ordering Guarantee |
+| :--- | :--- |
+| **Index Scan** (PK / Secondary) | Preserves / provides indexed column order (ASC) |
+| **Filter** | Preserves input stream ordering |
+| **Projection** | Preserves when mapped columns/aliases are safe |
+| **Limit** | Preserves input stream ordering |
+| **Offset** | Preserves input stream ordering |
+| **Sort** | Establishes requested `OrderingProperty` |
+| **StreamingAggregate** | Provides `GROUP BY` column ordering |
+| **HashAggregate** | None (`NoOrdering`) |
+| **ExternalAggregate** | None (`NoOrdering`) |
+| **MergeJoin** | Conditional on both input stream orderings |
+| **HashJoin** | None (`NoOrdering`) |
+| **ExternalHashJoin** | None (`NoOrdering`) |
+| **NestedLoop** | None / conservative (`NoOrdering`) |
+| **MultiIndexScan** | None (`NoOrdering`) |
+| **SkipScan** | None (`NoOrdering`) |
+| **Set Operations** (`UNION`, `INTERSECT`, `EXCEPT`) | None (`NoOrdering`) |
+| **CTEs / Derived Tables** | None (`NoOrdering`) |
+| **Recursive CTE** | None (`NoOrdering`) |
+
+
 ---
 
 ## 1. Engine, Catalog & Relational Layer (`src/engine`)

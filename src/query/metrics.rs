@@ -234,6 +234,10 @@ pub struct OperatorCounters {
     pub streaming_aggregate_sort_spilled: bool,
     /// Streaming aggregate specific: Estimated memory footprint
     pub streaming_aggregate_memory_bytes: usize,
+    /// Global Physical Properties / Sort Elimination: Whether sort was required
+    pub sort_required: bool,
+    /// Global Physical Properties / Sort Elimination: Whether sort was eliminated
+    pub sort_eliminated: bool,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -492,7 +496,7 @@ pub fn format_plan_with_metrics(
     }
 
     // 4. Sort
-    if !plan.order_by.is_empty() {
+    if !plan.order_by.is_empty() && plan.order_by_sort_required {
         write_indent(&mut out, indent);
         let keys: Vec<String> = plan
             .order_by

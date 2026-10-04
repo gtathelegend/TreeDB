@@ -471,6 +471,10 @@ pub struct PhysicalPlan {
     pub projections: Vec<(Expr, Option<String>)>,
     /// Sort keys (ORDER BY).
     pub order_by: Vec<SortKey>,
+    /// Whether the ORDER BY clause requires an explicit Sort execution operator.
+    pub order_by_sort_required: bool,
+    /// Active physical ordering property guaranteed at plan root.
+    pub provided_ordering: Option<crate::query::physical_properties::OrderingProperty>,
     /// Offset pagination.
     pub offset: Option<usize>,
     /// Limit pagination.
@@ -514,6 +518,8 @@ impl PhysicalPlan {
             window_exprs: Vec::new(),
             projections: Vec::new(),
             order_by: Vec::new(),
+            order_by_sort_required: false,
+            provided_ordering: None,
             offset: None,
             limit: None,
             set_op: Some(set_op),
@@ -643,7 +649,7 @@ impl fmt::Display for PhysicalPlan {
             indent += 1;
         }
 
-        if !self.order_by.is_empty() {
+        if !self.order_by.is_empty() && self.order_by_sort_required {
             write_indent(f, indent)?;
             let keys: Vec<String> = self
                 .order_by
@@ -1748,6 +1754,8 @@ fn optimize_all_inner_joins(
             window_exprs: bound.window_exprs.clone(),
             projections: bound.projections.clone(),
             order_by: bound.order_by.clone(),
+            order_by_sort_required: false,
+            provided_ordering: None,
             offset: bound.offset,
             limit: bound.limit,
             set_op: None,
@@ -1852,6 +1860,8 @@ fn optimize_all_inner_joins(
         );
     }
 
+    let mut current_ordering = post_agg_ordering;
+
     if let Some(having) = &bound.having {
         cur_cost += CostModel::filter_cost(cur_rows);
         let dummy_schema = Schema::new_projected(vec![]);
@@ -1866,8 +1876,39 @@ fn optimize_all_inner_joins(
 
     if !bound.window_exprs.is_empty() {
         cur_cost += CostModel::window_cost(cur_rows);
+        if let Some(w) = bound.window_exprs.first() {
+            let mut win_cols = Vec::new();
+            for p in &w.window_spec.partition_by {
+                if let Expr::Column(col) = p {
+                    win_cols.push(crate::query::physical_properties::OrderingColumn {
+                        column: col.clone(),
+                        direction: crate::query::operator::SortDirection::Ascending,
+                        nulls_first: true,
+                    });
+                }
+            }
+            for o in &w.window_spec.order_by {
+                if let Expr::Column(col) = &o.expression {
+                    win_cols.push(crate::query::physical_properties::OrderingColumn {
+                        column: col.clone(),
+                        direction: o.direction,
+                        nulls_first: o.nulls_first.unwrap_or(
+                            o.direction == crate::query::operator::SortDirection::Ascending,
+                        ),
+                    });
+                }
+            }
+            if !win_cols.is_empty() {
+                current_ordering =
+                    crate::query::physical_properties::OrderingProperty::new(win_cols);
+            }
+        }
     }
 
+    let post_proj_ordering = current_ordering.project(&bound.projections);
+    current_ordering = post_proj_ordering;
+
+    let mut sort_required = false;
     if !bound.order_by.is_empty() {
         let sort_budget = resource_sig
             .map(|r| r.sort_budget)
@@ -1886,8 +1927,12 @@ fn optimize_all_inner_joins(
         )
         .with_resource_signature(resource_sig.cloned());
 
-        let is_already_sorted = post_agg_ordering.satisfies_order_by(&bound.order_by, None);
-        if !is_already_sorted {
+        let is_already_sorted =
+            current_ordering.satisfies_order_by(&bound.order_by, None, Some(&bound.projections));
+        if is_already_sorted {
+            sort_required = false;
+        } else {
+            sort_required = true;
             let sort_cost = if let Some(fb_reg) = feedback {
                 let spill_status = fb_reg.get_spill_status(&key);
                 let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
@@ -1896,6 +1941,9 @@ fn optimize_all_inner_joins(
                 CostModel::sort_cost_with_budget(cur_rows, 64.0, sort_budget, SpillStatus::Unknown)
             };
             cur_cost += sort_cost;
+            current_ordering = crate::query::physical_properties::OrderingProperty::from_sort_keys(
+                &bound.order_by,
+            );
         }
     }
 
@@ -1911,6 +1959,8 @@ fn optimize_all_inner_joins(
         window_exprs: bound.window_exprs.clone(),
         projections: bound.projections.clone(),
         order_by: bound.order_by.clone(),
+        order_by_sort_required: sort_required,
+        provided_ordering: Some(current_ordering),
         offset: bound.offset,
         limit: bound.limit,
         set_op: None,
@@ -1966,6 +2016,8 @@ fn optimize_with_outer_barriers(
             window_exprs: bound.window_exprs.clone(),
             projections: bound.projections.clone(),
             order_by: bound.order_by.clone(),
+            order_by_sort_required: false,
+            provided_ordering: None,
             offset: bound.offset,
             limit: bound.limit,
             set_op: None,
@@ -2287,6 +2339,8 @@ fn optimize_with_outer_barriers(
         );
     }
 
+    let mut current_ordering = post_agg_ordering;
+
     if let Some(having) = &bound.having {
         cur_cost += CostModel::filter_cost(cur_rows);
         let dummy_schema = Schema::new_projected(vec![]);
@@ -2301,8 +2355,39 @@ fn optimize_with_outer_barriers(
 
     if !bound.window_exprs.is_empty() {
         cur_cost += CostModel::window_cost(cur_rows);
+        if let Some(w) = bound.window_exprs.first() {
+            let mut win_cols = Vec::new();
+            for p in &w.window_spec.partition_by {
+                if let Expr::Column(col) = p {
+                    win_cols.push(crate::query::physical_properties::OrderingColumn {
+                        column: col.clone(),
+                        direction: crate::query::operator::SortDirection::Ascending,
+                        nulls_first: true,
+                    });
+                }
+            }
+            for o in &w.window_spec.order_by {
+                if let Expr::Column(col) = &o.expression {
+                    win_cols.push(crate::query::physical_properties::OrderingColumn {
+                        column: col.clone(),
+                        direction: o.direction,
+                        nulls_first: o.nulls_first.unwrap_or(
+                            o.direction == crate::query::operator::SortDirection::Ascending,
+                        ),
+                    });
+                }
+            }
+            if !win_cols.is_empty() {
+                current_ordering =
+                    crate::query::physical_properties::OrderingProperty::new(win_cols);
+            }
+        }
     }
 
+    let post_proj_ordering = current_ordering.project(&bound.projections);
+    current_ordering = post_proj_ordering;
+
+    let mut sort_required = false;
     if !bound.order_by.is_empty() {
         let sort_budget = resource_sig
             .map(|r| r.sort_budget)
@@ -2321,8 +2406,12 @@ fn optimize_with_outer_barriers(
         )
         .with_resource_signature(resource_sig.cloned());
 
-        let is_already_sorted = post_agg_ordering.satisfies_order_by(&bound.order_by, None);
-        if !is_already_sorted {
+        let is_already_sorted =
+            current_ordering.satisfies_order_by(&bound.order_by, None, Some(&bound.projections));
+        if is_already_sorted {
+            sort_required = false;
+        } else {
+            sort_required = true;
             let sort_cost = if let Some(fb_reg) = feedback {
                 let spill_status = fb_reg.get_spill_status(&key);
                 let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
@@ -2331,6 +2420,9 @@ fn optimize_with_outer_barriers(
                 CostModel::sort_cost_with_budget(cur_rows, 64.0, sort_budget, SpillStatus::Unknown)
             };
             cur_cost += sort_cost;
+            current_ordering = crate::query::physical_properties::OrderingProperty::from_sort_keys(
+                &bound.order_by,
+            );
         }
     }
 
@@ -2346,6 +2438,8 @@ fn optimize_with_outer_barriers(
         window_exprs: bound.window_exprs.clone(),
         projections: bound.projections.clone(),
         order_by: bound.order_by.clone(),
+        order_by_sort_required: sort_required,
+        provided_ordering: Some(current_ordering),
         offset: bound.offset,
         limit: bound.limit,
         set_op: None,
@@ -2909,16 +3003,19 @@ impl Optimizer {
                 Option<AggregateStrategy>,
                 f64,
                 f64,
+                bool,
+                crate::query::physical_properties::OrderingProperty,
             )> = None;
 
             for base_table_scan in candidate_scans {
                 let mut cur_cost = base_table_scan.cost;
                 let mut cur_rows = base_table_scan.estimated_rows;
 
-                let scan_ordering = crate::query::merge_join::ordering_property_for_table_scan(
-                    &tables[0],
-                    &base_table_scan,
-                );
+                let scan_ordering =
+                    crate::query::physical_properties::ordering_property_for_table_scan(
+                        &tables[0],
+                        &base_table_scan,
+                    );
                 let (agg_strategy, post_agg_cost, post_agg_ordering) = plan_aggregation_strategy(
                     cur_cost,
                     cur_rows,
@@ -2932,6 +3029,7 @@ impl Optimizer {
                     stats_gen,
                 );
                 cur_cost = post_agg_cost;
+                let mut current_ordering = post_agg_ordering;
 
                 if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
                     cur_rows = CardinalityEstimator::estimate_group_by_cardinality(
@@ -2955,8 +3053,37 @@ impl Optimizer {
 
                 if !bound.window_exprs.is_empty() {
                     cur_cost += CostModel::window_cost(cur_rows);
+                    if let Some(w) = bound.window_exprs.first() {
+                        let mut win_cols = Vec::new();
+                        for p in &w.window_spec.partition_by {
+                            if let Expr::Column(col) = p {
+                                win_cols.push(crate::query::physical_properties::OrderingColumn {
+                                    column: col.clone(),
+                                    direction: crate::query::operator::SortDirection::Ascending,
+                                    nulls_first: true,
+                                });
+                            }
+                        }
+                        for o in &w.window_spec.order_by {
+                            if let Expr::Column(col) = &o.expression {
+                                win_cols.push(crate::query::physical_properties::OrderingColumn {
+                                    column: col.clone(),
+                                    direction: o.direction,
+                                    nulls_first: o.nulls_first.unwrap_or(
+                                        o.direction
+                                            == crate::query::operator::SortDirection::Ascending,
+                                    ),
+                                });
+                            }
+                        }
+                        if !win_cols.is_empty() {
+                            current_ordering =
+                                crate::query::physical_properties::OrderingProperty::new(win_cols);
+                        }
+                    }
                 }
 
+                let mut sort_required = false;
                 if !bound.order_by.is_empty() {
                     let sort_budget = resource_sig
                         .map(|r| r.sort_budget)
@@ -2975,9 +3102,15 @@ impl Optimizer {
                     )
                     .with_resource_signature(resource_sig.cloned());
 
-                    let is_already_sorted = post_agg_ordering
-                        .satisfies_order_by(&bound.order_by, Some(tables[0].qualifier()));
-                    if !is_already_sorted {
+                    let is_already_sorted = current_ordering.satisfies_order_by(
+                        &bound.order_by,
+                        Some(tables[0].qualifier()),
+                        Some(&bound.projections),
+                    );
+                    if is_already_sorted {
+                        sort_required = false;
+                    } else {
+                        sort_required = true;
                         let sort_cost = if let Some(fb_reg) = feedback {
                             let spill_status = fb_reg.get_spill_status(&key);
                             let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
@@ -2996,24 +3129,44 @@ impl Optimizer {
                             )
                         };
                         cur_cost += sort_cost;
+                        current_ordering =
+                            crate::query::physical_properties::OrderingProperty::from_sort_keys(
+                                &bound.order_by,
+                            );
                     }
                 }
 
+                let post_proj_ordering = current_ordering.project(&bound.projections);
+                current_ordering = post_proj_ordering;
+
                 match &best_plan_info {
                     None => {
-                        best_plan_info = Some((base_table_scan, agg_strategy, cur_cost, cur_rows));
+                        best_plan_info = Some((
+                            base_table_scan,
+                            agg_strategy,
+                            cur_cost,
+                            cur_rows,
+                            sort_required,
+                            current_ordering,
+                        ));
                     }
-                    Some((_, _, best_cost, _)) => {
+                    Some((_, _, best_cost, _, _, _)) => {
                         if cur_cost < *best_cost {
-                            best_plan_info =
-                                Some((base_table_scan, agg_strategy, cur_cost, cur_rows));
+                            best_plan_info = Some((
+                                base_table_scan,
+                                agg_strategy,
+                                cur_cost,
+                                cur_rows,
+                                sort_required,
+                                current_ordering,
+                            ));
                         }
                     }
                 }
             }
 
-            let (base_table_scan, agg_strategy, cur_cost, cur_rows) = best_plan_info
-                .unwrap_or_else(|| {
+            let (base_table_scan, agg_strategy, cur_cost, cur_rows, sort_required, final_ordering) =
+                best_plan_info.unwrap_or_else(|| {
                     let default_scan = PhysicalTableScan {
                         table_name: tables[0].name.clone(),
                         table_alias: tables[0].alias.clone(),
@@ -3022,7 +3175,14 @@ impl Optimizer {
                         estimated_rows: 0.0,
                         cost: 0.0,
                     };
-                    (default_scan, None, 0.0, 0.0)
+                    (
+                        default_scan,
+                        None,
+                        0.0,
+                        0.0,
+                        !bound.order_by.is_empty(),
+                        crate::query::physical_properties::OrderingProperty::default(),
+                    )
                 });
 
             return Ok(PhysicalPlan {
@@ -3037,6 +3197,8 @@ impl Optimizer {
                 window_exprs: bound.window_exprs.clone(),
                 projections: bound.projections.clone(),
                 order_by: bound.order_by.clone(),
+                order_by_sort_required: sort_required,
+                provided_ordering: Some(final_ordering),
                 offset: bound.offset,
                 limit: bound.limit,
                 set_op: None,
