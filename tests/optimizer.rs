@@ -988,6 +988,7 @@ fn baseline_execute(
         post_join_filter: bound.filter.clone(),
         group_by: bound.group_by.clone(),
         aggregates: bound.aggregates.clone(),
+        aggregate_strategy: None,
         having: bound.having.clone(),
         window_exprs: bound.window_exprs.clone(),
         projections: bound.projections.clone(),

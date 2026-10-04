@@ -125,13 +125,13 @@ fn test_r413_exact_membership() {
     let (mut db, _temp) = create_test_db();
     let mut txn = db.begin_transaction().unwrap();
 
-    txn.execute_statement("CREATE TABLE a (id INT PRIMARY KEY, val INT);")
+    txn.execute_statement("CREATE TABLE a (id INT PRIMARY KEY, b_id INT, val INT);")
         .unwrap();
     txn.execute_statement("CREATE TABLE b (id INT PRIMARY KEY, val INT);")
         .unwrap();
 
     for i in 1..=20 {
-        txn.execute_statement(&format!("INSERT INTO a VALUES ({i}, {i} * 2);"))
+        txn.execute_statement(&format!("INSERT INTO a VALUES ({i}, {i}, {i} * 2);"))
             .unwrap();
     }
     for i in 11..=15 {
@@ -140,7 +140,7 @@ fn test_r413_exact_membership() {
     }
 
     let (res, metrics) = txn
-        .execute_sql_with_metrics("SELECT a.id, b.id FROM a JOIN b ON a.id = b.id;")
+        .execute_sql_with_metrics("SELECT a.id, b.id FROM a JOIN b ON a.b_id = b.id;")
         .unwrap();
 
     assert_eq!(res.rows.len(), 5);

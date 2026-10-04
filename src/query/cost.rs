@@ -14,6 +14,7 @@ pub const TUPLE_FETCH_COST: f64 = 0.5;
 pub const SORT_CPU_COST: f64 = 0.05;
 pub const JOIN_CPU_COST: f64 = 0.02;
 pub const AGG_CPU_COST: f64 = 0.01;
+pub const STREAMING_AGG_CPU_COST: f64 = 0.005;
 pub const WINDOW_CPU_COST: f64 = 0.02;
 pub const HASH_BUILD_CPU_COST: f64 = 0.01;
 pub const HASH_PROBE_CPU_COST: f64 = 0.005;
@@ -426,6 +427,18 @@ impl CostModel {
         } else {
             Self::aggregate_cost(rows)
         }
+    }
+
+    /// Computes the cost of streaming aggregation over an ordered input stream.
+    pub fn streaming_aggregate_cost(
+        input_rows: f64,
+        num_group_cols: usize,
+        num_aggs: usize,
+    ) -> f64 {
+        let rows = input_rows.max(0.0);
+        let group_key_cost = 0.001 * (num_group_cols as f64);
+        let agg_update_cost = 0.002 * (num_aggs as f64);
+        rows * (STREAMING_AGG_CPU_COST + group_key_cost + agg_update_cost)
     }
 
     /// Computes the cost of window function evaluation.

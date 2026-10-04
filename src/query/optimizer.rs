@@ -421,6 +421,31 @@ pub struct PhysicalSetOp {
     pub schema: Schema,
 }
 
+/// Execution strategy chosen for a physical aggregation operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AggregateStrategy {
+    /// In-memory hash aggregation.
+    Hash,
+    /// Ordered streaming aggregation over ordered or sorted input stream.
+    Streaming { sort_required: bool },
+    /// Spilled external hash aggregation.
+    External,
+}
+
+impl fmt::Display for AggregateStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hash => write!(f, "HashAggregate"),
+            Self::Streaming { sort_required } => write!(
+                f,
+                "StreamingAggregate(sort_required: {})",
+                if *sort_required { "Yes" } else { "No" }
+            ),
+            Self::External => write!(f, "ExternalAggregate"),
+        }
+    }
+}
+
 /// Complete physical execution plan produced by the cost-based optimizer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalPlan {
@@ -436,6 +461,8 @@ pub struct PhysicalPlan {
     pub group_by: Vec<Expr>,
     /// Aggregate expressions.
     pub aggregates: Vec<AggregateExpr>,
+    /// Physical execution strategy for aggregation.
+    pub aggregate_strategy: Option<AggregateStrategy>,
     /// Post-aggregation filter predicate (HAVING).
     pub having: Option<Expr>,
     /// Window expressions to compute.
@@ -482,6 +509,7 @@ impl PhysicalPlan {
             post_join_filter: None,
             group_by: Vec::new(),
             aggregates: Vec::new(),
+            aggregate_strategy: None,
             having: None,
             window_exprs: Vec::new(),
             projections: Vec::new(),
@@ -701,12 +729,33 @@ impl fmt::Display for PhysicalPlan {
             write_indent(f, indent)?;
             let groups: Vec<String> = self.group_by.iter().map(|g| g.to_string()).collect();
             let aggs: Vec<String> = self.aggregates.iter().map(|a| a.to_string()).collect();
-            writeln!(
-                f,
-                "Aggregate (group_by: [{}], aggs: [{}])",
-                groups.join(", "),
-                aggs.join(", ")
-            )?;
+            match self.aggregate_strategy {
+                Some(AggregateStrategy::Streaming { sort_required }) => {
+                    writeln!(
+                        f,
+                        "StreamingAggregate (group_by: [{}], aggs: [{}], sort_required: {})",
+                        groups.join(", "),
+                        aggs.join(", "),
+                        if sort_required { "Yes" } else { "No" }
+                    )?;
+                }
+                Some(AggregateStrategy::External) => {
+                    writeln!(
+                        f,
+                        "ExternalAggregate (group_by: [{}], aggs: [{}])",
+                        groups.join(", "),
+                        aggs.join(", ")
+                    )?;
+                }
+                _ => {
+                    writeln!(
+                        f,
+                        "Aggregate (group_by: [{}], aggs: [{}])",
+                        groups.join(", "),
+                        aggs.join(", ")
+                    )?;
+                }
+            }
             indent += 1;
         }
 
@@ -1694,6 +1743,7 @@ fn optimize_all_inner_joins(
             post_join_filter: None,
             group_by: bound.group_by.clone(),
             aggregates: bound.aggregates.clone(),
+            aggregate_strategy: None,
             having: bound.having.clone(),
             window_exprs: bound.window_exprs.clone(),
             projections: bound.projections.clone(),
@@ -1743,6 +1793,81 @@ fn optimize_all_inner_joins(
         cur_rows = (cur_rows * sel).max(if cur_rows > 0.0 { 1.0 } else { 0.0 });
     }
 
+    let mut current_ordering = crate::query::merge_join::ordering_property_for_table_scan(
+        &tables[0],
+        &best_plan.base_scan,
+    );
+    if !best_plan.joins.is_empty() {
+        let last_join = best_plan.joins.last().unwrap();
+        if last_join.strategy == JoinStrategy::Merge {
+            if let Some(equi) = crate::query::external_hash_join::analyze_equi_join(
+                &last_join.on,
+                &tables[0].schema,
+                tables
+                    .get(1)
+                    .map(|t| &t.schema)
+                    .unwrap_or(&tables[0].schema),
+            ) {
+                let mut cols = Vec::new();
+                for k in &equi.left_keys {
+                    if let Expr::Column(col) = k {
+                        cols.push(crate::query::merge_join::OrderingColumn {
+                            column: col.clone(),
+                            direction: crate::query::operator::SortDirection::Ascending,
+                            nulls_first: true,
+                        });
+                    }
+                }
+                current_ordering = crate::query::merge_join::OrderingProperty::new(cols);
+            } else {
+                current_ordering = crate::query::merge_join::OrderingProperty::default();
+            }
+        } else {
+            current_ordering = crate::query::merge_join::OrderingProperty::default();
+        }
+    }
+
+    let (agg_strategy, post_agg_cost, post_agg_ordering) = plan_aggregation_strategy(
+        cur_cost,
+        cur_rows,
+        Some(&current_ordering),
+        &bound.group_by,
+        &bound.aggregates,
+        tables.first().map(|t| t.qualifier()),
+        feedback,
+        param_sig,
+        resource_sig,
+        stats_gen,
+    );
+    cur_cost = post_agg_cost;
+
+    if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+        let dummy_schema = Schema::new_projected(vec![]);
+        let schema_ref = tables.first().map(|t| &t.schema).unwrap_or(&dummy_schema);
+        cur_rows = CardinalityEstimator::estimate_group_by_cardinality(
+            cur_rows,
+            &bound.group_by,
+            tables.first().and_then(|t| t.stats.as_ref()),
+            schema_ref,
+        );
+    }
+
+    if let Some(having) = &bound.having {
+        cur_cost += CostModel::filter_cost(cur_rows);
+        let dummy_schema = Schema::new_projected(vec![]);
+        let schema_ref = tables.first().map(|t| &t.schema).unwrap_or(&dummy_schema);
+        let having_sel = CardinalityEstimator::estimate_expr_selectivity(
+            having,
+            tables.first().and_then(|t| t.stats.as_ref()),
+            schema_ref,
+        );
+        cur_rows = (cur_rows * having_sel).clamp(if cur_rows > 0.0 { 1.0 } else { 0.0 }, cur_rows);
+    }
+
+    if !bound.window_exprs.is_empty() {
+        cur_cost += CostModel::window_cost(cur_rows);
+    }
+
     if !bound.order_by.is_empty() {
         let sort_budget = resource_sig
             .map(|r| r.sort_budget)
@@ -1760,49 +1885,18 @@ fn optimize_all_inner_joins(
             stats_gen,
         )
         .with_resource_signature(resource_sig.cloned());
-        let sort_cost = if let Some(fb_reg) = feedback {
-            let spill_status = fb_reg.get_spill_status(&key);
-            let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
-            CostModel::sort_cost_with_budget(adj_rows, 64.0, sort_budget, spill_status)
-        } else {
-            CostModel::sort_cost_with_budget(cur_rows, 64.0, sort_budget, SpillStatus::Unknown)
-        };
-        cur_cost += sort_cost;
-    }
-    if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
-        let agg_budget = resource_sig
-            .map(|r| r.agg_budget)
-            .unwrap_or(DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES);
-        let key = FeedbackKey::new(
-            FeedbackContext::Aggregate {
-                group_by: bound
-                    .group_by
-                    .iter()
-                    .map(|g| g.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                aggregates: bound
-                    .aggregates
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            },
-            param_sig.cloned(),
-            stats_gen,
-        )
-        .with_resource_signature(resource_sig.cloned());
-        let agg_cost = if let Some(fb_reg) = feedback {
-            let spill_status = fb_reg.get_spill_status(&key);
-            let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
-            CostModel::aggregate_cost_with_budget(adj_rows, 64.0, agg_budget, spill_status)
-        } else {
-            CostModel::aggregate_cost_with_budget(cur_rows, 64.0, agg_budget, SpillStatus::Unknown)
-        };
-        cur_cost += agg_cost;
-    }
-    if !bound.window_exprs.is_empty() {
-        cur_cost += CostModel::window_cost(cur_rows);
+
+        let is_already_sorted = post_agg_ordering.satisfies_order_by(&bound.order_by, None);
+        if !is_already_sorted {
+            let sort_cost = if let Some(fb_reg) = feedback {
+                let spill_status = fb_reg.get_spill_status(&key);
+                let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
+                CostModel::sort_cost_with_budget(adj_rows, 64.0, sort_budget, spill_status)
+            } else {
+                CostModel::sort_cost_with_budget(cur_rows, 64.0, sort_budget, SpillStatus::Unknown)
+            };
+            cur_cost += sort_cost;
+        }
     }
 
     Ok(PhysicalPlan {
@@ -1812,6 +1906,7 @@ fn optimize_all_inner_joins(
         post_join_filter,
         group_by: bound.group_by.clone(),
         aggregates: bound.aggregates.clone(),
+        aggregate_strategy: agg_strategy,
         having: bound.having.clone(),
         window_exprs: bound.window_exprs.clone(),
         projections: bound.projections.clone(),
@@ -1866,6 +1961,7 @@ fn optimize_with_outer_barriers(
             post_join_filter: None,
             group_by: bound.group_by.clone(),
             aggregates: bound.aggregates.clone(),
+            aggregate_strategy: None,
             having: bound.having.clone(),
             window_exprs: bound.window_exprs.clone(),
             projections: bound.projections.clone(),
@@ -2134,6 +2230,79 @@ fn optimize_with_outer_barriers(
         cur_rows = (cur_rows * sel).max(if cur_rows > 0.0 { 1.0 } else { 0.0 });
     }
 
+    let mut current_ordering =
+        crate::query::merge_join::ordering_property_for_table_scan(&tables[0], &base_table_scan);
+    if !physical_joins.is_empty() {
+        let last_join = physical_joins.last().unwrap();
+        if last_join.strategy == JoinStrategy::Merge {
+            if let Some(equi) = crate::query::external_hash_join::analyze_equi_join(
+                &last_join.on,
+                &tables[0].schema,
+                tables
+                    .get(1)
+                    .map(|t| &t.schema)
+                    .unwrap_or(&tables[0].schema),
+            ) {
+                let mut cols = Vec::new();
+                for k in &equi.left_keys {
+                    if let Expr::Column(col) = k {
+                        cols.push(crate::query::merge_join::OrderingColumn {
+                            column: col.clone(),
+                            direction: crate::query::operator::SortDirection::Ascending,
+                            nulls_first: true,
+                        });
+                    }
+                }
+                current_ordering = crate::query::merge_join::OrderingProperty::new(cols);
+            } else {
+                current_ordering = crate::query::merge_join::OrderingProperty::default();
+            }
+        } else {
+            current_ordering = crate::query::merge_join::OrderingProperty::default();
+        }
+    }
+
+    let (agg_strategy, post_agg_cost, post_agg_ordering) = plan_aggregation_strategy(
+        cur_cost,
+        cur_rows,
+        Some(&current_ordering),
+        &bound.group_by,
+        &bound.aggregates,
+        tables.first().map(|t| t.qualifier()),
+        feedback,
+        param_sig,
+        resource_sig,
+        stats_gen,
+    );
+    cur_cost = post_agg_cost;
+
+    if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+        let dummy_schema = Schema::new_projected(vec![]);
+        let schema_ref = tables.first().map(|t| &t.schema).unwrap_or(&dummy_schema);
+        cur_rows = CardinalityEstimator::estimate_group_by_cardinality(
+            cur_rows,
+            &bound.group_by,
+            tables.first().and_then(|t| t.stats.as_ref()),
+            schema_ref,
+        );
+    }
+
+    if let Some(having) = &bound.having {
+        cur_cost += CostModel::filter_cost(cur_rows);
+        let dummy_schema = Schema::new_projected(vec![]);
+        let schema_ref = tables.first().map(|t| &t.schema).unwrap_or(&dummy_schema);
+        let having_sel = CardinalityEstimator::estimate_expr_selectivity(
+            having,
+            tables.first().and_then(|t| t.stats.as_ref()),
+            schema_ref,
+        );
+        cur_rows = (cur_rows * having_sel).clamp(if cur_rows > 0.0 { 1.0 } else { 0.0 }, cur_rows);
+    }
+
+    if !bound.window_exprs.is_empty() {
+        cur_cost += CostModel::window_cost(cur_rows);
+    }
+
     if !bound.order_by.is_empty() {
         let sort_budget = resource_sig
             .map(|r| r.sort_budget)
@@ -2151,49 +2320,18 @@ fn optimize_with_outer_barriers(
             stats_gen,
         )
         .with_resource_signature(resource_sig.cloned());
-        let sort_cost = if let Some(fb_reg) = feedback {
-            let spill_status = fb_reg.get_spill_status(&key);
-            let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
-            CostModel::sort_cost_with_budget(adj_rows, 64.0, sort_budget, spill_status)
-        } else {
-            CostModel::sort_cost_with_budget(cur_rows, 64.0, sort_budget, SpillStatus::Unknown)
-        };
-        cur_cost += sort_cost;
-    }
-    if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
-        let agg_budget = resource_sig
-            .map(|r| r.agg_budget)
-            .unwrap_or(DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES);
-        let key = FeedbackKey::new(
-            FeedbackContext::Aggregate {
-                group_by: bound
-                    .group_by
-                    .iter()
-                    .map(|g| g.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                aggregates: bound
-                    .aggregates
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            },
-            param_sig.cloned(),
-            stats_gen,
-        )
-        .with_resource_signature(resource_sig.cloned());
-        let agg_cost = if let Some(fb_reg) = feedback {
-            let spill_status = fb_reg.get_spill_status(&key);
-            let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
-            CostModel::aggregate_cost_with_budget(adj_rows, 64.0, agg_budget, spill_status)
-        } else {
-            CostModel::aggregate_cost_with_budget(cur_rows, 64.0, agg_budget, SpillStatus::Unknown)
-        };
-        cur_cost += agg_cost;
-    }
-    if !bound.window_exprs.is_empty() {
-        cur_cost += CostModel::window_cost(cur_rows);
+
+        let is_already_sorted = post_agg_ordering.satisfies_order_by(&bound.order_by, None);
+        if !is_already_sorted {
+            let sort_cost = if let Some(fb_reg) = feedback {
+                let spill_status = fb_reg.get_spill_status(&key);
+                let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
+                CostModel::sort_cost_with_budget(adj_rows, 64.0, sort_budget, spill_status)
+            } else {
+                CostModel::sort_cost_with_budget(cur_rows, 64.0, sort_budget, SpillStatus::Unknown)
+            };
+            cur_cost += sort_cost;
+        }
     }
 
     Ok(PhysicalPlan {
@@ -2203,6 +2341,7 @@ fn optimize_with_outer_barriers(
         post_join_filter,
         group_by: bound.group_by.clone(),
         aggregates: bound.aggregates.clone(),
+        aggregate_strategy: agg_strategy,
         having: bound.having.clone(),
         window_exprs: bound.window_exprs.clone(),
         projections: bound.projections.clone(),
@@ -2552,6 +2691,167 @@ fn plan_semi_anti_strategy(
     (best_strategy, best_index, best_cost)
 }
 
+/// Selected physical aggregation strategy, updated cumulative cost, and output ordering property.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_aggregation_strategy(
+    input_cost: f64,
+    input_rows: f64,
+    input_ordering: Option<&crate::query::merge_join::OrderingProperty>,
+    group_by: &[Expr],
+    aggregates: &[AggregateExpr],
+    table_qualifier: Option<&str>,
+    feedback: Option<&FeedbackRegistry>,
+    param_sig: Option<&ParamPlanningSignature>,
+    resource_sig: Option<&ResourcePlanningSignature>,
+    stats_gen: u64,
+) -> (
+    Option<AggregateStrategy>,
+    f64,
+    crate::query::merge_join::OrderingProperty,
+) {
+    if group_by.is_empty() && aggregates.is_empty() {
+        return (
+            None,
+            input_cost,
+            input_ordering.cloned().unwrap_or_default(),
+        );
+    }
+
+    let is_ordered = input_ordering
+        .map(|ord| ord.satisfies_group_by(group_by, table_qualifier))
+        .unwrap_or(false);
+
+    let agg_budget = resource_sig
+        .map(|r| r.agg_budget)
+        .unwrap_or(DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES);
+    let sort_budget = resource_sig
+        .map(|r| r.sort_budget)
+        .unwrap_or(DEFAULT_SORT_MEMORY_BUDGET_BYTES);
+
+    let key = FeedbackKey::new(
+        FeedbackContext::Aggregate {
+            group_by: group_by
+                .iter()
+                .map(|g| g.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            aggregates: aggregates
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        },
+        param_sig.cloned(),
+        stats_gen,
+    )
+    .with_resource_signature(resource_sig.cloned());
+
+    let (spill_status, adj_rows) = if let Some(fb_reg) = feedback {
+        (
+            fb_reg.get_spill_status(&key),
+            fb_reg.get_adjusted_cardinality(&key, input_rows),
+        )
+    } else {
+        (SpillStatus::Unknown, input_rows)
+    };
+
+    let cost_streaming_no_sort =
+        CostModel::streaming_aggregate_cost(adj_rows, group_by.len(), aggregates.len());
+
+    let cost_sort = CostModel::sort_cost_with_budget(adj_rows, 64.0, sort_budget, spill_status);
+    let cost_streaming_with_sort = cost_sort + cost_streaming_no_sort;
+
+    let cost_hash = CostModel::aggregate_cost_with_budget(adj_rows, 64.0, agg_budget, spill_status);
+
+    let is_hash_external = match spill_status {
+        SpillStatus::Spilled => true,
+        SpillStatus::NeverSpilled => false,
+        SpillStatus::Unknown => (adj_rows * 64.0) > (agg_budget as f64),
+    };
+
+    // If no GROUP BY (scalar aggregation)
+    if group_by.is_empty() {
+        let strategy = AggregateStrategy::Streaming {
+            sort_required: false,
+        };
+        return (
+            Some(strategy),
+            input_cost + cost_streaming_no_sort,
+            crate::query::merge_join::OrderingProperty::default(),
+        );
+    }
+
+    if is_ordered {
+        if cost_streaming_no_sort <= cost_hash {
+            let strategy = AggregateStrategy::Streaming {
+                sort_required: false,
+            };
+            let out_ordering = crate::query::merge_join::OrderingProperty::new(
+                group_by
+                    .iter()
+                    .filter_map(|expr| match expr {
+                        Expr::Column(name) => Some(crate::query::merge_join::OrderingColumn {
+                            column: name.clone(),
+                            direction: crate::query::operator::SortDirection::Ascending,
+                            nulls_first: true,
+                        }),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            (
+                Some(strategy),
+                input_cost + cost_streaming_no_sort,
+                out_ordering,
+            )
+        } else {
+            let strategy = if is_hash_external {
+                AggregateStrategy::External
+            } else {
+                AggregateStrategy::Hash
+            };
+            (
+                Some(strategy),
+                input_cost + cost_hash,
+                crate::query::merge_join::OrderingProperty::default(),
+            )
+        }
+    } else if cost_streaming_with_sort < cost_hash {
+        let strategy = AggregateStrategy::Streaming {
+            sort_required: true,
+        };
+        let out_ordering = crate::query::merge_join::OrderingProperty::new(
+            group_by
+                .iter()
+                .filter_map(|expr| match expr {
+                    Expr::Column(name) => Some(crate::query::merge_join::OrderingColumn {
+                        column: name.clone(),
+                        direction: crate::query::operator::SortDirection::Ascending,
+                        nulls_first: true,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        );
+        (
+            Some(strategy),
+            input_cost + cost_streaming_with_sort,
+            out_ordering,
+        )
+    } else {
+        let strategy = if is_hash_external {
+            AggregateStrategy::External
+        } else {
+            AggregateStrategy::Hash
+        };
+        (
+            Some(strategy),
+            input_cost + cost_hash,
+            crate::query::merge_join::OrderingProperty::default(),
+        )
+    }
+}
+
 /// Cost-based and statistics-aware query optimizer and physical access-path planner.
 pub struct Optimizer;
 
@@ -2593,9 +2893,9 @@ impl Optimizer {
             let constraint_set =
                 ConstraintSet::extract_from_conjuncts(&where_conjuncts, &mut metrics);
             let ref_cols = collect_table_referenced_columns(&tables[0], bound, &where_conjuncts);
-            let base_table_scan = plan_table_scan(
+            let candidate_scans = plan_table_scan_candidates(
                 &tables[0],
-                where_conjuncts,
+                where_conjuncts.clone(),
                 Some(&ref_cols),
                 false,
                 feedback,
@@ -2603,80 +2903,127 @@ impl Optimizer {
                 resource_sig,
                 stats_gen,
             );
-            let mut cur_cost = base_table_scan.cost;
-            let cur_rows = base_table_scan.estimated_rows;
 
-            if !bound.order_by.is_empty() {
-                let sort_budget = resource_sig
-                    .map(|r| r.sort_budget)
-                    .unwrap_or(DEFAULT_SORT_MEMORY_BUDGET_BYTES);
-                let key = FeedbackKey::new(
-                    FeedbackContext::Sort {
-                        order_by: bound
-                            .order_by
-                            .iter()
-                            .map(|k| k.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    },
-                    param_sig.cloned(),
+            let mut best_plan_info: Option<(
+                PhysicalTableScan,
+                Option<AggregateStrategy>,
+                f64,
+                f64,
+            )> = None;
+
+            for base_table_scan in candidate_scans {
+                let mut cur_cost = base_table_scan.cost;
+                let mut cur_rows = base_table_scan.estimated_rows;
+
+                let scan_ordering = crate::query::merge_join::ordering_property_for_table_scan(
+                    &tables[0],
+                    &base_table_scan,
+                );
+                let (agg_strategy, post_agg_cost, post_agg_ordering) = plan_aggregation_strategy(
+                    cur_cost,
+                    cur_rows,
+                    Some(&scan_ordering),
+                    &bound.group_by,
+                    &bound.aggregates,
+                    Some(tables[0].qualifier()),
+                    feedback,
+                    param_sig,
+                    resource_sig,
                     stats_gen,
-                )
-                .with_resource_signature(resource_sig.cloned());
-                let sort_cost = if let Some(fb_reg) = feedback {
-                    let spill_status = fb_reg.get_spill_status(&key);
-                    let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
-                    CostModel::sort_cost_with_budget(adj_rows, 64.0, sort_budget, spill_status)
-                } else {
-                    CostModel::sort_cost_with_budget(
+                );
+                cur_cost = post_agg_cost;
+
+                if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+                    cur_rows = CardinalityEstimator::estimate_group_by_cardinality(
                         cur_rows,
-                        64.0,
-                        sort_budget,
-                        SpillStatus::Unknown,
+                        &bound.group_by,
+                        tables[0].stats.as_ref(),
+                        &tables[0].schema,
+                    );
+                }
+
+                if let Some(having) = &bound.having {
+                    cur_cost += CostModel::filter_cost(cur_rows);
+                    let having_sel = CardinalityEstimator::estimate_expr_selectivity(
+                        having,
+                        tables[0].stats.as_ref(),
+                        &tables[0].schema,
+                    );
+                    cur_rows = (cur_rows * having_sel)
+                        .clamp(if cur_rows > 0.0 { 1.0 } else { 0.0 }, cur_rows);
+                }
+
+                if !bound.window_exprs.is_empty() {
+                    cur_cost += CostModel::window_cost(cur_rows);
+                }
+
+                if !bound.order_by.is_empty() {
+                    let sort_budget = resource_sig
+                        .map(|r| r.sort_budget)
+                        .unwrap_or(DEFAULT_SORT_MEMORY_BUDGET_BYTES);
+                    let key = FeedbackKey::new(
+                        FeedbackContext::Sort {
+                            order_by: bound
+                                .order_by
+                                .iter()
+                                .map(|k| k.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        },
+                        param_sig.cloned(),
+                        stats_gen,
                     )
-                };
-                cur_cost += sort_cost;
+                    .with_resource_signature(resource_sig.cloned());
+
+                    let is_already_sorted = post_agg_ordering
+                        .satisfies_order_by(&bound.order_by, Some(tables[0].qualifier()));
+                    if !is_already_sorted {
+                        let sort_cost = if let Some(fb_reg) = feedback {
+                            let spill_status = fb_reg.get_spill_status(&key);
+                            let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
+                            CostModel::sort_cost_with_budget(
+                                adj_rows,
+                                64.0,
+                                sort_budget,
+                                spill_status,
+                            )
+                        } else {
+                            CostModel::sort_cost_with_budget(
+                                cur_rows,
+                                64.0,
+                                sort_budget,
+                                SpillStatus::Unknown,
+                            )
+                        };
+                        cur_cost += sort_cost;
+                    }
+                }
+
+                match &best_plan_info {
+                    None => {
+                        best_plan_info = Some((base_table_scan, agg_strategy, cur_cost, cur_rows));
+                    }
+                    Some((_, _, best_cost, _)) => {
+                        if cur_cost < *best_cost {
+                            best_plan_info =
+                                Some((base_table_scan, agg_strategy, cur_cost, cur_rows));
+                        }
+                    }
+                }
             }
-            if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
-                let agg_budget = resource_sig
-                    .map(|r| r.agg_budget)
-                    .unwrap_or(DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES);
-                let key = FeedbackKey::new(
-                    FeedbackContext::Aggregate {
-                        group_by: bound
-                            .group_by
-                            .iter()
-                            .map(|g| g.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        aggregates: bound
-                            .aggregates
-                            .iter()
-                            .map(|a| a.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    },
-                    param_sig.cloned(),
-                    stats_gen,
-                )
-                .with_resource_signature(resource_sig.cloned());
-                let agg_cost = if let Some(fb_reg) = feedback {
-                    let spill_status = fb_reg.get_spill_status(&key);
-                    let adj_rows = fb_reg.get_adjusted_cardinality(&key, cur_rows);
-                    CostModel::aggregate_cost_with_budget(adj_rows, 64.0, agg_budget, spill_status)
-                } else {
-                    CostModel::aggregate_cost_with_budget(
-                        cur_rows,
-                        64.0,
-                        agg_budget,
-                        SpillStatus::Unknown,
-                    )
-                };
-                cur_cost += agg_cost;
-            }
-            if !bound.window_exprs.is_empty() {
-                cur_cost += CostModel::window_cost(cur_rows);
-            }
+
+            let (base_table_scan, agg_strategy, cur_cost, cur_rows) = best_plan_info
+                .unwrap_or_else(|| {
+                    let default_scan = PhysicalTableScan {
+                        table_name: tables[0].name.clone(),
+                        table_alias: tables[0].alias.clone(),
+                        access_path: AccessPath::FullTableScan,
+                        residual_filter: None,
+                        estimated_rows: 0.0,
+                        cost: 0.0,
+                    };
+                    (default_scan, None, 0.0, 0.0)
+                });
 
             return Ok(PhysicalPlan {
                 ctes: bound.ctes.clone(),
@@ -2685,6 +3032,7 @@ impl Optimizer {
                 post_join_filter: None,
                 group_by: bound.group_by.clone(),
                 aggregates: bound.aggregates.clone(),
+                aggregate_strategy: agg_strategy,
                 having: bound.having.clone(),
                 window_exprs: bound.window_exprs.clone(),
                 projections: bound.projections.clone(),
@@ -2746,12 +3094,37 @@ fn plan_table_scan(
     table: &TableOptInfo,
     conjuncts: Vec<Expr>,
     referenced_columns: Option<&HashSet<usize>>,
-    _is_multi_table: bool,
+    is_multi_table: bool,
     feedback: Option<&FeedbackRegistry>,
     param_sig: Option<&ParamPlanningSignature>,
     resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
 ) -> PhysicalTableScan {
+    let candidates = plan_table_scan_candidates(
+        table,
+        conjuncts,
+        referenced_columns,
+        is_multi_table,
+        feedback,
+        param_sig,
+        resource_sig,
+        stats_gen,
+    );
+    candidates.into_iter().next().unwrap()
+}
+
+/// Generates all valid candidate table scans for a table relation.
+#[allow(clippy::too_many_arguments)]
+fn plan_table_scan_candidates(
+    table: &TableOptInfo,
+    conjuncts: Vec<Expr>,
+    referenced_columns: Option<&HashSet<usize>>,
+    _is_multi_table: bool,
+    feedback: Option<&FeedbackRegistry>,
+    param_sig: Option<&ParamPlanningSignature>,
+    resource_sig: Option<&ResourcePlanningSignature>,
+    stats_gen: u64,
+) -> Vec<PhysicalTableScan> {
     let qualifier = table.qualifier();
     // 1. Unqualify conjuncts so they match raw table schema column names
     let unqual_conjuncts: Vec<Expr> = conjuncts
@@ -2765,14 +3138,14 @@ fn plan_table_scan(
     let mut metrics = InferenceMetrics::default();
     let constraint_set = ConstraintSet::extract_from_conjuncts(&unqual_conjuncts, &mut metrics);
     if constraint_set.is_unsatisfiable() {
-        return PhysicalTableScan {
+        return vec![PhysicalTableScan {
             table_name: table.name.clone(),
             table_alias: table.alias.clone(),
             access_path: AccessPath::EmptyResult,
             residual_filter: None,
             estimated_rows: 0.0,
             cost: 0.0,
-        };
+        }];
     }
 
     // If this is a CTE / in-memory relation, it does not possess a physical B-Tree index or primary key path.
@@ -2800,14 +3173,14 @@ fn plan_table_scan(
         }
         let cost = CostModel::table_scan_cost(estimated_rows, unqual_conjuncts.len());
 
-        return PhysicalTableScan {
+        return vec![PhysicalTableScan {
             table_name: table.name.clone(),
             table_alias: table.alias.clone(),
             access_path: AccessPath::FullTableScan,
             residual_filter,
             estimated_rows,
             cost,
-        };
+        }];
     }
 
     let multi_index_budget = resource_sig
@@ -3990,16 +4363,17 @@ fn plan_table_scan(
         }
     });
 
-    let best = candidates.remove(0);
-
-    PhysicalTableScan {
-        table_name: table.name.clone(),
-        table_alias: table.alias.clone(),
-        access_path: best.access_path,
-        residual_filter: best.residual_filter,
-        estimated_rows: best.estimated_rows,
-        cost: best.cost,
-    }
+    candidates
+        .into_iter()
+        .map(|cand| PhysicalTableScan {
+            table_name: table.name.clone(),
+            table_alias: table.alias.clone(),
+            access_path: cand.access_path,
+            residual_filter: cand.residual_filter,
+            estimated_rows: cand.estimated_rows,
+            cost: cand.cost,
+        })
+        .collect()
 }
 
 /// Collects all column indices in `table`'s schema that are referenced anywhere across the query.

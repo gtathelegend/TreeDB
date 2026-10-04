@@ -4080,14 +4080,71 @@ impl<'db> Transaction<'db> {
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
         let (mut working_schema, mut working_rows) = if is_aggregate {
             let pre_agg_count = current_rows.len();
-            let (grouped_schema, grouped_rows, agg_metrics) =
-                crate::query::AggregateOperator::apply_with_config(
-                    current_rows,
-                    &current_schema,
-                    &plan.group_by,
-                    &plan.aggregates,
-                    &self.db.aggregate_config,
-                )?;
+            let (grouped_schema, grouped_rows, agg_metric_op) = match plan.aggregate_strategy {
+                Some(crate::query::optimizer::AggregateStrategy::Streaming { sort_required }) => {
+                    let (schema, rows, stream_metrics) =
+                        crate::query::streaming_aggregate::StreamingAggregateOperator::new(
+                            &current_schema,
+                            &plan.group_by,
+                            &plan.aggregates,
+                            sort_required,
+                            Some(self.db.sort_config.clone()),
+                        )
+                        .execute(current_rows)?;
+
+                    let mut metric = crate::query::OperatorMetrics::new(
+                        crate::query::OperatorKind::StreamingAggregate,
+                        Some(plan.estimated_rows),
+                        Some(plan.total_cost),
+                    );
+                    metric.input_rows = stream_metrics.input_rows;
+                    metric.actual_rows = rows.len();
+                    metric.counters.streaming_aggregate_input_rows = stream_metrics.input_rows;
+                    metric.counters.streaming_aggregate_output_groups =
+                        stream_metrics.output_groups;
+                    metric.counters.streaming_aggregate_group_transitions =
+                        stream_metrics.group_transitions;
+                    metric.counters.streaming_aggregate_max_group_size =
+                        stream_metrics.max_group_size;
+                    metric.counters.streaming_aggregate_aggregate_updates =
+                        stream_metrics.aggregate_updates;
+                    metric.counters.streaming_aggregate_sort_required =
+                        stream_metrics.sort_required;
+                    metric.counters.streaming_aggregate_sort_spilled = stream_metrics.sort_spilled;
+                    metric.counters.streaming_aggregate_memory_bytes = stream_metrics.memory_bytes;
+                    metric.counters.rows_evaluated = stream_metrics.input_rows;
+                    metric.add_child(current_op);
+
+                    (schema, rows, metric)
+                }
+                _ => {
+                    let (grouped_schema, grouped_rows, agg_metrics) =
+                        crate::query::AggregateOperator::apply_with_config(
+                            current_rows,
+                            &current_schema,
+                            &plan.group_by,
+                            &plan.aggregates,
+                            &self.db.aggregate_config,
+                        )?;
+                    let mut agg_metric = crate::query::OperatorMetrics::new(
+                        crate::query::OperatorKind::Aggregate,
+                        Some(plan.estimated_rows),
+                        Some(plan.total_cost),
+                    );
+                    agg_metric.input_rows = pre_agg_count;
+                    agg_metric.actual_rows = grouped_rows.len();
+                    agg_metric.counters.group_count = agg_metrics.groups_created;
+                    agg_metric.counters.spill_partitions = agg_metrics.spill_partitions;
+                    agg_metric.counters.runs_created = agg_metrics.runs_created;
+                    agg_metric.counters.bytes_spilled = agg_metrics.bytes_spilled;
+                    agg_metric.counters.merge_passes = agg_metrics.merge_passes;
+                    agg_metric.counters.peak_memory_bytes = agg_metrics.peak_memory_bytes;
+                    agg_metric.counters.rows_evaluated = pre_agg_count;
+                    agg_metric.add_child(current_op);
+
+                    (grouped_schema, grouped_rows, agg_metric)
+                }
+            };
             let num_groups = grouped_rows.len();
 
             let (having_rows, final_rows) = match &plan.having {
@@ -4104,22 +4161,6 @@ impl<'db> Transaction<'db> {
                 None => (None, grouped_rows),
             };
 
-            let mut agg_metric = crate::query::OperatorMetrics::new(
-                crate::query::OperatorKind::Aggregate,
-                Some(plan.estimated_rows),
-                Some(plan.total_cost),
-            );
-            agg_metric.input_rows = pre_agg_count;
-            agg_metric.actual_rows = final_rows.len();
-            agg_metric.counters.group_count = agg_metrics.groups_created;
-            agg_metric.counters.spill_partitions = agg_metrics.spill_partitions;
-            agg_metric.counters.runs_created = agg_metrics.runs_created;
-            agg_metric.counters.bytes_spilled = agg_metrics.bytes_spilled;
-            agg_metric.counters.merge_passes = agg_metrics.merge_passes;
-            agg_metric.counters.peak_memory_bytes = agg_metrics.peak_memory_bytes;
-            agg_metric.counters.rows_evaluated = pre_agg_count;
-            agg_metric.add_child(current_op);
-
             if let Some(having_filtered) = having_rows {
                 let mut having_metric = crate::query::OperatorMetrics::new(
                     crate::query::OperatorKind::Filter,
@@ -4132,10 +4173,10 @@ impl<'db> Transaction<'db> {
                 having_metric.counters.rows_passed = having_filtered.len();
                 having_metric.counters.rows_rejected =
                     num_groups.saturating_sub(having_filtered.len());
-                having_metric.add_child(agg_metric);
+                having_metric.add_child(agg_metric_op);
                 current_op = having_metric;
             } else {
-                current_op = agg_metric;
+                current_op = agg_metric_op;
             }
 
             (grouped_schema, final_rows)

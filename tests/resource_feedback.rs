@@ -402,6 +402,7 @@ fn test_r195_plan_cache_does_not_reuse_incompatible_resource_plans() -> Result<(
         group_by: vec![],
         having: None,
         aggregates: vec![],
+        aggregate_strategy: None,
         window_exprs: vec![],
         post_join_filter: None,
         estimated_rows: 100.0,

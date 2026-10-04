@@ -75,6 +75,83 @@ impl OrderingProperty {
         }
         true
     }
+
+    /// Checks if this ordering property satisfies the required GROUP BY keys in prefix order.
+    pub fn satisfies_group_by(&self, group_by: &[Expr], table_qualifier: Option<&str>) -> bool {
+        if group_by.is_empty() {
+            return true;
+        }
+        if self.columns.len() < group_by.len() {
+            return false;
+        }
+        for (i, req_expr) in group_by.iter().enumerate() {
+            let req_col_name = match req_expr {
+                Expr::Column(name) => name,
+                _ => return false,
+            };
+            let req_bare = req_col_name.split('.').next_back().unwrap_or(req_col_name);
+            let ord_col = &self.columns[i];
+            let ord_bare = ord_col
+                .column
+                .split('.')
+                .next_back()
+                .unwrap_or(&ord_col.column);
+
+            if req_bare != ord_bare {
+                return false;
+            }
+            if ord_col.direction != SortDirection::Ascending {
+                return false;
+            }
+            if let (Some(qual), Some(req_qual)) = (table_qualifier, req_col_name.split('.').next())
+            {
+                if req_col_name.contains('.') && req_qual != qual {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Checks if this ordering property satisfies the required ORDER BY sort keys in prefix order.
+    pub fn satisfies_order_by(&self, order_by: &[SortKey], table_qualifier: Option<&str>) -> bool {
+        if order_by.is_empty() {
+            return true;
+        }
+        if self.columns.len() < order_by.len() {
+            return false;
+        }
+        for (i, sort_key) in order_by.iter().enumerate() {
+            let req_col_name = match &sort_key.expression {
+                Expr::Column(name) => name,
+                _ => return false,
+            };
+            let req_bare = req_col_name
+                .split('.')
+                .next_back()
+                .unwrap_or(req_col_name.as_str());
+            let ord_col = &self.columns[i];
+            let ord_bare = ord_col
+                .column
+                .split('.')
+                .next_back()
+                .unwrap_or(&ord_col.column);
+
+            if req_bare != ord_bare {
+                return false;
+            }
+            if ord_col.direction != sort_key.direction {
+                return false;
+            }
+            if let (Some(qual), Some(req_qual)) = (table_qualifier, req_col_name.split('.').next())
+            {
+                if req_col_name.contains('.') && req_qual != qual {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 /// Infers the output `OrderingProperty` produced by a table scan access path.
@@ -83,7 +160,7 @@ pub fn ordering_property_for_table_scan(
     scan: &PhysicalTableScan,
 ) -> OrderingProperty {
     match &scan.access_path {
-        AccessPath::PrimaryRangeScan { .. } => {
+        AccessPath::PrimaryRangeScan { .. } | AccessPath::FullTableScan => {
             let pk_col = table.schema.primary_key_column();
             OrderingProperty::new(vec![OrderingColumn {
                 column: pk_col.name.clone(),
@@ -148,9 +225,7 @@ pub fn ordering_property_for_table_scan(
             }
         }
         AccessPath::PrimaryPointLookup { .. } => OrderingProperty::default(),
-        AccessPath::MultiIndexScan { .. } | AccessPath::FullTableScan | AccessPath::EmptyResult => {
-            OrderingProperty::default()
-        }
+        AccessPath::MultiIndexScan { .. } | AccessPath::EmptyResult => OrderingProperty::default(),
     }
 }
 

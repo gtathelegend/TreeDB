@@ -1324,6 +1324,91 @@ impl CardinalityEstimator {
             }
         }
     }
+
+    /// Estimates output cardinality (number of distinct groups) for a GROUP BY aggregation.
+    pub fn estimate_group_by_cardinality(
+        input_rows: f64,
+        group_by: &[Expr],
+        stats: Option<&TableStatistics>,
+        schema: &Schema,
+    ) -> f64 {
+        let rows = input_rows.max(0.0);
+        if rows <= 0.0 || group_by.is_empty() {
+            return if rows > 0.0 { 1.0 } else { 0.0 };
+        }
+
+        // Single-column GROUP BY
+        if group_by.len() == 1 {
+            if let Expr::Column(col_name) = &group_by[0] {
+                let bare_name = col_name.split('.').next_back().unwrap_or(col_name);
+                if let Some(st) = stats {
+                    if let Some(col_st) = st.column(bare_name) {
+                        if col_st.distinct_count > 0 {
+                            return (col_st.distinct_count as f64).clamp(1.0, rows);
+                        }
+                    }
+                }
+            }
+            return (rows * 0.1).ceil().clamp(1.0, rows);
+        }
+
+        // Two-column GROUP BY: check pairwise column group correlation statistics (Phase 49)
+        if group_by.len() == 2 {
+            if let (Expr::Column(col0), Expr::Column(col1)) = (&group_by[0], &group_by[1]) {
+                let bare0 = col0.split('.').next_back().unwrap_or(col0);
+                let bare1 = col1.split('.').next_back().unwrap_or(col1);
+
+                if let Some(st) = stats {
+                    let idx0 = schema.columns.iter().position(|c| c.name == bare0);
+                    let idx1 = schema.columns.iter().position(|c| c.name == bare1);
+                    if let (Some(c0), Some(c1)) = (idx0, idx1) {
+                        let key1 = ColumnGroupKey::new(vec![c0, c1]);
+                        let key2 = ColumnGroupKey::new(vec![c1, c0]);
+                        if let Some(grp) = st
+                            .column_groups
+                            .get(&key1)
+                            .or_else(|| st.column_groups.get(&key2))
+                        {
+                            if grp.distinct_count > 0 {
+                                return (grp.distinct_count as f64).clamp(1.0, rows);
+                            }
+                        }
+                    }
+                    // Fallback to independence assumption bounded by NDVs
+                    let ndv0 = st
+                        .column(bare0)
+                        .map(|c| c.distinct_count as f64)
+                        .unwrap_or(rows.min(10.0));
+                    let ndv1 = st
+                        .column(bare1)
+                        .map(|c| c.distinct_count as f64)
+                        .unwrap_or(rows.min(10.0));
+                    let product = (ndv0.max(1.0) * ndv1.max(1.0)).min(rows);
+                    return product.clamp(1.0, rows);
+                }
+            }
+            return (rows * 0.2).ceil().clamp(1.0, rows);
+        }
+
+        // Multi-column GROUP BY (> 2 columns)
+        let mut est_groups = 1.0f64;
+        for expr in group_by {
+            if let Expr::Column(col_name) = expr {
+                let bare = col_name.split('.').next_back().unwrap_or(col_name);
+                if let Some(st) = stats {
+                    if let Some(col_st) = st.column(bare) {
+                        if col_st.distinct_count > 0 {
+                            est_groups *= col_st.distinct_count as f64;
+                            continue;
+                        }
+                    }
+                }
+            }
+            est_groups *= (rows * 0.1).max(2.0);
+        }
+
+        est_groups.clamp(1.0, rows)
+    }
 }
 
 fn extract_col_and_val(left: &Expr, right: &Expr) -> (Option<String>, Option<Value>) {

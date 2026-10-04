@@ -16,6 +16,10 @@ pub mod plan_cache;
 pub mod rewrite;
 pub mod runtime_filter;
 pub mod stats;
+pub mod streaming_aggregate;
+
+pub use optimizer::AggregateStrategy;
+pub use streaming_aggregate::{StreamingAggregateMetrics, StreamingAggregateOperator};
 
 pub use merge_join::{
     ordering_property_for_table_scan, MergeJoinOperator, OrderingColumn, OrderingProperty,

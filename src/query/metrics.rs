@@ -37,6 +37,8 @@ pub enum OperatorKind {
     NestedLoopAntiJoin,
     /// Group-by and aggregate computation.
     Aggregate,
+    /// Cost-based ordered streaming aggregation.
+    StreamingAggregate,
     /// Window function evaluation.
     Window,
     /// Subquery execution.
@@ -77,6 +79,7 @@ impl fmt::Display for OperatorKind {
             Self::NestedLoopSemiJoin => write!(f, "NestedLoopSemiJoin"),
             Self::NestedLoopAntiJoin => write!(f, "NestedLoopAntiJoin"),
             Self::Aggregate => write!(f, "Aggregate"),
+            Self::StreamingAggregate => write!(f, "StreamingAggregate"),
             Self::Window => write!(f, "Window"),
             Self::Subquery { kind } => write!(f, "Subquery ({kind})"),
             Self::Cte { name } => write!(f, "CTE {name}"),
@@ -215,6 +218,22 @@ pub struct OperatorCounters {
     pub merge_join_sort_left: bool,
     /// Merge join specific: Whether right input required sort
     pub merge_join_sort_right: bool,
+    /// Streaming aggregate specific: Input rows
+    pub streaming_aggregate_input_rows: usize,
+    /// Streaming aggregate specific: Output groups
+    pub streaming_aggregate_output_groups: usize,
+    /// Streaming aggregate specific: Group transitions
+    pub streaming_aggregate_group_transitions: usize,
+    /// Streaming aggregate specific: Maximum group size
+    pub streaming_aggregate_max_group_size: usize,
+    /// Streaming aggregate specific: Aggregate state updates
+    pub streaming_aggregate_aggregate_updates: usize,
+    /// Streaming aggregate specific: Sort required flag
+    pub streaming_aggregate_sort_required: bool,
+    /// Streaming aggregate specific: Sort spilled flag
+    pub streaming_aggregate_sort_spilled: bool,
+    /// Streaming aggregate specific: Estimated memory footprint
+    pub streaming_aggregate_memory_bytes: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -581,17 +600,52 @@ pub fn format_plan_with_metrics(
         write_indent(&mut out, indent);
         let groups: Vec<String> = plan.group_by.iter().map(|g| g.to_string()).collect();
         let aggs: Vec<String> = plan.aggregates.iter().map(|a| a.to_string()).collect();
-        out.push_str(&format!(
-            "Aggregate (group_by: [{}], aggs: [{proper_aggs}])\n",
-            groups.join(", "),
-            proper_aggs = aggs.join(", ")
-        ));
+        match plan.aggregate_strategy {
+            Some(crate::query::optimizer::AggregateStrategy::Streaming { sort_required }) => {
+                out.push_str(&format!(
+                    "StreamingAggregate (group_by: [{}], aggs: [{proper_aggs}], sort_required: {})\n",
+                    groups.join(", "),
+                    if sort_required { "Yes" } else { "No" },
+                    proper_aggs = aggs.join(", ")
+                ));
+            }
+            Some(crate::query::optimizer::AggregateStrategy::External) => {
+                out.push_str(&format!(
+                    "ExternalAggregate (group_by: [{}], aggs: [{proper_aggs}])\n",
+                    groups.join(", "),
+                    proper_aggs = aggs.join(", ")
+                ));
+            }
+            _ => {
+                out.push_str(&format!(
+                    "Aggregate (group_by: [{}], aggs: [{proper_aggs}])\n",
+                    groups.join(", "),
+                    proper_aggs = aggs.join(", ")
+                ));
+            }
+        }
         if let Some(root) = &metrics.root_operator {
-            if let Some(agg_op) =
-                find_operator_metrics(root, &|k| matches!(k, OperatorKind::Aggregate))
-            {
+            if let Some(agg_op) = find_operator_metrics(root, &|k| {
+                matches!(
+                    k,
+                    OperatorKind::Aggregate | OperatorKind::StreamingAggregate
+                )
+            }) {
                 write_indent(&mut out, indent + 1);
-                if agg_op.counters.runs_created > 0 || agg_op.counters.bytes_spilled > 0 {
+                if matches!(agg_op.kind, OperatorKind::StreamingAggregate) {
+                    out.push_str(&format!(
+                        "actual_rows: {}, group_count: {}, input_rows: {}, group_transitions: {}, max_group_size: {}, aggregate_updates: {}, sort_required: {}, sort_spilled: {}, memory_bytes: {}\n",
+                        agg_op.actual_rows,
+                        agg_op.counters.group_count,
+                        agg_op.counters.streaming_aggregate_input_rows,
+                        agg_op.counters.streaming_aggregate_group_transitions,
+                        agg_op.counters.streaming_aggregate_max_group_size,
+                        agg_op.counters.streaming_aggregate_aggregate_updates,
+                        if agg_op.counters.streaming_aggregate_sort_required { "Yes" } else { "No" },
+                        if agg_op.counters.streaming_aggregate_sort_spilled { "Yes" } else { "No" },
+                        agg_op.counters.streaming_aggregate_memory_bytes
+                    ));
+                } else if agg_op.counters.runs_created > 0 || agg_op.counters.bytes_spilled > 0 {
                     out.push_str(&format!(
                         "actual_rows: {}, group_count: {}, spill_partitions: {}, runs_created: {}, bytes_spilled: {}, merge_passes: {}, peak_memory_bytes: {}\n",
                         agg_op.actual_rows,
