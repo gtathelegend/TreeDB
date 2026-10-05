@@ -955,6 +955,10 @@ fn baseline_execute(
         residual_filter: None,
         estimated_rows: 0.0,
         cost: 0.0,
+        row_goal: None,
+        estimated_rows_examined: None,
+        estimated_qualifying_rows: None,
+        early_termination_possible: false,
     };
 
     let mut joins = Vec::new();
@@ -968,6 +972,10 @@ fn baseline_execute(
                 residual_filter: None,
                 estimated_rows: 0.0,
                 cost: 0.0,
+                row_goal: None,
+                estimated_rows_examined: None,
+                estimated_qualifying_rows: None,
+                early_termination_possible: false,
             },
             on: j.on.clone(),
             estimated_rows: 0.0,
@@ -998,6 +1006,10 @@ fn baseline_execute(
         provided_ordering: None,
         offset: bound.offset,
         limit: bound.limit,
+        row_goal: None,
+        estimated_rows_examined: None,
+        estimated_qualifying_rows: None,
+        row_goal_early_termination: false,
         total_cost: 0.0,
         estimated_rows: 0.0,
         logical_rewrites: Vec::new(),

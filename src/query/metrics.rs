@@ -255,6 +255,14 @@ pub struct OperatorCounters {
     pub top_n_offset: usize,
     /// General scan / operator early termination flag
     pub early_terminated: bool,
+    /// Row-goal specific: target candidate row goal (K = offset + limit)
+    pub row_goal: Option<usize>,
+    /// Row-goal specific: whether the row goal was satisfied
+    pub row_goal_satisfied: bool,
+    /// Row-goal specific: candidate entries/rows examined
+    pub rows_examined: usize,
+    /// Row-goal specific: qualifying rows passing residual predicates
+    pub rows_qualified: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -810,6 +818,50 @@ pub fn format_plan_with_metrics(
                         scan_op.counters.base_records_avoided,
                         scan_op.counters.covered_rows_output
                     ));
+                } else if scan_op.counters.row_goal.is_some() {
+                    if scan_op.counters.base_records_avoided > 0 {
+                        out.push_str(&format!(
+                            "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, row_goal: {}, rows_examined: {}, rows_qualified: {}, index_entries_examined: {}, base_records_fetched: {}, base_records_avoided: {}, covered_rows_output: {}, early_terminated: {}, row_goal_satisfied: {}\n",
+                            plan.base_table.cost,
+                            plan.base_table.estimated_rows,
+                            actual_rows_str,
+                            scan_op.counters.row_goal.unwrap_or(0),
+                            scan_op.counters.rows_examined,
+                            scan_op.counters.rows_qualified,
+                            scan_op.counters.index_entries_examined,
+                            scan_op.counters.base_records_fetched,
+                            scan_op.counters.base_records_avoided,
+                            scan_op.counters.covered_rows_output,
+                            scan_op.counters.early_terminated,
+                            scan_op.counters.row_goal_satisfied,
+                        ));
+                    } else if scan_op.counters.index_entries_examined > 0 {
+                        out.push_str(&format!(
+                            "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, row_goal: {}, rows_examined: {}, rows_qualified: {}, index_entries_examined: {}, base_records_fetched: {}, early_terminated: {}, row_goal_satisfied: {}\n",
+                            plan.base_table.cost,
+                            plan.base_table.estimated_rows,
+                            actual_rows_str,
+                            scan_op.counters.row_goal.unwrap_or(0),
+                            scan_op.counters.rows_examined,
+                            scan_op.counters.rows_qualified,
+                            scan_op.counters.index_entries_examined,
+                            scan_op.counters.base_records_fetched,
+                            scan_op.counters.early_terminated,
+                            scan_op.counters.row_goal_satisfied,
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}, row_goal: {}, rows_examined: {}, rows_qualified: {}, early_terminated: {}, row_goal_satisfied: {}\n",
+                            plan.base_table.cost,
+                            plan.base_table.estimated_rows,
+                            actual_rows_str,
+                            scan_op.counters.row_goal.unwrap_or(0),
+                            scan_op.counters.rows_examined,
+                            scan_op.counters.rows_qualified,
+                            scan_op.counters.early_terminated,
+                            scan_op.counters.row_goal_satisfied,
+                        ));
+                    }
                 } else if scan_op.counters.base_records_avoided > 0
                     || scan_op.counters.index_entries_examined > 0
                 {

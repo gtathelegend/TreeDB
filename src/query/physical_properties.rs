@@ -377,16 +377,122 @@ impl fmt::Display for OrderingProperty {
 }
 
 /// Global physical properties describing execution stream characteristics.
+/// Physical row-goal / bounded-output requirement for an execution subtree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct RowGoal {
+    /// Number of candidate qualifying rows the child subtree must produce (e.g. `OFFSET + LIMIT`).
+    pub candidate_rows: u64,
+    /// Number of output rows the parent operator requires (e.g. `LIMIT`).
+    pub required_output_rows: u64,
+    /// Number of initial rows discarded by pagination (e.g. `OFFSET`).
+    pub offset: u64,
+}
+
+impl RowGoal {
+    /// Creates a new `RowGoal`.
+    pub const fn new(candidate_rows: u64, required_output_rows: u64) -> Self {
+        let offset = candidate_rows.saturating_sub(required_output_rows);
+        Self {
+            candidate_rows,
+            required_output_rows,
+            offset,
+        }
+    }
+
+    /// Constructs a `RowGoal` from optional LIMIT and OFFSET parameters.
+    pub fn from_limit_offset(limit: Option<usize>, offset: Option<usize>) -> Option<Self> {
+        let l = limit?;
+        let o = offset.unwrap_or(0);
+        let cand = (o + l) as u64;
+        Some(Self {
+            candidate_rows: cand,
+            required_output_rows: l as u64,
+            offset: o as u64,
+        })
+    }
+
+    /// Returns the candidate requirement $K = \text{OFFSET} + \text{LIMIT}$.
+    pub const fn k(&self) -> u64 {
+        self.candidate_rows
+    }
+}
+
+impl fmt::Display for RowGoal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RowGoal(candidate={}, output={}, offset={})",
+            self.candidate_rows, self.required_output_rows, self.offset
+        )
+    }
+}
+
+/// Physical requirements demanded by a parent execution node (ordering and row-goal bounds).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequiredPhysicalProperties {
+    /// Required physical ordering.
+    pub ordering: RequiredOrdering,
+    /// Bounded row-goal requirement if output is bounded.
+    pub row_goal: Option<RowGoal>,
+}
+
+impl RequiredPhysicalProperties {
+    /// Creates a new `RequiredPhysicalProperties`.
+    pub const fn new(ordering: RequiredOrdering, row_goal: Option<RowGoal>) -> Self {
+        Self { ordering, row_goal }
+    }
+
+    /// Creates a requirement with only ordering.
+    pub const fn with_ordering(ordering: RequiredOrdering) -> Self {
+        Self {
+            ordering,
+            row_goal: None,
+        }
+    }
+
+    /// Creates a requirement with only row goal.
+    pub const fn with_row_goal(row_goal: RowGoal) -> Self {
+        Self {
+            ordering: RequiredOrdering {
+                columns: Vec::new(),
+            },
+            row_goal: Some(row_goal),
+        }
+    }
+
+    /// Returns `true` if no physical properties or row goals are required.
+    pub fn is_empty(&self) -> bool {
+        self.ordering.is_empty() && self.row_goal.is_none()
+    }
+}
+
+impl fmt::Display for RequiredPhysicalProperties {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.ordering, &self.row_goal) {
+            (ord, Some(rg)) if !ord.is_empty() => write!(f, "Ordering: {ord}, {rg}"),
+            (ord, None) if !ord.is_empty() => write!(f, "Ordering: {ord}"),
+            (_, Some(rg)) => write!(f, "{rg}"),
+            _ => write!(f, "NoRequirements"),
+        }
+    }
+}
+
+/// Global physical properties describing execution stream characteristics.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PhysicalProperties {
     /// Active physical ordering property, if guaranteed.
     pub ordering: Option<OrderingProperty>,
+    /// Active physical row-goal property, if guaranteed/bounded.
+    pub row_goal: Option<RowGoal>,
 }
 
 impl PhysicalProperties {
     /// Creates a new `PhysicalProperties` with optional ordering.
     pub fn new(ordering: Option<OrderingProperty>) -> Self {
-        Self { ordering }
+        Self {
+            ordering,
+            row_goal: None,
+        }
     }
 
     /// Creates a `PhysicalProperties` instance from guaranteed ordering.
@@ -397,24 +503,38 @@ impl PhysicalProperties {
             } else {
                 Some(ordering)
             },
+            row_goal: None,
         }
+    }
+
+    /// Creates a `PhysicalProperties` with both ordering and row-goal.
+    pub fn with_ordering_and_row_goal(
+        ordering: Option<OrderingProperty>,
+        row_goal: Option<RowGoal>,
+    ) -> Self {
+        Self { ordering, row_goal }
     }
 
     /// Creates a `PhysicalProperties` instance with no guaranteed physical properties.
     pub fn none() -> Self {
-        Self { ordering: None }
+        Self {
+            ordering: None,
+            row_goal: None,
+        }
     }
 
     /// Returns `true` if no physical properties are guaranteed.
     pub fn is_empty(&self) -> bool {
-        self.ordering.as_ref().is_none_or(|o| o.is_empty())
+        self.ordering.as_ref().is_none_or(|o| o.is_empty()) && self.row_goal.is_none()
     }
 }
 
 impl fmt::Display for PhysicalProperties {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.ordering {
-            Some(ord) if !ord.is_empty() => write!(f, "Ordering: {ord}"),
+        match (&self.ordering, &self.row_goal) {
+            (Some(ord), Some(rg)) if !ord.is_empty() => write!(f, "Ordering: {ord}, {rg}"),
+            (Some(ord), None) if !ord.is_empty() => write!(f, "Ordering: {ord}"),
+            (_, Some(rg)) => write!(f, "{rg}"),
             _ => write!(f, "NoProperties"),
         }
     }

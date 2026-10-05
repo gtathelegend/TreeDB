@@ -484,6 +484,55 @@ impl CostModel {
             * rejection_ratio.clamp(0.0, 1.0)
             * (TUPLE_FETCH_COST + HASH_PROBE_CPU_COST * 2.0)
     }
+
+    /// Estimates the expected number of entries / candidate rows that must be examined
+    /// to satisfy a bounded row-goal requirement $K$, given predicate selectivity $S$
+    /// and total population $N$.
+    pub fn expected_entries_for_row_goal(
+        row_goal_k: f64,
+        selectivity: f64,
+        total_population: f64,
+    ) -> f64 {
+        let pop = total_population.max(1.0);
+        let k = row_goal_k.max(1.0);
+        if selectivity >= 1.0 {
+            k.min(pop)
+        } else if selectivity <= 0.0 {
+            pop
+        } else {
+            let needed = (k / selectivity).ceil();
+            needed.min(pop).max(1.0)
+        }
+    }
+
+    /// Computes the execution cost of an ordered scan under a bounded row-goal requirement.
+    pub fn ordered_scan_row_goal_cost(
+        entries_examined: f64,
+        is_covering: bool,
+        is_primary_key: bool,
+        num_residual_filters: usize,
+    ) -> f64 {
+        let examined = entries_examined.max(1.0);
+        let filter_eval_cost = FILTER_CPU_COST * examined * (num_residual_filters as f64);
+        if is_primary_key {
+            BPLUS_TREE_HEIGHT_COST
+                + ((ROW_CPU_COST + TUPLE_FETCH_COST) * examined)
+                + filter_eval_cost
+        } else if is_covering {
+            SEC_INDEX_LOOKUP_COST
+                + ((ROW_CPU_COST + SEC_INDEX_FETCH_COST) * examined)
+                + filter_eval_cost
+        } else {
+            SEC_INDEX_LOOKUP_COST
+                + ((TUPLE_FETCH_COST + SEC_INDEX_FETCH_COST) * examined)
+                + filter_eval_cost
+        }
+    }
+
+    /// Computes the residual filter evaluation cost for a row goal.
+    pub fn row_goal_filter_cost(entries_examined: f64, num_residual_filters: usize) -> f64 {
+        FILTER_CPU_COST * entries_examined.max(0.0) * (num_residual_filters as f64)
+    }
 }
 
 /// Composite cost and row estimate tuple with deterministic comparison helpers.

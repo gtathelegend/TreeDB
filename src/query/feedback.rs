@@ -233,6 +233,13 @@ pub enum FeedbackContext {
         right_table: String,
         on_clause: String,
     },
+    /// Ordered scan execution under bounded row goal.
+    OrderedScan {
+        table_name: String,
+        index_name: String,
+        filter: String,
+        row_goal: u64,
+    },
 }
 
 impl fmt::Display for FeedbackContext {
@@ -316,6 +323,15 @@ impl fmt::Display for FeedbackContext {
             } => write!(
                 f,
                 "RuntimeFilter(type={join_type}, left={left_table}, right={right_table}, on={on_clause})"
+            ),
+            Self::OrderedScan {
+                table_name,
+                index_name,
+                filter,
+                row_goal,
+            } => write!(
+                f,
+                "OrderedScan(table={table_name}, index={index_name}, filter={filter}, row_goal={row_goal})"
             ),
         }
     }
@@ -510,12 +526,35 @@ impl FeedbackKey {
         )
     }
 
+    /// Constructs a feedback key for an ordered scan under a bounded row goal.
+    pub fn ordered_scan(
+        table_name: impl Into<String>,
+        index_name: impl Into<String>,
+        filter: impl Into<String>,
+        row_goal: u64,
+        param_signature: Option<ParamPlanningSignature>,
+        statistics_generation: u64,
+    ) -> Self {
+        Self {
+            context: FeedbackContext::OrderedScan {
+                table_name: table_name.into(),
+                index_name: index_name.into(),
+                filter: filter.into(),
+                row_goal,
+            },
+            param_signature,
+            statistics_generation,
+            resource_signature: None,
+        }
+    }
+
     /// Returns the primary table name associated with this feedback key if available.
     pub fn table_name(&self) -> Option<&str> {
         match &self.context {
             FeedbackContext::Scan { table_name, .. }
             | FeedbackContext::Filter { table_name, .. }
             | FeedbackContext::MultiIndex { table_name, .. }
+            | FeedbackContext::OrderedScan { table_name, .. }
             | FeedbackContext::SkipScan { table_name, .. } => Some(table_name.as_str()),
             FeedbackContext::Join { left_table, .. }
             | FeedbackContext::SemiAnti { left_table, .. }

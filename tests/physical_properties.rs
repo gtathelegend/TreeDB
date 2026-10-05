@@ -571,6 +571,10 @@ fn test_r630_multi_index_scan_no_false_ordering() -> Result<()> {
         residual_filter: None,
         estimated_rows: 100.0,
         cost: 10.0,
+        row_goal: None,
+        estimated_rows_examined: None,
+        estimated_qualifying_rows: None,
+        early_termination_possible: false,
     };
     let ord = treedb::query::physical_properties::ordering_property_for_table_scan(
         &treedb::query::TableOptInfo {
@@ -603,6 +607,10 @@ fn test_r631_skip_scan_no_false_ordering() -> Result<()> {
         residual_filter: None,
         estimated_rows: 10.0,
         cost: 5.0,
+        row_goal: None,
+        estimated_rows_examined: None,
+        estimated_qualifying_rows: None,
+        early_termination_possible: false,
     };
     let ord = treedb::query::physical_properties::ordering_property_for_table_scan(
         &treedb::query::TableOptInfo {

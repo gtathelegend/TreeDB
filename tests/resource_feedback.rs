@@ -393,6 +393,10 @@ fn test_r195_plan_cache_does_not_reuse_incompatible_resource_plans() -> Result<(
             residual_filter: None,
             estimated_rows: 100.0,
             cost: 10.0,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            early_termination_possible: false,
         },
         joins: vec![],
         order_by: vec![],
@@ -414,6 +418,10 @@ fn test_r195_plan_cache_does_not_reuse_incompatible_resource_plans() -> Result<(
         ctes: vec![],
         logical_rewrites: vec![],
         inferred_predicates: vec![],
+        row_goal: None,
+        estimated_rows_examined: None,
+        estimated_qualifying_rows: None,
+        row_goal_early_termination: false,
     };
 
     let validity = PlanValidity::new(1, 1, 1, vec!["t".to_string()], vec![])

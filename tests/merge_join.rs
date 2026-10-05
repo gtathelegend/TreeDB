@@ -853,6 +853,10 @@ fn test_r505_multi_index_does_not_falsely_advertise_ordering() -> Result<()> {
         residual_filter: None,
         estimated_rows: 100.0,
         cost: 50.0,
+        row_goal: None,
+        estimated_rows_examined: None,
+        estimated_qualifying_rows: None,
+        early_termination_possible: false,
     };
     let schema = treedb::engine::types::Schema::new(
         vec![treedb::engine::types::Column::new(
@@ -885,6 +889,10 @@ fn test_r506_skip_scan_ordering_safety() -> Result<()> {
         residual_filter: None,
         estimated_rows: 100.0,
         cost: 50.0,
+        row_goal: None,
+        estimated_rows_examined: None,
+        estimated_qualifying_rows: None,
+        early_termination_possible: false,
     };
     let schema = treedb::engine::types::Schema::new(
         vec![

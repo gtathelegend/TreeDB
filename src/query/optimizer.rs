@@ -350,6 +350,14 @@ pub struct PhysicalTableScan {
     pub estimated_rows: f64,
     /// Estimated cost of this table scan.
     pub cost: f64,
+    /// Bounded row goal requirement if active for this scan node.
+    pub row_goal: Option<crate::query::physical_properties::RowGoal>,
+    /// Estimated candidate entries/rows examined under row goal.
+    pub estimated_rows_examined: Option<f64>,
+    /// Estimated qualifying rows output under row goal.
+    pub estimated_qualifying_rows: Option<f64>,
+    /// Whether early termination is planned for this scan node.
+    pub early_termination_possible: bool,
 }
 
 impl PhysicalTableScan {
@@ -487,6 +495,14 @@ pub struct PhysicalPlan {
     pub logical_rewrites: Vec<String>,
     /// Inferred predicates and constraint diagnostics.
     pub inferred_predicates: Vec<InferredPredicate>,
+    /// Bounded row goal requirement if active for plan root.
+    pub row_goal: Option<crate::query::physical_properties::RowGoal>,
+    /// Estimated candidate entries/rows examined under row goal.
+    pub estimated_rows_examined: Option<f64>,
+    /// Estimated qualifying rows output under row goal.
+    pub estimated_qualifying_rows: Option<f64>,
+    /// Whether early termination is planned under row goal.
+    pub row_goal_early_termination: bool,
     /// Total estimated execution cost of this physical plan.
     pub total_cost: f64,
     /// Total estimated output row count of this physical plan.
@@ -510,6 +526,10 @@ impl PhysicalPlan {
                 residual_filter: None,
                 estimated_rows: 0.0,
                 cost: 0.0,
+                row_goal: None,
+                estimated_rows_examined: None,
+                estimated_qualifying_rows: None,
+                early_termination_possible: false,
             },
             joins: Vec::new(),
             post_join_filter: None,
@@ -528,6 +548,10 @@ impl PhysicalPlan {
             set_op: Some(set_op),
             logical_rewrites: Vec::new(),
             inferred_predicates: Vec::new(),
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            row_goal_early_termination: false,
             total_cost,
             estimated_rows,
         }
@@ -809,6 +833,22 @@ impl fmt::Display for PhysicalPlan {
                 "cost: {:.2}, estimated_rows: {:.0}",
                 self.base_table.cost, self.base_table.estimated_rows
             )?;
+            if let Some(rg) = &self.base_table.row_goal {
+                write_indent(f, indent + 1)?;
+                writeln!(f, "Row Goal: {}", rg.k())?;
+            }
+            if let Some(examined) = self.base_table.estimated_rows_examined {
+                write_indent(f, indent + 1)?;
+                writeln!(f, "Estimated Rows Examined: {:.0}", examined)?;
+            }
+            if let Some(qualifying) = self.base_table.estimated_qualifying_rows {
+                write_indent(f, indent + 1)?;
+                writeln!(f, "Estimated Qualifying Rows: {:.0}", qualifying)?;
+            }
+            if self.base_table.early_termination_possible {
+                write_indent(f, indent + 1)?;
+                writeln!(f, "Early Termination: possible")?;
+            }
             if let Some(rf) = &self.base_table.residual_filter {
                 format_subqueries_in_expr(rf, f, indent + 1)?;
             }
@@ -1754,6 +1794,10 @@ fn optimize_all_inner_joins(
             residual_filter: None,
             estimated_rows: 0.0,
             cost: 0.0,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            early_termination_possible: false,
         };
         return Ok(PhysicalPlan {
             ctes: bound.ctes.clone(),
@@ -1775,6 +1819,10 @@ fn optimize_all_inner_joins(
             set_op: None,
             logical_rewrites: Vec::new(),
             inferred_predicates: constraint_set.inferences,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            row_goal_early_termination: false,
             total_cost: 0.0,
             estimated_rows: 0.0,
         });
@@ -2001,6 +2049,10 @@ fn optimize_all_inner_joins(
         set_op: None,
         logical_rewrites: Vec::new(),
         inferred_predicates: constraint_set.inferences,
+        row_goal: None,
+        estimated_rows_examined: None,
+        estimated_qualifying_rows: None,
+        row_goal_early_termination: false,
         total_cost: cur_cost,
         estimated_rows: cur_rows,
     })
@@ -2038,6 +2090,10 @@ fn optimize_with_outer_barriers(
             residual_filter: None,
             estimated_rows: 0.0,
             cost: 0.0,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            early_termination_possible: false,
         };
         return Ok(PhysicalPlan {
             ctes: bound.ctes.clone(),
@@ -2059,6 +2115,10 @@ fn optimize_with_outer_barriers(
             set_op: None,
             logical_rewrites: Vec::new(),
             inferred_predicates: constraint_set.inferences,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            row_goal_early_termination: false,
             total_cost: 0.0,
             estimated_rows: 0.0,
         });
@@ -2502,6 +2562,10 @@ fn optimize_with_outer_barriers(
         set_op: None,
         logical_rewrites: Vec::new(),
         inferred_predicates: constraint_set.inferences,
+        row_goal: None,
+        estimated_rows_examined: None,
+        estimated_qualifying_rows: None,
+        row_goal_early_termination: false,
         total_cost: cur_cost,
         estimated_rows: cur_rows,
     })
@@ -3056,6 +3120,19 @@ impl Optimizer {
                 stats_gen,
             );
 
+            let safe_row_goal = bound.group_by.is_empty()
+                && bound.aggregates.is_empty()
+                && bound.window_exprs.is_empty();
+            let root_row_goal = if safe_row_goal {
+                crate::query::physical_properties::RowGoal::from_limit_offset(
+                    bound.limit,
+                    bound.offset,
+                )
+            } else {
+                None
+            };
+            let table_rows = CardinalityEstimator::estimate_table_rows(tables[0].stats.as_ref());
+
             let mut best_plan_info: Option<(
                 PhysicalTableScan,
                 Option<AggregateStrategy>,
@@ -3144,7 +3221,128 @@ impl Optimizer {
 
                 let mut sort_required = false;
                 let mut top_n = false;
-                if !bound.order_by.is_empty() {
+                let mut planned_scan = base_table_scan.clone();
+
+                if let Some(rg) = &root_row_goal {
+                    let k_req = rg.k() as f64;
+                    let is_already_sorted = if !bound.order_by.is_empty() {
+                        current_ordering.satisfies_order_by(
+                            &bound.order_by,
+                            Some(tables[0].qualifier()),
+                            Some(&bound.projections),
+                        )
+                    } else {
+                        true
+                    };
+
+                    if is_already_sorted {
+                        // Ordered scan early termination path
+                        let residual_sel = if let Some(rf) = &base_table_scan.residual_filter {
+                            CardinalityEstimator::estimate_expr_selectivity(
+                                rf,
+                                tables[0].stats.as_ref(),
+                                &tables[0].schema,
+                            )
+                        } else {
+                            1.0
+                        };
+
+                        let num_residuals = base_table_scan
+                            .residual_filter
+                            .as_ref()
+                            .map(|f| split_conjunction(f).len())
+                            .unwrap_or(0);
+                        let is_covering = matches!(
+                            base_table_scan.access_path,
+                            AccessPath::IndexOnlyScan { .. }
+                        );
+                        let is_pk = matches!(
+                            base_table_scan.access_path,
+                            AccessPath::PrimaryRangeScan { .. }
+                                | AccessPath::PrimaryPointLookup { .. }
+                                | AccessPath::FullTableScan
+                        );
+
+                        let candidate_pop = if residual_sel > 0.0 {
+                            (base_table_scan.estimated_rows / residual_sel)
+                                .min(table_rows)
+                                .max(1.0)
+                        } else {
+                            table_rows
+                        };
+
+                        let mut entries_examined = CostModel::expected_entries_for_row_goal(
+                            rg.k() as f64,
+                            residual_sel,
+                            candidate_pop,
+                        );
+
+                        let index_name = match &base_table_scan.access_path {
+                            AccessPath::SecondaryIndexScan { index_name, .. }
+                            | AccessPath::IndexOnlyScan { index_name, .. } => index_name.clone(),
+                            AccessPath::PrimaryRangeScan { .. } | AccessPath::FullTableScan => {
+                                "PRIMARY".to_string()
+                            }
+                            _ => String::new(),
+                        };
+                        if !index_name.is_empty() {
+                            let filter_str = base_table_scan
+                                .residual_filter
+                                .as_ref()
+                                .map(|f| f.to_string())
+                                .unwrap_or_default();
+                            let ord_fb_key = FeedbackKey::ordered_scan(
+                                &tables[0].name,
+                                &index_name,
+                                filter_str,
+                                rg.k(),
+                                param_sig.cloned(),
+                                stats_gen,
+                            )
+                            .with_resource_signature(resource_sig.cloned());
+                            if let Some(fb_reg) = feedback {
+                                if let Some(fb) = fb_reg.get_feedback(&ord_fb_key) {
+                                    entries_examined =
+                                        fb.effective_cardinality.clamp(1.0, candidate_pop);
+                                }
+                            }
+                        }
+
+                        let qualifying_rows = (entries_examined * residual_sel)
+                            .min(k_req)
+                            .min(base_table_scan.estimated_rows)
+                            .max(0.0);
+                        let scan_cost = CostModel::ordered_scan_row_goal_cost(
+                            entries_examined,
+                            is_covering,
+                            is_pk,
+                            num_residuals,
+                        );
+
+                        planned_scan.row_goal = Some(*rg);
+                        planned_scan.estimated_rows_examined = Some(entries_examined);
+                        planned_scan.estimated_qualifying_rows = Some(qualifying_rows);
+                        planned_scan.early_termination_possible = true;
+                        planned_scan.cost = scan_cost;
+                        planned_scan.estimated_rows = qualifying_rows;
+
+                        cur_cost = scan_cost;
+                        cur_rows = qualifying_rows;
+                        sort_required = false;
+                        top_n = false;
+                    } else {
+                        // Selective index / full scan candidate + Top-N
+                        sort_required = true;
+                        top_n = true;
+                        let top_n_cost = CostModel::top_n_cost(cur_rows, rg.k() as usize, 64.0);
+                        cur_cost += top_n_cost;
+                        cur_rows = cur_rows.min(k_req);
+                        current_ordering =
+                            crate::query::physical_properties::OrderingProperty::from_sort_keys(
+                                &bound.order_by,
+                            );
+                    }
+                } else if !bound.order_by.is_empty() {
                     let sort_budget = resource_sig
                         .map(|r| r.sort_budget)
                         .unwrap_or(DEFAULT_SORT_MEMORY_BUDGET_BYTES);
@@ -3170,16 +3368,6 @@ impl Optimizer {
                     if is_already_sorted {
                         sort_required = false;
                         top_n = false;
-                        if let Some(limit_val) = bound.limit {
-                            if bound.group_by.is_empty()
-                                && bound.aggregates.is_empty()
-                                && bound.window_exprs.is_empty()
-                            {
-                                let k = (bound.offset.unwrap_or(0) + limit_val) as f64;
-                                let scale = (k / cur_rows.max(1.0)).min(1.0);
-                                cur_cost *= scale;
-                            }
-                        }
                     } else {
                         sort_required = true;
                         let sort_cost = if let Some(fb_reg) = feedback {
@@ -3199,20 +3387,8 @@ impl Optimizer {
                                 SpillStatus::Unknown,
                             )
                         };
-                        if let Some(limit_val) = bound.limit {
-                            let k = bound.offset.unwrap_or(0) + limit_val;
-                            let top_n_cost = CostModel::top_n_cost(cur_rows, k, 64.0);
-                            if top_n_cost < sort_cost {
-                                top_n = true;
-                                cur_cost += top_n_cost;
-                            } else {
-                                top_n = false;
-                                cur_cost += sort_cost;
-                            }
-                        } else {
-                            top_n = false;
-                            cur_cost += sort_cost;
-                        }
+                        top_n = false;
+                        cur_cost += sort_cost;
                         current_ordering =
                             crate::query::physical_properties::OrderingProperty::from_sort_keys(
                                 &bound.order_by,
@@ -3231,7 +3407,7 @@ impl Optimizer {
                 match &best_plan_info {
                     None => {
                         best_plan_info = Some((
-                            base_table_scan,
+                            planned_scan,
                             agg_strategy,
                             cur_cost,
                             cur_rows,
@@ -3243,7 +3419,7 @@ impl Optimizer {
                     Some((_, _, best_cost, _, _, _, _)) => {
                         if cur_cost < *best_cost {
                             best_plan_info = Some((
-                                base_table_scan,
+                                planned_scan,
                                 agg_strategy,
                                 cur_cost,
                                 cur_rows,
@@ -3272,6 +3448,10 @@ impl Optimizer {
                     residual_filter: None,
                     estimated_rows: 0.0,
                     cost: 0.0,
+                    row_goal: None,
+                    estimated_rows_examined: None,
+                    estimated_qualifying_rows: None,
+                    early_termination_possible: false,
                 };
                 (
                     default_scan,
@@ -3286,7 +3466,7 @@ impl Optimizer {
 
             return Ok(PhysicalPlan {
                 ctes: bound.ctes.clone(),
-                base_table: base_table_scan,
+                base_table: base_table_scan.clone(),
                 joins: Vec::new(),
                 post_join_filter: None,
                 group_by: bound.group_by.clone(),
@@ -3304,6 +3484,10 @@ impl Optimizer {
                 set_op: None,
                 logical_rewrites: Vec::new(),
                 inferred_predicates: constraint_set.inferences,
+                row_goal: base_table_scan.row_goal.or(root_row_goal),
+                estimated_rows_examined: base_table_scan.estimated_rows_examined,
+                estimated_qualifying_rows: base_table_scan.estimated_qualifying_rows,
+                row_goal_early_termination: base_table_scan.early_termination_possible,
                 total_cost: cur_cost,
                 estimated_rows: cur_rows,
             });
@@ -3407,6 +3591,10 @@ fn plan_table_scan_candidates(
             residual_filter: None,
             estimated_rows: 0.0,
             cost: 0.0,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            early_termination_possible: false,
         }];
     }
 
@@ -3442,6 +3630,10 @@ fn plan_table_scan_candidates(
             residual_filter,
             estimated_rows,
             cost,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            early_termination_possible: false,
         }];
     }
 
@@ -3454,6 +3646,7 @@ fn plan_table_scan_candidates(
     let pk_name = &pk_col.name;
     let pk_type = pk_col.data_type;
 
+    let table_rows = CardinalityEstimator::estimate_table_rows(table.stats.as_ref());
     let mut candidates: Vec<AccessPathCandidate> = Vec::new();
 
     // Candidate 1: Full Table Scan
@@ -3680,26 +3873,46 @@ fn plan_table_scan_candidates(
                 }
             }
 
-            // 4c. Full index scan if index covers all required query columns
-            if !matched_predicate && is_covering {
-                let cost = CostModel::index_only_range_scan_cost(full_rows);
-                candidates.push(AccessPathCandidate {
-                    access_path: AccessPath::IndexOnlyScan {
-                        index_name: sec_meta.name.clone(),
-                        index_id: sec_meta.index_id,
-                        scan_type: SecondaryScanType::RangeScan {
-                            start: None,
-                            end: None,
+            // 4c. Full index scan
+            if !matched_predicate {
+                if is_covering {
+                    let cost = CostModel::index_only_range_scan_cost(table_rows);
+                    candidates.push(AccessPathCandidate {
+                        access_path: AccessPath::IndexOnlyScan {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::RangeScan {
+                                start: None,
+                                end: None,
+                            },
+                            covered_columns: covered_column_names.clone(),
                         },
-                        covered_columns: covered_column_names.clone(),
-                    },
-                    residual_filter: full_residual.clone(),
-                    estimated_rows: full_rows,
-                    cost,
-                    priority: 1,
-                    index_id: Some(sec_meta.index_id),
-                    index_name: Some(sec_meta.name.clone()),
-                });
+                        residual_filter: full_residual.clone(),
+                        estimated_rows: full_rows,
+                        cost,
+                        priority: 3,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
+                } else {
+                    let cost = CostModel::secondary_range_scan_cost(table_rows);
+                    candidates.push(AccessPathCandidate {
+                        access_path: AccessPath::SecondaryIndexScan {
+                            index_name: sec_meta.name.clone(),
+                            index_id: sec_meta.index_id,
+                            scan_type: SecondaryScanType::RangeScan {
+                                start: None,
+                                end: None,
+                            },
+                        },
+                        residual_filter: full_residual.clone(),
+                        estimated_rows: full_rows,
+                        cost,
+                        priority: 4,
+                        index_id: Some(sec_meta.index_id),
+                        index_name: Some(sec_meta.name.clone()),
+                    });
+                }
             }
         } else {
             // Composite secondary index
@@ -3978,33 +4191,52 @@ fn plan_table_scan_candidates(
                     }
                 }
 
-                if is_covering {
-                    // Full composite index scan if covering all columns
-                    let cost = CostModel::index_only_range_scan_cost(full_rows);
-                    candidates.push(AccessPathCandidate {
-                        access_path: AccessPath::IndexOnlyScan {
-                            index_name: sec_meta.name.clone(),
-                            index_id: sec_meta.index_id,
-                            scan_type: SecondaryScanType::RangeScan {
-                                start: None,
-                                end: None,
+                if m == 0 {
+                    if is_covering {
+                        // Full composite index scan if covering all columns
+                        let cost = CostModel::index_only_range_scan_cost(table_rows);
+                        candidates.push(AccessPathCandidate {
+                            access_path: AccessPath::IndexOnlyScan {
+                                index_name: sec_meta.name.clone(),
+                                index_id: sec_meta.index_id,
+                                scan_type: SecondaryScanType::RangeScan {
+                                    start: None,
+                                    end: None,
+                                },
+                                covered_columns: covered_column_names.clone(),
                             },
-                            covered_columns: covered_column_names.clone(),
-                        },
-                        residual_filter: full_residual.clone(),
-                        estimated_rows: full_rows,
-                        cost,
-                        priority: 1,
-                        index_id: Some(sec_meta.index_id),
-                        index_name: Some(sec_meta.name.clone()),
-                    });
+                            residual_filter: full_residual.clone(),
+                            estimated_rows: full_rows,
+                            cost,
+                            priority: 3,
+                            index_id: Some(sec_meta.index_id),
+                            index_name: Some(sec_meta.name.clone()),
+                        });
+                    } else {
+                        let cost = CostModel::secondary_range_scan_cost(table_rows);
+                        candidates.push(AccessPathCandidate {
+                            access_path: AccessPath::SecondaryIndexScan {
+                                index_name: sec_meta.name.clone(),
+                                index_id: sec_meta.index_id,
+                                scan_type: SecondaryScanType::RangeScan {
+                                    start: None,
+                                    end: None,
+                                },
+                            },
+                            residual_filter: full_residual.clone(),
+                            estimated_rows: full_rows,
+                            cost,
+                            priority: 4,
+                            index_id: Some(sec_meta.index_id),
+                            index_name: Some(sec_meta.name.clone()),
+                        });
+                    }
                 }
             }
         }
     }
 
     // Candidate 5: Multi-Index Scans (Intersection for AND, Union for OR)
-    let table_rows = CardinalityEstimator::estimate_table_rows(table.stats.as_ref());
 
     // 5a. Extract single-index candidate atoms from unqual_conjuncts
     #[derive(Debug, Clone)]
@@ -4634,6 +4866,10 @@ fn plan_table_scan_candidates(
             residual_filter: cand.residual_filter,
             estimated_rows: cand.estimated_rows,
             cost: cand.cost,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            early_termination_possible: false,
         })
         .collect()
 }

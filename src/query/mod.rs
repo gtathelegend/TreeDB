@@ -23,7 +23,7 @@ pub mod top_n;
 pub use optimizer::AggregateStrategy;
 pub use physical_properties::{
     ordering_property_for_table_scan, OrderingColumn, OrderingProperty, PhysicalProperties,
-    RequiredOrdering,
+    RequiredOrdering, RequiredPhysicalProperties, RowGoal,
 };
 pub use streaming_aggregate::{StreamingAggregateMetrics, StreamingAggregateOperator};
 pub use top_n::{TopNExecutionMetrics, TopNOperator};

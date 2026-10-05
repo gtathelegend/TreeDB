@@ -3669,6 +3669,19 @@ impl<'db> Transaction<'db> {
                 scan_metric.counters.index_lookups = index_lookups;
                 scan_metric.counters.rows_evaluated = initial_rows.len();
                 scan_metric.counters.early_terminated = early_terminated;
+                if plan.base_table.row_goal.is_some() {
+                    scan_metric.counters.row_goal =
+                        plan.base_table.row_goal.as_ref().map(|g| g.k() as usize);
+                    scan_metric.counters.rows_examined =
+                        early_index_entries.max(initial_rows.len());
+                    scan_metric.counters.rows_qualified = initial_rows.len();
+                    scan_metric.counters.row_goal_satisfied = early_terminated
+                        || scan_metric
+                            .counters
+                            .row_goal
+                            .map(|g| initial_rows.len() >= g)
+                            .unwrap_or(false);
+                }
                 if let Some(stats) = &skip_scan_stats {
                     scan_metric.counters.distinct_prefix_values = stats.distinct_prefix_values;
                     scan_metric.counters.skip_scan_probes = stats.skip_scan_probes;
@@ -5508,6 +5521,40 @@ impl<'db> Transaction<'db> {
             }
         }
 
+        if let Some(rg) = &plan.base_table.row_goal {
+            let index_name = match &plan.base_table.access_path {
+                crate::query::optimizer::AccessPath::SecondaryIndexScan { index_name, .. }
+                | crate::query::optimizer::AccessPath::IndexOnlyScan { index_name, .. } => {
+                    index_name.clone()
+                }
+                crate::query::optimizer::AccessPath::PrimaryRangeScan { .. }
+                | crate::query::optimizer::AccessPath::FullTableScan => "PRIMARY".to_string(),
+                _ => String::new(),
+            };
+            if !index_name.is_empty() {
+                let filter_str = plan
+                    .base_table
+                    .residual_filter
+                    .as_ref()
+                    .map(|f| f.to_string())
+                    .unwrap_or_default();
+                let ord_key = crate::query::FeedbackKey::ordered_scan(
+                    &plan.base_table.table_name,
+                    &index_name,
+                    filter_str,
+                    rg.k(),
+                    param_sig.clone(),
+                    stats_gen,
+                )
+                .with_resource_signature(Some(res_sig.clone()));
+                if let Some(entry) = self.db.feedback_registry.get(&ord_key) {
+                    if entry.should_replan() {
+                        return true;
+                    }
+                }
+            }
+        }
+
         // 2. Check joins
         let mut left_tbl = plan.base_table.table_name.clone();
         for join in &plan.joins {
@@ -5662,6 +5709,55 @@ impl<'db> Transaction<'db> {
             };
             obs.resource = Some(scan_res_obs);
             self.db.feedback_registry.record(key, obs);
+
+            if let Some(rg) = &plan.base_table.row_goal {
+                let index_name = match &plan.base_table.access_path {
+                    crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                        index_name, ..
+                    }
+                    | crate::query::optimizer::AccessPath::IndexOnlyScan { index_name, .. } => {
+                        index_name.clone()
+                    }
+                    crate::query::optimizer::AccessPath::PrimaryRangeScan { .. }
+                    | crate::query::optimizer::AccessPath::FullTableScan => "PRIMARY".to_string(),
+                    _ => String::new(),
+                };
+                if !index_name.is_empty() {
+                    let filter_str = plan
+                        .base_table
+                        .residual_filter
+                        .as_ref()
+                        .map(|f| f.to_string())
+                        .unwrap_or_default();
+                    let ord_key = crate::query::FeedbackKey::ordered_scan(
+                        &plan.base_table.table_name,
+                        &index_name,
+                        filter_str,
+                        rg.k(),
+                        param_sig.clone(),
+                        stats_gen,
+                    )
+                    .with_resource_signature(Some(res_sig.clone()));
+                    let examined = scan_metric
+                        .counters
+                        .rows_examined
+                        .max(scan_metric.counters.index_entries_examined)
+                        as f64;
+                    let qualified = scan_metric
+                        .counters
+                        .rows_qualified
+                        .max(scan_metric.actual_rows) as f64;
+                    let mut ord_obs = crate::query::FeedbackObservation::new(
+                        plan.base_table
+                            .estimated_rows_examined
+                            .unwrap_or(plan.base_table.estimated_rows),
+                        examined,
+                    );
+                    ord_obs.input_rows = Some(examined as usize);
+                    ord_obs.output_rows = Some(qualified as usize);
+                    self.db.feedback_registry.record(ord_key, ord_obs);
+                }
+            }
         }
 
         // 2. Joins
