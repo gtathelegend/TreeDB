@@ -613,8 +613,29 @@ impl fmt::Display for PhysicalPlan {
             for cte in &self.ctes {
                 write_indent(f, indent)?;
                 match &cte.kind {
-                    crate::sql::binder::BoundCteKind::NonRecursive { plan } => {
+                    crate::sql::binder::BoundCteKind::NonRecursive {
+                        plan,
+                        decision,
+                        materialize_id: _,
+                        consumer_count,
+                        estimated_inline_cost,
+                        estimated_materialize_cost,
+                        fingerprint: _,
+                    } => {
                         writeln!(f, "CTE {}", cte.name)?;
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Consumers: {consumer_count}")?;
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Estimated Rows: {}", plan.estimated_rows)?;
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Decision: {decision}")?;
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Estimated Inline Cost: {estimated_inline_cost:.2}")?;
+                        write_indent(f, indent + 1)?;
+                        writeln!(
+                            f,
+                            "Estimated Materialize Cost: {estimated_materialize_cost:.2}"
+                        )?;
                         if !cte.dependencies.is_empty() {
                             write_indent(f, indent + 1)?;
                             writeln!(f, "depends on: [{}]", cte.dependencies.join(", "))?;

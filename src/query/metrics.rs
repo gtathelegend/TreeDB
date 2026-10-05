@@ -53,6 +53,14 @@ pub enum OperatorKind {
     MergeJoin { join_type: String },
     /// Bounded priority queue Top-N sort.
     TopN,
+    /// Materialize intermediate subplan result.
+    Materialize {
+        id: usize,
+        name: Option<String>,
+        external: bool,
+    },
+    /// Read scan over a materialized intermediate result.
+    MaterializedScan { id: usize, name: Option<String> },
 }
 
 impl fmt::Display for OperatorKind {
@@ -90,6 +98,24 @@ impl fmt::Display for OperatorKind {
                 write!(f, "Recursive CTE {name} (iterations: {iterations})")
             }
             Self::SetOperation { op } => write!(f, "SetOperation ({op})"),
+            Self::Materialize { id, name, external } => {
+                if let Some(n) = name {
+                    write!(
+                        f,
+                        "Materialize #{} (name: {}, external: {})",
+                        id, n, external
+                    )
+                } else {
+                    write!(f, "Materialize #{} (external: {})", id, external)
+                }
+            }
+            Self::MaterializedScan { id, name } => {
+                if let Some(n) = name {
+                    write!(f, "MaterializedScan #{} (name: {})", id, n)
+                } else {
+                    write!(f, "MaterializedScan #{}", id)
+                }
+            }
         }
     }
 }
@@ -267,6 +293,22 @@ pub struct OperatorCounters {
     pub probe_rows_after_row_goal: usize,
     /// Merge join specific: duplicate runs processed during join
     pub duplicate_runs_processed: usize,
+    /// Materialization specific: ID of the materialized intermediate result
+    pub materialize_id: Option<usize>,
+    /// Materialization specific: Total rows materialized
+    pub rows_materialized: usize,
+    /// Materialization specific: Total bytes materialized
+    pub bytes_materialized: usize,
+    /// Materialization specific: Total consumers configured for reuse
+    pub materialize_consumers: usize,
+    /// Materialization specific: Total read operations performed across all consumers
+    pub materialize_reads: usize,
+    /// Materialization specific: Reused read count (consumer reads after producer execution)
+    pub materialize_reuse_reads: usize,
+    /// Materialization specific: Temporary spill file bytes
+    pub materialize_spill_bytes: usize,
+    /// Materialization specific: Temporary spill file count
+    pub materialize_spill_files: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -447,8 +489,28 @@ pub fn format_plan_with_metrics(
         for cte in &plan.ctes {
             write_indent(&mut out, indent);
             match &cte.kind {
-                crate::sql::binder::BoundCteKind::NonRecursive { plan: cte_plan } => {
+                crate::sql::binder::BoundCteKind::NonRecursive {
+                    plan: cte_plan,
+                    decision,
+                    materialize_id: _,
+                    consumer_count,
+                    estimated_inline_cost,
+                    estimated_materialize_cost,
+                    fingerprint: _,
+                } => {
                     out.push_str(&format!("CTE {}\n", cte.name));
+                    write_indent(&mut out, indent + 1);
+                    out.push_str(&format!("Consumers: {consumer_count}\n"));
+                    write_indent(&mut out, indent + 1);
+                    out.push_str(&format!("Decision: {decision}\n"));
+                    write_indent(&mut out, indent + 1);
+                    out.push_str(&format!(
+                        "Estimated Inline Cost: {estimated_inline_cost:.2}\n"
+                    ));
+                    write_indent(&mut out, indent + 1);
+                    out.push_str(&format!(
+                        "Estimated Materialize Cost: {estimated_materialize_cost:.2}\n"
+                    ));
                     if !cte.dependencies.is_empty() {
                         write_indent(&mut out, indent + 1);
                         out.push_str(&format!("depends on: [{}]\n", cte.dependencies.join(", ")));

@@ -507,7 +507,7 @@ fn collect_references_from_plan(
 
     for cte in &plan.ctes {
         match &cte.kind {
-            crate::sql::BoundCteKind::NonRecursive { plan } => {
+            crate::sql::BoundCteKind::NonRecursive { plan, .. } => {
                 collect_references_from_plan(plan, tables, indexes);
             }
             crate::sql::BoundCteKind::Recursive {

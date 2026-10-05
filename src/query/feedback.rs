@@ -249,6 +249,12 @@ pub enum FeedbackContext {
         on_clause: String,
         row_goal: u64,
     },
+    /// Reusable subplan or CTE materialization.
+    Materialization {
+        subplan_fingerprint: String,
+        decision: String,
+        consumer_count: usize,
+    },
 }
 
 impl fmt::Display for FeedbackContext {
@@ -352,6 +358,14 @@ impl fmt::Display for FeedbackContext {
             } => write!(
                 f,
                 "OrderedScan(table={table_name}, index={index_name}, filter={filter}, row_goal={row_goal})"
+            ),
+            Self::Materialization {
+                subplan_fingerprint,
+                decision,
+                consumer_count,
+            } => write!(
+                f,
+                "Materialization(fingerprint={subplan_fingerprint}, decision={decision}, consumers={consumer_count})"
             ),
         }
     }
@@ -595,6 +609,26 @@ impl FeedbackKey {
         }
     }
 
+    /// Constructs a feedback key for a common subplan or CTE materialization.
+    pub fn materialization(
+        subplan_fingerprint: impl Into<String>,
+        decision: impl Into<String>,
+        consumer_count: usize,
+        param_signature: Option<ParamPlanningSignature>,
+        statistics_generation: u64,
+    ) -> Self {
+        Self {
+            context: FeedbackContext::Materialization {
+                subplan_fingerprint: subplan_fingerprint.into(),
+                decision: decision.into(),
+                consumer_count,
+            },
+            param_signature,
+            statistics_generation,
+            resource_signature: None,
+        }
+    }
+
     /// Returns the primary table name associated with this feedback key if available.
     pub fn table_name(&self) -> Option<&str> {
         match &self.context {
@@ -608,6 +642,10 @@ impl FeedbackKey {
             | FeedbackContext::SemiAnti { left_table, .. }
             | FeedbackContext::RuntimeFilter { left_table, .. } => Some(left_table.as_str()),
             FeedbackContext::ExternalOp { relation_name, .. } => Some(relation_name.as_str()),
+            FeedbackContext::Materialization {
+                subplan_fingerprint,
+                ..
+            } => Some(subplan_fingerprint.as_str()),
             FeedbackContext::Sort { .. }
             | FeedbackContext::TopN { .. }
             | FeedbackContext::Aggregate { .. } => None,

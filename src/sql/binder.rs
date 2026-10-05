@@ -478,10 +478,22 @@ pub struct BoundJoin {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum BoundCteKind {
-    /// Standard non-recursive CTE evaluated once.
+    /// Standard non-recursive CTE evaluated once or inlined based on cost.
     NonRecursive {
         /// Fully optimized physical execution plan.
         plan: crate::query::optimizer::PhysicalPlan,
+        /// Cost-based decision on whether to inline or materialize.
+        decision: crate::query::materialize::MaterializationDecision,
+        /// Optional materialized ID when materialized.
+        materialize_id: Option<usize>,
+        /// Number of consumer references throughout the query.
+        consumer_count: usize,
+        /// Estimated cost to evaluate inline across all consumers.
+        estimated_inline_cost: f64,
+        /// Estimated cost to materialize once and read across all consumers.
+        estimated_materialize_cost: f64,
+        /// Deterministic subplan fingerprint.
+        fingerprint: Option<String>,
     },
     /// Recursive CTE evaluated iteratively until fixpoint or configured limits.
     Recursive {

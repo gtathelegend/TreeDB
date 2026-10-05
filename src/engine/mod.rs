@@ -4,6 +4,7 @@ pub mod transaction;
 pub mod types;
 
 pub use crate::query::external_multi_index::{MultiIndexConfig, MultiIndexExecutionMode};
+pub use crate::query::materialize::{MaterializeConfig, MaterializeOverride};
 pub use catalog::{
     Catalog, CatalogPage, IndexId, IndexMetadata, TableId, TableMetadata, CATALOG_MAGIC,
     CURRENT_CATALOG_VERSION, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
@@ -48,6 +49,7 @@ pub struct TreeDb {
     pub(crate) aggregate_config: AggregateConfig,
     pub(crate) join_config: JoinConfig,
     pub(crate) multi_index_config: MultiIndexConfig,
+    pub(crate) materialize_config: MaterializeConfig,
 }
 
 impl TreeDb {
@@ -86,6 +88,7 @@ impl TreeDb {
             aggregate_config: AggregateConfig::default(),
             join_config: JoinConfig::default(),
             multi_index_config: MultiIndexConfig::default(),
+            materialize_config: crate::query::materialize::MaterializeConfig::default(),
         })
     }
 
@@ -116,6 +119,7 @@ impl TreeDb {
             aggregate_config: AggregateConfig::default(),
             join_config: JoinConfig::default(),
             multi_index_config: MultiIndexConfig::default(),
+            materialize_config: crate::query::materialize::MaterializeConfig::default(),
         })
     }
 
@@ -140,6 +144,7 @@ impl TreeDb {
             aggregate_config: AggregateConfig::default(),
             join_config: JoinConfig::default(),
             multi_index_config: MultiIndexConfig::default(),
+            materialize_config: crate::query::materialize::MaterializeConfig::default(),
         }
     }
 
@@ -827,6 +832,29 @@ impl TreeDb {
     /// Sets the active external multi-index candidate configuration.
     pub fn set_multi_index_config(&mut self, config: MultiIndexConfig) {
         self.multi_index_config = config;
+    }
+
+    /// Returns a reference to the active materialization configuration.
+    pub fn materialize_config(&self) -> &crate::query::materialize::MaterializeConfig {
+        &self.materialize_config
+    }
+
+    /// Returns a mutable reference to the active materialization configuration.
+    pub fn materialize_config_mut(&mut self) -> &mut crate::query::materialize::MaterializeConfig {
+        &mut self.materialize_config
+    }
+
+    /// Sets the active materialization configuration.
+    pub fn set_materialize_config(&mut self, config: crate::query::materialize::MaterializeConfig) {
+        self.materialize_config = config;
+    }
+
+    /// Sets a test-only materialization override.
+    pub fn set_materialize_override(
+        &mut self,
+        test_override: crate::query::materialize::MaterializeOverride,
+    ) {
+        self.materialize_config.test_override = test_override;
     }
 
     /// Returns the deterministic resource planning signature for current memory configurations.

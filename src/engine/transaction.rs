@@ -294,6 +294,129 @@ fn validate_ast_cte_acyclicity(ctes: &[crate::sql::Cte]) -> Result<()> {
     Ok(())
 }
 
+fn make_non_recursive_bound_cte(
+    plan: crate::query::optimizer::PhysicalPlan,
+    schema: &crate::engine::types::Schema,
+    config: &crate::query::materialize::MaterializeConfig,
+    consumer_count: usize,
+    mat_id_counter: &mut usize,
+) -> crate::sql::BoundCteKind {
+    let est_rows = plan.estimated_rows;
+    let mut est_row_width = 16.0;
+    for c in &schema.columns {
+        est_row_width += match c.data_type {
+            crate::engine::types::DataType::Null => 1.0,
+            crate::engine::types::DataType::Boolean => 1.0,
+            crate::engine::types::DataType::Int64 => 8.0,
+            crate::engine::types::DataType::UInt64 => 8.0,
+            crate::engine::types::DataType::Float64 => 8.0,
+            crate::engine::types::DataType::String => 32.0,
+            crate::engine::types::DataType::Bytes => 32.0,
+        };
+    }
+    let est_bytes = (est_rows * est_row_width) as usize;
+    let is_external = est_bytes > config.memory_budget_bytes;
+    let (inline_cost, mat_cost, should_mat) =
+        crate::query::cost::CostModel::evaluate_materialization_cost(
+            plan.total_cost,
+            est_rows,
+            consumer_count,
+            is_external,
+        );
+    let decision = match config.test_override {
+        crate::query::materialize::MaterializeOverride::ForceInline => {
+            crate::query::materialize::MaterializationDecision::Inline
+        }
+        crate::query::materialize::MaterializeOverride::ForceMaterialize => {
+            crate::query::materialize::MaterializationDecision::Materialize
+        }
+        crate::query::materialize::MaterializeOverride::ForceExternalMaterialize => {
+            crate::query::materialize::MaterializationDecision::ExternalMaterialize
+        }
+        crate::query::materialize::MaterializeOverride::Auto => {
+            if consumer_count <= 1 {
+                crate::query::materialize::MaterializationDecision::Inline
+            } else if should_mat {
+                if is_external {
+                    crate::query::materialize::MaterializationDecision::ExternalMaterialize
+                } else {
+                    crate::query::materialize::MaterializationDecision::Materialize
+                }
+            } else {
+                crate::query::materialize::MaterializationDecision::Inline
+            }
+        }
+    };
+
+    let materialize_id = match decision {
+        crate::query::materialize::MaterializationDecision::Inline => None,
+        crate::query::materialize::MaterializationDecision::Materialize
+        | crate::query::materialize::MaterializationDecision::ExternalMaterialize => {
+            *mat_id_counter += 1;
+            Some(*mat_id_counter)
+        }
+    };
+
+    let fingerprint =
+        Some(crate::query::materialize::SubplanFingerprint::from_plan(&plan).to_hex());
+
+    crate::sql::BoundCteKind::NonRecursive {
+        plan,
+        decision,
+        materialize_id,
+        consumer_count,
+        estimated_inline_cost: inline_cost,
+        estimated_materialize_cost: mat_cost,
+        fingerprint,
+    }
+}
+
+fn count_table_references_in_plan(
+    plan: &crate::query::optimizer::PhysicalPlan,
+    name: &str,
+) -> usize {
+    let mut count = 0;
+    if plan.base_table.table_name == name {
+        count += 1;
+    }
+    for join in &plan.joins {
+        if join.right.table_name == name {
+            count += 1;
+        }
+    }
+    if let Some(set_op) = &plan.set_op {
+        count += count_table_references_in_plan(&set_op.left, name);
+        count += count_table_references_in_plan(&set_op.right, name);
+    }
+    count
+}
+
+fn count_cte_consumers(
+    ctes: &[crate::sql::BoundCte],
+    main_plan: &crate::query::optimizer::PhysicalPlan,
+    name: &str,
+) -> usize {
+    let mut count = count_table_references_in_plan(main_plan, name);
+    for cte in ctes {
+        match &cte.kind {
+            crate::sql::BoundCteKind::NonRecursive {
+                plan: inner_plan, ..
+            } => {
+                count += count_table_references_in_plan(inner_plan, name);
+            }
+            crate::sql::BoundCteKind::Recursive {
+                anchor_plan,
+                recursive_plan,
+                ..
+            } => {
+                count += count_table_references_in_plan(anchor_plan, name);
+                count += count_table_references_in_plan(recursive_plan, name);
+            }
+        }
+    }
+    count
+}
+
 struct TxnBufferPoolCatalog<'a, 'b> {
     bp: &'a std::cell::RefCell<&'b mut crate::storage::buffer_pool::BufferPool>,
     ctes: Option<&'a [crate::sql::BoundCte]>,
@@ -819,6 +942,7 @@ impl<'db> Transaction<'db> {
     ) -> Result<()> {
         validate_ast_cte_acyclicity(ctes)?;
         let mut declared_names = std::collections::HashSet::new();
+        let mut mat_id_counter = 0;
         for cte in ctes {
             if !declared_names.insert(&cte.name) {
                 return Err(Error::DuplicateCteName(cte.name.clone()));
@@ -871,14 +995,20 @@ impl<'db> Transaction<'db> {
                     let mut dependencies = Vec::new();
                     collect_cte_dependencies(&cte_plan, visible_ctes, &mut dependencies);
 
+                    let cte_kind = make_non_recursive_bound_cte(
+                        cte_plan,
+                        &final_schema,
+                        &self.db.materialize_config,
+                        1,
+                        &mut mat_id_counter,
+                    );
+
                     // Check for cyclic dependencies in visible_ctes + this CTE
                     let mut temp_ctes = visible_ctes.clone();
                     temp_ctes.push(crate::sql::BoundCte {
                         name: cte.name.clone(),
                         output_schema: final_schema.clone(),
-                        kind: crate::sql::BoundCteKind::NonRecursive {
-                            plan: cte_plan.clone(),
-                        },
+                        kind: cte_kind.clone(),
                         dependencies: dependencies.clone(),
                     });
                     validate_cte_acyclicity(&temp_ctes)?;
@@ -886,7 +1016,7 @@ impl<'db> Transaction<'db> {
                     visible_ctes.push(crate::sql::BoundCte {
                         name: cte.name.clone(),
                         output_schema: final_schema,
-                        kind: crate::sql::BoundCteKind::NonRecursive { plan: cte_plan },
+                        kind: cte_kind,
                         dependencies,
                     });
                 }
@@ -931,13 +1061,19 @@ impl<'db> Transaction<'db> {
                     let mut dependencies = Vec::new();
                     collect_cte_dependencies(&cte_plan, visible_ctes, &mut dependencies);
 
+                    let cte_kind = make_non_recursive_bound_cte(
+                        cte_plan,
+                        &final_schema,
+                        &self.db.materialize_config,
+                        1,
+                        &mut mat_id_counter,
+                    );
+
                     let mut temp_ctes = visible_ctes.clone();
                     temp_ctes.push(crate::sql::BoundCte {
                         name: cte.name.clone(),
                         output_schema: final_schema.clone(),
-                        kind: crate::sql::BoundCteKind::NonRecursive {
-                            plan: cte_plan.clone(),
-                        },
+                        kind: cte_kind.clone(),
                         dependencies: dependencies.clone(),
                     });
                     validate_cte_acyclicity(&temp_ctes)?;
@@ -945,7 +1081,7 @@ impl<'db> Transaction<'db> {
                     visible_ctes.push(crate::sql::BoundCte {
                         name: cte.name.clone(),
                         output_schema: final_schema,
-                        kind: crate::sql::BoundCteKind::NonRecursive { plan: cte_plan },
+                        kind: cte_kind,
                         dependencies,
                     });
                 }
@@ -991,14 +1127,20 @@ impl<'db> Transaction<'db> {
                         projected_schema
                     };
 
+                    let anchor_kind = make_non_recursive_bound_cte(
+                        anchor_plan.clone(),
+                        &final_schema,
+                        &self.db.materialize_config,
+                        1,
+                        &mut mat_id_counter,
+                    );
+
                     // 4. Create scope where cte.name is available with final_schema
                     let mut rec_visible_ctes = visible_ctes.clone();
                     rec_visible_ctes.push(crate::sql::BoundCte {
                         name: cte.name.clone(),
                         output_schema: final_schema.clone(),
-                        kind: crate::sql::BoundCteKind::NonRecursive {
-                            plan: anchor_plan.clone(),
-                        },
+                        kind: anchor_kind,
                         dependencies: Vec::new(),
                     });
 
@@ -1119,6 +1261,7 @@ impl<'db> Transaction<'db> {
         let rewrite_logs = rewrite_res.rewrites;
 
         // If the FROM or JOIN relations contain non-flattened derived tables, plan them as statement-local CTEs
+        let mut mat_id_counter = 0;
         if let crate::sql::ast::TableRef::Derived { query, alias } = &rewritten_ast.from {
             let inner_plan = match query {
                 crate::sql::ast::DerivedQuery::Select(select_stmt) => {
@@ -1129,10 +1272,17 @@ impl<'db> Transaction<'db> {
                 }
             };
             let output_schema = self.derive_cte_output_schema(&inner_plan, &visible_ctes)?;
+            let kind = make_non_recursive_bound_cte(
+                inner_plan,
+                &output_schema,
+                &self.db.materialize_config,
+                1,
+                &mut mat_id_counter,
+            );
             visible_ctes.push(crate::sql::binder::BoundCte {
                 name: alias.clone(),
                 output_schema,
-                kind: crate::sql::binder::BoundCteKind::NonRecursive { plan: inner_plan },
+                kind,
                 dependencies: Vec::new(),
             });
         }
@@ -1154,10 +1304,17 @@ impl<'db> Transaction<'db> {
                         )?,
                 };
                 let output_schema = self.derive_cte_output_schema(&inner_plan, &visible_ctes)?;
+                let kind = make_non_recursive_bound_cte(
+                    inner_plan,
+                    &output_schema,
+                    &self.db.materialize_config,
+                    1,
+                    &mut mat_id_counter,
+                );
                 visible_ctes.push(crate::sql::binder::BoundCte {
                     name: alias.clone(),
                     output_schema,
-                    kind: crate::sql::binder::BoundCteKind::NonRecursive { plan: inner_plan },
+                    kind,
                     dependencies: Vec::new(),
                 });
             }
@@ -1240,6 +1397,29 @@ impl<'db> Transaction<'db> {
             self.db.statistics_generation,
         )?;
         plan.logical_rewrites = rewrite_logs;
+
+        // Refine CTE decisions with exact consumer counts
+        let mut refined_ctes = Vec::with_capacity(plan.ctes.len());
+        let mut mat_counter = 0;
+        for cte in &plan.ctes {
+            let mut refined_cte = cte.clone();
+            if let crate::sql::BoundCteKind::NonRecursive {
+                plan: inner_plan, ..
+            } = &cte.kind
+            {
+                let consumer_count = count_cte_consumers(&plan.ctes, &plan, &cte.name);
+                refined_cte.kind = make_non_recursive_bound_cte(
+                    inner_plan.clone(),
+                    &cte.output_schema,
+                    &self.db.materialize_config,
+                    consumer_count,
+                    &mut mat_counter,
+                );
+            }
+            refined_ctes.push(refined_cte);
+        }
+        plan.ctes = refined_ctes;
+
         Ok(plan)
     }
 
@@ -1332,6 +1512,28 @@ impl<'db> Transaction<'db> {
             plan.offset = Some(offset as usize);
         }
         plan.ctes = visible_ctes;
+
+        // Refine CTE decisions with exact consumer counts
+        let mut refined_ctes = Vec::with_capacity(plan.ctes.len());
+        let mut mat_counter = 0;
+        for cte in &plan.ctes {
+            let mut refined_cte = cte.clone();
+            if let crate::sql::BoundCteKind::NonRecursive {
+                plan: inner_plan, ..
+            } = &cte.kind
+            {
+                let consumer_count = count_cte_consumers(&plan.ctes, &plan, &cte.name);
+                refined_cte.kind = make_non_recursive_bound_cte(
+                    inner_plan.clone(),
+                    &cte.output_schema,
+                    &self.db.materialize_config,
+                    consumer_count,
+                    &mut mat_counter,
+                );
+            }
+            refined_ctes.push(refined_cte);
+        }
+        plan.ctes = refined_ctes;
 
         Ok(plan)
     }
@@ -3088,6 +3290,24 @@ impl<'db> Transaction<'db> {
         self.db.set_multi_index_config(config);
     }
 
+    /// Returns a reference to the active materialization configuration.
+    pub fn materialize_config(&self) -> &crate::query::materialize::MaterializeConfig {
+        self.db.materialize_config()
+    }
+
+    /// Sets the active materialization configuration.
+    pub fn set_materialize_config(&mut self, config: crate::query::materialize::MaterializeConfig) {
+        self.db.set_materialize_config(config);
+    }
+
+    /// Sets a test-only materialization override.
+    pub fn set_materialize_override(
+        &mut self,
+        test_override: crate::query::materialize::MaterializeOverride,
+    ) {
+        self.db.set_materialize_override(test_override);
+    }
+
     /// Executes a fully optimized `PhysicalPlan` against this transaction.
     pub fn execute_physical_plan(
         &mut self,
@@ -3143,25 +3363,66 @@ impl<'db> Transaction<'db> {
         for cte in &plan.ctes {
             if !cte_store.contains_key(&cte.name) {
                 match &cte.kind {
-                    crate::sql::BoundCteKind::NonRecursive { plan: cte_plan } => {
-                        let (res, cte_op) = self.execute_physical_plan_internal_with_metrics(
-                            cte_plan,
-                            outer_contexts,
-                            cte_store,
-                        )?;
-                        let mut cte_metric = crate::query::OperatorMetrics::new(
-                            crate::query::OperatorKind::Cte {
-                                name: cte.name.clone(),
-                            },
-                            Some(cte_plan.estimated_rows),
-                            Some(cte_plan.total_cost),
-                        );
-                        cte_metric.actual_rows = res.rows.len();
-                        cte_metric.input_rows = res.rows.len();
-                        cte_metric.add_child(cte_op);
-                        cte_metrics.push(cte_metric);
-                        cte_store.insert(cte.name.clone(), (cte.output_schema.clone(), res.rows));
-                    }
+                    crate::sql::BoundCteKind::NonRecursive {
+                        plan: cte_plan,
+                        decision,
+                        materialize_id,
+                        consumer_count,
+                        ..
+                    } => match decision {
+                        crate::query::materialize::MaterializationDecision::Materialize
+                        | crate::query::materialize::MaterializationDecision::ExternalMaterialize =>
+                        {
+                            let force_spill = matches!(
+                                    decision,
+                                    crate::query::materialize::MaterializationDecision::ExternalMaterialize
+                                );
+                            let (res, cte_op) = self.execute_physical_plan_internal_with_metrics(
+                                cte_plan,
+                                outer_contexts,
+                                cte_store,
+                            )?;
+                            let mat_id = materialize_id.unwrap_or(1);
+                            let (storage, mat_metrics) =
+                                crate::query::materialize::MaterializeOperator::materialize_rows(
+                                    mat_id,
+                                    res.rows.clone(),
+                                    &cte.output_schema,
+                                    *consumer_count,
+                                    self.materialize_config(),
+                                    force_spill,
+                                )?;
+                            let is_external = matches!(
+                                storage,
+                                crate::query::materialize::MaterializedStorage::Spilled { .. }
+                            );
+
+                            let mut mat_op = crate::query::OperatorMetrics::new(
+                                crate::query::OperatorKind::Materialize {
+                                    id: mat_id,
+                                    name: Some(cte.name.clone()),
+                                    external: is_external,
+                                },
+                                Some(cte_plan.estimated_rows),
+                                Some(cte_plan.total_cost),
+                            );
+                            mat_op.actual_rows = mat_metrics.rows_materialized;
+                            mat_op.input_rows = mat_metrics.rows_materialized;
+                            mat_op.counters.materialize_id = Some(mat_id);
+                            mat_op.counters.rows_materialized = mat_metrics.rows_materialized;
+                            mat_op.counters.bytes_materialized = mat_metrics.bytes_materialized;
+                            mat_op.counters.materialize_consumers = *consumer_count;
+                            mat_op.counters.peak_memory_bytes = mat_metrics.peak_memory_bytes;
+                            mat_op.counters.materialize_spill_bytes = mat_metrics.spill_bytes;
+                            mat_op.counters.materialize_spill_files = mat_metrics.spill_files;
+                            mat_op.add_child(cte_op);
+                            cte_metrics.push(mat_op);
+
+                            cte_store
+                                .insert(cte.name.clone(), (cte.output_schema.clone(), res.rows));
+                        }
+                        crate::query::materialize::MaterializationDecision::Inline => {}
+                    },
                     crate::sql::BoundCteKind::Recursive {
                         anchor_plan,
                         recursive_plan,
@@ -3350,6 +3611,84 @@ impl<'db> Transaction<'db> {
                 scan_metric.actual_rows = initial_rows.len();
                 scan_metric.counters.tuples_fetched = initial_rows.len();
                 scan_metric.counters.rows_evaluated = initial_rows.len();
+
+                let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
+                    Some(filter) => {
+                        let filtered = self.filter_rows_with_outer_internal(
+                            initial_rows.clone(),
+                            &raw_schema,
+                            filter,
+                            outer_contexts,
+                            cte_store,
+                        )?;
+                        let mut filter_metric = crate::query::OperatorMetrics::new(
+                            crate::query::OperatorKind::Filter,
+                            Some(plan.base_table.estimated_rows),
+                            Some(plan.base_table.cost),
+                        );
+                        filter_metric.input_rows = initial_rows.len();
+                        filter_metric.actual_rows = filtered.len();
+                        filter_metric.counters.rows_evaluated = initial_rows.len();
+                        filter_metric.counters.rows_passed = filtered.len();
+                        filter_metric.counters.rows_rejected =
+                            initial_rows.len().saturating_sub(filtered.len());
+                        filter_metric.add_child(scan_metric);
+                        (filtered, filter_metric)
+                    }
+                    None => (initial_rows, scan_metric),
+                };
+
+                let schema = if plan.joins.is_empty() {
+                    raw_schema
+                } else {
+                    let q = plan.base_table.qualifier();
+                    let cols: Vec<crate::engine::types::Column> = raw_schema
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            crate::engine::types::Column::new(
+                                format!("{q}.{}", c.name),
+                                c.data_type,
+                                c.nullable,
+                            )
+                        })
+                        .collect();
+                    crate::engine::types::Schema::new_projected(cols)
+                };
+
+                (schema, filtered_rows, table_op)
+            } else if let Some(cte) = plan
+                .ctes
+                .iter()
+                .find(|c| c.name == plan.base_table.table_name)
+            {
+                let (res, inner_op) = match &cte.kind {
+                    crate::sql::BoundCteKind::NonRecursive {
+                        plan: inner_plan, ..
+                    } => self.execute_physical_plan_internal_with_metrics(
+                        inner_plan,
+                        outer_contexts,
+                        cte_store,
+                    )?,
+                    crate::sql::BoundCteKind::Recursive { .. } => {
+                        return Err(Error::TableNotFound(plan.base_table.table_name.clone()));
+                    }
+                };
+                let raw_schema = cte.output_schema.clone();
+                let initial_rows = res.rows;
+                let mut scan_metric = crate::query::OperatorMetrics::new(
+                    crate::query::OperatorKind::TableScan {
+                        table_name: plan.base_table.table_name.clone(),
+                        access_path: "Inlined CTE Scan".to_string(),
+                    },
+                    Some(plan.base_table.estimated_rows),
+                    Some(plan.base_table.cost),
+                );
+                scan_metric.input_rows = initial_rows.len();
+                scan_metric.actual_rows = initial_rows.len();
+                scan_metric.counters.tuples_fetched = initial_rows.len();
+                scan_metric.counters.rows_evaluated = initial_rows.len();
+                scan_metric.add_child(inner_op);
 
                 let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
                     Some(filter) => {
@@ -3828,6 +4167,79 @@ impl<'db> Transaction<'db> {
                     scan_metric.actual_rows = initial_rows.len();
                     scan_metric.counters.tuples_fetched = initial_rows.len();
                     scan_metric.counters.rows_evaluated = initial_rows.len();
+
+                    let (filtered_rows, table_op) = match &join.right.residual_filter {
+                        Some(filter) => {
+                            let filtered = self.filter_rows_with_outer_internal(
+                                initial_rows.clone(),
+                                &raw_schema,
+                                filter,
+                                outer_contexts,
+                                cte_store,
+                            )?;
+                            let mut filter_metric = crate::query::OperatorMetrics::new(
+                                crate::query::OperatorKind::Filter,
+                                Some(join.right.estimated_rows),
+                                Some(join.right.cost),
+                            );
+                            filter_metric.input_rows = initial_rows.len();
+                            filter_metric.actual_rows = filtered.len();
+                            filter_metric.counters.rows_evaluated = initial_rows.len();
+                            filter_metric.counters.rows_passed = filtered.len();
+                            filter_metric.counters.rows_rejected =
+                                initial_rows.len().saturating_sub(filtered.len());
+                            filter_metric.add_child(scan_metric);
+                            (filtered, filter_metric)
+                        }
+                        None => (initial_rows, scan_metric),
+                    };
+
+                    let q = join.right.qualifier();
+                    let cols: Vec<crate::engine::types::Column> = raw_schema
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            crate::engine::types::Column::new(
+                                format!("{q}.{}", c.name),
+                                c.data_type,
+                                c.nullable,
+                            )
+                        })
+                        .collect();
+                    (
+                        crate::engine::types::Schema::new_projected(cols),
+                        filtered_rows,
+                        table_op,
+                    )
+                } else if let Some(cte) = plan.ctes.iter().find(|c| c.name == join.right.table_name)
+                {
+                    let (res, inner_op) = match &cte.kind {
+                        crate::sql::BoundCteKind::NonRecursive {
+                            plan: inner_plan, ..
+                        } => self.execute_physical_plan_internal_with_metrics(
+                            inner_plan,
+                            outer_contexts,
+                            cte_store,
+                        )?,
+                        crate::sql::BoundCteKind::Recursive { .. } => {
+                            return Err(Error::TableNotFound(join.right.table_name.clone()));
+                        }
+                    };
+                    let raw_schema = cte.output_schema.clone();
+                    let initial_rows = res.rows;
+                    let mut scan_metric = crate::query::OperatorMetrics::new(
+                        crate::query::OperatorKind::TableScan {
+                            table_name: join.right.table_name.clone(),
+                            access_path: "Inlined CTE Scan".to_string(),
+                        },
+                        Some(join.right.estimated_rows),
+                        Some(join.right.cost),
+                    );
+                    scan_metric.input_rows = initial_rows.len();
+                    scan_metric.actual_rows = initial_rows.len();
+                    scan_metric.counters.tuples_fetched = initial_rows.len();
+                    scan_metric.counters.rows_evaluated = initial_rows.len();
+                    scan_metric.add_child(inner_op);
 
                     let (filtered_rows, table_op) = match &join.right.residual_filter {
                         Some(filter) => {
@@ -4550,61 +4962,6 @@ impl<'db> Transaction<'db> {
         self.pre_evaluate_uncorrelated_subqueries_internal(plan, outer_contexts, &mut cte_store)
     }
 
-    fn pre_evaluate_uncorrelated_subqueries_internal(
-        &mut self,
-        plan: &mut crate::query::optimizer::PhysicalPlan,
-        outer_contexts: &[(&Row, &Schema)],
-        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
-    ) -> Result<()> {
-        if let Some(set_op) = &mut plan.set_op {
-            self.pre_evaluate_uncorrelated_subqueries_internal(
-                &mut set_op.left,
-                outer_contexts,
-                cte_store,
-            )?;
-            self.pre_evaluate_uncorrelated_subqueries_internal(
-                &mut set_op.right,
-                outer_contexts,
-                cte_store,
-            )?;
-            return Ok(());
-        }
-        if let Some(rf) = &mut plan.base_table.residual_filter {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(rf, outer_contexts, cte_store)?;
-        }
-        for join in &mut plan.joins {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(
-                &mut join.on,
-                outer_contexts,
-                cte_store,
-            )?;
-            if let Some(rf) = &mut join.right.residual_filter {
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(rf, outer_contexts, cte_store)?;
-            }
-        }
-        if let Some(post_filter) = &mut plan.post_join_filter {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(
-                post_filter,
-                outer_contexts,
-                cte_store,
-            )?;
-        }
-        if let Some(having) = &mut plan.having {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(having, outer_contexts, cte_store)?;
-        }
-        for (proj, _) in &mut plan.projections {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(proj, outer_contexts, cte_store)?;
-        }
-        for sort_key in &mut plan.order_by {
-            self.pre_evaluate_uncorrelated_subqueries_in_expr(
-                &mut sort_key.expression,
-                outer_contexts,
-                cte_store,
-            )?;
-        }
-        Ok(())
-    }
-
     fn execute_index_probe_semi_anti(
         &mut self,
         current_rows: &[Row],
@@ -4889,43 +5246,166 @@ impl<'db> Transaction<'db> {
         Ok(Some((out_rows, join_metric)))
     }
 
+    fn pre_evaluate_uncorrelated_subqueries_internal(
+        &mut self,
+        plan: &mut crate::query::optimizer::PhysicalPlan,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
+    ) -> Result<()> {
+        if let Some(set_op) = &mut plan.set_op {
+            self.pre_evaluate_uncorrelated_subqueries_internal(
+                &mut set_op.left,
+                outer_contexts,
+                cte_store,
+            )?;
+            self.pre_evaluate_uncorrelated_subqueries_internal(
+                &mut set_op.right,
+                outer_contexts,
+                cte_store,
+            )?;
+            return Ok(());
+        }
+        let mut subquery_cache = std::collections::HashMap::new();
+        if let Some(filter) = &mut plan.base_table.residual_filter {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                filter,
+                outer_contexts,
+                cte_store,
+                &mut subquery_cache,
+            )?;
+        }
+        for join in &mut plan.joins {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                &mut join.on,
+                outer_contexts,
+                cte_store,
+                &mut subquery_cache,
+            )?;
+            if let Some(filter) = &mut join.right.residual_filter {
+                self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                    filter,
+                    outer_contexts,
+                    cte_store,
+                    &mut subquery_cache,
+                )?;
+            }
+        }
+        if let Some(post_f) = &mut plan.post_join_filter {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                post_f,
+                outer_contexts,
+                cte_store,
+                &mut subquery_cache,
+            )?;
+        }
+        if let Some(having) = &mut plan.having {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                having,
+                outer_contexts,
+                cte_store,
+                &mut subquery_cache,
+            )?;
+        }
+        for (proj, _) in &mut plan.projections {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                proj,
+                outer_contexts,
+                cte_store,
+                &mut subquery_cache,
+            )?;
+        }
+        for sort_key in &mut plan.order_by {
+            self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                &mut sort_key.expression,
+                outer_contexts,
+                cte_store,
+                &mut subquery_cache,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn pre_evaluate_uncorrelated_subqueries_in_expr(
         &mut self,
         expr: &mut crate::query::expr::Expr,
         outer_contexts: &[(&Row, &Schema)],
         cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
     ) -> Result<()> {
+        let mut subquery_cache = std::collections::HashMap::new();
+        self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+            expr,
+            outer_contexts,
+            cte_store,
+            &mut subquery_cache,
+        )
+    }
+
+    fn pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+        &mut self,
+        expr: &mut crate::query::expr::Expr,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
+        subquery_cache: &mut std::collections::HashMap<
+            String,
+            crate::query::expr::MaterializedSubqueryResult,
+        >,
+    ) -> Result<()> {
         match expr {
             crate::query::expr::Expr::Subquery(sub) => {
                 if !sub.is_correlated && sub.materialized.is_none() {
-                    let mat = self.evaluate_subquery_materialized_internal(
-                        sub,
-                        outer_contexts,
-                        cte_store,
-                    )?;
-                    sub.materialized = Some(mat);
+                    let fp = crate::query::materialize::SubplanFingerprint::from_plan(&sub.plan)
+                        .to_hex();
+                    if let Some(cached) = subquery_cache.get(&fp) {
+                        sub.materialized = Some(cached.clone());
+                    } else {
+                        let mat = self.evaluate_subquery_materialized_internal(
+                            sub,
+                            outer_contexts,
+                            cte_store,
+                        )?;
+                        subquery_cache.insert(fp, mat.clone());
+                        sub.materialized = Some(mat);
+                    }
                 }
             }
             crate::query::expr::Expr::Binary { left, right, .. } => {
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(left, outer_contexts, cte_store)?;
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(
+                self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                    left,
+                    outer_contexts,
+                    cte_store,
+                    subquery_cache,
+                )?;
+                self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
                     right,
                     outer_contexts,
                     cte_store,
+                    subquery_cache,
                 )?;
             }
             crate::query::expr::Expr::Unary { expr, .. }
             | crate::query::expr::Expr::IsNull(expr)
             | crate::query::expr::Expr::IsNotNull(expr) => {
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(expr, outer_contexts, cte_store)?;
+                self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                    expr,
+                    outer_contexts,
+                    cte_store,
+                    subquery_cache,
+                )?;
             }
             crate::query::expr::Expr::InList { expr, list, .. } => {
-                self.pre_evaluate_uncorrelated_subqueries_in_expr(expr, outer_contexts, cte_store)?;
+                self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
+                    expr,
+                    outer_contexts,
+                    cte_store,
+                    subquery_cache,
+                )?;
                 for item in list {
-                    self.pre_evaluate_uncorrelated_subqueries_in_expr(
+                    self.pre_evaluate_uncorrelated_subqueries_in_expr_cached(
                         item,
                         outer_contexts,
                         cte_store,
+                        subquery_cache,
                     )?;
                 }
             }
@@ -6079,6 +6559,59 @@ impl<'db> Transaction<'db> {
                 };
                 a_obs.resource = Some(agg_res_obs);
                 self.db.feedback_registry.record(agg_key, a_obs);
+            }
+        }
+
+        // 5. Materialization
+        for cte in &plan.ctes {
+            if let crate::sql::BoundCteKind::NonRecursive {
+                plan: inner_plan,
+                decision,
+                consumer_count,
+                ..
+            } = &cte.kind
+            {
+                if let Some(mat_metric) = root_op.find_first(&|m| match &m.kind {
+                    crate::query::OperatorKind::Materialize { name, .. } => {
+                        name.as_deref() == Some(cte.name.as_str())
+                    }
+                    _ => false,
+                }) {
+                    let fp = crate::query::materialize::SubplanFingerprint::from_plan(inner_plan)
+                        .to_hex();
+                    let mat_key = crate::query::FeedbackKey::materialization(
+                        fp,
+                        decision.to_string(),
+                        *consumer_count,
+                        param_sig.clone(),
+                        stats_gen,
+                    )
+                    .with_resource_signature(Some(res_sig.clone()));
+
+                    let mut mat_obs = crate::query::FeedbackObservation::new(
+                        inner_plan.estimated_rows,
+                        mat_metric.actual_rows as f64,
+                    );
+                    mat_obs.input_rows = Some(mat_metric.input_rows);
+                    mat_obs.output_rows = Some(mat_metric.actual_rows);
+                    let did_spill = mat_metric.counters.materialize_spill_bytes > 0;
+                    mat_obs.spill_occurred = Some(did_spill);
+                    let mat_res = crate::query::ResourceObservation {
+                        memory_budget_bytes: self.db.materialize_config.memory_budget_bytes,
+                        estimated_peak_memory_bytes: mat_metric.counters.bytes_materialized,
+                        actual_peak_memory_bytes: mat_metric.counters.peak_memory_bytes,
+                        estimated_spill_bytes: 0,
+                        actual_spill_bytes: mat_metric.counters.materialize_spill_bytes,
+                        spill_runs: mat_metric.counters.materialize_spill_files,
+                        temporary_bytes: mat_metric.counters.materialize_spill_bytes,
+                        temporary_files: mat_metric.counters.materialize_spill_files,
+                        execution_time_us: mat_metric.execution_time.as_micros() as u64,
+                        did_spill,
+                        is_clamped: false,
+                    };
+                    mat_obs.resource = Some(mat_res);
+                    self.db.feedback_registry.record(mat_key, mat_obs);
+                }
             }
         }
     }

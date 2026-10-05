@@ -23,6 +23,10 @@ pub const SKIP_SCAN_PROBE_COST: f64 = 0.05;
 pub const RECORD_ID_SET_OP_CPU_COST: f64 = 0.001;
 pub const SPILL_RECORD_ID_IO_COST: f64 = 0.005;
 
+pub const MATERIALIZE_WRITE_CPU_COST: f64 = 0.005;
+pub const MATERIALIZE_READ_CPU_COST: f64 = 0.002;
+pub const MATERIALIZE_SPILL_IO_COST: f64 = 0.02;
+
 /// Centralized, deterministic cost model estimating execution effort for physical plans.
 pub struct CostModel;
 
@@ -663,6 +667,42 @@ impl CostModel {
             + (ROW_CPU_COST * matches);
 
         left_cost + right_cost + left_sort_cost + right_sort_cost + merge_stream_cost
+    }
+
+    /// Computes the cost to write rows to a materialized intermediate result.
+    pub fn materialize_write_cost(estimated_rows: f64, is_external: bool) -> f64 {
+        let r = estimated_rows.max(0.0);
+        if is_external {
+            r * (MATERIALIZE_WRITE_CPU_COST + MATERIALIZE_SPILL_IO_COST)
+        } else {
+            r * MATERIALIZE_WRITE_CPU_COST
+        }
+    }
+
+    /// Computes the cost for a single consumer to read rows from a materialized intermediate result.
+    pub fn materialize_read_cost(estimated_rows: f64, is_external: bool) -> f64 {
+        let r = estimated_rows.max(0.0);
+        if is_external {
+            r * (MATERIALIZE_READ_CPU_COST + MATERIALIZE_SPILL_IO_COST)
+        } else {
+            r * MATERIALIZE_READ_CPU_COST
+        }
+    }
+
+    /// Evaluates the total inline vs materialization cost across a specified number of consumers.
+    pub fn evaluate_materialization_cost(
+        subplan_cost: f64,
+        estimated_rows: f64,
+        consumer_count: usize,
+        is_external: bool,
+    ) -> (f64, f64, bool) {
+        let inline_cost = subplan_cost * (consumer_count.max(1) as f64);
+        let write_cost = Self::materialize_write_cost(estimated_rows, is_external);
+        let read_cost = Self::materialize_read_cost(estimated_rows, is_external)
+            * (consumer_count.max(1) as f64);
+        let materialize_cost = subplan_cost + write_cost + read_cost;
+        let should_materialize = consumer_count >= 2 && (materialize_cost < inline_cost);
+        (inline_cost, materialize_cost, should_materialize)
     }
 }
 
