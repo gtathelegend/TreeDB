@@ -266,6 +266,35 @@ impl JoinOperator {
         Vec<Row>,
         crate::query::external_hash_join::JoinExecutionMetrics,
     )> {
+        Self::apply_with_config_and_row_goal(
+            left_rows,
+            left_schema,
+            right_rows,
+            right_schema,
+            join_type,
+            on_predicate,
+            config,
+            None,
+        )
+    }
+
+    /// Executes a join between `left_rows` and `right_rows` using `join_type`, `on_predicate`,
+    /// `JoinConfig`, and an optional bounded `row_goal`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_with_config_and_row_goal(
+        left_rows: Vec<Row>,
+        left_schema: &Schema,
+        right_rows: &[Row],
+        right_schema: &Schema,
+        join_type: JoinType,
+        on_predicate: &Expr,
+        config: &crate::query::external_hash_join::JoinConfig,
+        row_goal: Option<usize>,
+    ) -> Result<(
+        Schema,
+        Vec<Row>,
+        crate::query::external_hash_join::JoinExecutionMetrics,
+    )> {
         if let Some(equi_plan) = crate::query::external_hash_join::analyze_equi_join(
             on_predicate,
             left_schema,
@@ -277,7 +306,8 @@ impl JoinOperator {
                 join_type,
                 equi_plan,
                 config.clone(),
-            );
+            )
+            .with_row_goal(row_goal);
             joiner.execute(left_rows, right_rows.to_vec())
         } else {
             if join_type == JoinType::Semi || join_type == JoinType::Anti {
@@ -296,6 +326,8 @@ impl JoinOperator {
                 let mut matched_rows = 0;
                 let mut matched_outer_rows = 0;
                 let mut unmatched_outer_rows = 0;
+                let mut early_terminated = false;
+                let mut row_goal_satisfied = false;
 
                 for left_row in &left_rows {
                     let mut left_matched = false;
@@ -325,6 +357,13 @@ impl JoinOperator {
                         || (join_type == JoinType::Anti && !left_matched)
                     {
                         out_rows.push(left_row.clone());
+                        if let Some(k) = row_goal {
+                            if out_rows.len() >= k {
+                                early_terminated = true;
+                                row_goal_satisfied = true;
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -336,6 +375,9 @@ impl JoinOperator {
                     matched_rows,
                     matched_outer_rows,
                     unmatched_outer_rows,
+                    row_goal,
+                    early_terminated,
+                    row_goal_satisfied,
                     ..Default::default()
                 };
 
@@ -366,6 +408,8 @@ impl JoinOperator {
             let mut candidate_pairs = 0;
             let mut matched_rows = 0;
             let mut right_matched = vec![false; right_rows.len()];
+            let mut early_terminated = false;
+            let mut row_goal_satisfied = false;
 
             let left_nulls = vec![Value::Null; left_schema.columns.len()];
             let right_nulls = vec![Value::Null; right_schema.columns.len()];
@@ -387,6 +431,13 @@ impl JoinOperator {
                         right_matched[r_idx] = true;
                         matched_rows += 1;
                         out_rows.push(joined_row);
+                        if let Some(k) = row_goal {
+                            if join_type == JoinType::Inner && out_rows.len() >= k {
+                                early_terminated = true;
+                                row_goal_satisfied = true;
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -397,9 +448,13 @@ impl JoinOperator {
                     combined_values.extend_from_slice(&right_nulls);
                     out_rows.push(Row::new(combined_values));
                 }
+
+                if early_terminated {
+                    break;
+                }
             }
 
-            if join_type == JoinType::Right || join_type == JoinType::Full {
+            if !early_terminated && (join_type == JoinType::Right || join_type == JoinType::Full) {
                 for (r_idx, right_row) in right_rows.iter().enumerate() {
                     if !right_matched[r_idx] {
                         let mut combined_values =
@@ -417,6 +472,9 @@ impl JoinOperator {
                 rows_output: out_rows.len(),
                 candidate_pairs,
                 matched_rows,
+                row_goal,
+                early_terminated,
+                row_goal_satisfied,
                 ..Default::default()
             };
 

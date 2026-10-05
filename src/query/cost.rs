@@ -533,6 +533,137 @@ impl CostModel {
     pub fn row_goal_filter_cost(entries_examined: f64, num_residual_filters: usize) -> f64 {
         FILTER_CPU_COST * entries_examined.max(0.0) * (num_residual_filters as f64)
     }
+
+    /// Computes the expected outer probes required to produce a join row-goal $K$.
+    pub fn expected_outer_probes_for_join_row_goal(
+        row_goal_k: f64,
+        estimated_join_output: f64,
+        outer_rows: f64,
+    ) -> f64 {
+        let outer = outer_rows.max(1.0);
+        let k = row_goal_k.max(1.0);
+        let output = estimated_join_output.max(0.0);
+        if output <= 0.0 {
+            return outer;
+        }
+        let rows_per_probe = output / outer;
+        if rows_per_probe <= 0.0 {
+            outer
+        } else {
+            let needed = (k / rows_per_probe).ceil();
+            needed.clamp(1.0, outer)
+        }
+    }
+
+    /// Computes the cost of a nested loop join under a bounded output row goal.
+    pub fn nested_loop_join_row_goal_cost(
+        left_cost: f64,
+        left_probes: f64,
+        right_cost: f64,
+        right_rows: f64,
+        matches_output: f64,
+    ) -> f64 {
+        let probes = left_probes.max(1.0);
+        let right_r = right_rows.max(1.0);
+        let matches = matches_output.max(0.0);
+        left_cost
+            + (probes * right_cost)
+            + (JOIN_CPU_COST * probes * right_r)
+            + (ROW_CPU_COST * matches)
+    }
+
+    /// Computes the cost of an in-memory or spilled hash join under a bounded output row goal.
+    pub fn hash_join_row_goal_cost(
+        left_cost: f64,
+        left_probes: f64,
+        right_cost: f64,
+        right_rows: f64,
+        memory_budget_bytes: usize,
+        matches_output: f64,
+    ) -> f64 {
+        let probes = left_probes.max(1.0);
+        let right_r = right_rows.max(1.0);
+        let matches = matches_output.max(0.0);
+        let estimated_row_bytes = 64.0;
+        let estimated_build_bytes = right_r * estimated_row_bytes;
+
+        // Full build phase is always required
+        let build_cost = right_cost + (right_r * (ROW_CPU_COST + HASH_BUILD_CPU_COST));
+        // Bounded probe phase
+        let probe_cost = (probes * (ROW_CPU_COST + HASH_PROBE_CPU_COST)) + (ROW_CPU_COST * matches);
+
+        let spill_cost = if estimated_build_bytes > (memory_budget_bytes as f64) {
+            let page_size = 4096.0;
+            let left_pages = (probes * estimated_row_bytes / page_size).ceil();
+            let right_pages = (estimated_build_bytes / page_size).ceil();
+            2.0 * PAGE_READ_COST * (left_pages + right_pages)
+        } else {
+            0.0
+        };
+
+        left_cost + build_cost + probe_cost + spill_cost
+    }
+
+    /// Computes the cost of an external hash join under a bounded output row goal.
+    pub fn external_hash_join_row_goal_cost(
+        left_cost: f64,
+        left_probes: f64,
+        right_cost: f64,
+        right_rows: f64,
+        memory_budget_bytes: usize,
+        matches_output: f64,
+    ) -> f64 {
+        Self::hash_join_row_goal_cost(
+            left_cost,
+            left_probes,
+            right_cost,
+            right_rows,
+            memory_budget_bytes,
+            matches_output,
+        )
+    }
+
+    /// Computes the cost of a merge join under a bounded output row goal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn merge_join_row_goal_cost(
+        left_cost: f64,
+        left_rows: f64,
+        left_needs_sort: bool,
+        right_cost: f64,
+        right_rows: f64,
+        right_needs_sort: bool,
+        has_residual: bool,
+        sort_budget: usize,
+        estimated_merge_rows_examined: f64,
+        matches_output: f64,
+    ) -> f64 {
+        let left_r = left_rows.max(1.0);
+        let right_r = right_rows.max(1.0);
+        let examined = estimated_merge_rows_examined.max(1.0);
+        let matches = matches_output.max(0.0);
+
+        let left_sort_cost = if left_needs_sort {
+            Self::sort_cost_with_budget(left_r, 64.0, sort_budget, SpillStatus::Unknown)
+        } else {
+            0.0
+        };
+
+        let right_sort_cost = if right_needs_sort {
+            Self::sort_cost_with_budget(right_r, 64.0, sort_budget, SpillStatus::Unknown)
+        } else {
+            0.0
+        };
+
+        let merge_stream_cost = (STREAMING_AGG_CPU_COST * examined)
+            + (if has_residual {
+                FILTER_CPU_COST * examined
+            } else {
+                0.0
+            })
+            + (ROW_CPU_COST * matches);
+
+        left_cost + right_cost + left_sort_cost + right_sort_cost + merge_stream_cost
+    }
 }
 
 /// Composite cost and row estimate tuple with deterministic comparison helpers.

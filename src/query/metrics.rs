@@ -263,6 +263,10 @@ pub struct OperatorCounters {
     pub rows_examined: usize,
     /// Row-goal specific: qualifying rows passing residual predicates
     pub rows_qualified: usize,
+    /// Row-goal join specific: probe rows processed after row goal satisfied
+    pub probe_rows_after_row_goal: usize,
+    /// Merge join specific: duplicate runs processed during join
+    pub duplicate_runs_processed: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.
@@ -1022,6 +1026,19 @@ pub fn format_plan_with_metrics(
                         out.push_str(&format!(
                             "cost: {:.2}, estimated_rows: {:.0}, actual_rows: {}\n",
                             join.cost, join.estimated_rows, metrics.total_rows
+                        ));
+                    }
+                    if let Some(rg) = jm.counters.row_goal {
+                        write_indent(&mut out, indent + 1);
+                        out.push_str(&format!(
+                            "row_goal: {}, rows_output: {}, left_rows_processed: {}, right_rows_processed: {}, candidate_pairs: {}, early_terminated: {}, row_goal_satisfied: {}\n",
+                            rg,
+                            jm.counters.rows_output,
+                            jm.counters.rows_left,
+                            jm.counters.rows_right,
+                            jm.counters.candidate_pairs,
+                            jm.counters.early_terminated,
+                            jm.counters.row_goal_satisfied,
                         ));
                     }
                     if jm.counters.runtime_filter_enabled {

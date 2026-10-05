@@ -23,6 +23,7 @@ pub struct MergeJoinOperator<'a> {
     left_sorted: bool,
     right_sorted: bool,
     config: JoinConfig,
+    row_goal: Option<usize>,
 }
 
 impl<'a> MergeJoinOperator<'a> {
@@ -44,7 +45,14 @@ impl<'a> MergeJoinOperator<'a> {
             left_sorted,
             right_sorted,
             config,
+            row_goal: None,
         }
+    }
+
+    /// Sets the row goal for early termination during merge scan.
+    pub fn with_row_goal(mut self, goal: Option<usize>) -> Self {
+        self.row_goal = goal;
+        self
     }
 
     /// Executes the merge join on input left and right rows.
@@ -181,6 +189,7 @@ impl<'a> MergeJoinOperator<'a> {
                 }
                 Ordering::Equal => {
                     metrics.merge_join_key_matches += 1;
+                    metrics.duplicate_runs_processed += 1;
 
                     // Find end of duplicate run on left
                     let mut left_end = left_idx + 1;
@@ -254,6 +263,15 @@ impl<'a> MergeJoinOperator<'a> {
                                 out_rows.push(candidate_row);
                                 left_matched_any[l_offset] = true;
                                 right_matched_any[r_offset] = true;
+                                if let Some(k) = self.row_goal {
+                                    if self.join_type == JoinType::Inner && out_rows.len() >= k {
+                                        metrics.early_terminated = true;
+                                        metrics.row_goal_satisfied = true;
+                                        metrics.row_goal = Some(k);
+                                        metrics.rows_output = out_rows.len();
+                                        return Ok((joined_schema, out_rows, metrics));
+                                    }
+                                }
                             }
                         }
                     }

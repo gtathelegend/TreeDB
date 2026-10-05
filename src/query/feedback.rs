@@ -240,6 +240,15 @@ pub enum FeedbackContext {
         filter: String,
         row_goal: u64,
     },
+    /// Relational join execution under a bounded output row goal.
+    JoinRowGoal {
+        join_type: String,
+        strategy: String,
+        left_table: String,
+        right_table: String,
+        on_clause: String,
+        row_goal: u64,
+    },
 }
 
 impl fmt::Display for FeedbackContext {
@@ -265,6 +274,17 @@ impl fmt::Display for FeedbackContext {
             } => write!(
                 f,
                 "Join(type={join_type}, left={left_table}, right={right_table}, on={on_clause})"
+            ),
+            Self::JoinRowGoal {
+                join_type,
+                strategy,
+                left_table,
+                right_table,
+                on_clause,
+                row_goal,
+            } => write!(
+                f,
+                "JoinRowGoal(type={join_type}, strategy={strategy}, left={left_table}, right={right_table}, on={on_clause}, goal={row_goal})"
             ),
             Self::SemiAnti {
                 strategy,
@@ -548,6 +568,33 @@ impl FeedbackKey {
         }
     }
 
+    /// Constructs a feedback key for a join execution under a bounded output row goal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_row_goal(
+        join_type: impl Into<String>,
+        strategy: impl Into<String>,
+        left_table: impl Into<String>,
+        right_table: impl Into<String>,
+        on_clause: impl Into<String>,
+        row_goal: u64,
+        param_signature: Option<ParamPlanningSignature>,
+        statistics_generation: u64,
+    ) -> Self {
+        Self {
+            context: FeedbackContext::JoinRowGoal {
+                join_type: join_type.into(),
+                strategy: strategy.into(),
+                left_table: left_table.into(),
+                right_table: right_table.into(),
+                on_clause: on_clause.into(),
+                row_goal,
+            },
+            param_signature,
+            statistics_generation,
+            resource_signature: None,
+        }
+    }
+
     /// Returns the primary table name associated with this feedback key if available.
     pub fn table_name(&self) -> Option<&str> {
         match &self.context {
@@ -557,6 +604,7 @@ impl FeedbackKey {
             | FeedbackContext::OrderedScan { table_name, .. }
             | FeedbackContext::SkipScan { table_name, .. } => Some(table_name.as_str()),
             FeedbackContext::Join { left_table, .. }
+            | FeedbackContext::JoinRowGoal { left_table, .. }
             | FeedbackContext::SemiAnti { left_table, .. }
             | FeedbackContext::RuntimeFilter { left_table, .. } => Some(left_table.as_str()),
             FeedbackContext::ExternalOp { relation_name, .. } => Some(relation_name.as_str()),

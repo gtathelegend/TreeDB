@@ -4090,6 +4090,8 @@ impl<'db> Transaction<'db> {
             let right_count = right_rows.len();
             let candidate_pairs = left_count * right_count;
 
+            let join_row_goal = join.row_goal.as_ref().map(|rg| rg.k() as usize);
+
             let (next_schema, next_rows, join_exec_metrics) = if outer_contexts.is_empty() {
                 if join.strategy == crate::query::optimizer::JoinStrategy::Merge {
                     if let Some(equi_plan) = crate::query::external_hash_join::analyze_equi_join(
@@ -4105,10 +4107,11 @@ impl<'db> Transaction<'db> {
                             !join.left_sort,
                             !join.right_sort,
                             self.db.join_config.clone(),
-                        );
+                        )
+                        .with_row_goal(join_row_goal);
                         merge_op.execute(current_rows, right_rows)?
                     } else {
-                        crate::query::operator::JoinOperator::apply_with_config(
+                        crate::query::operator::JoinOperator::apply_with_config_and_row_goal(
                             current_rows,
                             &current_schema,
                             &right_rows,
@@ -4116,10 +4119,11 @@ impl<'db> Transaction<'db> {
                             join.join_type,
                             &join.on,
                             &self.db.join_config,
+                            join_row_goal,
                         )?
                     }
                 } else {
-                    crate::query::operator::JoinOperator::apply_with_config(
+                    crate::query::operator::JoinOperator::apply_with_config_and_row_goal(
                         current_rows,
                         &current_schema,
                         &right_rows,
@@ -4127,6 +4131,7 @@ impl<'db> Transaction<'db> {
                         join.join_type,
                         &join.on,
                         &self.db.join_config,
+                        join_row_goal,
                     )?
                 }
             } else {
@@ -4199,6 +4204,20 @@ impl<'db> Transaction<'db> {
             join_metric.counters.hash_build_rows = join_exec_metrics.hash_build_rows;
             join_metric.counters.hash_probe_rows = join_exec_metrics.hash_probe_rows;
             join_metric.counters.rows_output = next_rows.len();
+            join_metric.counters.row_goal = join_row_goal;
+            join_metric.counters.early_terminated = join_exec_metrics.early_terminated;
+            join_metric.counters.row_goal_satisfied = join_exec_metrics.row_goal_satisfied;
+            join_metric.counters.rows_examined = if join_exec_metrics.hash_probe_rows > 0 {
+                join_exec_metrics.hash_build_rows + join_exec_metrics.hash_probe_rows
+            } else if join_exec_metrics.merge_join_left_rows > 0 {
+                join_exec_metrics.merge_join_left_rows + join_exec_metrics.merge_join_right_rows
+            } else {
+                join_exec_metrics.candidate_pairs
+            };
+            join_metric.counters.probe_rows_after_row_goal =
+                join_exec_metrics.probe_rows_after_row_goal;
+            join_metric.counters.duplicate_runs_processed =
+                join_exec_metrics.duplicate_runs_processed;
             join_metric.counters.spill_partitions = join_exec_metrics.spill_partitions;
             join_metric.counters.runs_created = join_exec_metrics.runs_created;
             join_metric.counters.bytes_spilled = join_exec_metrics.bytes_spilled;
@@ -4673,6 +4692,9 @@ impl<'db> Transaction<'db> {
         let mut unmatched_outer_rows = 0;
         let mut inner_rows_fetched = 0;
         let mut candidate_pairs = 0;
+        let row_goal_k = join.row_goal.as_ref().map(|rg| rg.k() as usize);
+        let mut early_terminated = false;
+        let mut row_goal_satisfied = false;
 
         for outer_row in current_rows {
             let outer_val = match outer_expr.evaluate(outer_row, current_schema)? {
@@ -4680,6 +4702,13 @@ impl<'db> Transaction<'db> {
                     unmatched_outer_rows += 1;
                     if !is_semi {
                         out_rows.push(outer_row.clone());
+                        if let Some(k) = row_goal_k {
+                            if out_rows.len() >= k {
+                                early_terminated = true;
+                                row_goal_satisfied = true;
+                                break;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -4789,12 +4818,26 @@ impl<'db> Transaction<'db> {
                 matched_outer_rows += 1;
                 if is_semi {
                     out_rows.push(outer_row.clone());
+                    if let Some(k) = row_goal_k {
+                        if out_rows.len() >= k {
+                            early_terminated = true;
+                            row_goal_satisfied = true;
+                            break;
+                        }
+                    }
                 }
             } else {
                 failed_probes += 1;
                 unmatched_outer_rows += 1;
                 if !is_semi {
                     out_rows.push(outer_row.clone());
+                    if let Some(k) = row_goal_k {
+                        if out_rows.len() >= k {
+                            early_terminated = true;
+                            row_goal_satisfied = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -4822,6 +4865,10 @@ impl<'db> Transaction<'db> {
         join_metric.counters.failed_probes = failed_probes;
         join_metric.counters.candidate_pairs = candidate_pairs;
         join_metric.counters.rows_output = out_rows.len();
+        join_metric.counters.row_goal = row_goal_k;
+        join_metric.counters.early_terminated = early_terminated;
+        join_metric.counters.row_goal_satisfied = row_goal_satisfied;
+        join_metric.counters.rows_examined = index_probes + inner_rows_fetched;
 
         let mut inner_scan_metric = crate::query::OperatorMetrics::new(
             crate::query::OperatorKind::TableScan {
@@ -5875,6 +5922,32 @@ impl<'db> Transaction<'db> {
                 };
                 j_obs.resource = Some(join_res_obs);
                 self.db.feedback_registry.record(j_key, j_obs);
+
+                if let Some(rg) = &join.row_goal {
+                    let jrg_key = crate::query::FeedbackKey::join_row_goal(
+                        join.join_type.to_string(),
+                        join.strategy.to_string(),
+                        left_table_name.clone(),
+                        right_table_name.clone(),
+                        join.on.to_string(),
+                        rg.k(),
+                        param_sig.clone(),
+                        stats_gen,
+                    )
+                    .with_resource_signature(Some(res_sig.clone()));
+                    let mut jrg_obs = crate::query::FeedbackObservation::new(
+                        join.estimated_rows_examined.unwrap_or(join.estimated_rows),
+                        (j_metric
+                            .counters
+                            .rows_examined
+                            .max(j_metric.counters.rows_left)) as f64,
+                    );
+                    jrg_obs.input_rows = Some(j_metric.input_rows);
+                    jrg_obs.output_rows = Some(j_metric.actual_rows);
+                    jrg_obs.left_rows = Some(j_metric.counters.rows_left);
+                    jrg_obs.right_rows = Some(j_metric.counters.rows_right);
+                    self.db.feedback_registry.record(jrg_key, jrg_obs);
+                }
 
                 if j_metric.counters.runtime_filter_enabled {
                     let rf_key = crate::query::FeedbackKey::runtime_filter(

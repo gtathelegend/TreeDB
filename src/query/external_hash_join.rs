@@ -205,6 +205,16 @@ pub struct JoinExecutionMetrics {
     pub merge_join_sort_left: bool,
     /// Merge join specific: Whether right input required sort
     pub merge_join_sort_right: bool,
+    /// Row-goal specific: target candidate row goal
+    pub row_goal: Option<usize>,
+    /// Row-goal specific: whether the row goal was satisfied
+    pub row_goal_satisfied: bool,
+    /// Row-goal specific: whether early termination occurred
+    pub early_terminated: bool,
+    /// Row-goal specific: probe rows avoided after row goal satisfaction
+    pub probe_rows_after_row_goal: usize,
+    /// Merge join specific: duplicate runs processed
+    pub duplicate_runs_processed: usize,
 }
 
 /// Composite join key constructed from evaluated equi-join expressions.
@@ -728,6 +738,7 @@ pub struct ExternalHashJoiner<'a> {
     right_keys: Vec<Expr>,
     residual_predicate: Option<Expr>,
     config: JoinConfig,
+    row_goal: Option<usize>,
 }
 
 impl<'a> ExternalHashJoiner<'a> {
@@ -747,7 +758,14 @@ impl<'a> ExternalHashJoiner<'a> {
             right_keys: equi_plan.right_keys,
             residual_predicate: equi_plan.residual_predicate,
             config,
+            row_goal: None,
         }
+    }
+
+    /// Sets the row goal for early termination during probe.
+    pub fn with_row_goal(mut self, goal: Option<usize>) -> Self {
+        self.row_goal = goal;
+        self
     }
 
     /// Executes the join between `left_rows` and `right_rows`.
@@ -1000,6 +1018,19 @@ impl<'a> ExternalHashJoiner<'a> {
                 combined.extend_from_slice(&l_row.values);
                 combined.extend_from_slice(&right_nulls);
                 out_rows.push(Row::new(combined));
+            }
+
+            if let Some(k) = self.row_goal {
+                if (self.join_type == JoinType::Inner || self.join_type == JoinType::Semi)
+                    && out_rows.len() >= k
+                {
+                    metrics.early_terminated = true;
+                    metrics.row_goal_satisfied = true;
+                    metrics.row_goal = Some(k);
+                    metrics.probe_rows_after_row_goal =
+                        left_rows.len().saturating_sub(metrics.hash_probe_rows);
+                    break;
+                }
             }
         }
 

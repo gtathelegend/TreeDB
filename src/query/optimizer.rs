@@ -414,6 +414,16 @@ pub struct PhysicalJoin {
     pub left_sort: bool,
     /// Whether the right input needs explicit sorting for Merge Join.
     pub right_sort: bool,
+    /// Optional output row goal requested by parent query.
+    pub row_goal: Option<crate::query::physical_properties::RowGoal>,
+    /// Estimated rows/entries examined to satisfy the row goal.
+    pub estimated_rows_examined: Option<f64>,
+    /// Estimated qualifying rows passing join predicates.
+    pub estimated_qualifying_rows: Option<f64>,
+    /// Whether early termination is semantically safe and possible.
+    pub early_termination_possible: bool,
+    /// Which execution phase can terminate early (e.g. "possible", "probe phase").
+    pub early_stop_phase: Option<String>,
 }
 
 /// Physical relational set operation node.
@@ -918,6 +928,40 @@ impl fmt::Display for PhysicalPlan {
                         join.cost, join.estimated_rows
                     )?;
                 }
+                if let Some(rg) = &join.row_goal {
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "Row Goal: {}", rg.k())?;
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "Estimated Join Rows: {:.0}", join.estimated_rows)?;
+                    if join.strategy == JoinStrategy::Hash {
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Estimated Build Rows: {:.0}", join.right.estimated_rows)?;
+                        if let Some(examined) = join.estimated_rows_examined {
+                            write_indent(f, indent + 1)?;
+                            writeln!(
+                                f,
+                                "Estimated Probe Rows To Goal: {:.0}",
+                                (examined - join.right.estimated_rows).max(1.0)
+                            )?;
+                        }
+                    } else if join.strategy == JoinStrategy::Merge {
+                        if let Some(examined) = join.estimated_rows_examined {
+                            write_indent(f, indent + 1)?;
+                            writeln!(f, "Estimated Input Rows To Goal: {:.0}", examined)?;
+                        }
+                    } else if let Some(examined) = join.estimated_rows_examined {
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Estimated Outer Probes To Goal: {:.0}", examined)?;
+                    }
+                    if join.early_termination_possible {
+                        write_indent(f, indent + 1)?;
+                        if let Some(phase) = &join.early_stop_phase {
+                            writeln!(f, "Early Termination: {phase}")?;
+                        } else {
+                            writeln!(f, "Early Termination: possible")?;
+                        }
+                    }
+                }
                 if let Some(rf) = &join.runtime_filter {
                     write_indent(f, indent + 1)?;
                     writeln!(f, "Runtime Filter:")?;
@@ -1228,6 +1272,8 @@ fn optimize_inner_join_region_dp(
     param_sig: Option<&ParamPlanningSignature>,
     resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
+    row_goal: Option<&crate::query::physical_properties::RowGoal>,
+    required_ordering: Option<&crate::query::physical_properties::RequiredOrdering>,
 ) -> DPPlan {
     let num_rels = graph.relations.len();
     assert!(num_rels > 0 && num_rels <= MAX_ENUMERATED_RELATIONS);
@@ -1365,6 +1411,8 @@ fn optimize_inner_join_region_dp(
                     JoinType::Inner,
                     &left_accum_schema,
                     resource_sig,
+                    row_goal,
+                    required_ordering,
                 );
 
                 let mut cand_joins = left_plan.joins.clone();
@@ -1379,6 +1427,11 @@ fn optimize_inner_join_region_dp(
                     runtime_filter: rf,
                     left_sort: choice.left_sort,
                     right_sort: choice.right_sort,
+                    row_goal: choice.row_goal,
+                    estimated_rows_examined: choice.estimated_rows_examined,
+                    estimated_qualifying_rows: choice.estimated_qualifying_rows,
+                    early_termination_possible: choice.early_termination_possible,
+                    early_stop_phase: choice.early_stop_phase,
                 });
 
                 let mut cand_perm = left_plan.perm.clone();
@@ -1423,6 +1476,8 @@ fn optimize_inner_join_region_greedy(
     param_sig: Option<&ParamPlanningSignature>,
     resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
+    row_goal: Option<&crate::query::physical_properties::RowGoal>,
+    required_ordering: Option<&crate::query::physical_properties::RequiredOrdering>,
 ) -> DPPlan {
     let num_rels = graph.relations.len();
     assert!(num_rels > 0);
@@ -1612,6 +1667,8 @@ fn optimize_inner_join_region_greedy(
             JoinType::Inner,
             &left_accum_schema,
             resource_sig,
+            row_goal,
+            required_ordering,
         );
 
         joins.push(PhysicalJoin {
@@ -1625,6 +1682,11 @@ fn optimize_inner_join_region_greedy(
             runtime_filter: rf,
             left_sort: choice.left_sort,
             right_sort: choice.right_sort,
+            row_goal: choice.row_goal,
+            estimated_rows_examined: choice.estimated_rows_examined,
+            estimated_qualifying_rows: choice.estimated_qualifying_rows,
+            early_termination_possible: choice.early_termination_possible,
+            early_stop_phase: choice.early_stop_phase,
         });
 
         cur_cost = choice.cost;
@@ -1840,10 +1902,44 @@ fn optimize_all_inner_joins(
         stats_gen,
     );
 
-    let best_plan = if num_tables <= MAX_ENUMERATED_RELATIONS {
-        optimize_inner_join_region_dp(&graph, feedback, param_sig, resource_sig, stats_gen)
+    let safe_row_goal =
+        bound.group_by.is_empty() && bound.aggregates.is_empty() && bound.window_exprs.is_empty();
+    let root_row_goal = if safe_row_goal {
+        crate::query::physical_properties::RowGoal::from_limit_offset(bound.limit, bound.offset)
     } else {
-        optimize_inner_join_region_greedy(&graph, feedback, param_sig, resource_sig, stats_gen)
+        None
+    };
+    let required_ordering = if !bound.order_by.is_empty() {
+        Some(
+            crate::query::physical_properties::RequiredOrdering::from_sort_keys(
+                &bound.order_by,
+                None,
+            ),
+        )
+    } else {
+        None
+    };
+
+    let best_plan = if num_tables <= MAX_ENUMERATED_RELATIONS {
+        optimize_inner_join_region_dp(
+            &graph,
+            feedback,
+            param_sig,
+            resource_sig,
+            stats_gen,
+            root_row_goal.as_ref(),
+            required_ordering.as_ref(),
+        )
+    } else {
+        optimize_inner_join_region_greedy(
+            &graph,
+            feedback,
+            param_sig,
+            resource_sig,
+            stats_gen,
+            root_row_goal.as_ref(),
+            required_ordering.as_ref(),
+        )
     };
 
     let mut remaining_post = unhandled;
@@ -2294,50 +2390,98 @@ fn optimize_with_outer_barriers(
             join_rows = fb_reg.get_adjusted_cardinality(&key, join_rows);
         }
 
-        let (chosen_strategy, chosen_index, chosen_cost, chosen_left_sort, chosen_right_sort) =
-            if join_type == JoinType::Semi || join_type == JoinType::Anti {
-                let (strat, idx, c) = plan_semi_anti_strategy(
-                    cur_cost,
-                    cur_rows,
+        let safe_row_goal = bound.group_by.is_empty()
+            && bound.aggregates.is_empty()
+            && bound.window_exprs.is_empty();
+        let root_row_goal = if safe_row_goal {
+            crate::query::physical_properties::RowGoal::from_limit_offset(bound.limit, bound.offset)
+        } else {
+            None
+        };
+        let required_ordering = if !bound.order_by.is_empty() {
+            Some(
+                crate::query::physical_properties::RequiredOrdering::from_sort_keys(
+                    &bound.order_by,
+                    None,
+                ),
+            )
+        } else {
+            None
+        };
+
+        let (
+            chosen_strategy,
+            chosen_index,
+            chosen_cost,
+            chosen_left_sort,
+            chosen_right_sort,
+            chosen_row_goal,
+            chosen_examined,
+            chosen_qualifying,
+            chosen_early,
+            chosen_phase,
+        ) = if join_type == JoinType::Semi || join_type == JoinType::Anti {
+            let (strat, idx, c, examined, qualifying, early, phase) = plan_semi_anti_strategy(
+                cur_cost,
+                cur_rows,
+                &tables[0],
+                &tables[right_table_idx],
+                &right_table_scan,
+                &on_expr,
+                join_type,
+                feedback,
+                param_sig,
+                resource_sig,
+                stats_gen,
+                root_row_goal.as_ref(),
+            );
+            (
+                strat,
+                idx,
+                c,
+                false,
+                false,
+                root_row_goal,
+                examined,
+                qualifying,
+                early,
+                phase,
+            )
+        } else {
+            let left_ord = if physical_joins.is_empty() {
+                Some(crate::query::merge_join::ordering_property_for_table_scan(
                     &tables[0],
-                    &tables[right_table_idx],
-                    &right_table_scan,
-                    &on_expr,
-                    join_type,
-                    feedback,
-                    param_sig,
-                    resource_sig,
-                    stats_gen,
-                );
-                (strat, idx, c, false, false)
+                    &base_table_scan,
+                ))
             } else {
-                let left_ord = if physical_joins.is_empty() {
-                    Some(crate::query::merge_join::ordering_property_for_table_scan(
-                        &tables[0],
-                        &base_table_scan,
-                    ))
-                } else {
-                    None
-                };
-                let choice = plan_general_join_strategy(
-                    cur_cost,
-                    cur_rows,
-                    left_ord.as_ref(),
-                    &tables[right_table_idx],
-                    &right_table_scan,
-                    &on_expr,
-                    join_type,
-                    &accum_schema,
-                    resource_sig,
-                );
-                (
-                    choice.strategy,
-                    choice.index_name,
-                    choice.cost,
-                    choice.left_sort,
-                    choice.right_sort,
-                )
+                None
             };
+            let choice = plan_general_join_strategy(
+                cur_cost,
+                cur_rows,
+                left_ord.as_ref(),
+                &tables[right_table_idx],
+                &right_table_scan,
+                &on_expr,
+                join_type,
+                &accum_schema,
+                resource_sig,
+                root_row_goal.as_ref(),
+                required_ordering.as_ref(),
+            );
+            (
+                choice.strategy,
+                choice.index_name,
+                choice.cost,
+                choice.left_sort,
+                choice.right_sort,
+                choice.row_goal,
+                choice.estimated_rows_examined,
+                choice.estimated_qualifying_rows,
+                choice.early_termination_possible,
+                choice.early_stop_phase,
+            )
+        };
 
         let rf = plan_runtime_filter_for_join(
             join_type,
@@ -2368,6 +2512,11 @@ fn optimize_with_outer_barriers(
             runtime_filter: rf,
             left_sort: chosen_left_sort,
             right_sort: chosen_right_sort,
+            row_goal: chosen_row_goal,
+            estimated_rows_examined: chosen_examined,
+            estimated_qualifying_rows: chosen_qualifying,
+            early_termination_possible: chosen_early,
+            early_stop_phase: chosen_phase,
         });
     }
 
@@ -2627,6 +2776,11 @@ pub struct PlannedJoinChoice {
     pub cost: f64,
     pub left_sort: bool,
     pub right_sort: bool,
+    pub row_goal: Option<crate::query::physical_properties::RowGoal>,
+    pub estimated_rows_examined: Option<f64>,
+    pub estimated_qualifying_rows: Option<f64>,
+    pub early_termination_possible: bool,
+    pub early_stop_phase: Option<String>,
 }
 
 /// Evaluates candidate physical join strategies (NestedLoop, HashJoin, MergeJoin)
@@ -2639,9 +2793,11 @@ pub fn plan_general_join_strategy(
     right_table: &TableOptInfo,
     right_scan: &PhysicalTableScan,
     on: &Expr,
-    _join_type: JoinType,
+    join_type: JoinType,
     left_schema: &Schema,
     resource_sig: Option<&ResourcePlanningSignature>,
+    row_goal: Option<&crate::query::physical_properties::RowGoal>,
+    required_ordering: Option<&crate::query::physical_properties::RequiredOrdering>,
 ) -> PlannedJoinChoice {
     let join_budget = resource_sig
         .map(|r| r.join_budget)
@@ -2650,36 +2806,124 @@ pub fn plan_general_join_strategy(
         .map(|r| r.sort_budget)
         .unwrap_or(crate::query::external_sort::DEFAULT_SORT_MEMORY_BUDGET_BYTES);
 
-    // 1. Always evaluate NestedLoop as baseline
-    let cost_nl = CostModel::nested_loop_join_cost(
-        left_cost,
+    let est_join_rows = CardinalityEstimator::estimate_join_cardinality(
+        join_type,
         left_rows,
-        right_scan.cost,
+        None,
         right_scan.estimated_rows,
+        right_table.stats.as_ref(),
+        on,
+        &right_table.schema,
     );
+
+    let is_inner = join_type == JoinType::Inner;
+
+    // 1. NestedLoop Strategy
+    let nl_ordering_compatible = match required_ordering {
+        Some(req) if !req.is_empty() => left_ordering
+            .map(|ord| ord.satisfies_required_ordering(req))
+            .unwrap_or(false),
+        _ => true,
+    };
+    let nl_can_early_stop = is_inner && nl_ordering_compatible;
+
+    let (cost_nl, nl_examined, nl_early, nl_phase) = match (row_goal, nl_can_early_stop) {
+        (Some(rg), true) => {
+            let k = rg.k() as f64;
+            let probes =
+                CostModel::expected_outer_probes_for_join_row_goal(k, est_join_rows, left_rows);
+            let cost = CostModel::nested_loop_join_row_goal_cost(
+                left_cost,
+                probes,
+                right_scan.cost,
+                right_scan.estimated_rows,
+                k,
+            );
+            (cost, Some(probes), true, Some("possible".to_string()))
+        }
+        _ => {
+            let cost = CostModel::nested_loop_join_cost(
+                left_cost,
+                left_rows,
+                right_scan.cost,
+                right_scan.estimated_rows,
+            );
+            (cost, None, false, None)
+        }
+    };
 
     let mut best_strategy = JoinStrategy::NestedLoop;
     let mut best_cost = cost_nl;
     let mut best_left_sort = false;
     let mut best_right_sort = false;
+    let mut best_examined = nl_examined;
+    let mut best_early = nl_early;
+    let mut best_phase = nl_phase;
 
     // 2. If equi-join conjuncts exist, evaluate Hash and Merge
     if let Some(equi_plan) =
         crate::query::external_hash_join::analyze_equi_join(on, left_schema, &right_table.schema)
     {
         // Hash Join candidate
-        let cost_hash = CostModel::hash_join_cost(
-            left_cost,
-            left_rows,
-            right_scan.cost,
-            right_scan.estimated_rows,
-            join_budget,
-        );
+        let hash_ordering_compatible = !matches!(required_ordering, Some(req) if !req.is_empty());
+        let hash_can_early_stop = is_inner && hash_ordering_compatible;
+
+        let is_external = right_scan.estimated_rows * 64.0 > join_budget as f64;
+        let (cost_hash, hash_examined, hash_early, hash_phase) =
+            match (row_goal, hash_can_early_stop) {
+                (Some(rg), true) => {
+                    let k = rg.k() as f64;
+                    let probes = CostModel::expected_outer_probes_for_join_row_goal(
+                        k,
+                        est_join_rows,
+                        left_rows,
+                    );
+                    let cost = if is_external {
+                        CostModel::external_hash_join_row_goal_cost(
+                            left_cost,
+                            probes,
+                            right_scan.cost,
+                            right_scan.estimated_rows,
+                            join_budget,
+                            k,
+                        )
+                    } else {
+                        CostModel::hash_join_row_goal_cost(
+                            left_cost,
+                            probes,
+                            right_scan.cost,
+                            right_scan.estimated_rows,
+                            join_budget,
+                            k,
+                        )
+                    };
+                    (
+                        cost,
+                        Some(right_scan.estimated_rows + probes),
+                        true,
+                        Some("probe phase".to_string()),
+                    )
+                }
+                _ => {
+                    let cost = CostModel::hash_join_cost(
+                        left_cost,
+                        left_rows,
+                        right_scan.cost,
+                        right_scan.estimated_rows,
+                        join_budget,
+                    );
+                    (cost, None, false, None)
+                }
+            };
+
         if cost_hash < best_cost {
             best_strategy = JoinStrategy::Hash;
             best_cost = cost_hash;
             best_left_sort = false;
             best_right_sort = false;
+            best_examined = hash_examined;
+            best_early = hash_early;
+            best_phase = hash_phase;
         }
 
         // Merge Join candidate
@@ -2694,22 +2938,87 @@ pub fn plan_general_join_strategy(
             .unwrap_or(false);
         let left_needs_sort = !left_has_order;
 
-        let cost_merge = CostModel::merge_join_cost(
-            left_cost,
-            left_rows,
-            left_needs_sort,
-            right_scan.cost,
-            right_scan.estimated_rows,
-            right_needs_sort,
-            equi_plan.residual_predicate.is_some(),
-            sort_budget,
-        );
+        // Check whether merge join ordering satisfies required ordering
+        let merge_ordering_compatible = match required_ordering {
+            Some(req) if !req.is_empty() => {
+                let join_output_order = crate::query::physical_properties::OrderingProperty::new(
+                    equi_plan
+                        .left_keys
+                        .iter()
+                        .filter_map(|k| {
+                            if let Expr::Column(c) = k {
+                                Some(crate::query::physical_properties::OrderingColumn {
+                                    column: c.clone(),
+                                    direction: crate::query::operator::SortDirection::Ascending,
+                                    nulls_first: true,
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                );
+                join_output_order.satisfies_required_ordering(req)
+            }
+            _ => true,
+        };
+
+        let can_early_stop_merge = is_inner && merge_ordering_compatible;
+
+        let (cost_merge, merge_examined, merge_early, merge_phase) =
+            match (row_goal, can_early_stop_merge) {
+                (Some(rg), true) => {
+                    let k = rg.k() as f64;
+                    let probes = CostModel::expected_outer_probes_for_join_row_goal(
+                        k,
+                        est_join_rows,
+                        left_rows,
+                    );
+                    let merge_examined = (probes
+                        + (probes / left_rows.max(1.0)) * right_scan.estimated_rows)
+                        .min(left_rows + right_scan.estimated_rows);
+                    let cost = CostModel::merge_join_row_goal_cost(
+                        left_cost,
+                        left_rows,
+                        left_needs_sort,
+                        right_scan.cost,
+                        right_scan.estimated_rows,
+                        right_needs_sort,
+                        equi_plan.residual_predicate.is_some(),
+                        sort_budget,
+                        merge_examined,
+                        k,
+                    );
+                    (
+                        cost,
+                        Some(merge_examined),
+                        true,
+                        Some("possible".to_string()),
+                    )
+                }
+                _ => {
+                    let cost = CostModel::merge_join_cost(
+                        left_cost,
+                        left_rows,
+                        left_needs_sort,
+                        right_scan.cost,
+                        right_scan.estimated_rows,
+                        right_needs_sort,
+                        equi_plan.residual_predicate.is_some(),
+                        sort_budget,
+                    );
+                    (cost, None, false, None)
+                }
+            };
 
         if cost_merge < best_cost {
             best_strategy = JoinStrategy::Merge;
             best_cost = cost_merge;
             best_left_sort = left_needs_sort;
             best_right_sort = right_needs_sort;
+            best_examined = merge_examined;
+            best_early = merge_early;
+            best_phase = merge_phase;
         }
     }
 
@@ -2719,11 +3028,20 @@ pub fn plan_general_join_strategy(
         cost: best_cost,
         left_sort: best_left_sort,
         right_sort: best_right_sort,
+        row_goal: if best_early { row_goal.cloned() } else { None },
+        estimated_rows_examined: best_examined,
+        estimated_qualifying_rows: if best_early {
+            row_goal.map(|rg| (rg.k() as f64).min(est_join_rows))
+        } else {
+            None
+        },
+        early_termination_possible: best_early,
+        early_stop_phase: best_phase,
     }
 }
 
 /// Evaluates costs of applicable physical strategies for SEMI/ANTI joins and selects the cheapest.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn plan_semi_anti_strategy(
     left_cost: f64,
     left_rows: f64,
@@ -2736,7 +3054,16 @@ fn plan_semi_anti_strategy(
     param_sig: Option<&ParamPlanningSignature>,
     resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
-) -> (JoinStrategy, Option<String>, f64) {
+    row_goal: Option<&crate::query::physical_properties::RowGoal>,
+) -> (
+    JoinStrategy,
+    Option<String>,
+    f64,
+    Option<f64>,
+    Option<f64>,
+    bool,
+    Option<String>,
+) {
     let mut match_prob = CardinalityEstimator::estimate_semi_match_probability(
         left_rows,
         left_table.stats.as_ref(),
@@ -2765,8 +3092,27 @@ fn plan_semi_anti_strategy(
         }
     }
 
+    let expected_probes = if let Some(rg) = row_goal {
+        let k = rg.k() as f64;
+        if join_type == JoinType::Semi {
+            (k / match_prob.max(0.001)).min(left_rows)
+        } else {
+            (k / (1.0 - match_prob).max(0.001)).min(left_rows)
+        }
+    } else {
+        left_rows
+    };
+
     // 1. NestedLoop Strategy
-    let nl_cost = if join_type == JoinType::Semi {
+    let nl_cost = if let Some(rg) = row_goal {
+        CostModel::nested_loop_join_row_goal_cost(
+            left_cost,
+            expected_probes,
+            right_scan.cost,
+            right_scan.estimated_rows,
+            rg.k() as f64,
+        )
+    } else if join_type == JoinType::Semi {
         CostModel::nested_loop_semi_cost(
             left_cost,
             left_rows,
@@ -2835,7 +3181,16 @@ fn plan_semi_anti_strategy(
         let join_budget = resource_sig
             .map(|r| r.join_budget)
             .unwrap_or(DEFAULT_JOIN_MEMORY_BUDGET_BYTES);
-        let hash_cost = if join_type == JoinType::Semi {
+        let hash_cost = if let Some(rg) = row_goal {
+            CostModel::hash_join_row_goal_cost(
+                left_cost,
+                expected_probes,
+                right_scan.cost,
+                right_scan.estimated_rows,
+                join_budget,
+                rg.k() as f64,
+            )
+        } else if join_type == JoinType::Semi {
             CostModel::hash_semi_cost(
                 left_cost,
                 left_rows,
@@ -2888,7 +3243,7 @@ fn plan_semi_anti_strategy(
 
                 let idx_cost = CostModel::index_probe_join_cost(
                     left_cost,
-                    left_rows,
+                    expected_probes,
                     null_frac,
                     is_pk,
                     has_residual,
@@ -2903,7 +3258,26 @@ fn plan_semi_anti_strategy(
         }
     }
 
-    (best_strategy, best_index, best_cost)
+    let (early_term, early_phase, est_examined, est_qualifying) = if let Some(rg) = row_goal {
+        (
+            true,
+            Some("possible".to_string()),
+            Some(expected_probes),
+            Some(rg.k() as f64),
+        )
+    } else {
+        (false, None, None, None)
+    };
+
+    (
+        best_strategy,
+        best_index,
+        best_cost,
+        est_examined,
+        est_qualifying,
+        early_term,
+        early_phase,
+    )
 }
 
 /// Selected physical aggregation strategy, updated cumulative cost, and output ordering property.

@@ -985,6 +985,11 @@ fn baseline_execute(
             runtime_filter: None,
             left_sort: false,
             right_sort: false,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            early_termination_possible: false,
+            early_stop_phase: None,
         });
     }
 
