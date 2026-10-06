@@ -9,6 +9,7 @@ pub mod external_sort;
 pub mod feedback;
 pub mod inference;
 pub mod materialize;
+pub mod memo;
 pub mod merge_join;
 pub mod metrics;
 pub mod operator;
@@ -21,6 +22,10 @@ pub mod stats;
 pub mod streaming_aggregate;
 pub mod top_n;
 
+pub use memo::{
+    BestPlan, GroupId, LogicalOp, MemoConfig, MemoGroup, MemoStats, OptimizerMemo,
+    PhysicalAlternative, PhysicalPropertyKey,
+};
 pub use optimizer::AggregateStrategy;
 pub use physical_properties::{
     ordering_property_for_table_scan, OrderingColumn, OrderingProperty, PhysicalProperties,
@@ -85,11 +90,11 @@ pub use feedback::{
     DEFAULT_REPLAN_THRESHOLD_RATIO, OUTLIER_MAX_RATIO, OUTLIER_MIN_RATIO,
 };
 pub use materialize::{
-    estimate_row_memory as estimate_materialize_row_memory, MaterializationDecision,
-    MaterializationMetrics, MaterializeConfig, MaterializeOperator, MaterializeOverride,
-    MaterializedStorage, StatementMaterializeStore, SubplanFingerprint, TempMaterializeFile,
-    DEFAULT_MATERIALIZE_MEMORY_BUDGET_BYTES, DEFAULT_MAX_MATERIALIZE_TEMP_BYTES,
-    TEMP_MATERIALIZE_MAGIC, TEMP_MATERIALIZE_VERSION,
+    estimate_row_memory as estimate_materialize_row_memory, LogicalSubplanFingerprint,
+    MaterializationDecision, MaterializationMetrics, MaterializeConfig, MaterializeOperator,
+    MaterializeOverride, MaterializedStorage, StatementMaterializeStore, SubplanFingerprint,
+    TempMaterializeFile, DEFAULT_MATERIALIZE_MEMORY_BUDGET_BYTES,
+    DEFAULT_MAX_MATERIALIZE_TEMP_BYTES, TEMP_MATERIALIZE_MAGIC, TEMP_MATERIALIZE_VERSION,
 };
 pub use metrics::{
     estimate_error_ratio, find_operator_metrics, format_plan_with_metrics, OperatorCounters,

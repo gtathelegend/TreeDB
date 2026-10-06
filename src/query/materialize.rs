@@ -172,6 +172,11 @@ impl SubplanFingerprint {
         Self(s)
     }
 
+    /// Constructs a canonical deterministic fingerprint from a bound select logical expression.
+    pub fn from_bound(bound: &crate::sql::binder::BoundSelect) -> Self {
+        Self(LogicalSubplanFingerprint::from_bound(bound).0)
+    }
+
     /// Returns the raw canonical fingerprint string.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -183,6 +188,69 @@ impl SubplanFingerprint {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.0.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
+    }
+}
+
+/// Canonical logical fingerprint identifying a reusable subplan independently of physical access paths.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LogicalSubplanFingerprint(pub String);
+
+impl LogicalSubplanFingerprint {
+    /// Creates a new logical subplan fingerprint.
+    pub fn new(canonical: impl Into<String>) -> Self {
+        Self(canonical.into())
+    }
+
+    /// Constructs a logical fingerprint from a BoundSelect AST representation.
+    pub fn from_bound(bound: &crate::sql::binder::BoundSelect) -> Self {
+        let mut s = String::new();
+        s.push_str("LOGICAL_TABLE:");
+        s.push_str(&bound.table_name);
+        if let Some(alias) = &bound.table_alias {
+            s.push_str(&format!(";ALIAS:{alias}"));
+        }
+        if let Some(f) = &bound.filter {
+            s.push_str(&format!(";WHERE:{f}"));
+        }
+        for j in &bound.joins {
+            s.push_str(&format!(
+                ";JOIN:{:?}:{}:{:?}:{}",
+                j.join_type, j.table_name, j.table_alias, j.on
+            ));
+        }
+        for g in &bound.group_by {
+            s.push_str(&format!(";GRP:{g}"));
+        }
+        for a in &bound.aggregates {
+            s.push_str(&format!(";AGG:{a:?}"));
+        }
+        if let Some(h) = &bound.having {
+            s.push_str(&format!(";HAV:{h}"));
+        }
+        for (p, alias) in &bound.projections {
+            s.push_str(&format!(";PROJ:{p}:{:?}", alias));
+        }
+        for o in &bound.order_by {
+            s.push_str(&format!(";ORD:{:?}:{:?}", o.expression, o.direction));
+        }
+        if let Some(off) = bound.offset {
+            s.push_str(&format!(";OFF:{off}"));
+        }
+        if let Some(lim) = bound.limit {
+            s.push_str(&format!(";LIM:{lim}"));
+        }
+        Self(s)
+    }
+
+    /// Returns the raw string representation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for LogicalSubplanFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

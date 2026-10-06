@@ -176,6 +176,39 @@ impl OrderingProperty {
         true
     }
 
+    /// Checks if this ordering property satisfies another `OrderingProperty` in prefix order.
+    pub fn satisfies(&self, other: &OrderingProperty) -> bool {
+        if other.columns.is_empty() {
+            return true;
+        }
+        if self.columns.len() < other.columns.len() {
+            return false;
+        }
+        for (i, other_col) in other.columns.iter().enumerate() {
+            let this_col = &self.columns[i];
+            let other_bare = other_col
+                .column
+                .split('.')
+                .next_back()
+                .unwrap_or(&other_col.column);
+            let this_bare = this_col
+                .column
+                .split('.')
+                .next_back()
+                .unwrap_or(&this_col.column);
+            if !other_bare.eq_ignore_ascii_case(this_bare) {
+                return false;
+            }
+            if this_col.direction != other_col.direction {
+                return false;
+            }
+            if this_col.nulls_first != other_col.nulls_first {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Checks if this ordering property satisfies the required ORDER BY sort keys in prefix order.
     pub fn satisfies_order_by(
         &self,

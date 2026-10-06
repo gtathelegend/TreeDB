@@ -401,7 +401,7 @@ impl fmt::Display for CteQuery {
 }
 
 /// Supported SQL relational set operators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SetOperator {
     /// `UNION` (duplicate-eliminating union).
     Union,
@@ -761,7 +761,7 @@ impl fmt::Display for TableRef {
 }
 
 /// Type of relational JOIN operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JoinType {
     /// INNER JOIN: Only pairs of rows satisfying the join predicate are emitted.
     Inner,

@@ -3624,6 +3624,200 @@ impl Optimizer {
         Self::optimize_with_resource_feedback(bound, tables, feedback, param_sig, None, stats_gen)
     }
 
+    /// Optimizes a bound SQL query using the bounded property-aware optimizer memo.
+    pub fn optimize_with_memo(
+        bound: &BoundSelect,
+        tables: &[TableOptInfo],
+        memo: &mut crate::query::memo::OptimizerMemo,
+        feedback: Option<&FeedbackRegistry>,
+        param_sig: Option<&ParamPlanningSignature>,
+        resource_sig: Option<&ResourcePlanningSignature>,
+        stats_gen: u64,
+    ) -> Result<PhysicalPlan> {
+        let is_multi_table = !bound.joins.is_empty();
+        let where_conjuncts = match &bound.filter {
+            Some(f) => split_conjunction(f),
+            None => Vec::new(),
+        };
+
+        if !is_multi_table {
+            let req_cols = compute_query_required_columns(bound);
+            let ref_cols = collect_table_referenced_columns(&tables[0], bound, &where_conjuncts);
+            let candidate_scans = plan_table_scan_candidates(
+                &tables[0],
+                where_conjuncts.clone(),
+                Some(&ref_cols),
+                false,
+                feedback,
+                param_sig,
+                resource_sig,
+                stats_gen,
+                Some(&req_cols),
+            );
+
+            let log_op = crate::query::memo::LogicalOp::Scan {
+                table_name: tables[0].name.clone(),
+                table_alias: tables[0].alias.clone(),
+                filter: bound.filter.as_ref().map(|f| f.to_string()),
+            };
+
+            let gid = match memo.get_or_create_group(log_op) {
+                Ok(id) => id,
+                Err(_) => {
+                    return Self::optimize_with_resource_feedback(
+                        bound,
+                        tables,
+                        feedback,
+                        param_sig,
+                        resource_sig,
+                        stats_gen,
+                    );
+                }
+            };
+
+            let safe_row_goal = bound.group_by.is_empty()
+                && bound.aggregates.is_empty()
+                && bound.window_exprs.is_empty();
+            let root_row_goal = if safe_row_goal {
+                crate::query::physical_properties::RowGoal::from_limit_offset(
+                    bound.limit,
+                    bound.offset,
+                )
+            } else {
+                None
+            };
+
+            for base_table_scan in &candidate_scans {
+                let mut cur_cost = base_table_scan.cost;
+                let mut cur_rows = base_table_scan.estimated_rows;
+
+                let scan_ordering =
+                    crate::query::physical_properties::ordering_property_for_table_scan(
+                        &tables[0],
+                        base_table_scan,
+                    );
+                let (agg_strategy, post_agg_cost, post_agg_ordering) = plan_aggregation_strategy(
+                    cur_cost,
+                    cur_rows,
+                    Some(&scan_ordering),
+                    &bound.group_by,
+                    &bound.aggregates,
+                    Some(tables[0].qualifier()),
+                    feedback,
+                    param_sig,
+                    resource_sig,
+                    stats_gen,
+                );
+                cur_cost = post_agg_cost;
+                let current_ordering = post_agg_ordering;
+
+                if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+                    cur_rows = CardinalityEstimator::estimate_group_by_cardinality(
+                        cur_rows,
+                        &bound.group_by,
+                        tables[0].stats.as_ref(),
+                        &tables[0].schema,
+                    );
+                }
+
+                if let Some(having) = &bound.having {
+                    cur_cost += CostModel::filter_cost(cur_rows);
+                    let having_sel = CardinalityEstimator::estimate_expr_selectivity(
+                        having,
+                        tables[0].stats.as_ref(),
+                        &tables[0].schema,
+                    );
+                    cur_rows = (cur_rows * having_sel)
+                        .clamp(if cur_rows > 0.0 { 1.0 } else { 0.0 }, cur_rows);
+                }
+
+                let (sort_required, top_n, final_ordering) = if bound.order_by.is_empty() {
+                    (false, false, current_ordering)
+                } else {
+                    let req_ord =
+                        crate::query::physical_properties::OrderingProperty::from_sort_keys(
+                            &bound.order_by,
+                        );
+                    let provides = current_ordering.satisfies(&req_ord);
+                    if provides {
+                        (false, false, current_ordering)
+                    } else if let Some(rg) = root_row_goal.as_ref() {
+                        let top_n_cost = CostModel::top_n_cost(cur_rows, rg.k() as usize, 64.0);
+                        cur_cost += top_n_cost;
+                        (false, true, req_ord)
+                    } else {
+                        let sort_cost = CostModel::sort_cost(cur_rows);
+                        cur_cost += sort_cost;
+                        (true, false, req_ord)
+                    }
+                };
+
+                let plan = PhysicalPlan {
+                    ctes: bound.ctes.clone(),
+                    base_table: base_table_scan.clone(),
+                    joins: Vec::new(),
+                    post_join_filter: None,
+                    group_by: bound.group_by.clone(),
+                    aggregates: bound.aggregates.clone(),
+                    aggregate_strategy: agg_strategy,
+                    having: bound.having.clone(),
+                    window_exprs: bound.window_exprs.clone(),
+                    projections: bound.projections.clone(),
+                    order_by: bound.order_by.clone(),
+                    order_by_sort_required: sort_required,
+                    order_by_top_n: top_n,
+                    provided_ordering: Some(final_ordering),
+                    offset: bound.offset,
+                    limit: bound.limit,
+                    set_op: None,
+                    logical_rewrites: Vec::new(),
+                    inferred_predicates: Vec::new(),
+                    row_goal: base_table_scan.row_goal.or(root_row_goal),
+                    estimated_rows_examined: base_table_scan.estimated_rows_examined,
+                    estimated_qualifying_rows: base_table_scan.estimated_qualifying_rows,
+                    row_goal_early_termination: base_table_scan.early_termination_possible,
+                    total_cost: cur_cost,
+                    estimated_rows: cur_rows,
+                };
+
+                let desc = format!("{:?}", base_table_scan.access_path);
+                let _ = memo.add_alternative(gid, plan, desc);
+            }
+
+            let root_ordering = if bound.order_by.is_empty() {
+                crate::query::physical_properties::OrderingProperty::default()
+            } else {
+                crate::query::physical_properties::OrderingProperty::from_sort_keys(&bound.order_by)
+            };
+
+            let prop_key = crate::query::memo::PhysicalPropertyKey::new(
+                &root_ordering,
+                &req_cols,
+                root_row_goal.as_ref(),
+                resource_sig,
+            );
+
+            if let Ok(best) = memo.optimize_group(
+                gid,
+                &prop_key,
+                &root_ordering,
+                &req_cols,
+                root_row_goal.as_ref(),
+            ) {
+                return Ok(best.physical_plan);
+            }
+        }
+
+        Self::optimize_with_resource_feedback(
+            bound,
+            tables,
+            feedback,
+            param_sig,
+            resource_sig,
+            stats_gen,
+        )
+    }
+
     /// Optimizes a bound SQL query with adaptive runtime cardinality and resource feedback.
     #[allow(clippy::type_complexity)]
     pub fn optimize_with_resource_feedback(
@@ -4152,7 +4346,7 @@ fn plan_table_scan(
 
 /// Generates all valid candidate table scans for a table relation.
 #[allow(clippy::too_many_arguments)]
-fn plan_table_scan_candidates(
+pub fn plan_table_scan_candidates(
     table: &TableOptInfo,
     conjuncts: Vec<Expr>,
     referenced_columns: Option<&HashSet<usize>>,
