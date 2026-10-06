@@ -98,6 +98,16 @@ impl SortKey {
         self.nulls_first = Some(nulls_first);
         self
     }
+
+    /// Collects all column names referenced by this sort key into the provided set.
+    pub fn collect_referenced_columns(&self, out: &mut std::collections::BTreeSet<String>) {
+        self.expression.collect_referenced_columns(out);
+    }
+
+    /// Returns the set of all column names referenced by this sort key.
+    pub fn referenced_columns(&self) -> std::collections::BTreeSet<String> {
+        self.expression.referenced_columns()
+    }
 }
 
 impl std::fmt::Display for SortDirection {

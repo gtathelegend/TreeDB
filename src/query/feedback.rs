@@ -255,6 +255,12 @@ pub enum FeedbackContext {
         decision: String,
         consumer_count: usize,
     },
+    /// Column demand and late materialization execution context.
+    ColumnDemand {
+        table_name: String,
+        access_path: String,
+        late_materialization: bool,
+    },
 }
 
 impl fmt::Display for FeedbackContext {
@@ -366,6 +372,14 @@ impl fmt::Display for FeedbackContext {
             } => write!(
                 f,
                 "Materialization(fingerprint={subplan_fingerprint}, decision={decision}, consumers={consumer_count})"
+            ),
+            Self::ColumnDemand {
+                table_name,
+                access_path,
+                late_materialization,
+            } => write!(
+                f,
+                "ColumnDemand(table={table_name}, access={access_path}, late_mat={late_materialization})"
             ),
         }
     }
@@ -629,6 +643,26 @@ impl FeedbackKey {
         }
     }
 
+    /// Constructs a feedback key for column demand and late materialization observations.
+    pub fn column_demand(
+        table_name: impl Into<String>,
+        access_path: impl Into<String>,
+        late_materialization: bool,
+        param_signature: Option<ParamPlanningSignature>,
+        statistics_generation: u64,
+    ) -> Self {
+        Self {
+            context: FeedbackContext::ColumnDemand {
+                table_name: table_name.into(),
+                access_path: access_path.into(),
+                late_materialization,
+            },
+            param_signature,
+            statistics_generation,
+            resource_signature: None,
+        }
+    }
+
     /// Returns the primary table name associated with this feedback key if available.
     pub fn table_name(&self) -> Option<&str> {
         match &self.context {
@@ -636,7 +670,8 @@ impl FeedbackKey {
             | FeedbackContext::Filter { table_name, .. }
             | FeedbackContext::MultiIndex { table_name, .. }
             | FeedbackContext::OrderedScan { table_name, .. }
-            | FeedbackContext::SkipScan { table_name, .. } => Some(table_name.as_str()),
+            | FeedbackContext::SkipScan { table_name, .. }
+            | FeedbackContext::ColumnDemand { table_name, .. } => Some(table_name.as_str()),
             FeedbackContext::Join { left_table, .. }
             | FeedbackContext::JoinRowGoal { left_table, .. }
             | FeedbackContext::SemiAnti { left_table, .. }

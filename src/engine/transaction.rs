@@ -3771,6 +3771,9 @@ impl<'db> Transaction<'db> {
                 let mut early_terminated = false;
                 let mut early_index_entries = 0;
 
+                let mut late_cand_rows = 0;
+                let mut late_fetched_rows = 0;
+
                 let initial_rows = match &plan.base_table.access_path {
                     crate::query::optimizer::AccessPath::PrimaryPointLookup { key } => {
                         index_lookups = 1;
@@ -3819,69 +3822,168 @@ impl<'db> Transaction<'db> {
                         index_name,
                         scan_type,
                         ..
-                    } => match scan_type {
-                        crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                    } => {
+                        if plan.base_table.late_materialization {
                             index_lookups = 1;
-                            table.index_lookup(index_name, val)?
-                        }
-                        crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals)
-                        | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
-                            index_lookups = 1;
-                            table.composite_index_lookup(index_name, vals)?
-                        }
-                        crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
-                            index_lookups = 1;
-                            if let Some(k) = early_stop_bound {
-                                let all_rows =
-                                    table.index_scan(index_name, start.as_ref(), end.as_ref())?;
-                                let mut rows = Vec::new();
-                                for row in all_rows {
-                                    early_index_entries += 1;
-                                    let keep = match &plan.base_table.residual_filter {
-                                        Some(f) => {
-                                            let res = self.evaluate_expr_with_outer_internal(
-                                                f,
-                                                &row,
-                                                &raw_schema,
-                                                outer_contexts,
-                                                cte_store,
-                                            )?;
-                                            match res {
-                                                Value::Boolean(b) => b,
-                                                _ => false,
-                                            }
+                            let (meta, entries) =
+                                table.secondary_index_leaf_entries(index_name, scan_type)?;
+                            drop(table);
+
+                            let mut surviving_rids = Vec::new();
+                            for entry in entries {
+                                late_cand_rows += 1;
+                                early_index_entries += 1;
+                                // 1. Decode index partial row
+                                let partial_row = crate::engine::table::Table::decode_secondary_leaf_entry_partial(
+                                    &raw_schema,
+                                    &meta,
+                                    &entry,
+                                )?;
+
+                                // 2. Evaluate index-covered filter if any
+                                let index_passed = match &plan.base_table.index_covered_filter {
+                                    Some(cov_f) => {
+                                        let res = self.evaluate_expr_with_outer_internal(
+                                            cov_f,
+                                            &partial_row,
+                                            &raw_schema,
+                                            outer_contexts,
+                                            cte_store,
+                                        )?;
+                                        match res {
+                                            Value::Boolean(b) => b,
+                                            _ => false,
                                         }
-                                        None => true,
-                                    };
-                                    if keep {
-                                        rows.push(row);
+                                    }
+                                    None => true,
+                                };
+
+                                if index_passed {
+                                    surviving_rids.push(entry.rid);
+                                }
+                            }
+
+                            // 3. Surviving candidates: fetch base records
+                            let base_records: Vec<crate::engine::types::Row> = {
+                                let mut tbl = self.open_table(&plan.base_table.table_name)?;
+                                let mut fetched = Vec::new();
+                                for rid in surviving_rids {
+                                    if let Some(r) = tbl.get_by_rid(rid)? {
+                                        late_fetched_rows += 1;
+                                        fetched.push(r);
+                                    }
+                                }
+                                fetched
+                            };
+
+                            // 4. Evaluate base-record filter if any and apply early termination
+                            let mut rows = Vec::new();
+                            for base_row in base_records {
+                                let base_passed = match &plan.base_table.base_record_filter {
+                                    Some(b_f) => {
+                                        let res = self.evaluate_expr_with_outer_internal(
+                                            b_f,
+                                            &base_row,
+                                            &raw_schema,
+                                            outer_contexts,
+                                            cte_store,
+                                        )?;
+                                        match res {
+                                            Value::Boolean(b) => b,
+                                            _ => false,
+                                        }
+                                    }
+                                    None => true,
+                                };
+
+                                if base_passed {
+                                    rows.push(base_row);
+                                    if let Some(k) = early_stop_bound {
                                         if rows.len() >= k {
                                             early_terminated = true;
                                             break;
                                         }
                                     }
                                 }
-                                rows
-                            } else {
-                                table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                            }
+                            rows
+                        } else {
+                            match scan_type {
+                                crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                                    index_lookups = 1;
+                                    table.index_lookup(index_name, val)?
+                                }
+                                crate::query::optimizer::SecondaryScanType::CompositePointLookup(
+                                    vals,
+                                )
+                                | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
+                                    index_lookups = 1;
+                                    table.composite_index_lookup(index_name, vals)?
+                                }
+                                crate::query::optimizer::SecondaryScanType::RangeScan {
+                                    start,
+                                    end,
+                                } => {
+                                    index_lookups = 1;
+                                    if let Some(k) = early_stop_bound {
+                                        let all_rows = table.index_scan(
+                                            index_name,
+                                            start.as_ref(),
+                                            end.as_ref(),
+                                        )?;
+                                        let mut rows = Vec::new();
+                                        for row in all_rows {
+                                            early_index_entries += 1;
+                                            let keep = match &plan.base_table.residual_filter {
+                                                Some(f) => {
+                                                    let res =
+                                                        self.evaluate_expr_with_outer_internal(
+                                                            f,
+                                                            &row,
+                                                            &raw_schema,
+                                                            outer_contexts,
+                                                            cte_store,
+                                                        )?;
+                                                    match res {
+                                                        Value::Boolean(b) => b,
+                                                        _ => false,
+                                                    }
+                                                }
+                                                None => true,
+                                            };
+                                            if keep {
+                                                rows.push(row);
+                                                if rows.len() >= k {
+                                                    early_terminated = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        rows
+                                    } else {
+                                        table.index_scan(index_name, start.as_ref(), end.as_ref())?
+                                    }
+                                }
+                                crate::query::optimizer::SecondaryScanType::SkipScan {
+                                    skipped_prefix_columns,
+                                    constrained_columns,
+                                } => {
+                                    let constrained_values: Vec<Value> = constrained_columns
+                                        .iter()
+                                        .map(|(_, v)| v.clone())
+                                        .collect();
+                                    let (rows, stats) = table.index_skip_scan(
+                                        index_name,
+                                        skipped_prefix_columns.len(),
+                                        &constrained_values,
+                                    )?;
+                                    index_lookups = stats.skip_scan_probes;
+                                    skip_scan_stats = Some(stats);
+                                    rows
+                                }
                             }
                         }
-                        crate::query::optimizer::SecondaryScanType::SkipScan {
-                            skipped_prefix_columns,
-                            constrained_columns,
-                        } => {
-                            let constrained_values: Vec<Value> =
-                                constrained_columns.iter().map(|(_, v)| v.clone()).collect();
-                            let (rows, stats) = table.index_skip_scan(
-                                index_name,
-                                skipped_prefix_columns.len(),
-                                &constrained_values,
-                            )?;
-                            index_lookups = stats.skip_scan_probes;
-                            skip_scan_stats = Some(stats);
-                            rows
-                        }
-                    },
+                    }
                     crate::query::optimizer::AccessPath::IndexOnlyScan {
                         index_name,
                         scan_type,
@@ -4044,7 +4146,19 @@ impl<'db> Transaction<'db> {
                     scan_metric.counters.bytes_spilled = stats.spill_bytes_written;
                     scan_metric.counters.peak_memory_bytes = stats.peak_candidate_memory;
                 }
-                if is_index_only {
+                scan_metric.counters.columns_required = plan.base_table.required_columns.len();
+                scan_metric.counters.columns_pruned = plan.base_table.pruned_columns.len();
+                scan_metric.counters.late_materialization_enabled =
+                    plan.base_table.late_materialization;
+                scan_metric.counters.index_only = is_index_only;
+                if plan.base_table.late_materialization {
+                    scan_metric.counters.candidate_rows = late_cand_rows;
+                    scan_metric.counters.rows_fetched = late_fetched_rows;
+                    scan_metric.counters.base_records_fetched = late_fetched_rows;
+                    scan_metric.counters.base_records_avoided =
+                        late_cand_rows.saturating_sub(late_fetched_rows);
+                    scan_metric.counters.tuples_fetched = late_fetched_rows;
+                } else if is_index_only {
                     scan_metric.counters.tuples_fetched = 0;
                     scan_metric.counters.base_records_fetched = 0;
                     scan_metric.counters.base_records_avoided = initial_rows.len();
@@ -4073,7 +4187,9 @@ impl<'db> Transaction<'db> {
                 }
 
                 let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
-                    Some(filter) if early_stop_bound.is_none() => {
+                    Some(filter)
+                        if early_stop_bound.is_none() && !plan.base_table.late_materialization =>
+                    {
                         let filtered = self.filter_rows_with_outer_internal(
                             initial_rows.clone(),
                             &raw_schema,

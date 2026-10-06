@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::engine::types::{Column, DataType, Row, Schema, Value};
@@ -216,6 +217,23 @@ impl AggregateExpr {
             AggregateExpr::Function { func, expr } => format!("{func}({expr})"),
         }
     }
+
+    /// Collects all column names referenced by this aggregate expression into the provided set.
+    pub fn collect_referenced_columns(&self, out: &mut BTreeSet<String>) {
+        match self {
+            AggregateExpr::CountAll => {}
+            AggregateExpr::Function { expr, .. } => {
+                expr.collect_referenced_columns(out);
+            }
+        }
+    }
+
+    /// Returns the set of all column names referenced by this aggregate expression.
+    pub fn referenced_columns(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        self.collect_referenced_columns(&mut out);
+        out
+    }
 }
 
 impl fmt::Display for AggregateExpr {
@@ -294,6 +312,29 @@ impl WindowExpr {
     /// Canonical display name for the window expression.
     pub fn display_name(&self) -> &str {
         &self.display_name
+    }
+
+    /// Collects all column names referenced by this window expression into the provided set.
+    pub fn collect_referenced_columns(&self, out: &mut BTreeSet<String>) {
+        for arg in &self.args {
+            arg.collect_referenced_columns(out);
+        }
+        if let Some(def) = &self.default {
+            def.collect_referenced_columns(out);
+        }
+        for pb in &self.window_spec.partition_by {
+            pb.collect_referenced_columns(out);
+        }
+        for ob in &self.window_spec.order_by {
+            ob.expression.collect_referenced_columns(out);
+        }
+    }
+
+    /// Returns the set of all column names referenced by this window expression.
+    pub fn referenced_columns(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        self.collect_referenced_columns(&mut out);
+        out
     }
 }
 
@@ -581,6 +622,47 @@ impl Expr {
     /// Creates an IS NOT NULL check (`expr IS NOT NULL`).
     pub fn is_not_null(expr: Expr) -> Self {
         Expr::IsNotNull(Box::new(expr))
+    }
+
+    /// Collects all column identifiers and outer column references accessed by this expression tree.
+    pub fn collect_referenced_columns(&self, out: &mut BTreeSet<String>) {
+        match self {
+            Expr::Column(name) => {
+                out.insert(name.clone());
+            }
+            Expr::OuterColumn { name, .. } => {
+                out.insert(name.clone());
+            }
+            Expr::Binary { left, right, .. } => {
+                left.collect_referenced_columns(out);
+                right.collect_referenced_columns(out);
+            }
+            Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+                expr.collect_referenced_columns(out);
+            }
+            Expr::InList { expr, list, .. } => {
+                expr.collect_referenced_columns(out);
+                for item in list {
+                    item.collect_referenced_columns(out);
+                }
+            }
+            Expr::Subquery(sub) => {
+                if let SubqueryKind::In { expr, .. } = &sub.kind {
+                    expr.collect_referenced_columns(out);
+                }
+                for outer_ref in &sub.outer_references {
+                    out.insert(outer_ref.clone());
+                }
+            }
+            Expr::Literal(_) | Expr::Parameter { .. } => {}
+        }
+    }
+
+    /// Returns the complete deterministic sorted set of column names referenced by this expression.
+    pub fn referenced_columns(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        self.collect_referenced_columns(&mut out);
+        out
     }
 
     /// Infers the output `DataType` of this expression when evaluated against `schema`.

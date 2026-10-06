@@ -636,6 +636,123 @@ impl<'a> Table<'a> {
         Ok(rows)
     }
 
+    /// Fetches and decodes a base record by its `RecordId`.
+    pub fn get_by_rid(&mut self, rid: RecordId) -> Result<Option<Row>> {
+        if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+            let row = self.metadata.schema.decode_tuple(&bytes)?;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Retrieves secondary index leaf entries for late materialization.
+    pub fn secondary_index_leaf_entries(
+        &mut self,
+        index_name: &str,
+        scan_type: &crate::query::optimizer::SecondaryScanType,
+    ) -> Result<(
+        IndexMetadata,
+        Vec<crate::index::secondary::SecondaryLeafEntry>,
+    )> {
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let entries: Vec<crate::index::secondary::SecondaryLeafEntry> = match scan_type {
+            crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                let idx_key = if meta.column_indices.len() == 1 {
+                    IndexKey::from_value(val)
+                } else {
+                    crate::index::composite::CompositeIndexKey::from_values(std::slice::from_ref(
+                        val,
+                    ))
+                    .to_index_key(meta.column_indices.len())
+                };
+                sec_idx.lookup_entries(self.buffer_pool, &idx_key)?
+            }
+            crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals) => {
+                let key = crate::index::composite::CompositeIndexKey::from_values(vals)
+                    .to_index_key(meta.column_indices.len());
+                sec_idx.lookup_entries(self.buffer_pool, &key)?
+            }
+            crate::query::optimizer::SecondaryScanType::PrefixScan(prefix_vals) => {
+                if prefix_vals.len() == meta.column_indices.len() {
+                    let key = crate::index::composite::CompositeIndexKey::from_values(prefix_vals)
+                        .to_index_key(meta.column_indices.len());
+                    sec_idx.lookup_entries(self.buffer_pool, &key)?
+                } else {
+                    let start_bytes =
+                        crate::index::composite::CompositeIndexKey::encode_prefix_values(
+                            prefix_vals,
+                            meta.column_indices.len(),
+                        );
+                    let end_bytes =
+                        crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
+                    let start_key = IndexKey::new(start_bytes);
+                    let end_key = end_bytes.map(IndexKey::new);
+                    sec_idx.scan_entries(self.buffer_pool, Some(&start_key), end_key.as_ref())?
+                }
+            }
+            crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
+                let start_key = start.as_ref().map(IndexKey::from_value);
+                let end_key = end.as_ref().map(IndexKey::from_value);
+                sec_idx.scan_entries(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?
+            }
+            crate::query::optimizer::SecondaryScanType::SkipScan { .. } => Vec::new(),
+        };
+
+        Ok((meta, entries))
+    }
+
+    /// Decodes a secondary leaf entry into a partial row tuple containing only index key and payload columns.
+    pub fn decode_secondary_leaf_entry_partial(
+        schema: &Schema,
+        meta: &IndexMetadata,
+        entry: &crate::index::secondary::SecondaryLeafEntry,
+    ) -> Result<Row> {
+        let schema_len = schema.columns.len();
+        let mut row_values = vec![Value::Null; schema_len];
+
+        let key_col_types: Vec<crate::engine::types::DataType> = meta
+            .column_indices
+            .iter()
+            .map(|&i| schema.columns[i].data_type)
+            .collect();
+        let inc_col_types: Vec<crate::engine::types::DataType> = meta
+            .include_column_indices
+            .iter()
+            .map(|&i| schema.columns[i].data_type)
+            .collect();
+
+        let key_values = if meta.column_indices.len() == 1 {
+            let val = entry.key.to_value(key_col_types[0])?;
+            vec![val]
+        } else {
+            crate::index::composite::CompositeIndexKey::decode_values(
+                &entry.key.bytes,
+                &key_col_types,
+            )?
+        };
+
+        for (&col_idx, val) in meta.column_indices.iter().zip(key_values) {
+            row_values[col_idx] = val;
+        }
+
+        if !meta.include_column_indices.is_empty() && !entry.payload.is_empty() {
+            let inc_values =
+                crate::index::covering::CoveredPayload::decode(&entry.payload, &inc_col_types)?;
+            for (&inc_idx, val) in meta.include_column_indices.iter().zip(inc_values) {
+                row_values[inc_idx] = val;
+            }
+        }
+
+        Ok(Row::new(row_values))
+    }
+
     /// Performs an index skip scan over a composite secondary index, enumerating distinct leading-prefix
     /// values and probing for `(prefix, constrained_suffix)`. Fetches base records from `RecordStore`.
     pub fn index_skip_scan(

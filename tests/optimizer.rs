@@ -959,6 +959,12 @@ fn baseline_execute(
         estimated_rows_examined: None,
         estimated_qualifying_rows: None,
         early_termination_possible: false,
+        required_columns: vec![],
+        pruned_columns: vec![],
+        covered_columns: vec![],
+        late_materialization: false,
+        index_covered_filter: None,
+        base_record_filter: None,
     };
 
     let mut joins = Vec::new();
@@ -976,6 +982,12 @@ fn baseline_execute(
                 estimated_rows_examined: None,
                 estimated_qualifying_rows: None,
                 early_termination_possible: false,
+                required_columns: vec![],
+                pruned_columns: vec![],
+                covered_columns: vec![],
+                late_materialization: false,
+                index_covered_filter: None,
+                base_record_filter: None,
             },
             on: j.on.clone(),
             estimated_rows: 0.0,

@@ -857,6 +857,12 @@ fn test_r505_multi_index_does_not_falsely_advertise_ordering() -> Result<()> {
         estimated_rows_examined: None,
         estimated_qualifying_rows: None,
         early_termination_possible: false,
+        required_columns: vec![],
+        pruned_columns: vec![],
+        covered_columns: vec![],
+        late_materialization: false,
+        index_covered_filter: None,
+        base_record_filter: None,
     };
     let schema = treedb::engine::types::Schema::new(
         vec![treedb::engine::types::Column::new(
@@ -893,6 +899,12 @@ fn test_r506_skip_scan_ordering_safety() -> Result<()> {
         estimated_rows_examined: None,
         estimated_qualifying_rows: None,
         early_termination_possible: false,
+        required_columns: vec![],
+        pruned_columns: vec![],
+        covered_columns: vec![],
+        late_materialization: false,
+        index_covered_filter: None,
+        base_record_filter: None,
     };
     let schema = treedb::engine::types::Schema::new(
         vec![

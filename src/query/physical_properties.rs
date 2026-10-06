@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::query::expr::Expr;
+use crate::engine::types::Schema;
+use crate::query::expr::{AggregateExpr, Expr};
 use crate::query::operator::{SortDirection, SortKey};
 use crate::query::optimizer::{AccessPath, PhysicalTableScan, SecondaryScanType, TableOptInfo};
 
@@ -427,52 +429,348 @@ impl fmt::Display for RowGoal {
     }
 }
 
-/// Physical requirements demanded by a parent execution node (ordering and row-goal bounds).
+/// Canonical, deterministic representation of column demand / required columns across queries and operators.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RequiredColumns {
+    /// Deterministic sorted set of column references.
+    /// Can contain qualified names like "users.age", unqualified names like "age", or wildcard "*".
+    pub columns: BTreeSet<String>,
+}
+
+impl RequiredColumns {
+    /// Creates an empty `RequiredColumns` set.
+    pub fn empty() -> Self {
+        Self {
+            columns: BTreeSet::new(),
+        }
+    }
+
+    /// Creates a new `RequiredColumns` set.
+    pub fn new() -> Self {
+        Self::empty()
+    }
+
+    /// Creates a `RequiredColumns` representing all columns (wildcard `*`).
+    pub fn all() -> Self {
+        let mut columns = BTreeSet::new();
+        columns.insert("*".to_string());
+        Self { columns }
+    }
+
+    /// Returns `true` if there are no required columns.
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Returns `true` if this demand requires all columns.
+    pub fn is_all(&self) -> bool {
+        self.columns.contains("*")
+    }
+
+    /// Number of column specifications in this set.
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Inserts a column specification into the required columns set.
+    pub fn insert(&mut self, col: impl Into<String>) {
+        let s = col.into();
+        if !s.is_empty() {
+            self.columns.insert(s);
+        }
+    }
+
+    /// Inserts multiple column specifications.
+    pub fn insert_all(&mut self, cols: impl IntoIterator<Item = String>) {
+        for c in cols {
+            self.insert(c);
+        }
+    }
+
+    /// Constructs a `RequiredColumns` from an iterator of column names.
+    pub fn from_columns(cols: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let mut set = Self::empty();
+        for c in cols {
+            set.insert(c);
+        }
+        set
+    }
+
+    /// Constructs a `RequiredColumns` from columns referenced by an expression.
+    pub fn from_expr(expr: &Expr) -> Self {
+        let mut cols = BTreeSet::new();
+        expr.collect_referenced_columns(&mut cols);
+        Self { columns: cols }
+    }
+
+    /// Constructs a `RequiredColumns` from multiple expressions.
+    pub fn from_exprs<'a>(exprs: impl IntoIterator<Item = &'a Expr>) -> Self {
+        let mut cols = BTreeSet::new();
+        for e in exprs {
+            e.collect_referenced_columns(&mut cols);
+        }
+        Self { columns: cols }
+    }
+
+    /// Constructs a `RequiredColumns` from a slice of `SortKey`s.
+    pub fn from_sort_keys(sort_keys: &[SortKey]) -> Self {
+        let mut cols = BTreeSet::new();
+        for sk in sort_keys {
+            sk.expression.collect_referenced_columns(&mut cols);
+        }
+        Self { columns: cols }
+    }
+
+    /// Constructs a `RequiredColumns` from aggregate expressions.
+    pub fn from_aggregates(aggregates: &[AggregateExpr]) -> Self {
+        let mut cols = BTreeSet::new();
+        for agg in aggregates {
+            match agg {
+                AggregateExpr::CountAll => {}
+                AggregateExpr::Function { expr, .. } => {
+                    expr.collect_referenced_columns(&mut cols);
+                }
+            }
+        }
+        Self { columns: cols }
+    }
+
+    /// Constructs a `RequiredColumns` from window expressions.
+    pub fn from_window_exprs(window_exprs: &[crate::query::expr::WindowExpr]) -> Self {
+        let mut cols = BTreeSet::new();
+        for win in window_exprs {
+            for arg in &win.args {
+                arg.collect_referenced_columns(&mut cols);
+            }
+            if let Some(def) = &win.default {
+                def.collect_referenced_columns(&mut cols);
+            }
+            for pb in &win.window_spec.partition_by {
+                pb.collect_referenced_columns(&mut cols);
+            }
+            for ob in &win.window_spec.order_by {
+                ob.expression.collect_referenced_columns(&mut cols);
+            }
+        }
+        Self { columns: cols }
+    }
+
+    /// Returns the union of two `RequiredColumns` sets.
+    pub fn union(&self, other: &Self) -> Self {
+        let mut cols = self.columns.clone();
+        cols.extend(other.columns.clone());
+        Self { columns: cols }
+    }
+
+    /// Unions another `RequiredColumns` into `self`.
+    pub fn union_with(&mut self, other: &Self) {
+        self.columns.extend(other.columns.clone());
+    }
+
+    /// Returns the intersection of two `RequiredColumns` sets.
+    pub fn intersect(&self, other: &Self) -> Self {
+        if self.is_all() {
+            return other.clone();
+        }
+        if other.is_all() {
+            return self.clone();
+        }
+        let cols: BTreeSet<String> = self.columns.intersection(&other.columns).cloned().collect();
+        Self { columns: cols }
+    }
+
+    /// Returns `true` if `self` contains all column demands in `other`.
+    pub fn contains(&self, other: &Self) -> bool {
+        if self.is_all() {
+            return true;
+        }
+        other.columns.is_subset(&self.columns)
+    }
+
+    /// Checks whether a specific column is demanded for a given table qualifier and table name.
+    pub fn is_required_for_table(&self, qualifier: &str, table_name: &str, col_name: &str) -> bool {
+        if self.is_all() {
+            return true;
+        }
+        if self.columns.contains(col_name) {
+            return true;
+        }
+        if !qualifier.is_empty() {
+            let qual_col = format!("{qualifier}.{col_name}");
+            if self.columns.contains(&qual_col) || self.columns.contains(&format!("{qualifier}.*"))
+            {
+                return true;
+            }
+        }
+        if !table_name.is_empty() && table_name != qualifier {
+            let tbl_col = format!("{table_name}.{col_name}");
+            if self.columns.contains(&tbl_col) || self.columns.contains(&format!("{table_name}.*"))
+            {
+                return true;
+            }
+        }
+        // Case-insensitive fallback
+        let col_lower = col_name.to_ascii_lowercase();
+        for c in &self.columns {
+            let c_lower = c.to_ascii_lowercase();
+            if c_lower == col_lower {
+                return true;
+            }
+            if let Some((q, rest)) = c_lower.split_once('.') {
+                if (q == qualifier.to_ascii_lowercase() || q == table_name.to_ascii_lowercase())
+                    && (rest == "*" || rest == col_lower)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Resolves the required column indices in `schema` for a table.
+    pub fn table_column_indices(
+        &self,
+        qualifier: &str,
+        table_name: &str,
+        schema: &Schema,
+    ) -> BTreeSet<usize> {
+        let mut indices = BTreeSet::new();
+        for (i, col) in schema.columns.iter().enumerate() {
+            if self.is_required_for_table(qualifier, table_name, &col.name) {
+                indices.insert(i);
+            }
+        }
+        indices
+    }
+
+    /// Resolves the required column names in `schema` for a table.
+    pub fn table_column_names(
+        &self,
+        qualifier: &str,
+        table_name: &str,
+        schema: &Schema,
+    ) -> Vec<String> {
+        schema
+            .columns
+            .iter()
+            .filter(|col| self.is_required_for_table(qualifier, table_name, &col.name))
+            .map(|col| col.name.clone())
+            .collect()
+    }
+
+    /// Resolves the pruned (unneeded) column names in `schema` for a table.
+    pub fn pruned_column_names(
+        &self,
+        qualifier: &str,
+        table_name: &str,
+        schema: &Schema,
+    ) -> Vec<String> {
+        schema
+            .columns
+            .iter()
+            .filter(|col| !self.is_required_for_table(qualifier, table_name, &col.name))
+            .map(|col| col.name.clone())
+            .collect()
+    }
+
+    /// Returns a sorted `Vec` of all column demand strings.
+    pub fn to_vec(&self) -> Vec<String> {
+        self.columns.iter().cloned().collect()
+    }
+}
+
+impl fmt::Display for RequiredColumns {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cols: Vec<&str> = self.columns.iter().map(|s| s.as_str()).collect();
+        write!(f, "[{}]", cols.join(", "))
+    }
+}
+
+/// Physical requirements demanded by a parent execution node (ordering, row-goal bounds, and column demand).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequiredPhysicalProperties {
     /// Required physical ordering.
     pub ordering: RequiredOrdering,
     /// Bounded row-goal requirement if output is bounded.
     pub row_goal: Option<RowGoal>,
+    /// Column demand required by the consumer subtree.
+    pub required_columns: RequiredColumns,
 }
 
 impl RequiredPhysicalProperties {
-    /// Creates a new `RequiredPhysicalProperties`.
-    pub const fn new(ordering: RequiredOrdering, row_goal: Option<RowGoal>) -> Self {
-        Self { ordering, row_goal }
+    /// Creates a new `RequiredPhysicalProperties` with ordering and row-goal.
+    pub fn new(ordering: RequiredOrdering, row_goal: Option<RowGoal>) -> Self {
+        Self {
+            ordering,
+            row_goal,
+            required_columns: RequiredColumns::empty(),
+        }
+    }
+
+    /// Creates a `RequiredPhysicalProperties` with all properties.
+    pub fn with_all(
+        ordering: RequiredOrdering,
+        row_goal: Option<RowGoal>,
+        required_columns: RequiredColumns,
+    ) -> Self {
+        Self {
+            ordering,
+            row_goal,
+            required_columns,
+        }
     }
 
     /// Creates a requirement with only ordering.
-    pub const fn with_ordering(ordering: RequiredOrdering) -> Self {
+    pub fn with_ordering(ordering: RequiredOrdering) -> Self {
         Self {
             ordering,
             row_goal: None,
+            required_columns: RequiredColumns::empty(),
         }
     }
 
     /// Creates a requirement with only row goal.
-    pub const fn with_row_goal(row_goal: RowGoal) -> Self {
+    pub fn with_row_goal(row_goal: RowGoal) -> Self {
         Self {
             ordering: RequiredOrdering {
                 columns: Vec::new(),
             },
             row_goal: Some(row_goal),
+            required_columns: RequiredColumns::empty(),
         }
     }
 
-    /// Returns `true` if no physical properties or row goals are required.
+    /// Creates a requirement with only required columns.
+    pub fn with_required_columns(required_columns: RequiredColumns) -> Self {
+        Self {
+            ordering: RequiredOrdering::default(),
+            row_goal: None,
+            required_columns,
+        }
+    }
+
+    /// Returns `true` if no physical properties, row goals, or column demands are required.
     pub fn is_empty(&self) -> bool {
-        self.ordering.is_empty() && self.row_goal.is_none()
+        self.ordering.is_empty() && self.row_goal.is_none() && self.required_columns.is_empty()
     }
 }
 
 impl fmt::Display for RequiredPhysicalProperties {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (&self.ordering, &self.row_goal) {
-            (ord, Some(rg)) if !ord.is_empty() => write!(f, "Ordering: {ord}, {rg}"),
-            (ord, None) if !ord.is_empty() => write!(f, "Ordering: {ord}"),
-            (_, Some(rg)) => write!(f, "{rg}"),
-            _ => write!(f, "NoRequirements"),
+        let mut parts = Vec::new();
+        if !self.ordering.is_empty() {
+            parts.push(format!("Ordering: {}", self.ordering));
+        }
+        if let Some(rg) = &self.row_goal {
+            parts.push(format!("{rg}"));
+        }
+        if !self.required_columns.is_empty() {
+            parts.push(format!("RequiredColumns: {}", self.required_columns));
+        }
+        if parts.is_empty() {
+            write!(f, "NoRequirements")
+        } else {
+            write!(f, "{}", parts.join(", "))
         }
     }
 }
@@ -484,6 +782,8 @@ pub struct PhysicalProperties {
     pub ordering: Option<OrderingProperty>,
     /// Active physical row-goal property, if guaranteed/bounded.
     pub row_goal: Option<RowGoal>,
+    /// Output columns provided / materialized in the execution stream.
+    pub required_columns: Option<RequiredColumns>,
 }
 
 impl PhysicalProperties {
@@ -492,6 +792,7 @@ impl PhysicalProperties {
         Self {
             ordering,
             row_goal: None,
+            required_columns: None,
         }
     }
 
@@ -504,6 +805,7 @@ impl PhysicalProperties {
                 Some(ordering)
             },
             row_goal: None,
+            required_columns: None,
         }
     }
 
@@ -512,7 +814,24 @@ impl PhysicalProperties {
         ordering: Option<OrderingProperty>,
         row_goal: Option<RowGoal>,
     ) -> Self {
-        Self { ordering, row_goal }
+        Self {
+            ordering,
+            row_goal,
+            required_columns: None,
+        }
+    }
+
+    /// Creates a `PhysicalProperties` with ordering, row-goal, and column demand.
+    pub fn with_all(
+        ordering: Option<OrderingProperty>,
+        row_goal: Option<RowGoal>,
+        required_columns: Option<RequiredColumns>,
+    ) -> Self {
+        Self {
+            ordering,
+            row_goal,
+            required_columns,
+        }
     }
 
     /// Creates a `PhysicalProperties` instance with no guaranteed physical properties.
@@ -520,22 +839,38 @@ impl PhysicalProperties {
         Self {
             ordering: None,
             row_goal: None,
+            required_columns: None,
         }
     }
 
     /// Returns `true` if no physical properties are guaranteed.
     pub fn is_empty(&self) -> bool {
-        self.ordering.as_ref().is_none_or(|o| o.is_empty()) && self.row_goal.is_none()
+        self.ordering.as_ref().is_none_or(|o| o.is_empty())
+            && self.row_goal.is_none()
+            && self.required_columns.as_ref().is_none_or(|c| c.is_empty())
     }
 }
 
 impl fmt::Display for PhysicalProperties {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (&self.ordering, &self.row_goal) {
-            (Some(ord), Some(rg)) if !ord.is_empty() => write!(f, "Ordering: {ord}, {rg}"),
-            (Some(ord), None) if !ord.is_empty() => write!(f, "Ordering: {ord}"),
-            (_, Some(rg)) => write!(f, "{rg}"),
-            _ => write!(f, "NoProperties"),
+        let mut parts = Vec::new();
+        if let Some(ord) = &self.ordering {
+            if !ord.is_empty() {
+                parts.push(format!("Ordering: {ord}"));
+            }
+        }
+        if let Some(rg) = &self.row_goal {
+            parts.push(format!("{rg}"));
+        }
+        if let Some(cols) = &self.required_columns {
+            if !cols.is_empty() {
+                parts.push(format!("ProvidedColumns: {cols}"));
+            }
+        }
+        if parts.is_empty() {
+            write!(f, "NoProperties")
+        } else {
+            write!(f, "{}", parts.join(", "))
         }
     }
 }

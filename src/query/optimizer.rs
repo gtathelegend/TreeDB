@@ -358,12 +358,55 @@ pub struct PhysicalTableScan {
     pub estimated_qualifying_rows: Option<f64>,
     /// Whether early termination is planned for this scan node.
     pub early_termination_possible: bool,
+    /// Required column names needed from this scan by the consumer execution tree.
+    pub required_columns: Vec<String>,
+    /// Pruned unreferenced column names omitted from demand.
+    pub pruned_columns: Vec<String>,
+    /// Covered column names if scan utilizes covering index properties.
+    pub covered_columns: Vec<String>,
+    /// Whether late base-record materialization is enabled for this scan node.
+    pub late_materialization: bool,
+    /// Index-covered filtering predicate evaluated before base record fetching.
+    pub index_covered_filter: Option<Expr>,
+    /// Base-record filtering predicate evaluated after base record fetching.
+    pub base_record_filter: Option<Expr>,
 }
 
 impl PhysicalTableScan {
     /// Returns the active qualifier (alias if present, else table name).
     pub fn qualifier(&self) -> &str {
         self.table_alias.as_deref().unwrap_or(&self.table_name)
+    }
+
+    /// Creates an empty result physical table scan.
+    pub fn new_empty(table_name: String, table_alias: Option<String>) -> Self {
+        Self::new_with_access_path(table_name, table_alias, AccessPath::EmptyResult)
+    }
+
+    /// Creates a physical table scan with a specified access path.
+    pub fn new_with_access_path(
+        table_name: String,
+        table_alias: Option<String>,
+        access_path: AccessPath,
+    ) -> Self {
+        Self {
+            table_name,
+            table_alias,
+            access_path,
+            residual_filter: None,
+            estimated_rows: 0.0,
+            cost: 0.0,
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            early_termination_possible: false,
+            required_columns: Vec::new(),
+            pruned_columns: Vec::new(),
+            covered_columns: Vec::new(),
+            late_materialization: false,
+            index_covered_filter: None,
+            base_record_filter: None,
+        }
     }
 }
 
@@ -540,6 +583,12 @@ impl PhysicalPlan {
                 estimated_rows_examined: None,
                 estimated_qualifying_rows: None,
                 early_termination_possible: false,
+                required_columns: Vec::new(),
+                pruned_columns: Vec::new(),
+                covered_columns: Vec::new(),
+                late_materialization: false,
+                index_covered_filter: None,
+                base_record_filter: None,
             },
             joins: Vec::new(),
             post_join_filter: None,
@@ -864,6 +913,42 @@ impl fmt::Display for PhysicalPlan {
                 "cost: {:.2}, estimated_rows: {:.0}",
                 self.base_table.cost, self.base_table.estimated_rows
             )?;
+            if !self.base_table.required_columns.is_empty() {
+                write_indent(f, indent + 1)?;
+                writeln!(
+                    f,
+                    "Required Columns: [{}]",
+                    self.base_table.required_columns.join(", ")
+                )?;
+            }
+            if !self.base_table.pruned_columns.is_empty() {
+                write_indent(f, indent + 1)?;
+                writeln!(
+                    f,
+                    "Pruned Columns: [{}]",
+                    self.base_table.pruned_columns.join(", ")
+                )?;
+            }
+            if !self.base_table.covered_columns.is_empty() {
+                write_indent(f, indent + 1)?;
+                writeln!(
+                    f,
+                    "Covered Columns: [{}]",
+                    self.base_table.covered_columns.join(", ")
+                )?;
+            }
+            if self.base_table.late_materialization {
+                write_indent(f, indent + 1)?;
+                writeln!(f, "Late Materialization: true")?;
+                if let Some(icf) = &self.base_table.index_covered_filter {
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "Index-Covered Filter: [{icf}]")?;
+                }
+                if let Some(brf) = &self.base_table.base_record_filter {
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "Base-Record Filter: [{brf}]")?;
+                }
+            }
             if let Some(rg) = &self.base_table.row_goal {
                 write_indent(f, indent + 1)?;
                 writeln!(f, "Row Goal: {}", rg.k())?;
@@ -1025,6 +1110,42 @@ impl fmt::Display for PhysicalPlan {
                         "cost: {:.2}, estimated_rows: {:.0}",
                         self.base_table.cost, self.base_table.estimated_rows
                     )?;
+                    if !self.base_table.required_columns.is_empty() {
+                        write_indent(f, indent + 1)?;
+                        writeln!(
+                            f,
+                            "Required Columns: [{}]",
+                            self.base_table.required_columns.join(", ")
+                        )?;
+                    }
+                    if !self.base_table.pruned_columns.is_empty() {
+                        write_indent(f, indent + 1)?;
+                        writeln!(
+                            f,
+                            "Pruned Columns: [{}]",
+                            self.base_table.pruned_columns.join(", ")
+                        )?;
+                    }
+                    if !self.base_table.covered_columns.is_empty() {
+                        write_indent(f, indent + 1)?;
+                        writeln!(
+                            f,
+                            "Covered Columns: [{}]",
+                            self.base_table.covered_columns.join(", ")
+                        )?;
+                    }
+                    if self.base_table.late_materialization {
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Late Materialization: true")?;
+                        if let Some(icf) = &self.base_table.index_covered_filter {
+                            write_indent(f, indent + 1)?;
+                            writeln!(f, "Index-Covered Filter: [{icf}]")?;
+                        }
+                        if let Some(brf) = &self.base_table.base_record_filter {
+                            write_indent(f, indent + 1)?;
+                            writeln!(f, "Base-Record Filter: [{brf}]")?;
+                        }
+                    }
                     if let Some(rf) = &self.base_table.residual_filter {
                         format_subqueries_in_expr(rf, f, indent + 1)?;
                     }
@@ -1052,6 +1173,42 @@ impl fmt::Display for PhysicalPlan {
                     "cost: {:.2}, estimated_rows: {:.0}",
                     join.right.cost, join.right.estimated_rows
                 )?;
+                if !join.right.required_columns.is_empty() {
+                    write_indent(f, indent + 1)?;
+                    writeln!(
+                        f,
+                        "Required Columns: [{}]",
+                        join.right.required_columns.join(", ")
+                    )?;
+                }
+                if !join.right.pruned_columns.is_empty() {
+                    write_indent(f, indent + 1)?;
+                    writeln!(
+                        f,
+                        "Pruned Columns: [{}]",
+                        join.right.pruned_columns.join(", ")
+                    )?;
+                }
+                if !join.right.covered_columns.is_empty() {
+                    write_indent(f, indent + 1)?;
+                    writeln!(
+                        f,
+                        "Covered Columns: [{}]",
+                        join.right.covered_columns.join(", ")
+                    )?;
+                }
+                if join.right.late_materialization {
+                    write_indent(f, indent + 1)?;
+                    writeln!(f, "Late Materialization: true")?;
+                    if let Some(icf) = &join.right.index_covered_filter {
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Index-Covered Filter: [{icf}]")?;
+                    }
+                    if let Some(brf) = &join.right.base_record_filter {
+                        write_indent(f, indent + 1)?;
+                        writeln!(f, "Base-Record Filter: [{brf}]")?;
+                    }
+                }
                 if let Some(rf) = &join.right.residual_filter {
                     format_subqueries_in_expr(rf, f, indent + 1)?;
                 }
@@ -1785,6 +1942,7 @@ fn build_join_graph(
         }
 
         let ref_cols = bound.map(|b| collect_table_referenced_columns(t, b, candidate_conjuncts));
+        let req_cols = bound.map(compute_query_required_columns);
         let base_scan = plan_table_scan(
             t,
             table_local_conjuncts[local_id].clone(),
@@ -1794,6 +1952,7 @@ fn build_join_graph(
             param_sig,
             resource_sig,
             stats_gen,
+            req_cols.as_ref(),
         );
         relations.push(JoinGraphRelation {
             id: local_id,
@@ -1870,18 +2029,8 @@ fn optimize_all_inner_joins(
     constraint_set.propagate_inner_joins(&join_on_clauses, &mut metrics);
 
     if constraint_set.is_unsatisfiable() {
-        let empty_scan = PhysicalTableScan {
-            table_name: tables[0].name.clone(),
-            table_alias: tables[0].alias.clone(),
-            access_path: AccessPath::EmptyResult,
-            residual_filter: None,
-            estimated_rows: 0.0,
-            cost: 0.0,
-            row_goal: None,
-            estimated_rows_examined: None,
-            estimated_qualifying_rows: None,
-            early_termination_possible: false,
-        };
+        let empty_scan =
+            PhysicalTableScan::new_empty(tables[0].name.clone(), tables[0].alias.clone());
         return Ok(PhysicalPlan {
             ctes: bound.ctes.clone(),
             base_table: empty_scan,
@@ -2200,18 +2349,8 @@ fn optimize_with_outer_barriers(
     constraint_set.propagate_inner_joins(&inner_on_clauses, &mut metrics);
 
     if constraint_set.is_unsatisfiable() {
-        let empty_scan = PhysicalTableScan {
-            table_name: tables[0].name.clone(),
-            table_alias: tables[0].alias.clone(),
-            access_path: AccessPath::EmptyResult,
-            residual_filter: None,
-            estimated_rows: 0.0,
-            cost: 0.0,
-            row_goal: None,
-            estimated_rows_examined: None,
-            estimated_qualifying_rows: None,
-            early_termination_possible: false,
-        };
+        let empty_scan =
+            PhysicalTableScan::new_empty(tables[0].name.clone(), tables[0].alias.clone());
         return Ok(PhysicalPlan {
             ctes: bound.ctes.clone(),
             base_table: empty_scan,
@@ -2331,6 +2470,7 @@ fn optimize_with_outer_barriers(
     }
 
     // 3. Plan Base Table Scan
+    let req_cols_all = compute_query_required_columns(bound);
     let ref_cols_base = collect_table_referenced_columns(&tables[0], bound, where_conjuncts);
     let base_table_scan = plan_table_scan(
         &tables[0],
@@ -2341,6 +2481,7 @@ fn optimize_with_outer_barriers(
         param_sig,
         resource_sig,
         stats_gen,
+        Some(&req_cols_all),
     );
 
     let mut physical_joins = Vec::new();
@@ -2370,6 +2511,7 @@ fn optimize_with_outer_barriers(
             param_sig,
             resource_sig,
             stats_gen,
+            Some(&req_cols_all),
         );
 
         let mut join_rows = CardinalityEstimator::estimate_join_cardinality(
@@ -3503,6 +3645,7 @@ impl Optimizer {
             let mut metrics = InferenceMetrics::default();
             let constraint_set =
                 ConstraintSet::extract_from_conjuncts(&where_conjuncts, &mut metrics);
+            let req_cols = compute_query_required_columns(bound);
             let ref_cols = collect_table_referenced_columns(&tables[0], bound, &where_conjuncts);
             let candidate_scans = plan_table_scan_candidates(
                 &tables[0],
@@ -3513,6 +3656,7 @@ impl Optimizer {
                 param_sig,
                 resource_sig,
                 stats_gen,
+                Some(&req_cols),
             );
 
             let safe_row_goal = bound.group_by.is_empty()
@@ -3836,18 +3980,11 @@ impl Optimizer {
                 top_n,
                 final_ordering,
             ) = best_plan_info.unwrap_or_else(|| {
-                let default_scan = PhysicalTableScan {
-                    table_name: tables[0].name.clone(),
-                    table_alias: tables[0].alias.clone(),
-                    access_path: AccessPath::FullTableScan,
-                    residual_filter: None,
-                    estimated_rows: 0.0,
-                    cost: 0.0,
-                    row_goal: None,
-                    estimated_rows_examined: None,
-                    estimated_qualifying_rows: None,
-                    early_termination_possible: false,
-                };
+                let default_scan = PhysicalTableScan::new_with_access_path(
+                    tables[0].name.clone(),
+                    tables[0].alias.clone(),
+                    AccessPath::FullTableScan,
+                );
                 (
                     default_scan,
                     None,
@@ -3917,6 +4054,60 @@ impl Optimizer {
     }
 }
 
+/// Extracts the authoritative column demand for a bound SQL query.
+pub fn compute_query_required_columns(
+    bound: &BoundSelect,
+) -> crate::query::physical_properties::RequiredColumns {
+    use std::collections::BTreeSet;
+    let mut cols = BTreeSet::new();
+
+    // 1. Projections
+    for (expr, _) in &bound.projections {
+        expr.collect_referenced_columns(&mut cols);
+    }
+
+    // 2. WHERE filter
+    if let Some(f) = &bound.filter {
+        f.collect_referenced_columns(&mut cols);
+    }
+
+    // 3. JOIN conditions
+    for join in &bound.joins {
+        join.on.collect_referenced_columns(&mut cols);
+    }
+
+    // 4. GROUP BY
+    for gb in &bound.group_by {
+        gb.collect_referenced_columns(&mut cols);
+    }
+
+    // 5. Aggregates
+    for agg in &bound.aggregates {
+        agg.collect_referenced_columns(&mut cols);
+    }
+
+    // 6. HAVING
+    if let Some(h) = &bound.having {
+        h.collect_referenced_columns(&mut cols);
+    }
+
+    // 7. Window expressions
+    for win in &bound.window_exprs {
+        win.collect_referenced_columns(&mut cols);
+    }
+
+    // 8. ORDER BY
+    for sk in &bound.order_by {
+        sk.collect_referenced_columns(&mut cols);
+    }
+
+    if cols.contains("*") {
+        return crate::query::physical_properties::RequiredColumns::all();
+    }
+
+    crate::query::physical_properties::RequiredColumns::from_columns(cols)
+}
+
 /// Candidate access path evaluated during cost-based access-path selection.
 #[derive(Debug, Clone)]
 struct AccessPathCandidate {
@@ -3927,6 +4118,9 @@ struct AccessPathCandidate {
     priority: u8,
     index_id: Option<IndexId>,
     index_name: Option<String>,
+    late_materialization: bool,
+    index_covered_filter: Option<Expr>,
+    base_record_filter: Option<Expr>,
 }
 
 /// Analyzes local predicates for a single table and selects the optimal cost-based access path.
@@ -3940,6 +4134,7 @@ fn plan_table_scan(
     param_sig: Option<&ParamPlanningSignature>,
     resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
+    required_cols: Option<&crate::query::physical_properties::RequiredColumns>,
 ) -> PhysicalTableScan {
     let candidates = plan_table_scan_candidates(
         table,
@@ -3950,6 +4145,7 @@ fn plan_table_scan(
         param_sig,
         resource_sig,
         stats_gen,
+        required_cols,
     );
     candidates.into_iter().next().unwrap()
 }
@@ -3965,6 +4161,7 @@ fn plan_table_scan_candidates(
     param_sig: Option<&ParamPlanningSignature>,
     resource_sig: Option<&ResourcePlanningSignature>,
     stats_gen: u64,
+    required_cols: Option<&crate::query::physical_properties::RequiredColumns>,
 ) -> Vec<PhysicalTableScan> {
     let qualifier = table.qualifier();
     // 1. Unqualify conjuncts so they match raw table schema column names
@@ -3979,18 +4176,10 @@ fn plan_table_scan_candidates(
     let mut metrics = InferenceMetrics::default();
     let constraint_set = ConstraintSet::extract_from_conjuncts(&unqual_conjuncts, &mut metrics);
     if constraint_set.is_unsatisfiable() {
-        return vec![PhysicalTableScan {
-            table_name: table.name.clone(),
-            table_alias: table.alias.clone(),
-            access_path: AccessPath::EmptyResult,
-            residual_filter: None,
-            estimated_rows: 0.0,
-            cost: 0.0,
-            row_goal: None,
-            estimated_rows_examined: None,
-            estimated_qualifying_rows: None,
-            early_termination_possible: false,
-        }];
+        return vec![PhysicalTableScan::new_empty(
+            table.name.clone(),
+            table.alias.clone(),
+        )];
     }
 
     // If this is a CTE / in-memory relation, it does not possess a physical B-Tree index or primary key path.
@@ -4018,6 +4207,21 @@ fn plan_table_scan_candidates(
         }
         let cost = CostModel::table_scan_cost(estimated_rows, unqual_conjuncts.len());
 
+        let (req_names, pruned_names, _) = table.schema.columns.iter().enumerate().fold(
+            (Vec::new(), Vec::new(), std::collections::BTreeSet::new()),
+            |(mut req, mut pruned, mut idx), (i, c)| {
+                if required_cols
+                    .is_none_or(|rc| rc.is_required_for_table(qualifier, &table.name, &c.name))
+                {
+                    req.push(c.name.clone());
+                    idx.insert(i);
+                } else {
+                    pruned.push(c.name.clone());
+                }
+                (req, pruned, idx)
+            },
+        );
+
         return vec![PhysicalTableScan {
             table_name: table.name.clone(),
             table_alias: table.alias.clone(),
@@ -4029,6 +4233,12 @@ fn plan_table_scan_candidates(
             estimated_rows_examined: None,
             estimated_qualifying_rows: None,
             early_termination_possible: false,
+            required_columns: req_names,
+            pruned_columns: pruned_names,
+            covered_columns: Vec::new(),
+            late_materialization: false,
+            index_covered_filter: None,
+            base_record_filter: None,
         }];
     }
 
@@ -4040,6 +4250,76 @@ fn plan_table_scan_candidates(
     let pk_col = schema.primary_key_column();
     let pk_name = &pk_col.name;
     let pk_type = pk_col.data_type;
+
+    let (req_names, pruned_names, req_indices): (
+        Vec<String>,
+        Vec<String>,
+        std::collections::BTreeSet<usize>,
+    ) = {
+        let mut req_set = std::collections::BTreeSet::new();
+        if let Some(rc) = required_cols {
+            if rc.is_all() {
+                for col in &schema.columns {
+                    req_set.insert(col.name.clone());
+                }
+            } else {
+                for col in &schema.columns {
+                    if rc.is_required_for_table(qualifier, &table.name, &col.name) {
+                        req_set.insert(col.name.clone());
+                    }
+                }
+            }
+        } else if let Some(ref_cols) = referenced_columns {
+            for &idx in ref_cols {
+                if idx < schema.columns.len() {
+                    req_set.insert(schema.columns[idx].name.clone());
+                }
+            }
+        } else {
+            for col in &schema.columns {
+                req_set.insert(col.name.clone());
+            }
+        }
+
+        let mut req_vec = Vec::new();
+        let mut pruned_vec = Vec::new();
+        let mut indices = std::collections::BTreeSet::new();
+        for (i, col) in schema.columns.iter().enumerate() {
+            if req_set.contains(&col.name) {
+                req_vec.push(col.name.clone());
+                indices.insert(i);
+            } else {
+                pruned_vec.push(col.name.clone());
+            }
+        }
+        (req_vec, pruned_vec, indices)
+    };
+
+    let classify_residual = |conjuncts: &[Expr],
+                             sec_meta: &crate::engine::catalog::IndexMetadata|
+     -> (Vec<Expr>, Vec<Expr>) {
+        let mut index_covered = Vec::new();
+        let mut base_record = Vec::new();
+        for conj in conjuncts {
+            let mut cols = std::collections::BTreeSet::new();
+            conj.collect_referenced_columns(&mut cols);
+            let all_covered = !cols.is_empty()
+                && cols.iter().all(|col_name| {
+                    let bare = col_name.split('.').next_back().unwrap_or(col_name);
+                    if let Some(pos) = schema.columns.iter().position(|c| c.name == bare) {
+                        sec_meta.covers_column(pos)
+                    } else {
+                        false
+                    }
+                });
+            if all_covered {
+                index_covered.push(conj.clone());
+            } else {
+                base_record.push(conj.clone());
+            }
+        }
+        (index_covered, base_record)
+    };
 
     let table_rows = CardinalityEstimator::estimate_table_rows(table.stats.as_ref());
     let mut candidates: Vec<AccessPathCandidate> = Vec::new();
@@ -4063,6 +4343,9 @@ fn plan_table_scan_candidates(
         priority: 3,
         index_id: None,
         index_name: None,
+        late_materialization: false,
+        index_covered_filter: None,
+        base_record_filter: None,
     });
 
     // Candidate 2: Primary Key Point Lookup
@@ -4083,6 +4366,9 @@ fn plan_table_scan_candidates(
                     priority: 0,
                     index_id: None,
                     index_name: None,
+                    late_materialization: false,
+                    index_covered_filter: None,
+                    base_record_filter: None,
                 });
             }
         }
@@ -4103,6 +4389,9 @@ fn plan_table_scan_candidates(
                     priority: 0,
                     index_id: None,
                     index_name: None,
+                    late_materialization: false,
+                    index_covered_filter: None,
+                    base_record_filter: None,
                 });
             }
         }
@@ -4136,17 +4425,16 @@ fn plan_table_scan_candidates(
             priority: 1,
             index_id: None,
             index_name: None,
+            late_materialization: false,
+            index_covered_filter: None,
+            base_record_filter: None,
         });
     }
 
-    // Candidate 4: Secondary Indexes (including Covering Index-Only scans)
+    // Candidate 4: Secondary Indexes (including Covering Index-Only scans and Late Materialization)
     for sec_meta in &table.indexes {
-        let is_covering = match referenced_columns {
-            Some(req_cols) => {
-                !req_cols.is_empty() && req_cols.iter().all(|&c| sec_meta.covers_column(c))
-            }
-            None => false,
-        };
+        let is_covering =
+            !req_indices.is_empty() && req_indices.iter().all(|&c| sec_meta.covers_column(c));
         let covered_column_names: Vec<String> = sec_meta
             .include_column_indices
             .iter()
@@ -4167,7 +4455,7 @@ fn plan_table_scan_candidates(
                         matched_predicate = true;
                         let mut residual = unqual_conjuncts.clone();
                         residual.remove(idx);
-                        let residual_filter = recombine_conjunction(residual);
+                        let residual_filter = recombine_conjunction(residual.clone());
                         let est_rows = CardinalityEstimator::estimate_sec_point_rows(
                             table.stats.as_ref(),
                             sec_meta,
@@ -4188,22 +4476,58 @@ fn plan_table_scan_candidates(
                                 priority: 0,
                                 index_id: Some(sec_meta.index_id),
                                 index_name: Some(sec_meta.name.clone()),
+                                late_materialization: false,
+                                index_covered_filter: None,
+                                base_record_filter: None,
                             });
                         } else {
+                            let (index_cov, base_rec) = classify_residual(&residual, sec_meta);
                             let cost = CostModel::secondary_point_lookup_cost(est_rows);
                             candidates.push(AccessPathCandidate {
                                 access_path: AccessPath::SecondaryIndexScan {
                                     index_name: sec_meta.name.clone(),
                                     index_id: sec_meta.index_id,
-                                    scan_type: SecondaryScanType::PointLookup(val),
+                                    scan_type: SecondaryScanType::PointLookup(val.clone()),
                                 },
-                                residual_filter,
+                                residual_filter: residual_filter.clone(),
                                 estimated_rows: est_rows,
                                 cost,
                                 priority: 2,
                                 index_id: Some(sec_meta.index_id),
                                 index_name: Some(sec_meta.name.clone()),
+                                late_materialization: false,
+                                index_covered_filter: None,
+                                base_record_filter: None,
                             });
+
+                            if !index_cov.is_empty() {
+                                let avg_row_width =
+                                    CostModel::estimated_row_width(schema, &req_indices);
+                                let late_cost = CostModel::late_materialization_scan_cost(
+                                    cost,
+                                    est_rows,
+                                    est_rows,
+                                    index_cov.len(),
+                                    base_rec.len(),
+                                    avg_row_width,
+                                );
+                                candidates.push(AccessPathCandidate {
+                                    access_path: AccessPath::SecondaryIndexScan {
+                                        index_name: sec_meta.name.clone(),
+                                        index_id: sec_meta.index_id,
+                                        scan_type: SecondaryScanType::PointLookup(val),
+                                    },
+                                    residual_filter,
+                                    estimated_rows: est_rows,
+                                    cost: late_cost,
+                                    priority: 2,
+                                    index_id: Some(sec_meta.index_id),
+                                    index_name: Some(sec_meta.name.clone()),
+                                    late_materialization: true,
+                                    index_covered_filter: recombine_conjunction(index_cov),
+                                    base_record_filter: recombine_conjunction(base_rec),
+                                });
+                            }
                         }
                     }
                 }
@@ -4220,7 +4544,7 @@ fn plan_table_scan_candidates(
                     .filter(|(i, _)| !used_indices.contains(i))
                     .map(|(_, c)| c.clone())
                     .collect();
-                let residual_filter = recombine_conjunction(residual);
+                let residual_filter = recombine_conjunction(residual.clone());
                 let est_rows = CardinalityEstimator::estimate_sec_range_rows(
                     table.stats.as_ref(),
                     sec_meta,
@@ -4246,25 +4570,63 @@ fn plan_table_scan_candidates(
                         priority: 1,
                         index_id: Some(sec_meta.index_id),
                         index_name: Some(sec_meta.name.clone()),
+                        late_materialization: false,
+                        index_covered_filter: None,
+                        base_record_filter: None,
                     });
                 } else {
+                    let (index_cov, base_rec) = classify_residual(&residual, sec_meta);
                     let cost = CostModel::secondary_range_scan_cost(est_rows);
                     candidates.push(AccessPathCandidate {
                         access_path: AccessPath::SecondaryIndexScan {
                             index_name: sec_meta.name.clone(),
                             index_id: sec_meta.index_id,
                             scan_type: SecondaryScanType::RangeScan {
-                                start: sec_start,
-                                end: sec_end,
+                                start: sec_start.clone(),
+                                end: sec_end.clone(),
                             },
                         },
-                        residual_filter,
+                        residual_filter: residual_filter.clone(),
                         estimated_rows: est_rows,
                         cost,
                         priority: 2,
                         index_id: Some(sec_meta.index_id),
                         index_name: Some(sec_meta.name.clone()),
+                        late_materialization: false,
+                        index_covered_filter: None,
+                        base_record_filter: None,
                     });
+
+                    if !index_cov.is_empty() {
+                        let avg_row_width = CostModel::estimated_row_width(schema, &req_indices);
+                        let late_cost = CostModel::late_materialization_scan_cost(
+                            cost,
+                            est_rows,
+                            est_rows,
+                            index_cov.len(),
+                            base_rec.len(),
+                            avg_row_width,
+                        );
+                        candidates.push(AccessPathCandidate {
+                            access_path: AccessPath::SecondaryIndexScan {
+                                index_name: sec_meta.name.clone(),
+                                index_id: sec_meta.index_id,
+                                scan_type: SecondaryScanType::RangeScan {
+                                    start: sec_start,
+                                    end: sec_end,
+                                },
+                            },
+                            residual_filter,
+                            estimated_rows: est_rows,
+                            cost: late_cost,
+                            priority: 2,
+                            index_id: Some(sec_meta.index_id),
+                            index_name: Some(sec_meta.name.clone()),
+                            late_materialization: true,
+                            index_covered_filter: recombine_conjunction(index_cov),
+                            base_record_filter: recombine_conjunction(base_rec),
+                        });
+                    }
                 }
             }
 
@@ -4288,8 +4650,12 @@ fn plan_table_scan_candidates(
                         priority: 3,
                         index_id: Some(sec_meta.index_id),
                         index_name: Some(sec_meta.name.clone()),
+                        late_materialization: false,
+                        index_covered_filter: None,
+                        base_record_filter: None,
                     });
                 } else {
+                    let (index_cov, base_rec) = classify_residual(&unqual_conjuncts, sec_meta);
                     let cost = CostModel::secondary_range_scan_cost(table_rows);
                     candidates.push(AccessPathCandidate {
                         access_path: AccessPath::SecondaryIndexScan {
@@ -4306,7 +4672,41 @@ fn plan_table_scan_candidates(
                         priority: 4,
                         index_id: Some(sec_meta.index_id),
                         index_name: Some(sec_meta.name.clone()),
+                        late_materialization: false,
+                        index_covered_filter: None,
+                        base_record_filter: None,
                     });
+
+                    if !index_cov.is_empty() {
+                        let avg_row_width = CostModel::estimated_row_width(schema, &req_indices);
+                        let late_cost = CostModel::late_materialization_scan_cost(
+                            cost,
+                            full_rows,
+                            full_rows,
+                            index_cov.len(),
+                            base_rec.len(),
+                            avg_row_width,
+                        );
+                        candidates.push(AccessPathCandidate {
+                            access_path: AccessPath::SecondaryIndexScan {
+                                index_name: sec_meta.name.clone(),
+                                index_id: sec_meta.index_id,
+                                scan_type: SecondaryScanType::RangeScan {
+                                    start: None,
+                                    end: None,
+                                },
+                            },
+                            residual_filter: full_residual.clone(),
+                            estimated_rows: full_rows,
+                            cost: late_cost,
+                            priority: 4,
+                            index_id: Some(sec_meta.index_id),
+                            index_name: Some(sec_meta.name.clone()),
+                            late_materialization: true,
+                            index_covered_filter: recombine_conjunction(index_cov),
+                            base_record_filter: recombine_conjunction(base_rec),
+                        });
+                    }
                 }
             }
         } else {
@@ -4349,7 +4749,7 @@ fn plan_table_scan_candidates(
                     .filter(|(i, _)| !used_indices.contains(i))
                     .map(|(_, c)| c.clone())
                     .collect();
-                let residual_filter = recombine_conjunction(residual);
+                let residual_filter = recombine_conjunction(residual.clone());
                 let est_rows =
                     CardinalityEstimator::estimate_sec_point_rows(table.stats.as_ref(), sec_meta);
 
@@ -4368,22 +4768,59 @@ fn plan_table_scan_candidates(
                         priority: 0,
                         index_id: Some(sec_meta.index_id),
                         index_name: Some(sec_meta.name.clone()),
+                        late_materialization: false,
+                        index_covered_filter: None,
+                        base_record_filter: None,
                     });
                 } else {
+                    let (index_cov, base_rec) = classify_residual(&residual, sec_meta);
                     let cost = CostModel::secondary_point_lookup_cost(est_rows);
                     candidates.push(AccessPathCandidate {
                         access_path: AccessPath::SecondaryIndexScan {
                             index_name: sec_meta.name.clone(),
                             index_id: sec_meta.index_id,
-                            scan_type: SecondaryScanType::CompositePointLookup(prefix_values),
+                            scan_type: SecondaryScanType::CompositePointLookup(
+                                prefix_values.clone(),
+                            ),
                         },
-                        residual_filter,
+                        residual_filter: residual_filter.clone(),
                         estimated_rows: est_rows,
                         cost,
                         priority: 2,
                         index_id: Some(sec_meta.index_id),
                         index_name: Some(sec_meta.name.clone()),
+                        late_materialization: false,
+                        index_covered_filter: None,
+                        base_record_filter: None,
                     });
+
+                    if !index_cov.is_empty() {
+                        let avg_row_width = CostModel::estimated_row_width(schema, &req_indices);
+                        let late_cost = CostModel::late_materialization_scan_cost(
+                            cost,
+                            est_rows,
+                            est_rows,
+                            index_cov.len(),
+                            base_rec.len(),
+                            avg_row_width,
+                        );
+                        candidates.push(AccessPathCandidate {
+                            access_path: AccessPath::SecondaryIndexScan {
+                                index_name: sec_meta.name.clone(),
+                                index_id: sec_meta.index_id,
+                                scan_type: SecondaryScanType::CompositePointLookup(prefix_values),
+                            },
+                            residual_filter,
+                            estimated_rows: est_rows,
+                            cost: late_cost,
+                            priority: 2,
+                            index_id: Some(sec_meta.index_id),
+                            index_name: Some(sec_meta.name.clone()),
+                            late_materialization: true,
+                            index_covered_filter: recombine_conjunction(index_cov),
+                            base_record_filter: recombine_conjunction(base_rec),
+                        });
+                    }
                 }
             } else if m > 0 {
                 // Proper composite prefix scan
@@ -4393,7 +4830,7 @@ fn plan_table_scan_candidates(
                     .filter(|(i, _)| !used_indices.contains(i))
                     .map(|(_, c)| c.clone())
                     .collect();
-                let residual_filter = recombine_conjunction(residual);
+                let residual_filter = recombine_conjunction(residual.clone());
                 let est_rows = CardinalityEstimator::estimate_sec_prefix_rows(
                     table.stats.as_ref(),
                     sec_meta,
@@ -4415,22 +4852,57 @@ fn plan_table_scan_candidates(
                         priority: 1,
                         index_id: Some(sec_meta.index_id),
                         index_name: Some(sec_meta.name.clone()),
+                        late_materialization: false,
+                        index_covered_filter: None,
+                        base_record_filter: None,
                     });
                 } else {
+                    let (index_cov, base_rec) = classify_residual(&residual, sec_meta);
                     let cost = CostModel::secondary_range_scan_cost(est_rows);
                     candidates.push(AccessPathCandidate {
                         access_path: AccessPath::SecondaryIndexScan {
                             index_name: sec_meta.name.clone(),
                             index_id: sec_meta.index_id,
-                            scan_type: SecondaryScanType::PrefixScan(prefix_values),
+                            scan_type: SecondaryScanType::PrefixScan(prefix_values.clone()),
                         },
-                        residual_filter,
+                        residual_filter: residual_filter.clone(),
                         estimated_rows: est_rows,
                         cost,
                         priority: 2,
                         index_id: Some(sec_meta.index_id),
                         index_name: Some(sec_meta.name.clone()),
+                        late_materialization: false,
+                        index_covered_filter: None,
+                        base_record_filter: None,
                     });
+
+                    if !index_cov.is_empty() {
+                        let avg_row_width = CostModel::estimated_row_width(schema, &req_indices);
+                        let late_cost = CostModel::late_materialization_scan_cost(
+                            cost,
+                            est_rows,
+                            est_rows,
+                            index_cov.len(),
+                            base_rec.len(),
+                            avg_row_width,
+                        );
+                        candidates.push(AccessPathCandidate {
+                            access_path: AccessPath::SecondaryIndexScan {
+                                index_name: sec_meta.name.clone(),
+                                index_id: sec_meta.index_id,
+                                scan_type: SecondaryScanType::PrefixScan(prefix_values),
+                            },
+                            residual_filter,
+                            estimated_rows: est_rows,
+                            cost: late_cost,
+                            priority: 2,
+                            index_id: Some(sec_meta.index_id),
+                            index_name: Some(sec_meta.name.clone()),
+                            late_materialization: true,
+                            index_covered_filter: recombine_conjunction(index_cov),
+                            base_record_filter: recombine_conjunction(base_rec),
+                        });
+                    }
                 }
             } else {
                 // Check for Skip Scan candidate (unconstrained leading prefix + contiguous constrained suffix)
@@ -4557,6 +5029,9 @@ fn plan_table_scan_candidates(
                                     priority: 1,
                                     index_id: Some(sec_meta.index_id),
                                     index_name: Some(sec_meta.name.clone()),
+                                    late_materialization: false,
+                                    index_covered_filter: None,
+                                    base_record_filter: None,
                                 });
                             } else {
                                 let cost = CostModel::skip_scan_cost(
@@ -4580,6 +5055,9 @@ fn plan_table_scan_candidates(
                                     priority: 2,
                                     index_id: Some(sec_meta.index_id),
                                     index_name: Some(sec_meta.name.clone()),
+                                    late_materialization: false,
+                                    index_covered_filter: None,
+                                    base_record_filter: None,
                                 });
                             }
                         }
@@ -4606,8 +5084,12 @@ fn plan_table_scan_candidates(
                             priority: 3,
                             index_id: Some(sec_meta.index_id),
                             index_name: Some(sec_meta.name.clone()),
+                            late_materialization: false,
+                            index_covered_filter: None,
+                            base_record_filter: None,
                         });
                     } else {
+                        let (index_cov, base_rec) = classify_residual(&unqual_conjuncts, sec_meta);
                         let cost = CostModel::secondary_range_scan_cost(table_rows);
                         candidates.push(AccessPathCandidate {
                             access_path: AccessPath::SecondaryIndexScan {
@@ -4624,7 +5106,42 @@ fn plan_table_scan_candidates(
                             priority: 4,
                             index_id: Some(sec_meta.index_id),
                             index_name: Some(sec_meta.name.clone()),
+                            late_materialization: false,
+                            index_covered_filter: None,
+                            base_record_filter: None,
                         });
+
+                        if !index_cov.is_empty() {
+                            let avg_row_width =
+                                CostModel::estimated_row_width(schema, &req_indices);
+                            let late_cost = CostModel::late_materialization_scan_cost(
+                                cost,
+                                full_rows,
+                                full_rows,
+                                index_cov.len(),
+                                base_rec.len(),
+                                avg_row_width,
+                            );
+                            candidates.push(AccessPathCandidate {
+                                access_path: AccessPath::SecondaryIndexScan {
+                                    index_name: sec_meta.name.clone(),
+                                    index_id: sec_meta.index_id,
+                                    scan_type: SecondaryScanType::RangeScan {
+                                        start: None,
+                                        end: None,
+                                    },
+                                },
+                                residual_filter: full_residual.clone(),
+                                estimated_rows: full_rows,
+                                cost: late_cost,
+                                priority: 4,
+                                index_id: Some(sec_meta.index_id),
+                                index_name: Some(sec_meta.name.clone()),
+                                late_materialization: true,
+                                index_covered_filter: recombine_conjunction(index_cov),
+                                base_record_filter: recombine_conjunction(base_rec),
+                            });
+                        }
                     }
                 }
             }
@@ -4850,6 +5367,9 @@ fn plan_table_scan_candidates(
                     priority: 2,
                     index_id: None,
                     index_name: None,
+                    late_materialization: false,
+                    index_covered_filter: None,
+                    base_record_filter: None,
                 });
             }
         }
@@ -4954,6 +5474,9 @@ fn plan_table_scan_candidates(
                             priority: 2,
                             index_id: None,
                             index_name: None,
+                            late_materialization: false,
+                            index_covered_filter: None,
+                            base_record_filter: None,
                         });
                     }
                 }
@@ -5114,6 +5637,9 @@ fn plan_table_scan_candidates(
                     priority: 2,
                     index_id: None,
                     index_name: None,
+                    late_materialization: false,
+                    index_covered_filter: None,
+                    base_record_filter: None,
                 });
             }
         }
@@ -5254,17 +5780,42 @@ fn plan_table_scan_candidates(
 
     candidates
         .into_iter()
-        .map(|cand| PhysicalTableScan {
-            table_name: table.name.clone(),
-            table_alias: table.alias.clone(),
-            access_path: cand.access_path,
-            residual_filter: cand.residual_filter,
-            estimated_rows: cand.estimated_rows,
-            cost: cand.cost,
-            row_goal: None,
-            estimated_rows_examined: None,
-            estimated_qualifying_rows: None,
-            early_termination_possible: false,
+        .map(|cand| {
+            let covered_cols = match &cand.access_path {
+                AccessPath::IndexOnlyScan {
+                    covered_columns, ..
+                } => covered_columns.clone(),
+                AccessPath::SecondaryIndexScan { index_name, .. } => table
+                    .indexes
+                    .iter()
+                    .find(|m| &m.name == index_name)
+                    .map(|m| {
+                        m.all_column_indices()
+                            .iter()
+                            .map(|&i| schema.columns[i].name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            PhysicalTableScan {
+                table_name: table.name.clone(),
+                table_alias: table.alias.clone(),
+                access_path: cand.access_path,
+                residual_filter: cand.residual_filter,
+                estimated_rows: cand.estimated_rows,
+                cost: cand.cost,
+                row_goal: None,
+                estimated_rows_examined: None,
+                estimated_qualifying_rows: None,
+                early_termination_possible: false,
+                required_columns: req_names.clone(),
+                pruned_columns: pruned_names.clone(),
+                covered_columns: covered_cols,
+                late_materialization: cand.late_materialization,
+                index_covered_filter: cand.index_covered_filter,
+                base_record_filter: cand.base_record_filter,
+            }
         })
         .collect()
 }

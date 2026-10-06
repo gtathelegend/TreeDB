@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
+use crate::engine::types::{DataType, Schema};
 use crate::query::feedback::SpillStatus;
 
 /// Canonical cost parameters for TreeDB's centralized cost model.
@@ -703,6 +705,74 @@ impl CostModel {
         let materialize_cost = subplan_cost + write_cost + read_cost;
         let should_materialize = consumer_count >= 2 && (materialize_cost < inline_cost);
         (inline_cost, materialize_cost, should_materialize)
+    }
+
+    /// Estimates the average row width in bytes for a subset of required column indices.
+    pub fn estimated_row_width(schema: &Schema, required_column_indices: &BTreeSet<usize>) -> f64 {
+        if required_column_indices.is_empty() {
+            return 8.0; // Minimal record id / count width
+        }
+        let mut width: f64 = 0.0;
+        for &idx in required_column_indices {
+            if let Some(col) = schema.columns.get(idx) {
+                let col_width = match col.data_type {
+                    DataType::Boolean => 1.0,
+                    DataType::Int64 | DataType::UInt64 | DataType::Float64 => 8.0,
+                    DataType::String => 32.0,
+                    DataType::Bytes => 32.0,
+                    DataType::Null => 0.0,
+                };
+                width += col_width;
+            }
+        }
+        width.max(4.0)
+    }
+
+    /// Computes the cost of a secondary index scan using late materialization.
+    ///
+    /// Evaluates index-covered predicates on candidate index entries, applies row goal / limit bounds,
+    /// and fetches base tuples from RecordStore only for surviving candidate rows.
+    pub fn late_materialization_scan_cost(
+        index_scan_cost: f64,
+        candidate_index_entries: f64,
+        surviving_base_fetches: f64,
+        num_index_filters: usize,
+        num_base_filters: usize,
+        row_width: f64,
+    ) -> f64 {
+        let entries = candidate_index_entries.max(1.0);
+        let fetches = surviving_base_fetches.max(0.0);
+        let width_factor = (row_width / 64.0).clamp(0.5, 3.0);
+
+        let index_filter_cost = FILTER_CPU_COST * entries * (num_index_filters as f64);
+        let fetch_cost = (TUPLE_FETCH_COST * width_factor) * fetches;
+        let base_filter_cost = FILTER_CPU_COST * fetches * (num_base_filters as f64);
+
+        index_scan_cost + index_filter_cost + fetch_cost + base_filter_cost
+    }
+
+    /// Computes column-width-aware materialization cost.
+    pub fn column_aware_materialize_cost(
+        rows: f64,
+        row_width: f64,
+        num_consumers: usize,
+        is_external: bool,
+    ) -> f64 {
+        let width_factor = (row_width / 64.0).clamp(0.2, 5.0);
+        let r = rows.max(1.0);
+        let write_cost = if is_external {
+            r * (MATERIALIZE_WRITE_CPU_COST + MATERIALIZE_SPILL_IO_COST) * width_factor
+        } else {
+            r * MATERIALIZE_WRITE_CPU_COST * width_factor
+        };
+        let read_cost = if is_external {
+            r * (MATERIALIZE_READ_CPU_COST + MATERIALIZE_SPILL_IO_COST)
+                * (num_consumers.max(1) as f64)
+                * width_factor
+        } else {
+            r * MATERIALIZE_READ_CPU_COST * (num_consumers.max(1) as f64) * width_factor
+        };
+        write_cost + read_cost
     }
 }
 

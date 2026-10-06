@@ -309,6 +309,26 @@ pub struct OperatorCounters {
     pub materialize_spill_bytes: usize,
     /// Materialization specific: Temporary spill file count
     pub materialize_spill_files: usize,
+    /// Column demand specific: Count of columns required by consumer/query
+    pub columns_required: usize,
+    /// Column demand specific: Count of columns pruned from scan/materialization
+    pub columns_pruned: usize,
+    /// Column demand specific: Base columns materialized
+    pub base_columns_materialized: usize,
+    /// Column demand specific: Total bytes fetched from storage
+    pub bytes_fetched: usize,
+    /// Late materialization specific: Whether late materialization was executed
+    pub late_materialization_enabled: bool,
+    /// Late materialization specific: Candidate rows before base fetch
+    pub candidate_rows: usize,
+    /// Late materialization specific: Rows fetched from base RecordStore
+    pub rows_fetched: usize,
+    /// Covering execution: whether index-only scan avoided base table fetches
+    pub index_only: bool,
+    /// Late materialization specific: Rows before materialization
+    pub rows_before_materialization: usize,
+    /// Late materialization specific: Rows after materialization
+    pub rows_after_materialization: usize,
 }
 
 /// Runtime execution metrics collected for an individual physical operator node.

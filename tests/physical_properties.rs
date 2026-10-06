@@ -575,6 +575,12 @@ fn test_r630_multi_index_scan_no_false_ordering() -> Result<()> {
         estimated_rows_examined: None,
         estimated_qualifying_rows: None,
         early_termination_possible: false,
+        required_columns: vec![],
+        pruned_columns: vec![],
+        covered_columns: vec![],
+        late_materialization: false,
+        index_covered_filter: None,
+        base_record_filter: None,
     };
     let ord = treedb::query::physical_properties::ordering_property_for_table_scan(
         &treedb::query::TableOptInfo {
@@ -605,12 +611,18 @@ fn test_r631_skip_scan_no_false_ordering() -> Result<()> {
             },
         },
         residual_filter: None,
-        estimated_rows: 10.0,
+        estimated_rows: 100.0,
         cost: 5.0,
         row_goal: None,
         estimated_rows_examined: None,
         estimated_qualifying_rows: None,
         early_termination_possible: false,
+        required_columns: vec![],
+        pruned_columns: vec![],
+        covered_columns: vec![],
+        late_materialization: false,
+        index_covered_filter: None,
+        base_record_filter: None,
     };
     let ord = treedb::query::physical_properties::ordering_property_for_table_scan(
         &treedb::query::TableOptInfo {
