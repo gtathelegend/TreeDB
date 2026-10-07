@@ -432,6 +432,25 @@ impl TreeDb {
         Ok(explanation)
     }
 
+    /// Generates a human-readable explanation including the deterministic physical plan fingerprint for a SQL query.
+    pub fn explain_sql_with_fingerprint(&mut self, sql: &str) -> Result<String> {
+        let mut txn = self.begin_transaction()?;
+        let explanation = txn.explain_sql_with_fingerprint(sql)?;
+        txn.commit()?;
+        Ok(explanation)
+    }
+
+    /// Computes the deterministic physical plan fingerprint for a SQL query within an auto-committed transaction.
+    pub fn explain_plan_fingerprint(
+        &mut self,
+        sql: &str,
+    ) -> Result<crate::query::fingerprint::PhysicalPlanFingerprint> {
+        let mut txn = self.begin_transaction()?;
+        let fp = txn.explain_plan_fingerprint(sql)?;
+        txn.commit()?;
+        Ok(fp)
+    }
+
     /// Executes an arbitrary top-level SQL statement (`SELECT`, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`)
     /// directly on the database engine within an auto-committed transaction.
     pub fn execute_statement(&mut self, sql: &str) -> Result<StatementResult> {

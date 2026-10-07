@@ -1943,6 +1943,26 @@ impl<'db> Transaction<'db> {
         Ok(crate::query::PhysicalPlanValidator::format_validation_diagnostics(&plan, &val_ctx))
     }
 
+    /// Generates deterministic validation diagnostics including physical plan fingerprint for a SQL query.
+    pub fn explain_sql_with_fingerprint(&mut self, sql: &str) -> Result<String> {
+        let plan = self.plan_sql(sql)?;
+        let val_ctx = self.create_validation_context()?;
+        Ok(
+            crate::query::PhysicalPlanValidator::format_validation_diagnostics_with_fingerprint(
+                &plan, &val_ctx,
+            ),
+        )
+    }
+
+    /// Computes and returns the deterministic physical plan fingerprint for a SQL query.
+    pub fn explain_plan_fingerprint(
+        &mut self,
+        sql: &str,
+    ) -> Result<crate::query::fingerprint::PhysicalPlanFingerprint> {
+        let plan = self.plan_sql(sql)?;
+        Ok(plan.fingerprint())
+    }
+
     /// Generates deterministic validation and plan explanation diagnostics for an arbitrary physical plan.
     pub fn explain_plan_diagnostics(
         &mut self,

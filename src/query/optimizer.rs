@@ -615,6 +615,29 @@ impl PhysicalPlan {
             estimated_rows,
         }
     }
+
+    /// Computes the deterministic physical plan fingerprint for this plan.
+    pub fn fingerprint(&self) -> crate::query::fingerprint::PhysicalPlanFingerprint {
+        crate::query::fingerprint::PhysicalPlanFingerprint::from_plan(self)
+    }
+
+    /// Computes the deterministic physical plan fingerprint with optional resource configuration.
+    pub fn fingerprint_with_resources(
+        &self,
+        resources: Option<&crate::query::plan_cache::ResourcePlanningSignature>,
+    ) -> crate::query::fingerprint::PhysicalPlanFingerprint {
+        crate::query::fingerprint::PhysicalPlanFingerprint::from_plan_with_resources(
+            self, resources,
+        )
+    }
+
+    /// Computes the deterministic canonical serialized string representation of this plan.
+    pub fn canonical_form(
+        &self,
+        resources: Option<&crate::query::plan_cache::ResourcePlanningSignature>,
+    ) -> String {
+        crate::query::fingerprint::canonicalize_plan(self, resources)
+    }
 }
 
 impl fmt::Display for PhysicalPlan {

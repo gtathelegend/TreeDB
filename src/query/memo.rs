@@ -302,6 +302,8 @@ pub struct PhysicalAlternative {
     pub properties: PhysicalProperties,
     /// Canonical fingerprint of this physical plan.
     pub fingerprint: String,
+    /// Strongly typed canonical physical plan fingerprint.
+    pub plan_fingerprint: crate::query::fingerprint::PhysicalPlanFingerprint,
 }
 
 /// The winning best-plan result for a specific physical property requirement key.
@@ -457,6 +459,7 @@ impl OptimizerMemo {
             row_goal: plan.row_goal,
         };
 
+        let plan_fp = plan.fingerprint();
         let alt = PhysicalAlternative {
             id: alt_id,
             description: desc,
@@ -465,6 +468,7 @@ impl OptimizerMemo {
             cardinality,
             properties,
             fingerprint: fp.clone(),
+            plan_fingerprint: plan_fp,
         };
 
         group.alternative_fingerprints.insert(fp);
@@ -475,37 +479,15 @@ impl OptimizerMemo {
 
     /// Computes a canonical, deterministic fingerprint for a physical plan alternative.
     pub fn compute_physical_fingerprint(&self, plan: &PhysicalPlan, desc: &str) -> String {
-        let mut s = String::new();
-        s.push_str("DESC:");
-        s.push_str(desc);
-        s.push_str(";BASE:");
-        s.push_str(&plan.base_table.table_name);
-        s.push_str(";PATH:");
-        s.push_str(&format!("{:?}", plan.base_table.access_path));
-        if plan.base_table.late_materialization {
-            s.push_str(";LATE_MAT:true");
-        }
-        if let Some(f) = &plan.base_table.residual_filter {
-            s.push_str(&format!(";RES:{f}"));
-        }
-        for j in &plan.joins {
-            s.push_str(&format!(
-                ";JOIN:{:?}:{}:{:?}:{:?}:lsort={}:rsort={}",
-                j.join_type, j.right.table_name, j.strategy, j.on, j.left_sort, j.right_sort
-            ));
-        }
-        if let Some(agg) = plan.aggregate_strategy {
-            s.push_str(&format!(";AGG:{agg:?}"));
-        }
-        if plan.order_by_top_n {
-            s.push_str(";TOP_N:true");
-        } else if plan.order_by_sort_required {
-            s.push_str(";SORT:true");
-        }
-        if let Some(rg) = &plan.row_goal {
-            s.push_str(&format!(";RG:k={}", rg.k()));
-        }
-        s
+        format!("desc={};{}", desc, plan.fingerprint().canonical())
+    }
+
+    /// Computes the strongly typed physical plan fingerprint for a plan.
+    pub fn plan_fingerprint(
+        &self,
+        plan: &PhysicalPlan,
+    ) -> crate::query::fingerprint::PhysicalPlanFingerprint {
+        plan.fingerprint()
     }
 
     /// Optimizes a logical memo group under the required physical properties, selecting the best physical plan.

@@ -227,6 +227,8 @@ impl PlanValidity {
 pub struct PlanCacheEntry {
     /// Cached physical execution plan.
     pub plan: PhysicalPlan,
+    /// Canonical, deterministic physical plan fingerprint for identity and diagnostics.
+    pub fingerprint: crate::query::fingerprint::PhysicalPlanFingerprint,
     /// Validity assumptions recorded when the plan was compiled.
     pub validity: PlanValidity,
     /// Logical access sequence counter used for deterministic LRU replacement.
@@ -324,15 +326,30 @@ impl PlanCache {
             self.evict_lru();
         }
 
+        let fingerprint = plan.fingerprint();
         self.entries.insert(
             key,
             PlanCacheEntry {
                 plan,
+                fingerprint,
                 validity,
                 last_accessed: self.access_counter,
             },
         );
         self.stats.entries = self.entries.len();
+    }
+
+    /// Retrieves an immutable reference to the cached entry for diagnostics without updating LRU.
+    pub fn get_entry(&self, key: &PlanCacheKey) -> Option<&PlanCacheEntry> {
+        self.entries.get(key)
+    }
+
+    /// Returns the physical plan fingerprint of a cached plan if present.
+    pub fn fingerprint(
+        &self,
+        key: &PlanCacheKey,
+    ) -> Option<&crate::query::fingerprint::PhysicalPlanFingerprint> {
+        self.entries.get(key).map(|e| &e.fingerprint)
     }
 
     /// Performs deterministic LRU eviction of the oldest accessed entry.

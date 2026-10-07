@@ -719,6 +719,20 @@ impl PhysicalPlanValidator {
         }
     }
 
+    /// Formats deterministic validation diagnostics along with physical plan fingerprint.
+    pub fn format_validation_diagnostics_with_fingerprint(
+        plan: &PhysicalPlan,
+        context: &PlanValidationContext,
+    ) -> String {
+        match Self::validate(plan, context) {
+            Ok(_) => format!(
+                "Physical Plan Fingerprint: {}\n{plan}\nValidation: OK",
+                plan.fingerprint()
+            ),
+            Err(err) => format!("{err}"),
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Internal validation methods
     // ------------------------------------------------------------------------

@@ -396,6 +396,8 @@ pub struct FeedbackKey {
     pub statistics_generation: u64,
     /// Resource planning signature (isolating memory-budget and spill configurations).
     pub resource_signature: Option<ResourcePlanningSignature>,
+    /// Deterministic physical plan fingerprint identifying the physical strategy (if available).
+    pub physical_fingerprint: Option<crate::query::fingerprint::PhysicalPlanFingerprint>,
 }
 
 impl FeedbackKey {
@@ -410,6 +412,7 @@ impl FeedbackKey {
             param_signature,
             statistics_generation,
             resource_signature: None,
+            physical_fingerprint: None,
         }
     }
 
@@ -419,6 +422,15 @@ impl FeedbackKey {
         resource_signature: Option<ResourcePlanningSignature>,
     ) -> Self {
         self.resource_signature = resource_signature;
+        self
+    }
+
+    /// Sets the physical plan fingerprint for this feedback key.
+    pub fn with_physical_fingerprint(
+        mut self,
+        physical_fingerprint: Option<crate::query::fingerprint::PhysicalPlanFingerprint>,
+    ) -> Self {
+        self.physical_fingerprint = physical_fingerprint;
         self
     }
 
@@ -593,6 +605,7 @@ impl FeedbackKey {
             param_signature,
             statistics_generation,
             resource_signature: None,
+            physical_fingerprint: None,
         }
     }
 
@@ -620,6 +633,7 @@ impl FeedbackKey {
             param_signature,
             statistics_generation,
             resource_signature: None,
+            physical_fingerprint: None,
         }
     }
 
@@ -640,6 +654,7 @@ impl FeedbackKey {
             param_signature,
             statistics_generation,
             resource_signature: None,
+            physical_fingerprint: None,
         }
     }
 
@@ -660,6 +675,7 @@ impl FeedbackKey {
             param_signature,
             statistics_generation,
             resource_signature: None,
+            physical_fingerprint: None,
         }
     }
 

@@ -7,6 +7,7 @@ pub mod external_hash_join;
 pub mod external_multi_index;
 pub mod external_sort;
 pub mod feedback;
+pub mod fingerprint;
 pub mod inference;
 pub mod materialize;
 pub mod memo;
@@ -89,6 +90,10 @@ pub use feedback::{
     FeedbackObservation, FeedbackRegistry, ResourceFeedback, ResourceObservation, SpillStatus,
     DEFAULT_FEEDBACK_ALPHA, DEFAULT_FEEDBACK_CAPACITY, DEFAULT_REPLAN_MIN_OBSERVATIONS,
     DEFAULT_REPLAN_THRESHOLD_RATIO, OUTLIER_MAX_RATIO, OUTLIER_MIN_RATIO,
+};
+pub use fingerprint::{
+    canonicalize_plan, fnv1a_128, fnv1a_64, PhysicalPlanFingerprint,
+    PHYSICAL_PLAN_FINGERPRINT_VERSION,
 };
 pub use materialize::{
     estimate_row_memory as estimate_materialize_row_memory, LogicalSubplanFingerprint,

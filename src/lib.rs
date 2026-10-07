@@ -32,12 +32,12 @@ pub use query::{
     MultiIndexChildScan, MultiIndexConfig, MultiIndexExecutionMode, MultiIndexSpillMetrics,
     MultiIndexStrategy, OffsetLimitOperator, OperatorCounters, OperatorKind, OperatorMetrics,
     OptimizerMemo, OrderingColumn, OrderingProperty, ParamPlanningSignature, PhysicalAlternative,
-    PhysicalPlanValidator, PhysicalProperties, PhysicalPropertyKey, PlanCache, PlanCacheEntry,
-    PlanCacheKey, PlanCacheStats, PlanCost, PlanValidationContext, PlanValidationError,
-    PlanValidity, ProjectOperator, Query, QueryExecutionMetrics, QueryResult, RequiredColumns,
-    RequiredOrdering, RequiredPhysicalProperties, ResourceFeedback, ResourceObservation,
-    ResourcePlanningSignature, RowGoal, RunReader, SortConfig, SortDirection, SortExecutionMetrics,
-    SortKey, SortOperator, SpillStatus, StatisticsProvider, StatsRegistry,
+    PhysicalPlanFingerprint, PhysicalPlanValidator, PhysicalProperties, PhysicalPropertyKey,
+    PlanCache, PlanCacheEntry, PlanCacheKey, PlanCacheStats, PlanCost, PlanValidationContext,
+    PlanValidationError, PlanValidity, ProjectOperator, Query, QueryExecutionMetrics, QueryResult,
+    RequiredColumns, RequiredOrdering, RequiredPhysicalProperties, ResourceFeedback,
+    ResourceObservation, ResourcePlanningSignature, RowGoal, RunReader, SortConfig, SortDirection,
+    SortExecutionMetrics, SortKey, SortOperator, SpillStatus, StatisticsProvider, StatsRegistry,
     StreamingAggregateMetrics, StreamingAggregateOperator, TableStatistics, TableValidationInfo,
     TempAggregateFile, TempJoinFile, TempMultiIndexRunFile, TempRunFile, TopNExecutionMetrics,
     TopNOperator, UnaryOp, ValidatedPhysicalPlan, DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES,
@@ -46,7 +46,7 @@ pub use query::{
     DEFAULT_MULTI_INDEX_MEMORY_BUDGET_BYTES, DEFAULT_PLAN_CACHE_CAPACITY,
     DEFAULT_REPLAN_MIN_OBSERVATIONS, DEFAULT_REPLAN_THRESHOLD_RATIO,
     DEFAULT_SORT_MEMORY_BUDGET_BYTES, MAX_MULTI_INDEXES, OUTLIER_MAX_RATIO, OUTLIER_MIN_RATIO,
-    RECORD_ID_SET_OP_CPU_COST, SKIP_SCAN_PROBE_COST,
+    PHYSICAL_PLAN_FINGERPRINT_VERSION, RECORD_ID_SET_OP_CPU_COST, SKIP_SCAN_PROBE_COST,
 };
 
 pub use sql::{

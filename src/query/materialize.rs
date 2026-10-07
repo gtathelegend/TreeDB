@@ -128,48 +128,7 @@ impl SubplanFingerprint {
 
     /// Constructs a canonical deterministic fingerprint from a physical plan.
     pub fn from_plan(plan: &crate::query::optimizer::PhysicalPlan) -> Self {
-        let mut s = String::new();
-        s.push_str("TABLE:");
-        s.push_str(&plan.base_table.table_name);
-        s.push_str(";PATH:");
-        s.push_str(&format!("{:?}", plan.base_table.access_path));
-        if let Some(f) = &plan.base_table.residual_filter {
-            s.push_str(&format!(";RES:{f}"));
-        }
-        for j in &plan.joins {
-            s.push_str(&format!(
-                ";JOIN:{:?}:{}:{:?}",
-                j.join_type, j.right.table_name, j.on
-            ));
-        }
-        if let Some(pj) = &plan.post_join_filter {
-            s.push_str(&format!(";PJF:{pj}"));
-        }
-        for g in &plan.group_by {
-            s.push_str(&format!(";GRP:{g}"));
-        }
-        for a in &plan.aggregates {
-            s.push_str(&format!(";AGG:{a:?}"));
-        }
-        if let Some(h) = &plan.having {
-            s.push_str(&format!(";HAV:{h}"));
-        }
-        for (p, alias) in &plan.projections {
-            s.push_str(&format!(";PROJ:{p}:{:?}", alias));
-        }
-        for o in &plan.order_by {
-            s.push_str(&format!(";ORD:{:?}:{:?}", o.expression, o.direction));
-        }
-        if let Some(off) = plan.offset {
-            s.push_str(&format!(";OFF:{off}"));
-        }
-        if let Some(lim) = plan.limit {
-            s.push_str(&format!(";LIM:{lim}"));
-        }
-        if let Some(so) = &plan.set_op {
-            s.push_str(&format!(";SETOP:{:?}", so.op));
-        }
-        Self(s)
+        Self(plan.fingerprint().canonical().to_string())
     }
 
     /// Constructs a canonical deterministic fingerprint from a bound select logical expression.
