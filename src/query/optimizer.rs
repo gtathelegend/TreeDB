@@ -3804,7 +3804,11 @@ impl Optimizer {
                 &req_cols,
                 root_row_goal.as_ref(),
             ) {
-                return Ok(best.physical_plan);
+                let val_ctx = crate::query::PlanValidationContext::from_tables(tables)
+                    .with_resource_signature(resource_sig.cloned());
+                let validated =
+                    crate::query::PhysicalPlanValidator::validate(&best.physical_plan, &val_ctx)?;
+                return Ok(validated.into_inner());
             }
         }
 
@@ -3835,7 +3839,7 @@ impl Optimizer {
             None => Vec::new(),
         };
 
-        if !is_multi_table {
+        let plan = if !is_multi_table {
             let mut metrics = InferenceMetrics::default();
             let constraint_set =
                 ConstraintSet::extract_from_conjuncts(&where_conjuncts, &mut metrics);
@@ -4190,7 +4194,7 @@ impl Optimizer {
                 )
             });
 
-            return Ok(PhysicalPlan {
+            PhysicalPlan {
                 ctes: bound.ctes.clone(),
                 base_table: base_table_scan.clone(),
                 joins: Vec::new(),
@@ -4216,35 +4220,40 @@ impl Optimizer {
                 row_goal_early_termination: base_table_scan.early_termination_possible,
                 total_cost: cur_cost,
                 estimated_rows: cur_rows,
-            });
-        }
+            }
+        } else {
+            // Multi-table query: check if all joins are INNER JOINs eligible for full reordering
+            let has_any_stats = tables.iter().any(|t| t.stats.is_some());
+            let all_inner = bound.joins.iter().all(|j| j.join_type == JoinType::Inner);
 
-        // Multi-table query: check if all joins are INNER JOINs eligible for full reordering
-        let has_any_stats = tables.iter().any(|t| t.stats.is_some());
-        let all_inner = bound.joins.iter().all(|j| j.join_type == JoinType::Inner);
+            if all_inner && tables.len() >= 2 && has_any_stats {
+                optimize_all_inner_joins(
+                    bound,
+                    tables,
+                    &where_conjuncts,
+                    feedback,
+                    param_sig,
+                    resource_sig,
+                    stats_gen,
+                )?
+            } else {
+                // Query with OUTER JOIN barriers or unanalyzed default sequential ordering
+                optimize_with_outer_barriers(
+                    bound,
+                    tables,
+                    &where_conjuncts,
+                    feedback,
+                    param_sig,
+                    resource_sig,
+                    stats_gen,
+                )?
+            }
+        };
 
-        if all_inner && tables.len() >= 2 && has_any_stats {
-            return optimize_all_inner_joins(
-                bound,
-                tables,
-                &where_conjuncts,
-                feedback,
-                param_sig,
-                resource_sig,
-                stats_gen,
-            );
-        }
-
-        // Query with OUTER JOIN barriers or unanalyzed default sequential ordering
-        optimize_with_outer_barriers(
-            bound,
-            tables,
-            &where_conjuncts,
-            feedback,
-            param_sig,
-            resource_sig,
-            stats_gen,
-        )
+        let val_ctx = crate::query::PlanValidationContext::from_tables(tables)
+            .with_resource_signature(resource_sig.cloned());
+        let validated = crate::query::PhysicalPlanValidator::validate(&plan, &val_ctx)?;
+        Ok(validated.into_inner())
     }
 }
 

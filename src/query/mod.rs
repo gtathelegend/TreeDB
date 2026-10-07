@@ -21,6 +21,7 @@ pub mod runtime_filter;
 pub mod stats;
 pub mod streaming_aggregate;
 pub mod top_n;
+pub mod validation;
 
 pub use memo::{
     BestPlan, GroupId, LogicalOp, MemoConfig, MemoGroup, MemoStats, OptimizerMemo,
@@ -117,4 +118,8 @@ pub use plan_cache::{
 pub use rewrite::{QueryRewriter, RewriteResult};
 pub use stats::{
     ColumnStatistics, IndexStatistics, StatisticsProvider, StatsRegistry, TableStatistics,
+};
+pub use validation::{
+    PhysicalPlanValidator, PlanValidationContext, PlanValidationError, TableValidationInfo,
+    ValidatedPhysicalPlan,
 };

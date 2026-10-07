@@ -1939,7 +1939,20 @@ impl<'db> Transaction<'db> {
     /// Generates a human-readable text explanation of the optimized physical execution plan for the given SQL query.
     pub fn explain_sql(&mut self, sql: &str) -> Result<String> {
         let plan = self.plan_sql(sql)?;
-        Ok(plan.to_string())
+        let val_ctx = self.create_validation_context()?;
+        Ok(crate::query::PhysicalPlanValidator::format_validation_diagnostics(&plan, &val_ctx))
+    }
+
+    /// Generates deterministic validation and plan explanation diagnostics for an arbitrary physical plan.
+    pub fn explain_plan_diagnostics(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+    ) -> String {
+        let ctx = match self.create_validation_context() {
+            Ok(c) => c,
+            Err(e) => return format!("Plan validation failed:\nreason: {e}"),
+        };
+        crate::query::PhysicalPlanValidator::format_validation_diagnostics(plan, &ctx)
     }
 
     /// Executes an arbitrary top-level SQL statement (`SELECT`, `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN`)
@@ -1970,9 +1983,15 @@ impl<'db> Transaction<'db> {
                         res.rows.len(),
                         Some(root_op),
                     );
-                    crate::query::metrics::format_plan_with_metrics(&plan, &metrics)
+                    format!(
+                        "{}\nValidation: OK",
+                        crate::query::metrics::format_plan_with_metrics(&plan, &metrics)
+                    )
                 } else {
-                    plan.to_string()
+                    let val_ctx = self.create_validation_context()?;
+                    crate::query::PhysicalPlanValidator::format_validation_diagnostics(
+                        &plan, &val_ctx,
+                    )
                 };
                 let schema = Schema::new_projected(vec![crate::engine::types::Column::new(
                     "plan",
@@ -3308,34 +3327,102 @@ impl<'db> Transaction<'db> {
         self.db.set_materialize_override(test_override);
     }
 
-    /// Executes a fully optimized `PhysicalPlan` against this transaction.
+    /// Constructs a `PlanValidationContext` from the current transaction, catalog, and resource state.
+    pub fn create_validation_context(&mut self) -> Result<crate::query::PlanValidationContext> {
+        let mut ctx = crate::query::PlanValidationContext::new()
+            .with_generations(
+                self.db.catalog_generation,
+                self.db.index_generation,
+                self.db.statistics_generation,
+            )
+            .with_resource_signature(Some(self.resource_planning_signature()))
+            .with_catalog_authoritative(true);
+
+        let tables = crate::engine::catalog::Catalog::list_tables(&mut self.db.buffer_pool)?;
+        for tbl_meta in tables {
+            let indexes = crate::engine::catalog::Catalog::list_indexes_for_table(
+                &mut self.db.buffer_pool,
+                tbl_meta.table_id,
+            )?;
+            ctx = ctx.with_table(crate::query::TableValidationInfo {
+                name: tbl_meta.name.clone(),
+                alias: None,
+                schema: tbl_meta.schema.clone(),
+                indexes,
+                is_cte: false,
+            });
+        }
+        Ok(ctx)
+    }
+
+    /// Validates a physical plan against this transaction's active catalog and resource contracts.
+    pub fn validate_physical_plan(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+    ) -> Result<crate::query::ValidatedPhysicalPlan> {
+        let ctx = self.create_validation_context()?;
+        crate::query::PhysicalPlanValidator::validate(plan, &ctx).map_err(crate::error::Error::from)
+    }
+
+    /// Executes a fully optimized `PhysicalPlan` against this transaction after validating it.
     pub fn execute_physical_plan(
         &mut self,
         plan: &crate::query::optimizer::PhysicalPlan,
     ) -> Result<crate::query::QueryResult> {
-        self.execute_physical_plan_with_outer(plan, &[])
+        let validated = self.validate_physical_plan(plan)?;
+        self.execute_validated_physical_plan(&validated)
     }
 
-    /// Executes a fully optimized `PhysicalPlan` against this transaction with outer scope contexts.
+    /// Executes a pre-validated `ValidatedPhysicalPlan` against this transaction.
+    pub fn execute_validated_physical_plan(
+        &mut self,
+        plan: &crate::query::ValidatedPhysicalPlan,
+    ) -> Result<crate::query::QueryResult> {
+        self.execute_validated_physical_plan_with_outer(plan, &[])
+    }
+
+    /// Executes a fully optimized `PhysicalPlan` against this transaction with outer scope contexts after validating it.
     pub fn execute_physical_plan_with_outer(
         &mut self,
         plan: &crate::query::optimizer::PhysicalPlan,
         outer_contexts: &[(&Row, &Schema)],
     ) -> Result<crate::query::QueryResult> {
+        let validated = self.validate_physical_plan(plan)?;
+        self.execute_validated_physical_plan_with_outer(&validated, outer_contexts)
+    }
+
+    /// Executes a pre-validated `ValidatedPhysicalPlan` against this transaction with outer scope contexts.
+    pub fn execute_validated_physical_plan_with_outer(
+        &mut self,
+        plan: &crate::query::ValidatedPhysicalPlan,
+        outer_contexts: &[(&Row, &Schema)],
+    ) -> Result<crate::query::QueryResult> {
         let mut cte_store = std::collections::HashMap::new();
-        let (qr, _metrics) =
-            self.execute_physical_plan_internal_with_metrics(plan, outer_contexts, &mut cte_store)?;
+        let (qr, _metrics) = self.execute_physical_plan_internal_with_metrics(
+            plan.plan(),
+            outer_contexts,
+            &mut cte_store,
+        )?;
         Ok(qr)
     }
 
-    /// Executes a fully optimized `PhysicalPlan` against this transaction, returning both the query result
-    /// and the full operator execution metrics tree.
+    /// Executes a fully optimized `PhysicalPlan` against this transaction, returning both query result
+    /// and metrics after validating the plan.
     pub fn execute_physical_plan_with_metrics(
         &mut self,
         plan: &crate::query::optimizer::PhysicalPlan,
     ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
+        let validated = self.validate_physical_plan(plan)?;
+        self.execute_validated_physical_plan_with_metrics(&validated)
+    }
+
+    /// Executes a pre-validated `ValidatedPhysicalPlan` against this transaction, returning both query result and metrics.
+    pub fn execute_validated_physical_plan_with_metrics(
+        &mut self,
+        plan: &crate::query::ValidatedPhysicalPlan,
+    ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
         let mut cte_store = std::collections::HashMap::new();
-        self.execute_physical_plan_internal_with_metrics(plan, &[], &mut cte_store)
+        self.execute_physical_plan_internal_with_metrics(plan.plan(), &[], &mut cte_store)
     }
 
     fn execute_physical_plan_internal(

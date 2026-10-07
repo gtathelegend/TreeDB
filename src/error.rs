@@ -207,6 +207,10 @@ pub enum Error {
     #[error("Query execution error: {0}")]
     QueryExecutionError(String),
 
+    /// Physical execution plan failed safety and contract validation.
+    #[error("{0}")]
+    PlanValidation(Box<crate::query::validation::PlanValidationError>),
+
     /// Lexical error encountered during SQL tokenization.
     #[error("SQL lexical error at position {start}..{end}: {message}")]
     SqlLexError {
@@ -546,4 +550,10 @@ pub enum Error {
     /// Corrupted or truncated temporary multi-index spill run file.
     #[error("External multi-index run corruption detected: {0}")]
     ExternalMultiIndexRunCorrupted(String),
+}
+
+impl From<crate::query::validation::PlanValidationError> for Error {
+    fn from(err: crate::query::validation::PlanValidationError) -> Self {
+        Error::PlanValidation(Box::new(err))
+    }
 }
