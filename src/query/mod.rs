@@ -9,6 +9,7 @@ pub mod external_sort;
 pub mod feedback;
 pub mod fingerprint;
 pub mod inference;
+pub mod lifecycle;
 pub mod materialize;
 pub mod memo;
 pub mod merge_join;
@@ -94,6 +95,13 @@ pub use feedback::{
 pub use fingerprint::{
     canonicalize_plan, fnv1a_128, fnv1a_64, PhysicalPlanFingerprint,
     PHYSICAL_PLAN_FINGERPRINT_VERSION,
+};
+pub use lifecycle::{
+    AdaptivePlanSelector, AdaptiveSelectionConfig, AdaptiveSelectionDiagnostics,
+    AdaptiveSelectionMetrics, AdaptiveSelectionResult, FeedbackConfidence, PlanCandidate,
+    PlanCandidateSet, PlanLifecycleState, PlanObservation, ReplanDecision, DEFAULT_MAX_CANDIDATES,
+    DEFAULT_MAX_COST_ADJUSTMENT_RATIO, DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_OBSERVATIONS,
+    DEFAULT_SWITCH_THRESHOLD,
 };
 pub use materialize::{
     estimate_row_memory as estimate_materialize_row_memory, LogicalSubplanFingerprint,

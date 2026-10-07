@@ -3820,6 +3820,27 @@ impl Optimizer {
                 resource_sig,
             );
 
+            let val_ctx = crate::query::PlanValidationContext::from_tables(tables)
+                .with_resource_signature(resource_sig.cloned());
+
+            if let Some(mut candidate_set) =
+                memo.to_candidate_set(gid, crate::query::lifecycle::DEFAULT_MAX_CANDIDATES)
+            {
+                candidate_set.validate_all(&val_ctx);
+                let mut selector = crate::query::lifecycle::AdaptivePlanSelector::default();
+                if let Ok(result) = selector.select(
+                    &candidate_set,
+                    None,
+                    feedback,
+                    param_sig,
+                    resource_sig,
+                    stats_gen,
+                    Some(&val_ctx),
+                ) {
+                    return Ok(result.selected_plan.into_inner());
+                }
+            }
+
             if let Ok(best) = memo.optimize_group(
                 gid,
                 &prop_key,
@@ -3827,8 +3848,6 @@ impl Optimizer {
                 &req_cols,
                 root_row_goal.as_ref(),
             ) {
-                let val_ctx = crate::query::PlanValidationContext::from_tables(tables)
-                    .with_resource_signature(resource_sig.cloned());
                 let validated =
                     crate::query::PhysicalPlanValidator::validate(&best.physical_plan, &val_ctx)?;
                 return Ok(validated.into_inner());
@@ -4277,6 +4296,186 @@ impl Optimizer {
             .with_resource_signature(resource_sig.cloned());
         let validated = crate::query::PhysicalPlanValidator::validate(&plan, &val_ctx)?;
         Ok(validated.into_inner())
+    }
+
+    /// Generates a bounded candidate set of physical plan alternatives for adaptive selection.
+    pub fn generate_candidate_plans(
+        bound: &BoundSelect,
+        tables: &[TableOptInfo],
+        feedback: Option<&FeedbackRegistry>,
+        param_sig: Option<&ParamPlanningSignature>,
+        resource_sig: Option<&ResourcePlanningSignature>,
+        stats_gen: u64,
+        max_candidates: usize,
+    ) -> Result<crate::query::lifecycle::PlanCandidateSet> {
+        let is_multi_table = !bound.joins.is_empty();
+        let mut candidate_set = crate::query::lifecycle::PlanCandidateSet::new(max_candidates);
+
+        if !is_multi_table && !tables.is_empty() {
+            let where_conjuncts = match &bound.filter {
+                Some(f) => split_conjunction(f),
+                None => Vec::new(),
+            };
+            let req_cols = compute_query_required_columns(bound);
+            let ref_cols = collect_table_referenced_columns(&tables[0], bound, &where_conjuncts);
+
+            let candidate_scans = plan_table_scan_candidates(
+                &tables[0],
+                where_conjuncts,
+                Some(&ref_cols),
+                false,
+                feedback,
+                param_sig,
+                resource_sig,
+                stats_gen,
+                Some(&req_cols),
+            );
+
+            let safe_row_goal = bound.group_by.is_empty()
+                && bound.aggregates.is_empty()
+                && bound.window_exprs.is_empty();
+            let root_row_goal = if safe_row_goal {
+                crate::query::physical_properties::RowGoal::from_limit_offset(
+                    bound.limit,
+                    bound.offset,
+                )
+            } else {
+                None
+            };
+
+            for base_table_scan in &candidate_scans {
+                let mut cur_cost = base_table_scan.cost;
+                let mut cur_rows = base_table_scan.estimated_rows;
+
+                let scan_ordering =
+                    crate::query::physical_properties::ordering_property_for_table_scan(
+                        &tables[0],
+                        base_table_scan,
+                    );
+                let (agg_strategy, post_agg_cost, post_agg_ordering) = plan_aggregation_strategy(
+                    cur_cost,
+                    cur_rows,
+                    Some(&scan_ordering),
+                    &bound.group_by,
+                    &bound.aggregates,
+                    Some(tables[0].qualifier()),
+                    feedback,
+                    param_sig,
+                    resource_sig,
+                    stats_gen,
+                );
+                cur_cost = post_agg_cost;
+                let current_ordering = post_agg_ordering;
+
+                if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+                    cur_rows = CardinalityEstimator::estimate_group_by_cardinality(
+                        cur_rows,
+                        &bound.group_by,
+                        tables[0].stats.as_ref(),
+                        &tables[0].schema,
+                    );
+                }
+
+                if let Some(having) = &bound.having {
+                    cur_cost += CostModel::filter_cost(cur_rows);
+                    let having_sel = CardinalityEstimator::estimate_expr_selectivity(
+                        having,
+                        tables[0].stats.as_ref(),
+                        &tables[0].schema,
+                    );
+                    cur_rows = (cur_rows * having_sel)
+                        .clamp(if cur_rows > 0.0 { 1.0 } else { 0.0 }, cur_rows);
+                }
+
+                let (sort_required, top_n, final_ordering) = if bound.order_by.is_empty() {
+                    (false, false, current_ordering)
+                } else {
+                    let req_ord =
+                        crate::query::physical_properties::OrderingProperty::from_sort_keys(
+                            &bound.order_by,
+                        );
+                    let provides = current_ordering.satisfies(&req_ord);
+                    if provides {
+                        (false, false, current_ordering)
+                    } else if let Some(rg) = root_row_goal.as_ref() {
+                        let top_n_cost = CostModel::top_n_cost(cur_rows, rg.k() as usize, 64.0);
+                        cur_cost += top_n_cost;
+                        (false, true, req_ord)
+                    } else {
+                        let sort_cost = CostModel::sort_cost(cur_rows);
+                        cur_cost += sort_cost;
+                        (true, false, req_ord)
+                    }
+                };
+
+                let plan = PhysicalPlan {
+                    ctes: bound.ctes.clone(),
+                    base_table: base_table_scan.clone(),
+                    joins: Vec::new(),
+                    post_join_filter: None,
+                    group_by: bound.group_by.clone(),
+                    aggregates: bound.aggregates.clone(),
+                    aggregate_strategy: agg_strategy,
+                    having: bound.having.clone(),
+                    window_exprs: bound.window_exprs.clone(),
+                    projections: bound.projections.clone(),
+                    order_by: bound.order_by.clone(),
+                    order_by_sort_required: sort_required,
+                    order_by_top_n: top_n,
+                    provided_ordering: Some(final_ordering.clone()),
+                    offset: bound.offset,
+                    limit: bound.limit,
+                    set_op: None,
+                    logical_rewrites: Vec::new(),
+                    inferred_predicates: Vec::new(),
+                    row_goal: base_table_scan.row_goal.or(root_row_goal),
+                    estimated_rows_examined: base_table_scan.estimated_rows_examined,
+                    estimated_qualifying_rows: base_table_scan.estimated_qualifying_rows,
+                    row_goal_early_termination: base_table_scan.early_termination_possible,
+                    total_cost: cur_cost,
+                    estimated_rows: cur_rows,
+                };
+
+                let props = crate::query::physical_properties::PhysicalProperties {
+                    ordering: Some(final_ordering),
+                    required_columns: Some(req_cols.clone()),
+                    row_goal: root_row_goal,
+                };
+
+                let desc = format!("{:?}", base_table_scan.access_path);
+                let cand = crate::query::lifecycle::PlanCandidate::new(
+                    plan, cur_cost, cur_rows, props, desc,
+                )
+                .with_resource_signature(resource_sig.cloned());
+                candidate_set.add_candidate(cand);
+            }
+        }
+
+        // Always include the optimal plan from optimize_with_resource_feedback
+        let optimal = Self::optimize_with_resource_feedback(
+            bound,
+            tables,
+            feedback,
+            param_sig,
+            resource_sig,
+            stats_gen,
+        )?;
+        let opt_cost = optimal.total_cost;
+        let opt_rows = optimal.estimated_rows;
+        let opt_props = crate::query::physical_properties::PhysicalProperties {
+            ordering: optimal.provided_ordering.clone(),
+            required_columns: None,
+            row_goal: optimal.row_goal,
+        };
+        let desc = format!("{:?}", optimal.base_table.access_path);
+        candidate_set.add_candidate(
+            crate::query::lifecycle::PlanCandidate::new(
+                optimal, opt_cost, opt_rows, opt_props, desc,
+            )
+            .with_resource_signature(resource_sig.cloned()),
+        );
+
+        Ok(candidate_set)
     }
 }
 

@@ -233,6 +233,31 @@ pub struct PlanCacheEntry {
     pub validity: PlanValidity,
     /// Logical access sequence counter used for deterministic LRU replacement.
     pub last_accessed: u64,
+    /// Whether adaptive feedback has flagged this entry for next-execution reoptimization.
+    pub needs_reoptimization: bool,
+    /// Bounded set of candidate alternative plan fingerprints recorded at planning time.
+    pub candidate_fingerprints: Vec<crate::query::fingerprint::PhysicalPlanFingerprint>,
+}
+
+impl PlanCacheEntry {
+    /// Marks this cache entry as needing re-optimization on its next execution.
+    pub fn mark_needs_reoptimization(&mut self) {
+        self.needs_reoptimization = true;
+    }
+
+    /// Returns `true` if this cache entry is marked for next-execution reoptimization.
+    pub fn needs_reoptimization(&self) -> bool {
+        self.needs_reoptimization
+    }
+
+    /// Attaches candidate alternative plan fingerprints to this entry.
+    pub fn with_candidate_fingerprints(
+        mut self,
+        fps: Vec<crate::query::fingerprint::PhysicalPlanFingerprint>,
+    ) -> Self {
+        self.candidate_fingerprints = fps;
+        self
+    }
 }
 
 /// Diagnostic telemetry recorded by the plan cache subsystem.
@@ -334,9 +359,50 @@ impl PlanCache {
                 fingerprint,
                 validity,
                 last_accessed: self.access_counter,
+                needs_reoptimization: false,
+                candidate_fingerprints: Vec::new(),
             },
         );
         self.stats.entries = self.entries.len();
+    }
+
+    /// Inserts a newly compiled physical plan into the cache with candidate alternative fingerprints.
+    pub fn insert_with_candidates(
+        &mut self,
+        key: PlanCacheKey,
+        plan: PhysicalPlan,
+        validity: PlanValidity,
+        candidates: Vec<crate::query::fingerprint::PhysicalPlanFingerprint>,
+    ) {
+        self.access_counter += 1;
+
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(&key) {
+            self.evict_lru();
+        }
+
+        let fingerprint = plan.fingerprint();
+        self.entries.insert(
+            key,
+            PlanCacheEntry {
+                plan,
+                fingerprint,
+                validity,
+                last_accessed: self.access_counter,
+                needs_reoptimization: false,
+                candidate_fingerprints: candidates,
+            },
+        );
+        self.stats.entries = self.entries.len();
+    }
+
+    /// Marks a cached plan entry as needing re-optimization on its next execution.
+    pub fn mark_needs_reoptimization(&mut self, key: &PlanCacheKey) -> bool {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.mark_needs_reoptimization();
+            true
+        } else {
+            false
+        }
     }
 
     /// Retrieves an immutable reference to the cached entry for diagnostics without updating LRU.

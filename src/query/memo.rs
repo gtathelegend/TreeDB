@@ -349,6 +349,17 @@ impl MemoGroup {
             alternative_fingerprints: BTreeSet::new(),
         }
     }
+
+    /// Converts physical alternatives in this group into a bounded candidate set for adaptive selection.
+    pub fn to_candidate_set(
+        &self,
+        max_candidates: usize,
+    ) -> crate::query::lifecycle::PlanCandidateSet {
+        crate::query::lifecycle::PlanCandidateSet::from_alternatives(
+            &self.alternatives,
+            max_candidates,
+        )
+    }
 }
 
 /// Bounded property-aware optimizer memo managing physical alternatives and optimal subplans.
@@ -676,5 +687,16 @@ impl OptimizerMemo {
     /// Formats concise memo diagnostics for EXPLAIN output.
     pub fn explain_diagnostics(&self) -> String {
         format!("{}", self.stats)
+    }
+
+    /// Extracts a bounded candidate set from the specified memo group for adaptive selection.
+    pub fn to_candidate_set(
+        &self,
+        group_id: GroupId,
+        max_candidates: usize,
+    ) -> Option<crate::query::lifecycle::PlanCandidateSet> {
+        self.groups
+            .get(group_id.0 as usize)
+            .map(|g| g.to_candidate_set(max_candidates))
     }
 }

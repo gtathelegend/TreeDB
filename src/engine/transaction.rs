@@ -2343,9 +2343,27 @@ impl<'db> Transaction<'db> {
                         self.db.statistics_generation,
                     );
                     if let Some(cached_plan) = maybe_cached {
-                        if self
-                            .check_plan_cache_should_replan(&cached_plan, Some(param_sig.clone()))
-                        {
+                        let is_marked = self
+                            .db
+                            .plan_cache
+                            .get_entry(&key)
+                            .map(|e| e.needs_reoptimization())
+                            .unwrap_or(false);
+                        let val_ok = self
+                            .create_validation_context()
+                            .map(|c| {
+                                crate::query::PhysicalPlanValidator::validate(&cached_plan, &c)
+                                    .is_ok()
+                            })
+                            .unwrap_or(false);
+                        let should_replan = is_marked
+                            || !val_ok
+                            || self.check_plan_cache_should_replan(
+                                &cached_plan,
+                                Some(param_sig.clone()),
+                            );
+
+                        if should_replan {
                             self.db.plan_cache.remove(&key);
                             let new_plan =
                                 self.plan_select_with_params(select_stmt, Some(params))?;
@@ -2359,7 +2377,9 @@ impl<'db> Transaction<'db> {
                                 indexes,
                             )
                             .with_resource_signature(Some(res_sig.clone()));
-                            self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                            self.db
+                                .plan_cache
+                                .insert(key.clone(), new_plan.clone(), validity);
                             new_plan
                         } else {
                             cached_plan
@@ -2375,12 +2395,28 @@ impl<'db> Transaction<'db> {
                             indexes,
                         )
                         .with_resource_signature(Some(res_sig.clone()));
-                        self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                        self.db
+                            .plan_cache
+                            .insert(key.clone(), new_plan.clone(), validity);
                         new_plan
                     }
                 };
                 let (query_result, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
-                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig));
+                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig.clone()));
+                if !self.has_catalog_mutations {
+                    let key = crate::query::PlanCacheKey::new(
+                        &stmt.sql,
+                        param_sig,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    )
+                    .with_resource_signature(Some(res_sig));
+                    if self.check_plan_cache_should_replan(&plan, Some(key.param_signature.clone()))
+                    {
+                        self.db.plan_cache.mark_needs_reoptimization(&key);
+                    }
+                }
                 Ok(StatementResult::Query(query_result))
             }
             crate::sql::Statement::SetQuery(set_stmt) => {
@@ -2404,9 +2440,27 @@ impl<'db> Transaction<'db> {
                         self.db.statistics_generation,
                     );
                     if let Some(cached_plan) = maybe_cached {
-                        if self
-                            .check_plan_cache_should_replan(&cached_plan, Some(param_sig.clone()))
-                        {
+                        let is_marked = self
+                            .db
+                            .plan_cache
+                            .get_entry(&key)
+                            .map(|e| e.needs_reoptimization())
+                            .unwrap_or(false);
+                        let val_ok = self
+                            .create_validation_context()
+                            .map(|c| {
+                                crate::query::PhysicalPlanValidator::validate(&cached_plan, &c)
+                                    .is_ok()
+                            })
+                            .unwrap_or(false);
+                        let should_replan = is_marked
+                            || !val_ok
+                            || self.check_plan_cache_should_replan(
+                                &cached_plan,
+                                Some(param_sig.clone()),
+                            );
+
+                        if should_replan {
                             self.db.plan_cache.remove(&key);
                             let new_plan =
                                 self.plan_set_query_with_params(set_stmt, Some(params))?;
@@ -2420,7 +2474,9 @@ impl<'db> Transaction<'db> {
                                 indexes,
                             )
                             .with_resource_signature(Some(res_sig.clone()));
-                            self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                            self.db
+                                .plan_cache
+                                .insert(key.clone(), new_plan.clone(), validity);
                             new_plan
                         } else {
                             cached_plan
@@ -2436,12 +2492,28 @@ impl<'db> Transaction<'db> {
                             indexes,
                         )
                         .with_resource_signature(Some(res_sig.clone()));
-                        self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                        self.db
+                            .plan_cache
+                            .insert(key.clone(), new_plan.clone(), validity);
                         new_plan
                     }
                 };
                 let (query_result, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
-                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig));
+                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig.clone()));
+                if !self.has_catalog_mutations {
+                    let key = crate::query::PlanCacheKey::new(
+                        &stmt.sql,
+                        param_sig,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    )
+                    .with_resource_signature(Some(res_sig));
+                    if self.check_plan_cache_should_replan(&plan, Some(key.param_signature.clone()))
+                    {
+                        self.db.plan_cache.mark_needs_reoptimization(&key);
+                    }
+                }
                 Ok(StatementResult::Query(query_result))
             }
             crate::sql::Statement::Insert(insert_stmt) => {
@@ -2555,9 +2627,27 @@ impl<'db> Transaction<'db> {
                         self.db.statistics_generation,
                     );
                     if let Some(cached_plan) = maybe_cached {
-                        if self
-                            .check_plan_cache_should_replan(&cached_plan, Some(param_sig.clone()))
-                        {
+                        let is_marked = self
+                            .db
+                            .plan_cache
+                            .get_entry(&key)
+                            .map(|e| e.needs_reoptimization())
+                            .unwrap_or(false);
+                        let val_ok = self
+                            .create_validation_context()
+                            .map(|c| {
+                                crate::query::PhysicalPlanValidator::validate(&cached_plan, &c)
+                                    .is_ok()
+                            })
+                            .unwrap_or(false);
+                        let should_replan = is_marked
+                            || !val_ok
+                            || self.check_plan_cache_should_replan(
+                                &cached_plan,
+                                Some(param_sig.clone()),
+                            );
+
+                        if should_replan {
                             self.db.plan_cache.remove(&key);
                             let new_plan =
                                 self.plan_select_with_params(select_stmt, Some(params))?;
@@ -2571,7 +2661,9 @@ impl<'db> Transaction<'db> {
                                 indexes,
                             )
                             .with_resource_signature(Some(res_sig.clone()));
-                            self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                            self.db
+                                .plan_cache
+                                .insert(key.clone(), new_plan.clone(), validity);
                             (new_plan, false)
                         } else {
                             (cached_plan, true)
@@ -2587,12 +2679,28 @@ impl<'db> Transaction<'db> {
                             indexes,
                         )
                         .with_resource_signature(Some(res_sig.clone()));
-                        self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                        self.db
+                            .plan_cache
+                            .insert(key.clone(), new_plan.clone(), validity);
                         (new_plan, false)
                     }
                 };
                 let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
-                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig));
+                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig.clone()));
+                if !self.has_catalog_mutations {
+                    let key = crate::query::PlanCacheKey::new(
+                        &stmt.sql,
+                        param_sig,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    )
+                    .with_resource_signature(Some(res_sig));
+                    if self.check_plan_cache_should_replan(&plan, Some(key.param_signature.clone()))
+                    {
+                        self.db.plan_cache.mark_needs_reoptimization(&key);
+                    }
+                }
                 let metrics = crate::query::QueryExecutionMetrics::new(
                     start.elapsed(),
                     qr.rows.len(),
@@ -2625,9 +2733,27 @@ impl<'db> Transaction<'db> {
                         self.db.statistics_generation,
                     );
                     if let Some(cached_plan) = maybe_cached {
-                        if self
-                            .check_plan_cache_should_replan(&cached_plan, Some(param_sig.clone()))
-                        {
+                        let is_marked = self
+                            .db
+                            .plan_cache
+                            .get_entry(&key)
+                            .map(|e| e.needs_reoptimization())
+                            .unwrap_or(false);
+                        let val_ok = self
+                            .create_validation_context()
+                            .map(|c| {
+                                crate::query::PhysicalPlanValidator::validate(&cached_plan, &c)
+                                    .is_ok()
+                            })
+                            .unwrap_or(false);
+                        let should_replan = is_marked
+                            || !val_ok
+                            || self.check_plan_cache_should_replan(
+                                &cached_plan,
+                                Some(param_sig.clone()),
+                            );
+
+                        if should_replan {
                             self.db.plan_cache.remove(&key);
                             let new_plan =
                                 self.plan_set_query_with_params(set_stmt, Some(params))?;
@@ -2641,7 +2767,9 @@ impl<'db> Transaction<'db> {
                                 indexes,
                             )
                             .with_resource_signature(Some(res_sig.clone()));
-                            self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                            self.db
+                                .plan_cache
+                                .insert(key.clone(), new_plan.clone(), validity);
                             (new_plan, false)
                         } else {
                             (cached_plan, true)
@@ -2657,12 +2785,28 @@ impl<'db> Transaction<'db> {
                             indexes,
                         )
                         .with_resource_signature(Some(res_sig.clone()));
-                        self.db.plan_cache.insert(key, new_plan.clone(), validity);
+                        self.db
+                            .plan_cache
+                            .insert(key.clone(), new_plan.clone(), validity);
                         (new_plan, false)
                     }
                 };
                 let (qr, root_op) = self.execute_physical_plan_with_metrics(&plan)?;
-                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig));
+                self.record_plan_execution_feedback(&plan, &root_op, Some(param_sig.clone()));
+                if !self.has_catalog_mutations {
+                    let key = crate::query::PlanCacheKey::new(
+                        &stmt.sql,
+                        param_sig,
+                        self.db.catalog_generation,
+                        self.db.index_generation,
+                        self.db.statistics_generation,
+                    )
+                    .with_resource_signature(Some(res_sig));
+                    if self.check_plan_cache_should_replan(&plan, Some(key.param_signature.clone()))
+                    {
+                        self.db.plan_cache.mark_needs_reoptimization(&key);
+                    }
+                }
                 let metrics = crate::query::QueryExecutionMetrics::new(
                     start.elapsed(),
                     qr.rows.len(),
@@ -6213,6 +6357,31 @@ impl<'db> Transaction<'db> {
         self.db.plan_cache_stats()
     }
 
+    /// Returns a reference to the physical plan cache.
+    pub fn plan_cache(&self) -> &crate::query::PlanCache {
+        self.db.plan_cache()
+    }
+
+    /// Returns a mutable reference to the physical plan cache.
+    pub fn plan_cache_mut(&mut self) -> &mut crate::query::PlanCache {
+        self.db.plan_cache_mut()
+    }
+
+    /// Returns the current catalog generation.
+    pub fn catalog_generation(&self) -> u64 {
+        self.db.catalog_generation
+    }
+
+    /// Returns the current index generation.
+    pub fn index_generation(&self) -> u64 {
+        self.db.index_generation
+    }
+
+    /// Returns the current statistics generation.
+    pub fn statistics_generation(&self) -> u64 {
+        self.db.statistics_generation
+    }
+
     /// Clears all entries from the physical plan cache.
     pub fn clear_plan_cache(&mut self) {
         self.db.clear_plan_cache();
@@ -6251,6 +6420,29 @@ impl<'db> Transaction<'db> {
     ) -> bool {
         let stats_gen = self.db.statistics_generation;
         let res_sig = self.resource_planning_signature();
+
+        // 0. Check fingerprint-specific feedback entry
+        let fp_key = crate::query::FeedbackKey::new(
+            crate::query::FeedbackContext::Scan {
+                table_name: plan.base_table.table_name.clone(),
+                predicate_repr: plan
+                    .base_table
+                    .residual_filter
+                    .as_ref()
+                    .map(|f| f.to_string())
+                    .unwrap_or_default(),
+                access_path_repr: plan.base_table.access_path.to_string(),
+            },
+            param_sig.clone(),
+            stats_gen,
+        )
+        .with_resource_signature(Some(res_sig.clone()))
+        .with_physical_fingerprint(Some(plan.fingerprint()));
+        if let Some(entry) = self.db.feedback_registry.get(&fp_key) {
+            if entry.should_replan() {
+                return true;
+            }
+        }
 
         // 1. Check base table scan
         let scan_key = crate::query::FeedbackKey::scan(
@@ -6390,6 +6582,142 @@ impl<'db> Transaction<'db> {
         }
 
         false
+    }
+
+    /// Returns the active adaptive plan selection configuration.
+    pub fn adaptive_config(&self) -> &crate::query::lifecycle::AdaptiveSelectionConfig {
+        &self.db.adaptive_config
+    }
+
+    /// Sets the active adaptive plan selection configuration.
+    pub fn set_adaptive_config(
+        &mut self,
+        config: crate::query::lifecycle::AdaptiveSelectionConfig,
+    ) {
+        self.db.adaptive_config = config;
+    }
+
+    /// Plans a query into a bounded candidate set, validates all alternatives, and executes adaptive selection.
+    pub fn select_adaptive_plan(
+        &mut self,
+        ast: &crate::sql::SelectStatement,
+        current_plan_fingerprint: Option<&crate::query::fingerprint::PhysicalPlanFingerprint>,
+        params: Option<&[Value]>,
+    ) -> Result<crate::query::lifecycle::AdaptiveSelectionResult> {
+        self.ensure_active()?;
+        let val_ctx = self.create_validation_context()?;
+        let param_sig = params.map(crate::query::ParamPlanningSignature::from_values);
+        let res_sig = self.resource_planning_signature();
+        let stats_gen = self.db.statistics_generation;
+
+        // Generate primary plan
+        let primary_plan = self.plan_select_with_params(ast, params)?;
+        let primary_cost = primary_plan.total_cost;
+        let primary_rows = primary_plan.estimated_rows;
+        let primary_props = crate::query::physical_properties::PhysicalProperties {
+            ordering: primary_plan.provided_ordering.clone(),
+            required_columns: None,
+            row_goal: primary_plan.row_goal,
+        };
+
+        let mut candidate_set =
+            crate::query::lifecycle::PlanCandidateSet::new(self.db.adaptive_config.max_candidates);
+
+        let primary_cand = crate::query::lifecycle::PlanCandidate::new(
+            primary_plan.clone(),
+            primary_cost,
+            primary_rows,
+            primary_props,
+            format!("{:?}", primary_plan.base_table.access_path),
+        )
+        .with_resource_signature(Some(res_sig.clone()));
+        candidate_set.add_candidate(primary_cand);
+
+        // If single table, also add candidate alternatives for all valid access paths
+        let table_name = &primary_plan.base_table.table_name;
+        if primary_plan.joins.is_empty() {
+            if let Ok((table_schema, indexes, is_cte)) =
+                self.resolve_table_for_planning(table_name, &[])
+            {
+                let stats = if is_cte {
+                    None
+                } else {
+                    self.db.get_statistics(table_name).cloned()
+                };
+                let table_info = crate::query::optimizer::TableOptInfo::new(
+                    table_name.clone(),
+                    primary_plan.base_table.table_alias.clone(),
+                    table_schema,
+                    indexes,
+                )
+                .with_cte(is_cte)
+                .with_stats(stats);
+
+                let bound_select = crate::sql::binder::bind_select_multi_with_catalog_and_params(
+                    ast,
+                    &[crate::sql::TableBinding::new(
+                        table_name,
+                        primary_plan.base_table.table_alias.as_deref(),
+                        &table_info.schema,
+                    )],
+                    None,
+                    params,
+                );
+
+                if let Ok(bound) = bound_select {
+                    if let Ok(cands) = crate::query::optimizer::Optimizer::generate_candidate_plans(
+                        &bound,
+                        &[table_info],
+                        Some(&self.db.feedback_registry),
+                        param_sig.as_ref(),
+                        Some(&res_sig),
+                        stats_gen,
+                        self.db.adaptive_config.max_candidates,
+                    ) {
+                        for cand in cands.candidates() {
+                            candidate_set.add_candidate(cand.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Validate all candidates
+        candidate_set.validate_all(&val_ctx);
+
+        // Run adaptive plan selection
+        let mut selector =
+            crate::query::lifecycle::AdaptivePlanSelector::new(self.db.adaptive_config.clone());
+        let res = selector
+            .select(
+                &candidate_set,
+                current_plan_fingerprint,
+                Some(&self.db.feedback_registry),
+                param_sig.as_ref(),
+                Some(&res_sig),
+                stats_gen,
+                Some(&val_ctx),
+            )
+            .map_err(Error::from)?;
+
+        Ok(res)
+    }
+
+    /// Generates deterministic adaptive selection diagnostics for a query string.
+    pub fn explain_adaptive_plan(&mut self, sql: &str) -> Result<String> {
+        let stmt = crate::sql::parse_statement(sql)?;
+        match stmt {
+            crate::sql::Statement::Select(select_stmt) => {
+                let res = self.select_adaptive_plan(&select_stmt, None, None)?;
+                let val_ctx = self.create_validation_context()?;
+                let plan_diag = crate::query::PhysicalPlanValidator::format_validation_diagnostics(
+                    res.selected_plan.plan(),
+                    &val_ctx,
+                );
+                Ok(format!("{}\n\n{}", res.diagnostics, plan_diag))
+            }
+            _ => Err(Error::UnsupportedExplainTarget(sql.to_string())),
+        }
     }
 
     /// Records execution feedback observations for a completed physical plan execution.

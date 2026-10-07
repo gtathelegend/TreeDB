@@ -21,6 +21,7 @@ use crate::query::external_aggregate::AggregateConfig;
 use crate::query::external_hash_join::JoinConfig;
 use crate::query::external_sort::SortConfig;
 use crate::query::feedback::FeedbackRegistry;
+use crate::query::lifecycle::AdaptiveSelectionConfig;
 use crate::query::plan_cache::{PlanCache, PlanCacheStats};
 use crate::query::stats::{StatsRegistry, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
@@ -50,6 +51,7 @@ pub struct TreeDb {
     pub(crate) join_config: JoinConfig,
     pub(crate) multi_index_config: MultiIndexConfig,
     pub(crate) materialize_config: MaterializeConfig,
+    pub(crate) adaptive_config: AdaptiveSelectionConfig,
 }
 
 impl TreeDb {
@@ -89,6 +91,7 @@ impl TreeDb {
             join_config: JoinConfig::default(),
             multi_index_config: MultiIndexConfig::default(),
             materialize_config: crate::query::materialize::MaterializeConfig::default(),
+            adaptive_config: AdaptiveSelectionConfig::default(),
         })
     }
 
@@ -120,6 +123,7 @@ impl TreeDb {
             join_config: JoinConfig::default(),
             multi_index_config: MultiIndexConfig::default(),
             materialize_config: crate::query::materialize::MaterializeConfig::default(),
+            adaptive_config: AdaptiveSelectionConfig::default(),
         })
     }
 
@@ -145,6 +149,7 @@ impl TreeDb {
             join_config: JoinConfig::default(),
             multi_index_config: MultiIndexConfig::default(),
             materialize_config: crate::query::materialize::MaterializeConfig::default(),
+            adaptive_config: AdaptiveSelectionConfig::default(),
         }
     }
 
@@ -776,6 +781,16 @@ impl TreeDb {
     /// Sets the maximum capacity of the physical plan cache.
     pub fn set_plan_cache_capacity(&mut self, capacity: usize) {
         self.plan_cache.set_capacity(capacity);
+    }
+
+    /// Returns a reference to the active adaptive plan selection configuration.
+    pub fn adaptive_config(&self) -> &AdaptiveSelectionConfig {
+        &self.adaptive_config
+    }
+
+    /// Sets the active adaptive plan selection configuration.
+    pub fn set_adaptive_config(&mut self, config: AdaptiveSelectionConfig) {
+        self.adaptive_config = config;
     }
 
     /// Returns the current catalog/schema generation counter.
