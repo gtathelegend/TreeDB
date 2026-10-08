@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::engine::isolation::{CommitSeq, MvccVisibilityPolicy, Snapshot};
 use crate::error::{Error, Result};
 use crate::index::node::{RecordId, INVALID_PAGE_ID};
 use crate::storage::buffer_pool::BufferPool;
@@ -9,6 +10,195 @@ use crate::storage::page::{PageId, PageType};
 use crate::storage::record_page::{
     RecordLocation, RecordPage, MAX_RECORD_SIZE, OVERFLOW_DESCRIPTOR_SIZE,
 };
+use crate::wal::lsn::TxnId;
+
+/// Canonical MVCC on-disk version serialization format version.
+pub const MVCC_VERSION_FORMAT: u16 = 1;
+
+/// Fixed header size in bytes for persistent MVCC record versions.
+///
+/// Layout:
+/// - `format_version`: u16 (2B)
+/// - `xmin`: u64 (8B)
+/// - `has_xmax`: u8 (1B)
+/// - `xmax`: u64 (8B)
+/// - `has_created_at`: u8 (1B)
+/// - `created_at`: u64 (8B)
+/// - `has_deleted_at`: u8 (1B)
+/// - `deleted_at`: u64 (8B)
+/// - `has_prev`: u8 (1B)
+/// - `prev_page_id`: u32 (4B)
+/// - `prev_slot_id`: u32 (4B)
+///
+/// Total = 46 bytes.
+pub const VERSION_HEADER_SIZE: usize = 46;
+
+/// Maximum allowable version chain traversal depth before rejecting as pathological.
+pub const MAX_VERSION_CHAIN_DEPTH: usize = 1000;
+
+/// Persistent MVCC record version metadata describing creation, deletion, and version history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionMetadata {
+    pub format_version: u16,
+    pub xmin: TxnId,
+    pub xmax: Option<TxnId>,
+    pub created_at: Option<CommitSeq>,
+    pub deleted_at: Option<CommitSeq>,
+    pub prev_version: Option<RecordId>,
+}
+
+impl VersionMetadata {
+    /// Creates a new uncommitted version created by `xmin`, optionally chained from `prev_version`.
+    pub fn new(xmin: TxnId, prev_version: Option<RecordId>) -> Self {
+        Self {
+            format_version: MVCC_VERSION_FORMAT,
+            xmin,
+            xmax: None,
+            created_at: None,
+            deleted_at: None,
+            prev_version,
+        }
+    }
+
+    /// Creates a new committed version created by `xmin` with `created_at` sequence.
+    pub fn new_committed(
+        xmin: TxnId,
+        created_at: CommitSeq,
+        prev_version: Option<RecordId>,
+    ) -> Self {
+        Self {
+            format_version: MVCC_VERSION_FORMAT,
+            xmin,
+            xmax: None,
+            created_at: Some(created_at),
+            deleted_at: None,
+            prev_version,
+        }
+    }
+
+    /// Serializes this version header into a slice of length at least `VERSION_HEADER_SIZE`.
+    pub fn serialize_into(&self, buf: &mut [u8]) {
+        assert!(
+            buf.len() >= VERSION_HEADER_SIZE,
+            "buffer must have at least {VERSION_HEADER_SIZE} bytes"
+        );
+        buf[0..2].copy_from_slice(&self.format_version.to_le_bytes());
+        buf[2..10].copy_from_slice(&self.xmin.0.to_le_bytes());
+        match self.xmax {
+            Some(x) => {
+                buf[10] = 1;
+                buf[11..19].copy_from_slice(&x.0.to_le_bytes());
+            }
+            None => {
+                buf[10] = 0;
+                buf[11..19].copy_from_slice(&0u64.to_le_bytes());
+            }
+        }
+        match self.created_at {
+            Some(c) => {
+                buf[19] = 1;
+                buf[20..28].copy_from_slice(&c.0.to_le_bytes());
+            }
+            None => {
+                buf[19] = 0;
+                buf[20..28].copy_from_slice(&0u64.to_le_bytes());
+            }
+        }
+        match self.deleted_at {
+            Some(d) => {
+                buf[28] = 1;
+                buf[29..37].copy_from_slice(&d.0.to_le_bytes());
+            }
+            None => {
+                buf[28] = 0;
+                buf[29..37].copy_from_slice(&0u64.to_le_bytes());
+            }
+        }
+        match self.prev_version {
+            Some(rid) => {
+                buf[37] = 1;
+                buf[38..42].copy_from_slice(&rid.page_id.to_le_bytes());
+                buf[42..46].copy_from_slice(&rid.slot_id.to_le_bytes());
+            }
+            None => {
+                buf[37] = 0;
+                buf[38..42].copy_from_slice(&0u32.to_le_bytes());
+                buf[42..46].copy_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+
+    /// Deserializes a byte buffer into `VersionMetadata` and the remaining user payload.
+    pub fn deserialize(buf: &[u8]) -> Result<(Self, &[u8])> {
+        if buf.len() < VERSION_HEADER_SIZE {
+            return Err(Error::InvalidVersionMetadata(format!(
+                "record buffer length {} is smaller than version header size {VERSION_HEADER_SIZE}",
+                buf.len()
+            )));
+        }
+
+        let format_version = u16::from_le_bytes([buf[0], buf[1]]);
+        if format_version != MVCC_VERSION_FORMAT {
+            return Err(Error::InvalidVersionMetadata(format!(
+                "unsupported version format version {format_version}, supported {MVCC_VERSION_FORMAT}"
+            )));
+        }
+
+        let xmin = TxnId(u64::from_le_bytes(buf[2..10].try_into().unwrap()));
+        let xmax = if buf[10] == 1 {
+            Some(TxnId(u64::from_le_bytes(buf[11..19].try_into().unwrap())))
+        } else {
+            None
+        };
+        let created_at = if buf[19] == 1 {
+            Some(CommitSeq(u64::from_le_bytes(
+                buf[20..28].try_into().unwrap(),
+            )))
+        } else {
+            None
+        };
+        let deleted_at = if buf[28] == 1 {
+            Some(CommitSeq(u64::from_le_bytes(
+                buf[29..37].try_into().unwrap(),
+            )))
+        } else {
+            None
+        };
+        let prev_version = if buf[37] == 1 {
+            let pid = u32::from_le_bytes(buf[38..42].try_into().unwrap());
+            let sid = u32::from_le_bytes(buf[42..46].try_into().unwrap());
+            Some(RecordId::new(pid, sid))
+        } else {
+            None
+        };
+
+        // Semantic invariant checks
+        if let (Some(c), Some(d)) = (created_at, deleted_at) {
+            if c > d {
+                return Err(Error::InvalidVersionMetadata(format!(
+                    "creation commit sequence {c} exceeds deletion commit sequence {d}"
+                )));
+            }
+        }
+        if deleted_at.is_some() && xmax.is_none() {
+            return Err(Error::InvalidVersionMetadata(
+                "version has deleted_at commit sequence without deleting transaction identity"
+                    .into(),
+            ));
+        }
+
+        let meta = Self {
+            format_version,
+            xmin,
+            xmax,
+            created_at,
+            deleted_at,
+            prev_version,
+        };
+        let payload = &buf[VERSION_HEADER_SIZE..];
+        Ok((meta, payload))
+    }
+}
 
 /// Persistent record storage manager coordinating variable-length inline and overflow records.
 ///
@@ -477,5 +667,258 @@ impl RecordStore {
         }
 
         Ok(visited)
+    }
+
+    /// Inserts a new MVCC version composed of a 44-byte `VersionMetadata` header followed by the user payload.
+    pub fn insert_version(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        metadata: &VersionMetadata,
+        payload: &[u8],
+    ) -> Result<RecordId> {
+        let mut full_buf = vec![0u8; VERSION_HEADER_SIZE + payload.len()];
+        metadata.serialize_into(&mut full_buf[..VERSION_HEADER_SIZE]);
+        full_buf[VERSION_HEADER_SIZE..].copy_from_slice(payload);
+        self.insert(buffer_pool, &full_buf)
+    }
+
+    /// Reads an individual physical MVCC version and splits it into `VersionMetadata` and user payload.
+    pub fn read_version(
+        &self,
+        buffer_pool: &mut BufferPool,
+        record_id: RecordId,
+    ) -> Result<Option<(VersionMetadata, Vec<u8>)>> {
+        let raw_bytes = match self.get(buffer_pool, record_id)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let (metadata, payload) = VersionMetadata::deserialize(&raw_bytes)?;
+        Ok(Some((metadata, payload.to_vec())))
+    }
+
+    /// Updates the persistent 44-byte MVCC metadata header of an existing record in place.
+    pub fn update_version_metadata(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        record_id: RecordId,
+        metadata: &VersionMetadata,
+    ) -> Result<()> {
+        if record_id.page_id == INVALID_PAGE_ID {
+            return Err(Error::InvalidRecordId(record_id));
+        }
+
+        let mut header_buf = [0u8; VERSION_HEADER_SIZE];
+        metadata.serialize_into(&mut header_buf);
+
+        let (is_overflow, head_page_id) = {
+            let page = buffer_pool.fetch_page(record_id.page_id)?;
+            if page.page_type() != PageType::Record {
+                let _ = buffer_pool.unpin_page(record_id.page_id, false);
+                return Err(Error::PageCorruption {
+                    page_id: record_id.page_id,
+                    reason: "expected Record page type tag",
+                });
+            }
+            let rp = match RecordPage::deserialize(page) {
+                Ok(rp) => rp,
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(record_id.page_id, false);
+                    return Err(e);
+                }
+            };
+            buffer_pool.unpin_page(record_id.page_id, false)?;
+
+            match rp.get_location(record_id.slot_id) {
+                Some(RecordLocation::Inline(_)) => (false, NO_OVERFLOW_PAGE),
+                Some(RecordLocation::Overflow(desc)) => (true, desc.head_page_id),
+                None => return Err(Error::InvalidRecordId(record_id)),
+            }
+        };
+
+        if !is_overflow {
+            let page_mut = buffer_pool.fetch_page_mut(record_id.page_id)?;
+            let mut rp = RecordPage::deserialize(page_mut)?;
+            let inline_slice = rp
+                .get_inline_payload_mut(record_id.slot_id)
+                .ok_or(Error::InvalidRecordId(record_id))?;
+            if inline_slice.len() < VERSION_HEADER_SIZE {
+                let _ = buffer_pool.unpin_page(record_id.page_id, false);
+                return Err(Error::InvalidVersionMetadata(format!(
+                    "inline record size {} is smaller than header size {VERSION_HEADER_SIZE}",
+                    inline_slice.len()
+                )));
+            }
+            inline_slice[..VERSION_HEADER_SIZE].copy_from_slice(&header_buf);
+            rp.serialize(page_mut)?;
+            buffer_pool.unpin_page(record_id.page_id, true)?;
+        } else {
+            let page_mut = buffer_pool.fetch_page_mut(head_page_id)?;
+            let mut op = OverflowPage::deserialize(page_mut)?;
+            let overflow_payload = op.payload_mut();
+            if overflow_payload.len() < VERSION_HEADER_SIZE {
+                let _ = buffer_pool.unpin_page(head_page_id, false);
+                return Err(Error::InvalidVersionMetadata(format!(
+                    "overflow head payload size {} is smaller than header size {VERSION_HEADER_SIZE}",
+                    overflow_payload.len()
+                )));
+            }
+            overflow_payload[..VERSION_HEADER_SIZE].copy_from_slice(&header_buf);
+            op.serialize(page_mut)?;
+            buffer_pool.unpin_page(head_page_id, true)?;
+        }
+
+        Ok(())
+    }
+
+    /// Traverses the version chain starting at `head_rid` to find the first version visible to `snapshot`.
+    ///
+    /// Detects cycles and enforces `MAX_VERSION_CHAIN_DEPTH`.
+    pub fn read_visible(
+        &self,
+        buffer_pool: &mut BufferPool,
+        head_rid: RecordId,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+    ) -> Result<Option<(RecordId, VersionMetadata, Vec<u8>)>> {
+        let mut curr_rid = head_rid;
+        let mut visited = HashSet::new();
+        let mut depth = 0;
+
+        while curr_rid.page_id != INVALID_PAGE_ID {
+            if !visited.insert(curr_rid) {
+                return Err(Error::VersionChainCycle(format!(
+                    "cycle detected at {curr_rid:?} in version chain originating at head {head_rid:?}"
+                )));
+            }
+            depth += 1;
+            if depth > MAX_VERSION_CHAIN_DEPTH {
+                return Err(Error::VersionChainTooDeep {
+                    depth,
+                    max_depth: MAX_VERSION_CHAIN_DEPTH,
+                });
+            }
+
+            let (metadata, payload) = match self.read_version(buffer_pool, curr_rid)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+            if MvccVisibilityPolicy::is_visible(
+                metadata.xmin,
+                metadata.xmax,
+                metadata.created_at,
+                metadata.deleted_at,
+                reader_txn,
+                snapshot,
+            ) {
+                return Ok(Some((curr_rid, metadata, payload)));
+            }
+
+            match metadata.prev_version {
+                Some(prev) => curr_rid = prev,
+                None => break,
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Helper returning only the visible user payload for `head_rid`, if any.
+    pub fn read_visible_payload(
+        &self,
+        buffer_pool: &mut BufferPool,
+        head_rid: RecordId,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .read_visible(buffer_pool, head_rid, reader_txn, snapshot)?
+            .map(|(_, _, p)| p))
+    }
+
+    /// Returns `true` if any version in the chain originating at `head_rid` is visible to `snapshot`.
+    pub fn is_record_visible(
+        &self,
+        buffer_pool: &mut BufferPool,
+        head_rid: RecordId,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+    ) -> Result<bool> {
+        Ok(self
+            .read_visible(buffer_pool, head_rid, reader_txn, snapshot)?
+            .is_some())
+    }
+
+    /// Validates the entire version chain starting from `head_rid`.
+    ///
+    /// Verifies:
+    /// 1. Every linked record exists and can be deserialized.
+    /// 2. No cycles.
+    /// 3. Depth does not exceed `MAX_VERSION_CHAIN_DEPTH`.
+    /// 4. Creation/deletion ordering invariants.
+    /// 5. Intersite commit sequence monotonicity across the chain.
+    ///
+    /// Returns the length (depth) of the version chain.
+    pub fn validate_version_chain(
+        &self,
+        buffer_pool: &mut BufferPool,
+        head_rid: RecordId,
+    ) -> Result<usize> {
+        let mut curr_rid = head_rid;
+        let mut visited = HashSet::new();
+        let mut depth = 0;
+        let mut next_created_at: Option<CommitSeq> = None;
+
+        while curr_rid.page_id != INVALID_PAGE_ID {
+            if !visited.insert(curr_rid) {
+                return Err(Error::VersionChainCycle(format!(
+                    "cycle detected at {curr_rid:?} in version chain originating at {head_rid:?}"
+                )));
+            }
+            depth += 1;
+            if depth > MAX_VERSION_CHAIN_DEPTH {
+                return Err(Error::VersionChainTooDeep {
+                    depth,
+                    max_depth: MAX_VERSION_CHAIN_DEPTH,
+                });
+            }
+
+            let (metadata, _) = self.read_version(buffer_pool, curr_rid)?.ok_or_else(|| {
+                Error::InvalidVersionReference(format!("missing record at {curr_rid:?}"))
+            })?;
+
+            if let (Some(c), Some(d)) = (metadata.created_at, metadata.deleted_at) {
+                if c > d {
+                    return Err(Error::InvalidVersionMetadata(format!(
+                        "created_at {c} > deleted_at {d} at {curr_rid:?}"
+                    )));
+                }
+            }
+
+            if let (Some(newer_created), Some(older_created)) =
+                (next_created_at, metadata.created_at)
+            {
+                if older_created > newer_created {
+                    return Err(Error::InvalidCommitSequence(format!(
+                        "older version commit seq {older_created} > newer version commit seq {newer_created}"
+                    )));
+                }
+            }
+            next_created_at = metadata.created_at;
+
+            match metadata.prev_version {
+                Some(prev) => {
+                    if prev == curr_rid {
+                        return Err(Error::VersionChainCycle(format!(
+                            "self-referencing previous pointer at {curr_rid:?}"
+                        )));
+                    }
+                    curr_rid = prev;
+                }
+                None => break,
+            }
+        }
+
+        Ok(depth)
     }
 }

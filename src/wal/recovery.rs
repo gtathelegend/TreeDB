@@ -34,6 +34,7 @@ pub struct RecoveryStats {
     pub undo_count: usize,
     pub clrs_generated: usize,
     pub checkpoint_lsn: Lsn,
+    pub max_commit_seq: u64,
 }
 
 /// Simulated crash / fault injection point during crash recovery testing.
@@ -179,6 +180,9 @@ impl RecoveryEngine {
                     if let Some(entry) = txn_table.get_mut(&rec.txn_id) {
                         entry.status = TxnStatus::Committed;
                         entry.last_lsn = rec.lsn;
+                    }
+                    if let LogRecordBody::Commit { commit_seq } = rec.body {
+                        stats.max_commit_seq = std::cmp::max(stats.max_commit_seq, commit_seq);
                     }
                 }
                 LogRecordType::Abort => {
@@ -428,6 +432,7 @@ impl RecoveryEngine {
         if log_manager.next_lsn().is_valid() {
             log_manager.flush(log_manager.next_lsn())?;
         }
+        page_manager.set_max_commit_seq(stats.max_commit_seq)?;
         page_manager.sync()?;
 
         Ok(stats)

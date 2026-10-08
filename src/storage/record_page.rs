@@ -330,6 +330,24 @@ impl RecordPage {
         }
     }
 
+    /// Retrieves a mutable reference to the inlined record payload bytes at `slot_id`.
+    pub fn get_inline_payload_mut(&mut self, slot_id: u32) -> Option<&mut [u8]> {
+        let slot = self.slots.get(slot_id as usize)?;
+        if slot.is_deleted() || slot.is_overflow() {
+            return None;
+        }
+
+        let start = slot.offset as usize;
+        let raw_len = slot.raw_length();
+        let end = start + raw_len;
+
+        if end > PAGE_PAYLOAD_SIZE || start < self.free_space_start as usize {
+            return None;
+        }
+
+        Some(&mut self.payload_data[start..end])
+    }
+
     /// Logically deletes the record or overflow descriptor at `slot_id`.
     ///
     /// Sets the slot descriptor to deleted (`offset: 0, length: 0`).

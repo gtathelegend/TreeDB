@@ -407,6 +407,16 @@ impl BufferPool {
         Ok(checkpoint_lsn)
     }
 
+    /// Updates the durable max commit sequence in the page manager header and persists it.
+    pub fn set_max_commit_seq(&mut self, seq: u64) -> Result<()> {
+        self.page_manager.set_max_commit_seq(seq)
+    }
+
+    /// Returns the current durable max commit sequence from the page manager header.
+    pub fn durable_max_commit_seq(&self) -> u64 {
+        self.page_manager.header().max_commit_seq
+    }
+
     /// Executes a synchronous checkpoint and safely truncates obsolete WAL records.
     ///
     /// Calculates the safe retention boundary:

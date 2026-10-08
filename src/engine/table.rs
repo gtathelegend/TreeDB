@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::engine::catalog::{Catalog, IndexMetadata, TableId, TableMetadata};
+use crate::engine::isolation::{CommitSeq, IsolationContext, Snapshot, TransactionWriteSet};
 use crate::engine::types::{Row, Schema, Value};
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
 use crate::index::secondary::{IndexKey, SecondaryIndex};
 use crate::query::stats::{ColumnStatistics, IndexStatistics, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::record_store::RecordStore;
+use crate::storage::record_store::{RecordStore, VersionMetadata};
+use crate::wal::lsn::{TxnId, NULL_TXN};
 use crate::RecordId;
 
 /// Runtime statistics collected during secondary index skip scan execution.
@@ -85,11 +87,13 @@ pub struct Table<'a> {
     record_store: RecordStore,
     indexes: Vec<(IndexMetadata, SecondaryIndex)>,
     buffer_pool: &'a mut BufferPool,
+    isolation_context: Option<IsolationContext>,
+    write_set: Option<&'a mut TransactionWriteSet>,
 }
 
 impl<'a> Table<'a> {
     /// Creates a new `Table` handle wrapping table metadata, primary tree, record store,
-    /// secondary indexes, and buffer pool.
+    /// secondary indexes, and buffer pool in autocommit mode.
     pub fn new(
         metadata: TableMetadata,
         tree: BPlusTree,
@@ -103,7 +107,57 @@ impl<'a> Table<'a> {
             record_store,
             indexes,
             buffer_pool,
+            isolation_context: None,
+            write_set: None,
         }
+    }
+
+    /// Creates a new `Table` handle within an explicit transactional isolation context and write set.
+    pub fn new_with_isolation(
+        metadata: TableMetadata,
+        tree: BPlusTree,
+        record_store: RecordStore,
+        indexes: Vec<(IndexMetadata, SecondaryIndex)>,
+        buffer_pool: &'a mut BufferPool,
+        isolation_context: Option<IsolationContext>,
+        write_set: Option<&'a mut TransactionWriteSet>,
+    ) -> Self {
+        Self {
+            metadata,
+            tree,
+            record_store,
+            indexes,
+            buffer_pool,
+            isolation_context,
+            write_set,
+        }
+    }
+
+    /// Sets or updates the active transactional isolation context for this table handle.
+    pub fn set_isolation_context(&mut self, ctx: Option<IsolationContext>) {
+        self.isolation_context = ctx;
+    }
+
+    /// Returns a reference to the active transactional isolation context, if any.
+    pub fn isolation_context(&self) -> Option<&IsolationContext> {
+        self.isolation_context.as_ref()
+    }
+
+    fn current_snapshot(&self) -> Snapshot {
+        match &self.isolation_context {
+            Some(ctx) => ctx.snapshot,
+            None => Snapshot::new(crate::engine::isolation::SnapshotId(0), CommitSeq(u64::MAX)),
+        }
+    }
+
+    fn reader_txn(&self) -> Option<TxnId> {
+        self.isolation_context.as_ref().and_then(|c| {
+            if c.txn_id == NULL_TXN {
+                None
+            } else {
+                Some(c.txn_id)
+            }
+        })
     }
 
     /// Returns a reference to the table metadata.
@@ -131,53 +185,81 @@ impl<'a> Table<'a> {
         &self.indexes
     }
 
-    /// Inserts a new row into the table and updates all attached secondary indexes.
-    ///
-    /// # Process
-    /// 1. Validates the row against the table schema.
-    /// 2. Extracts and encodes the canonical primary key.
-    /// 3. Verifies that no existing row with the same primary key exists (`Error::DuplicatePrimaryKey`).
-    /// 4. Validates unique constraints across all unique secondary indexes (`Error::DuplicateIndexKey`).
-    /// 5. Serializes the row into a deterministic binary tuple format.
-    /// 6. Inserts the tuple payload into the RecordStore.
-    /// 7. Inserts the canonical primary key and `RecordId` into the primary B+ Tree.
-    /// 8. Inserts `(IndexKey, RecordId)` entries into all secondary indexes.
-    /// 9. Synchronizes table and index root metadata in the catalog if roots were split/modified.
+    /// Inserts a new row into the table as an MVCC version and updates all attached secondary indexes.
     pub fn insert(&mut self, row: &Row) -> Result<()> {
         self.metadata.schema.validate_row(row)?;
         let key = self.metadata.schema.extract_primary_key(row)?;
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
 
-        if self.tree.get(self.buffer_pool, key)?.is_some() {
-            let pk_val = &row.values[self.metadata.schema.primary_key_idx];
-            return Err(Error::DuplicatePrimaryKey(format!("{pk_val}")));
+        let prev_rid = self.tree.get(self.buffer_pool, key)?;
+        if let Some(existing_rid) = prev_rid {
+            if self.record_store.is_record_visible(
+                self.buffer_pool,
+                existing_rid,
+                reader_txn,
+                &snapshot,
+            )? {
+                let pk_val = &row.values[self.metadata.schema.primary_key_idx];
+                return Err(Error::DuplicatePrimaryKey(format!("{pk_val}")));
+            }
         }
 
-        // Validate unique secondary index constraints
+        // Validate unique secondary index constraints against visible entries
         for (meta, sec_idx) in &self.indexes {
             if meta.unique {
                 let idx_key = meta.extract_index_key(row);
                 let existing = sec_idx.lookup(self.buffer_pool, &idx_key)?;
-                if !existing.is_empty() {
-                    let vals_str = meta
-                        .column_indices
-                        .iter()
-                        .map(|&i| format!("{}", row.values[i]))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(Error::DuplicateIndexKey(
-                        if meta.column_indices.len() == 1 {
-                            vals_str
-                        } else {
-                            format!("({vals_str})")
-                        },
-                    ));
+                for r in existing {
+                    if self.record_store.is_record_visible(
+                        self.buffer_pool,
+                        r,
+                        reader_txn,
+                        &snapshot,
+                    )? {
+                        let vals_str = meta
+                            .column_indices
+                            .iter()
+                            .map(|&i| format!("{}", row.values[i]))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(Error::DuplicateIndexKey(
+                            if meta.column_indices.len() == 1 {
+                                vals_str
+                            } else {
+                                format!("({vals_str})")
+                            },
+                        ));
+                    }
                 }
             }
         }
 
         let tuple_bytes = self.metadata.schema.encode_tuple(row)?;
-        let rid = self.record_store.insert(self.buffer_pool, &tuple_bytes)?;
-        self.tree.insert(self.buffer_pool, key, rid)?;
+        let rid = if let Some(txn) = reader_txn {
+            let meta = VersionMetadata::new(txn, prev_rid);
+            let rid = self
+                .record_store
+                .insert_version(self.buffer_pool, &meta, &tuple_bytes)?;
+            if let Some(ws) = &mut self.write_set {
+                ws.record_insert(rid);
+            }
+            rid
+        } else {
+            let commit_seq = CommitSeq(self.buffer_pool.durable_max_commit_seq().saturating_add(1));
+            let meta = VersionMetadata::new_committed(NULL_TXN, commit_seq, prev_rid);
+            let rid = self
+                .record_store
+                .insert_version(self.buffer_pool, &meta, &tuple_bytes)?;
+            let _ = self.buffer_pool.set_max_commit_seq(commit_seq.0);
+            rid
+        };
+
+        if prev_rid.is_some() {
+            self.tree.update(self.buffer_pool, key, rid)?;
+        } else {
+            self.tree.insert(self.buffer_pool, key, rid)?;
+        }
 
         // Maintain secondary indexes
         for (meta, sec_idx) in &mut self.indexes {
@@ -191,13 +273,20 @@ impl<'a> Table<'a> {
         Ok(())
     }
 
-    /// Retrieves an owned copy of the `Row` associated with the specified primary key `Value`.
+    /// Retrieves an owned copy of the `Row` associated with the specified primary key `Value` visible to the snapshot.
     pub fn get(&mut self, pk: &Value) -> Result<Option<Row>> {
         self.validate_pk_type(pk)?;
         let key = pk.encode_to_canonical_key()?;
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
 
         match self.tree.get(self.buffer_pool, key)? {
-            Some(rid) => match self.record_store.get(self.buffer_pool, rid)? {
+            Some(rid) => match self.record_store.read_visible_payload(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                &snapshot,
+            )? {
                 Some(bytes) => {
                     let row = self.metadata.schema.decode_tuple(&bytes)?;
                     Ok(Some(row))
@@ -208,64 +297,91 @@ impl<'a> Table<'a> {
         }
     }
 
-    /// Updates an existing row in the table matching the primary key in `row`.
-    ///
-    /// # Process
-    /// 1. Validates the row against the table schema.
-    /// 2. Extracts the canonical primary key.
-    /// 3. Looks up the existing `RecordId` in the primary B+ Tree index.
-    /// 4. Loads and decodes the old row to determine changed column values.
-    /// 5. Validates unique constraints on changed secondary indexed columns.
-    /// 6. Inserts the new tuple into the RecordStore.
-    /// 7. Updates the primary B+ Tree index mapping to point to the new `RecordId`.
-    /// 8. Deletes the old record from the RecordStore.
-    /// 9. Maintains secondary indexes (deletes old `(old_key, old_rid)` and inserts `(new_key, new_rid)` with updated payload).
-    /// 10. Synchronizes catalog metadata.
+    /// Updates an existing row matching the primary key in `row` by creating a new version chained to the previous version.
     pub fn update(&mut self, row: &Row) -> Result<()> {
         self.metadata.schema.validate_row(row)?;
         let key = self.metadata.schema.extract_primary_key(row)?;
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
 
         let old_rid = self
             .tree
             .get(self.buffer_pool, key)?
             .ok_or(Error::RowNotFound)?;
 
-        let old_bytes = self
+        let (_, old_meta, old_bytes) = self
             .record_store
-            .get(self.buffer_pool, old_rid)?
+            .read_visible(self.buffer_pool, old_rid, reader_txn, &snapshot)?
             .ok_or(Error::RowNotFound)?;
         let old_row = self.metadata.schema.decode_tuple(&old_bytes)?;
 
-        // Validate uniqueness on changed indexed values
+        // Validate uniqueness on changed indexed values against visible records
         for (meta, sec_idx) in &self.indexes {
             let old_key = meta.extract_index_key(&old_row);
             let new_key = meta.extract_index_key(row);
             if meta.unique && old_key != new_key {
                 let existing = sec_idx.lookup(self.buffer_pool, &new_key)?;
-                if existing.iter().any(|&r| r != old_rid) {
-                    let vals_str = meta
-                        .column_indices
-                        .iter()
-                        .map(|&i| format!("{}", row.values[i]))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(Error::DuplicateIndexKey(
-                        if meta.column_indices.len() == 1 {
-                            vals_str
-                        } else {
-                            format!("({vals_str})")
-                        },
-                    ));
+                for r in existing {
+                    if r != old_rid
+                        && self.record_store.is_record_visible(
+                            self.buffer_pool,
+                            r,
+                            reader_txn,
+                            &snapshot,
+                        )?
+                    {
+                        let vals_str = meta
+                            .column_indices
+                            .iter()
+                            .map(|&i| format!("{}", row.values[i]))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(Error::DuplicateIndexKey(
+                            if meta.column_indices.len() == 1 {
+                                vals_str
+                            } else {
+                                format!("({vals_str})")
+                            },
+                        ));
+                    }
                 }
             }
         }
 
         let tuple_bytes = self.metadata.schema.encode_tuple(row)?;
-        let new_rid = self.record_store.insert(self.buffer_pool, &tuple_bytes)?;
-        self.tree.update(self.buffer_pool, key, new_rid)?;
-        self.record_store.delete(self.buffer_pool, old_rid)?;
+        let new_rid = if let Some(txn) = reader_txn {
+            let mut updated_old = old_meta.clone();
+            updated_old.xmax = Some(txn);
+            self.record_store
+                .update_version_metadata(self.buffer_pool, old_rid, &updated_old)?;
 
-        // Update secondary indexes
+            let new_meta = VersionMetadata::new(txn, Some(old_rid));
+            let new_rid =
+                self.record_store
+                    .insert_version(self.buffer_pool, &new_meta, &tuple_bytes)?;
+            if let Some(ws) = &mut self.write_set {
+                ws.record_update(old_rid, new_rid);
+            }
+            new_rid
+        } else {
+            let commit_seq = CommitSeq(self.buffer_pool.durable_max_commit_seq().saturating_add(1));
+            let mut updated_old = old_meta.clone();
+            updated_old.xmax = Some(NULL_TXN);
+            updated_old.deleted_at = Some(commit_seq);
+            self.record_store
+                .update_version_metadata(self.buffer_pool, old_rid, &updated_old)?;
+
+            let new_meta = VersionMetadata::new_committed(NULL_TXN, commit_seq, Some(old_rid));
+            let new_rid =
+                self.record_store
+                    .insert_version(self.buffer_pool, &new_meta, &tuple_bytes)?;
+            let _ = self.buffer_pool.set_max_commit_seq(commit_seq.0);
+            new_rid
+        };
+
+        self.tree.update(self.buffer_pool, key, new_rid)?;
+
+        // Maintain secondary indexes by replacing old version mapping with new version mapping
         for (meta, sec_idx) in &mut self.indexes {
             let old_key = meta.extract_index_key(&old_row);
             let new_key = meta.extract_index_key(row);
@@ -280,37 +396,59 @@ impl<'a> Table<'a> {
         Ok(())
     }
 
-    /// Deletes a row matching the specified primary key `Value` from the table and secondary indexes.
+    /// Deletes a row matching `pk` by marking it with deletion metadata rather than physical deletion.
     pub fn delete(&mut self, pk: &Value) -> Result<Option<Row>> {
         self.validate_pk_type(pk)?;
         let key = pk.encode_to_canonical_key()?;
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
 
-        match self.tree.delete(self.buffer_pool, key)? {
-            Some(rid) => {
-                let bytes = self.record_store.get(self.buffer_pool, rid)?;
-                self.record_store.delete(self.buffer_pool, rid)?;
+        let old_rid = match self.tree.get(self.buffer_pool, key)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
 
-                let row = match bytes {
-                    Some(b) => {
-                        let decoded = self.metadata.schema.decode_tuple(&b)?;
-                        // Remove from all secondary indexes
-                        for (meta, sec_idx) in &mut self.indexes {
-                            let idx_key = meta.extract_index_key(&decoded);
-                            sec_idx.delete(self.buffer_pool, &idx_key, rid)?;
-                        }
-                        Some(decoded)
-                    }
-                    None => None,
-                };
+        let (_, old_meta, old_bytes) = match self.record_store.read_visible(
+            self.buffer_pool,
+            old_rid,
+            reader_txn,
+            &snapshot,
+        )? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
 
-                self.sync_metadata_if_needed()?;
-                Ok(row)
+        let row = self.metadata.schema.decode_tuple(&old_bytes)?;
+
+        if let Some(txn) = reader_txn {
+            let mut updated_old = old_meta.clone();
+            updated_old.xmax = Some(txn);
+            self.record_store
+                .update_version_metadata(self.buffer_pool, old_rid, &updated_old)?;
+            if let Some(ws) = &mut self.write_set {
+                ws.record_delete(old_rid);
             }
-            None => Ok(None),
+        } else {
+            let commit_seq = CommitSeq(self.buffer_pool.durable_max_commit_seq().saturating_add(1));
+            let mut updated_old = old_meta.clone();
+            updated_old.xmax = Some(NULL_TXN);
+            updated_old.deleted_at = Some(commit_seq);
+            self.record_store
+                .update_version_metadata(self.buffer_pool, old_rid, &updated_old)?;
+            let _ = self.buffer_pool.set_max_commit_seq(commit_seq.0);
         }
+
+        // Remove from secondary indexes
+        for (meta, sec_idx) in &mut self.indexes {
+            let idx_key = meta.extract_index_key(&row);
+            sec_idx.delete(self.buffer_pool, &idx_key, old_rid)?;
+        }
+
+        self.sync_metadata_if_needed()?;
+        Ok(Some(row))
     }
 
-    /// Performs an ordered range scan over primary keys in `[start, end)`.
+    /// Performs an ordered range scan over primary keys in `[start, end)` returning visible rows.
     pub fn scan(&mut self, start: Option<&Value>, end: Option<&Value>) -> Result<Vec<Row>> {
         let start_key = match start {
             Some(v) => {
@@ -330,9 +468,16 @@ impl<'a> Table<'a> {
 
         let rids = self.tree.scan(self.buffer_pool, start_key, end_key)?;
         let mut rows = Vec::with_capacity(rids.len());
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
 
         for (_k, rid) in rids {
-            if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+            if let Some(bytes) = self.record_store.read_visible_payload(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                &snapshot,
+            )? {
                 let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
             }
@@ -353,9 +498,16 @@ impl<'a> Table<'a> {
         let idx_key = IndexKey::from_value(value);
         let rids = sec_idx.lookup(self.buffer_pool, &idx_key)?;
         let mut rows = Vec::with_capacity(rids.len());
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
 
         for rid in rids {
-            if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+            if let Some(bytes) = self.record_store.read_visible_payload(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                &snapshot,
+            )? {
                 let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
             }
@@ -379,7 +531,12 @@ impl<'a> Table<'a> {
 
     /// Fetches and decodes a row tuple given its record storage ID.
     pub fn get_row_by_rid(&mut self, rid: RecordId) -> Result<Option<Row>> {
-        if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+        if let Some(bytes) =
+            self.record_store
+                .read_visible_payload(self.buffer_pool, rid, reader_txn, &snapshot)?
+        {
             let row = self.metadata.schema.decode_tuple(&bytes)?;
             Ok(Some(row))
         } else {
@@ -406,9 +563,16 @@ impl<'a> Table<'a> {
 
         let entries = sec_idx.scan(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?;
         let mut rows = Vec::with_capacity(entries.len());
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
 
         for (_k, rid) in entries {
-            if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+            if let Some(bytes) = self.record_store.read_visible_payload(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                &snapshot,
+            )? {
                 let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
             }
@@ -462,8 +626,15 @@ impl<'a> Table<'a> {
     ) -> Result<Vec<Row>> {
         let rids = self.composite_index_lookup_rids(index_name, prefix_values)?;
         let mut rows = Vec::with_capacity(rids.len());
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
         for rid in rids {
-            if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+            if let Some(bytes) = self.record_store.read_visible_payload(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                &snapshot,
+            )? {
                 let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
             }
@@ -487,9 +658,16 @@ impl<'a> Table<'a> {
 
         let entries = sec_idx.scan(self.buffer_pool, start_key, end_key)?;
         let mut rows = Vec::with_capacity(entries.len());
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
 
         for (_k, rid) in entries {
-            if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+            if let Some(bytes) = self.record_store.read_visible_payload(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                &snapshot,
+            )? {
                 let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
             }
@@ -603,7 +781,19 @@ impl<'a> Table<'a> {
             .collect();
 
         let mut rows = Vec::with_capacity(entries.len());
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+
         for entry in entries {
+            if !self.record_store.is_record_visible(
+                self.buffer_pool,
+                entry.rid,
+                reader_txn,
+                &snapshot,
+            )? {
+                continue;
+            }
+
             let mut row_values = vec![Value::Null; schema_len];
 
             // Decode key columns
@@ -638,7 +828,12 @@ impl<'a> Table<'a> {
 
     /// Fetches and decodes a base record by its `RecordId`.
     pub fn get_by_rid(&mut self, rid: RecordId) -> Result<Option<Row>> {
-        if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+        if let Some(bytes) =
+            self.record_store
+                .read_visible_payload(self.buffer_pool, rid, reader_txn, &snapshot)?
+        {
             let row = self.metadata.schema.decode_tuple(&bytes)?;
             Ok(Some(row))
         } else {
@@ -813,8 +1008,15 @@ impl<'a> Table<'a> {
 
             stats.index_entries_examined += entries.len();
 
+            let reader_txn = self.reader_txn();
+            let snapshot = self.current_snapshot();
             for entry in entries {
-                if let Some(bytes) = self.record_store.get(self.buffer_pool, entry.rid)? {
+                if let Some(bytes) = self.record_store.read_visible_payload(
+                    self.buffer_pool,
+                    entry.rid,
+                    reader_txn,
+                    &snapshot,
+                )? {
                     let row = self.metadata.schema.decode_tuple(&bytes)?;
                     rows.push(row);
                 }
@@ -866,6 +1068,8 @@ impl<'a> Table<'a> {
 
         let mut rows = Vec::new();
         let total_cols = meta.column_indices.len();
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
 
         for prefix in distinct_prefixes {
             stats.skip_scan_probes += 1;
@@ -891,6 +1095,15 @@ impl<'a> Table<'a> {
             stats.index_entries_examined += entries.len();
 
             for entry in entries {
+                if !self.record_store.is_record_visible(
+                    self.buffer_pool,
+                    entry.rid,
+                    reader_txn,
+                    &snapshot,
+                )? {
+                    continue;
+                }
+
                 let mut row_values = vec![Value::Null; schema_len];
 
                 // Decode key columns
@@ -1214,8 +1427,15 @@ impl<'a> Table<'a> {
 
         // Fetch base records from RecordStore only for surviving candidate RecordIds
         let mut rows = Vec::with_capacity(final_rids.len());
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
         for rid in final_rids {
-            if let Some(bytes) = self.record_store.get(self.buffer_pool, rid)? {
+            if let Some(bytes) = self.record_store.read_visible_payload(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                &snapshot,
+            )? {
                 let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
                 stats.base_records_fetched += 1;

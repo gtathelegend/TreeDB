@@ -588,6 +588,7 @@ pub struct Transaction<'db> {
     initial_root_page_id: PageId,
     initial_freelist_head: PageId,
     initial_free_page_count: u32,
+    #[allow(dead_code)]
     initial_page_count: u32,
     pub(crate) has_catalog_mutations: bool,
 }
@@ -602,7 +603,13 @@ impl<'db> Transaction<'db> {
         initial_free_page_count: u32,
         initial_page_count: u32,
     ) -> Self {
-        let isolation_context = crate::engine::isolation::IsolationContext::for_txn(txn_id);
+        let commit_seq = db.current_commit_seq();
+        let snapshot = db.snapshot_registry.register(commit_seq);
+        let isolation_context = crate::engine::isolation::IsolationContext::new(
+            crate::engine::isolation::IsolationLevel::ReadCommitted,
+            txn_id,
+            snapshot,
+        );
         Self::new_with_isolation(
             db,
             txn_id,
@@ -657,6 +664,11 @@ impl<'db> Transaction<'db> {
         &self.isolation_context.snapshot
     }
 
+    /// Sets the point-in-time snapshot for this transaction.
+    pub fn set_snapshot(&mut self, snapshot: crate::engine::isolation::Snapshot) {
+        self.isolation_context.snapshot = snapshot;
+    }
+
     /// Returns the baseline single-version visibility policy.
     pub fn visibility_policy(&self) -> crate::engine::isolation::CurrentVersionVisibility {
         crate::engine::isolation::CurrentVersionVisibility
@@ -703,10 +715,12 @@ impl<'db> Transaction<'db> {
     pub fn get(&mut self, key: Key) -> Result<Option<Vec<u8>>> {
         self.ensure_active()?;
         match self.db.tree.get(&mut self.db.buffer_pool, key)? {
-            Some(record_id) => self
-                .db
-                .record_store
-                .get(&mut self.db.buffer_pool, record_id),
+            Some(record_id) => self.db.record_store.read_visible_payload(
+                &mut self.db.buffer_pool,
+                record_id,
+                Some(self.txn_id),
+                &self.isolation_context.snapshot,
+            ),
             None => Ok(None),
         }
     }
@@ -714,27 +728,61 @@ impl<'db> Transaction<'db> {
     /// Inserts or updates a key-value mapping within this transaction.
     pub fn put(&mut self, key: Key, value: &[u8]) -> Result<()> {
         self.ensure_active()?;
-        if let Some(old_rid) = self.db.tree.get(&mut self.db.buffer_pool, key)? {
-            let record_id = self
-                .db
-                .record_store
-                .insert(&mut self.db.buffer_pool, value)?;
-            self.db
-                .tree
-                .update(&mut self.db.buffer_pool, key, record_id)?;
-            self.db
-                .record_store
-                .delete(&mut self.db.buffer_pool, old_rid)?;
-            self.write_set.record_update(old_rid, record_id);
+        let prev_rid = self.db.tree.get(&mut self.db.buffer_pool, key)?;
+        if let Some(old_rid) = prev_rid {
+            let is_vis = self.db.record_store.is_record_visible(
+                &mut self.db.buffer_pool,
+                old_rid,
+                Some(self.txn_id),
+                &self.isolation_context.snapshot,
+            )?;
+            if is_vis {
+                if let Ok(Some((mut old_meta, _))) = self
+                    .db
+                    .record_store
+                    .read_version(&mut self.db.buffer_pool, old_rid)
+                {
+                    old_meta.xmax = Some(self.txn_id);
+                    self.db.record_store.update_version_metadata(
+                        &mut self.db.buffer_pool,
+                        old_rid,
+                        &old_meta,
+                    )?;
+                }
+                let new_meta =
+                    crate::storage::record_store::VersionMetadata::new(self.txn_id, Some(old_rid));
+                let new_rid = self.db.record_store.insert_version(
+                    &mut self.db.buffer_pool,
+                    &new_meta,
+                    value,
+                )?;
+                self.db
+                    .tree
+                    .update(&mut self.db.buffer_pool, key, new_rid)?;
+                self.write_set.record_update(old_rid, new_rid);
+            } else {
+                let new_meta =
+                    crate::storage::record_store::VersionMetadata::new(self.txn_id, Some(old_rid));
+                let new_rid = self.db.record_store.insert_version(
+                    &mut self.db.buffer_pool,
+                    &new_meta,
+                    value,
+                )?;
+                self.db
+                    .tree
+                    .update(&mut self.db.buffer_pool, key, new_rid)?;
+                self.write_set.record_insert(new_rid);
+            }
         } else {
-            let record_id = self
-                .db
-                .record_store
-                .insert(&mut self.db.buffer_pool, value)?;
+            let new_meta = crate::storage::record_store::VersionMetadata::new(self.txn_id, None);
+            let new_rid =
+                self.db
+                    .record_store
+                    .insert_version(&mut self.db.buffer_pool, &new_meta, value)?;
             self.db
                 .tree
-                .insert(&mut self.db.buffer_pool, key, record_id)?;
-            self.write_set.record_insert(record_id);
+                .insert(&mut self.db.buffer_pool, key, new_rid)?;
+            self.write_set.record_insert(new_rid);
         }
         Ok(())
     }
@@ -749,17 +797,26 @@ impl<'db> Transaction<'db> {
     /// Returns `Ok(Some(Vec<u8>))` with the deleted value bytes if present, or `Ok(None)` if absent.
     pub fn delete(&mut self, key: Key) -> Result<Option<Vec<u8>>> {
         self.ensure_active()?;
-        match self.db.tree.delete(&mut self.db.buffer_pool, key)? {
-            Some(record_id) => {
-                let value = self
-                    .db
-                    .record_store
-                    .get(&mut self.db.buffer_pool, record_id)?;
-                self.db
-                    .record_store
-                    .delete(&mut self.db.buffer_pool, record_id)?;
-                self.write_set.record_delete(record_id);
-                Ok(value)
+        match self.db.tree.get(&mut self.db.buffer_pool, key)? {
+            Some(old_rid) => {
+                match self.db.record_store.read_visible(
+                    &mut self.db.buffer_pool,
+                    old_rid,
+                    Some(self.txn_id),
+                    &self.isolation_context.snapshot,
+                )? {
+                    Some((_, mut old_meta, val)) => {
+                        old_meta.xmax = Some(self.txn_id);
+                        self.db.record_store.update_version_metadata(
+                            &mut self.db.buffer_pool,
+                            old_rid,
+                            &old_meta,
+                        )?;
+                        self.write_set.record_delete(old_rid);
+                        Ok(Some(val))
+                    }
+                    None => Ok(None),
+                }
             }
             None => Ok(None),
         }
@@ -772,7 +829,12 @@ impl<'db> Transaction<'db> {
         let mut results = Vec::with_capacity(rids.len());
 
         for (k, rid) in rids {
-            if let Some(val) = self.db.record_store.get(&mut self.db.buffer_pool, rid)? {
+            if let Some(val) = self.db.record_store.read_visible_payload(
+                &mut self.db.buffer_pool,
+                rid,
+                Some(self.txn_id),
+                &self.isolation_context.snapshot,
+            )? {
                 results.push((k, val));
             }
         }
@@ -817,12 +879,14 @@ impl<'db> Transaction<'db> {
             indexes.push((idx_meta, sec_tree));
         }
 
-        Ok(crate::engine::table::Table::new(
+        Ok(crate::engine::table::Table::new_with_isolation(
             metadata,
             tree,
             record_store,
             indexes,
             &mut self.db.buffer_pool,
+            Some(self.isolation_context.clone()),
+            Some(&mut self.write_set),
         ))
     }
 
@@ -7446,8 +7510,59 @@ impl<'db> Transaction<'db> {
                 });
             }
         }
-        self.db.commit_txn(self.txn_id)?;
-        let _commit_seq = self.db.allocate_commit_seq();
+        let commit_seq = self.db.allocate_commit_seq();
+
+        // Stamp MVCC version metadata BEFORE calling commit_txn_with_seq.
+        // commit_txn_with_seq clears active_txn from the buffer pool; any page writes
+        // after that point won't generate WAL page-delta records, making them
+        // invisible to ARIES redo after a crash. By writing metadata first (while
+        // active_txn is still set), unpin_page(dirty=true) will WAL-log the changes.
+        for &rid in self.write_set.inserted_records() {
+            if let Ok(Some((mut meta, _))) = self
+                .db
+                .record_store
+                .read_version(&mut self.db.buffer_pool, rid)
+            {
+                meta.created_at = Some(commit_seq);
+                let _ = self.db.record_store.update_version_metadata(
+                    &mut self.db.buffer_pool,
+                    rid,
+                    &meta,
+                );
+            }
+        }
+        for &old_rid in self.write_set.updated_records() {
+            if let Ok(Some((mut meta, _))) = self
+                .db
+                .record_store
+                .read_version(&mut self.db.buffer_pool, old_rid)
+            {
+                meta.deleted_at = Some(commit_seq);
+                let _ = self.db.record_store.update_version_metadata(
+                    &mut self.db.buffer_pool,
+                    old_rid,
+                    &meta,
+                );
+            }
+        }
+        for &old_rid in self.write_set.deleted_records() {
+            if let Ok(Some((mut meta, _))) = self
+                .db
+                .record_store
+                .read_version(&mut self.db.buffer_pool, old_rid)
+            {
+                meta.deleted_at = Some(commit_seq);
+                let _ = self.db.record_store.update_version_metadata(
+                    &mut self.db.buffer_pool,
+                    old_rid,
+                    &meta,
+                );
+            }
+        }
+
+        // Now commit (WAL flush): active_txn is cleared here, after metadata is written.
+        self.db.commit_txn_with_seq(self.txn_id, commit_seq.0)?;
+
         self.db
             .snapshot_registry
             .release(self.isolation_context.snapshot.snapshot_id);
@@ -7524,6 +7639,40 @@ impl<'db> Transaction<'db> {
 
     fn abort_internal(&mut self) -> Result<()> {
         if self.state == TxnState::Active {
+            // Revert xmax on all updated and deleted records
+            for &old_rid in self.write_set.updated_records() {
+                if let Ok(Some((mut meta, _))) = self
+                    .db
+                    .record_store
+                    .read_version(&mut self.db.buffer_pool, old_rid)
+                {
+                    if meta.xmax == Some(self.txn_id) {
+                        meta.xmax = None;
+                        let _ = self.db.record_store.update_version_metadata(
+                            &mut self.db.buffer_pool,
+                            old_rid,
+                            &meta,
+                        );
+                    }
+                }
+            }
+            for &old_rid in self.write_set.deleted_records() {
+                if let Ok(Some((mut meta, _))) = self
+                    .db
+                    .record_store
+                    .read_version(&mut self.db.buffer_pool, old_rid)
+                {
+                    if meta.xmax == Some(self.txn_id) {
+                        meta.xmax = None;
+                        let _ = self.db.record_store.update_version_metadata(
+                            &mut self.db.buffer_pool,
+                            old_rid,
+                            &meta,
+                        );
+                    }
+                }
+            }
+
             self.db.abort_txn(self.txn_id)?;
             self.db
                 .snapshot_registry
@@ -7544,11 +7693,6 @@ impl<'db> Transaction<'db> {
                 .page_manager_mut()
                 .header_mut()
                 .free_page_count = self.initial_free_page_count;
-            self.db
-                .buffer_pool
-                .page_manager_mut()
-                .header_mut()
-                .page_count = self.initial_page_count;
             let _ = self
                 .db
                 .buffer_pool

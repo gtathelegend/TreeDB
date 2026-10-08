@@ -193,6 +193,15 @@ impl PageManager {
         self.write_header_to_disk()
     }
 
+    /// Updates the maximum allocated commit sequence in the header and persists it to disk.
+    pub fn set_max_commit_seq(&mut self, seq: u64) -> Result<()> {
+        if seq > self.header.max_commit_seq {
+            self.header.max_commit_seq = seq;
+            self.write_header_to_disk()?;
+        }
+        Ok(())
+    }
+
     /// Writes the serialized header directly to Page 0 on disk.
     pub fn write_header_to_disk(&mut self) -> Result<()> {
         let header_bytes = self.header.serialize();

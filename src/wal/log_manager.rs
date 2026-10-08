@@ -234,9 +234,14 @@ impl LogManager {
 
     /// Appends a `Commit` log record for `txn_id` and flushes the WAL through the commit LSN.
     pub fn commit_txn(&mut self, txn_id: TxnId) -> Result<Lsn> {
+        self.commit_txn_with_seq(txn_id, 0)
+    }
+
+    /// Appends a `Commit` log record for `txn_id` with an explicit commit sequence and flushes the WAL.
+    pub fn commit_txn_with_seq(&mut self, txn_id: TxnId, commit_seq: u64) -> Result<Lsn> {
         let prev_lsn = self.txn_prev_lsn.get(&txn_id).copied().unwrap_or(NULL_LSN);
         let lsn = self.allocate_lsn();
-        let record = LogRecord::new_commit(lsn, prev_lsn, txn_id);
+        let record = LogRecord::new_commit_with_seq(lsn, prev_lsn, txn_id, commit_seq);
         self.append_record(&record)?;
 
         self.txn_first_lsn.remove(&txn_id);

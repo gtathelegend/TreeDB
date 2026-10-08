@@ -43,6 +43,8 @@ pub struct DbHeader {
     pub free_page_count: u32,
     /// LSN of the most recent completed durable checkpoint (0 if none).
     pub last_checkpoint_lsn: Lsn,
+    /// Highest durable allocated logical commit sequence number (0 if none).
+    pub max_commit_seq: u64,
 }
 
 impl Default for DbHeader {
@@ -64,6 +66,7 @@ impl DbHeader {
             freelist_head: NO_FREE_PAGE,
             free_page_count: 0,
             last_checkpoint_lsn: NULL_LSN,
+            max_commit_seq: 0,
         }
     }
 
@@ -79,6 +82,7 @@ impl DbHeader {
         bytes[28..32].copy_from_slice(&self.freelist_head.to_le_bytes());
         bytes[32..36].copy_from_slice(&self.free_page_count.to_le_bytes());
         bytes[36..44].copy_from_slice(&self.last_checkpoint_lsn.to_bytes());
+        bytes[44..52].copy_from_slice(&self.max_commit_seq.to_le_bytes());
         bytes
     }
 
@@ -113,6 +117,7 @@ impl DbHeader {
         let freelist_head = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
         let free_page_count = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
         let last_checkpoint_lsn = Lsn::from_bytes(bytes[36..44].try_into().unwrap());
+        let max_commit_seq = u64::from_le_bytes(bytes[44..52].try_into().unwrap());
 
         Ok(Self {
             magic,
@@ -124,6 +129,7 @@ impl DbHeader {
             freelist_head,
             free_page_count,
             last_checkpoint_lsn,
+            max_commit_seq,
         })
     }
 }
@@ -140,6 +146,7 @@ mod tests {
         header.freelist_head = 7;
         header.free_page_count = 3;
         header.last_checkpoint_lsn = Lsn(42);
+        header.max_commit_seq = 99;
 
         let bytes = header.serialize();
         let restored = DbHeader::deserialize(&bytes).expect("deserialization should succeed");
@@ -147,6 +154,7 @@ mod tests {
         assert_eq!(restored.freelist_head, 7);
         assert_eq!(restored.free_page_count, 3);
         assert_eq!(restored.last_checkpoint_lsn, Lsn(42));
+        assert_eq!(restored.max_commit_seq, 99);
     }
 
     #[test]

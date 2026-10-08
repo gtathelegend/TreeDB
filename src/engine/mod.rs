@@ -19,10 +19,12 @@ pub use table::{MultiIndexScanStats, SkipScanStats, Table};
 pub use transaction::{StatementResult, Transaction, TxnState};
 pub use types::{Column, DataType, Row, Schema, Value, MAX_COLUMN_NAME_LEN, TUPLE_FORMAT_VERSION};
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
+use crate::index::node::RecordId;
 use crate::query::external_aggregate::AggregateConfig;
 use crate::query::external_hash_join::JoinConfig;
 use crate::query::external_sort::SortConfig;
@@ -60,6 +62,9 @@ pub struct TreeDb {
     pub(crate) adaptive_config: AdaptiveSelectionConfig,
     pub(crate) snapshot_registry: SnapshotRegistry,
     pub(crate) next_commit_seq: u64,
+    pub(crate) active_txn_inserts: HashMap<TxnId, Vec<RecordId>>,
+    pub(crate) active_txn_updates: HashMap<TxnId, Vec<RecordId>>,
+    pub(crate) active_txn_deletes: HashMap<TxnId, Vec<RecordId>>,
 }
 
 impl TreeDb {
@@ -69,17 +74,21 @@ impl TreeDb {
         let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
 
         let mut page_manager = PageManager::open(db_path)?;
-        let log_manager = if wal_path.exists() {
+        let (log_manager, max_commit_seq) = if wal_path.exists() {
             let mut log_mgr = LogManager::open(&wal_path)?;
             // Execute ARIES crash recovery before initializing buffer pool
-            RecoveryEngine::recover(&mut page_manager, &mut log_mgr)?;
-            log_mgr
+            let stats = RecoveryEngine::recover(&mut page_manager, &mut log_mgr)?;
+            let max_seq = std::cmp::max(page_manager.header().max_commit_seq, stats.max_commit_seq);
+            (log_mgr, max_seq)
         } else {
-            LogManager::create(&wal_path)?
+            let max_seq = page_manager.header().max_commit_seq;
+            (LogManager::create(&wal_path)?, max_seq)
         };
 
+        let next_commit_seq = max_commit_seq.saturating_add(1);
         let root_page_id = page_manager.header().root_page_id;
-        let buffer_pool = BufferPool::with_wal(pool_capacity, page_manager, log_manager)?;
+        let mut buffer_pool = BufferPool::with_wal(pool_capacity, page_manager, log_manager)?;
+        let _ = buffer_pool.set_max_commit_seq(max_commit_seq);
         let tree = BPlusTree::from_root(root_page_id);
         let record_store = RecordStore::new();
 
@@ -101,7 +110,10 @@ impl TreeDb {
             materialize_config: crate::query::materialize::MaterializeConfig::default(),
             adaptive_config: AdaptiveSelectionConfig::default(),
             snapshot_registry: SnapshotRegistry::new(),
-            next_commit_seq: 1,
+            next_commit_seq,
+            active_txn_inserts: HashMap::new(),
+            active_txn_updates: HashMap::new(),
+            active_txn_deletes: HashMap::new(),
         })
     }
 
@@ -136,6 +148,9 @@ impl TreeDb {
             adaptive_config: AdaptiveSelectionConfig::default(),
             snapshot_registry: SnapshotRegistry::new(),
             next_commit_seq: 1,
+            active_txn_inserts: HashMap::new(),
+            active_txn_updates: HashMap::new(),
+            active_txn_deletes: HashMap::new(),
         })
     }
 
@@ -145,6 +160,7 @@ impl TreeDb {
         record_store: RecordStore,
         buffer_pool: BufferPool,
     ) -> Self {
+        let next_commit_seq = buffer_pool.durable_max_commit_seq().saturating_add(1);
         Self {
             tree,
             record_store,
@@ -163,7 +179,10 @@ impl TreeDb {
             materialize_config: crate::query::materialize::MaterializeConfig::default(),
             adaptive_config: AdaptiveSelectionConfig::default(),
             snapshot_registry: SnapshotRegistry::new(),
-            next_commit_seq: 1,
+            next_commit_seq,
+            active_txn_inserts: HashMap::new(),
+            active_txn_updates: HashMap::new(),
+            active_txn_deletes: HashMap::new(),
         }
     }
 
@@ -220,14 +239,21 @@ impl TreeDb {
 
     /// Returns the current logical commit sequence without incrementing it.
     pub fn current_commit_seq(&self) -> CommitSeq {
-        CommitSeq(self.next_commit_seq)
+        CommitSeq(std::cmp::max(
+            self.next_commit_seq,
+            self.buffer_pool.durable_max_commit_seq().saturating_add(1),
+        ))
     }
 
-    /// Allocates and increments the next logical commit sequence number.
+    /// Allocates and increments the next logical commit sequence number, persisting it to disk.
     pub fn allocate_commit_seq(&mut self) -> CommitSeq {
-        let seq = CommitSeq(self.next_commit_seq);
-        self.next_commit_seq = self.next_commit_seq.saturating_add(1);
-        seq
+        let current = std::cmp::max(
+            self.next_commit_seq,
+            self.buffer_pool.durable_max_commit_seq().saturating_add(1),
+        );
+        let _ = self.buffer_pool.set_max_commit_seq(current);
+        self.next_commit_seq = current.saturating_add(1);
+        CommitSeq(current)
     }
 
     /// Returns the oldest active snapshot ID if any transactions are active.
@@ -256,8 +282,66 @@ impl TreeDb {
 
     /// Commits the specified transaction, flushing the WAL through the commit LSN.
     pub fn commit_txn(&mut self, txn_id: TxnId) -> Result<Lsn> {
+        let seq = self.allocate_commit_seq();
+        self.commit_txn_with_seq(txn_id, seq.0)
+    }
+
+    /// Commits the specified transaction with its assigned commit sequence, flushing the WAL through the commit LSN.
+    pub fn commit_txn_with_seq(&mut self, txn_id: TxnId, commit_seq: u64) -> Result<Lsn> {
+        let seq = if commit_seq > 0 {
+            CommitSeq(commit_seq)
+        } else {
+            self.allocate_commit_seq()
+        };
+        let _ = self.buffer_pool.set_max_commit_seq(seq.0);
+
+        if let Some(inserts) = self.active_txn_inserts.remove(&txn_id) {
+            for rid in inserts {
+                if let Ok(Some((mut meta, _))) =
+                    self.record_store.read_version(&mut self.buffer_pool, rid)
+                {
+                    meta.created_at = Some(seq);
+                    let _ = self.record_store.update_version_metadata(
+                        &mut self.buffer_pool,
+                        rid,
+                        &meta,
+                    );
+                }
+            }
+        }
+        if let Some(updates) = self.active_txn_updates.remove(&txn_id) {
+            for old_rid in updates {
+                if let Ok(Some((mut meta, _))) = self
+                    .record_store
+                    .read_version(&mut self.buffer_pool, old_rid)
+                {
+                    meta.deleted_at = Some(seq);
+                    let _ = self.record_store.update_version_metadata(
+                        &mut self.buffer_pool,
+                        old_rid,
+                        &meta,
+                    );
+                }
+            }
+        }
+        if let Some(deletes) = self.active_txn_deletes.remove(&txn_id) {
+            for old_rid in deletes {
+                if let Ok(Some((mut meta, _))) = self
+                    .record_store
+                    .read_version(&mut self.buffer_pool, old_rid)
+                {
+                    meta.deleted_at = Some(seq);
+                    let _ = self.record_store.update_version_metadata(
+                        &mut self.buffer_pool,
+                        old_rid,
+                        &meta,
+                    );
+                }
+            }
+        }
+
         if let Some(wal) = self.buffer_pool.wal_mut() {
-            let lsn = wal.commit_txn(txn_id)?;
+            let lsn = wal.commit_txn_with_seq(txn_id, seq.0)?;
             if self.active_txn == Some(txn_id) {
                 self.active_txn = None;
                 self.buffer_pool.clear_active_txn();
@@ -271,6 +355,42 @@ impl TreeDb {
     /// Aborts the specified transaction, rolling back physical page modifications
     /// using Compensation Log Records (CLRs) and flushing WAL through the abort LSN.
     pub fn abort_txn(&mut self, txn_id: TxnId) -> Result<Lsn> {
+        if let Some(updates) = self.active_txn_updates.remove(&txn_id) {
+            for old_rid in updates {
+                if let Ok(Some((mut meta, _))) = self
+                    .record_store
+                    .read_version(&mut self.buffer_pool, old_rid)
+                {
+                    if meta.xmax == Some(txn_id) {
+                        meta.xmax = None;
+                        let _ = self.record_store.update_version_metadata(
+                            &mut self.buffer_pool,
+                            old_rid,
+                            &meta,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(deletes) = self.active_txn_deletes.remove(&txn_id) {
+            for old_rid in deletes {
+                if let Ok(Some((mut meta, _))) = self
+                    .record_store
+                    .read_version(&mut self.buffer_pool, old_rid)
+                {
+                    if meta.xmax == Some(txn_id) {
+                        meta.xmax = None;
+                        let _ = self.record_store.update_version_metadata(
+                            &mut self.buffer_pool,
+                            old_rid,
+                            &meta,
+                        );
+                    }
+                }
+            }
+        }
+        self.active_txn_inserts.remove(&txn_id);
+
         let lsn = self.buffer_pool.abort_txn(txn_id)?;
         if self.active_txn == Some(txn_id) {
             self.active_txn = None;
@@ -300,25 +420,78 @@ impl TreeDb {
 
     /// Inserts or updates a key-value mapping in the database.
     ///
-    /// Stores the variable-length value payload in the Record Store and updates the B+ Tree index.
+    /// Stores the variable-length value payload in the Record Store as a committed MVCC version.
     pub fn put(&mut self, key: Key, value: &[u8]) -> Result<()> {
         let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
             Some(self.begin_txn()?)
         } else {
             None
         };
-
-        if let Some(old_rid) = self.tree.get(&mut self.buffer_pool, key)? {
-            let record_id = self.record_store.insert(&mut self.buffer_pool, value)?;
+        let txn_id = self.active_txn.unwrap_or(NULL_TXN);
+        let commit_seq = self.allocate_commit_seq();
+        let prev_rid = self.tree.get(&mut self.buffer_pool, key)?;
+        if let Some(old_rid) = prev_rid {
+            if let Ok(Some((mut old_meta, _))) = self
+                .record_store
+                .read_version(&mut self.buffer_pool, old_rid)
+            {
+                old_meta.xmax = Some(txn_id);
+                if auto_txn.is_some() {
+                    old_meta.deleted_at = Some(commit_seq);
+                }
+                let _ = self.record_store.update_version_metadata(
+                    &mut self.buffer_pool,
+                    old_rid,
+                    &old_meta,
+                );
+            }
+            if auto_txn.is_none() && txn_id != NULL_TXN {
+                self.active_txn_updates
+                    .entry(txn_id)
+                    .or_default()
+                    .push(old_rid);
+            }
+            let new_meta = if auto_txn.is_some() {
+                crate::storage::record_store::VersionMetadata::new_committed(
+                    txn_id,
+                    commit_seq,
+                    Some(old_rid),
+                )
+            } else {
+                crate::storage::record_store::VersionMetadata::new(txn_id, Some(old_rid))
+            };
+            let record_id =
+                self.record_store
+                    .insert_version(&mut self.buffer_pool, &new_meta, value)?;
+            if auto_txn.is_none() && txn_id != NULL_TXN {
+                self.active_txn_inserts
+                    .entry(txn_id)
+                    .or_default()
+                    .push(record_id);
+            }
             self.tree.update(&mut self.buffer_pool, key, record_id)?;
-            self.record_store.delete(&mut self.buffer_pool, old_rid)?;
         } else {
-            let record_id = self.record_store.insert(&mut self.buffer_pool, value)?;
+            let new_meta = if auto_txn.is_some() {
+                crate::storage::record_store::VersionMetadata::new_committed(
+                    txn_id, commit_seq, None,
+                )
+            } else {
+                crate::storage::record_store::VersionMetadata::new(txn_id, None)
+            };
+            let record_id =
+                self.record_store
+                    .insert_version(&mut self.buffer_pool, &new_meta, value)?;
+            if auto_txn.is_none() && txn_id != NULL_TXN {
+                self.active_txn_inserts
+                    .entry(txn_id)
+                    .or_default()
+                    .push(record_id);
+            }
             self.tree.insert(&mut self.buffer_pool, key, record_id)?;
         }
 
         if let Some(tid) = auto_txn {
-            self.commit_txn(tid)?;
+            self.commit_txn_with_seq(tid, commit_seq.0)?;
         }
 
         Ok(())
@@ -333,8 +506,17 @@ impl TreeDb {
     ///
     /// Returns `Ok(Some(Vec<u8>))` if the key exists, or `Ok(None)` if absent.
     pub fn get(&mut self, key: Key) -> Result<Option<Vec<u8>>> {
+        let snapshot = crate::engine::isolation::Snapshot::new(
+            crate::engine::isolation::SnapshotId(0),
+            crate::engine::isolation::CommitSeq(u64::MAX),
+        );
         match self.tree.get(&mut self.buffer_pool, key)? {
-            Some(record_id) => self.record_store.get(&mut self.buffer_pool, record_id),
+            Some(record_id) => self.record_store.read_visible_payload(
+                &mut self.buffer_pool,
+                record_id,
+                self.active_txn,
+                &snapshot,
+            ),
             None => Ok(None),
         }
     }
@@ -348,30 +530,74 @@ impl TreeDb {
         } else {
             None
         };
-
-        let result = match self.tree.delete(&mut self.buffer_pool, key)? {
-            Some(record_id) => {
-                let value = self.record_store.get(&mut self.buffer_pool, record_id)?;
-                self.record_store.delete(&mut self.buffer_pool, record_id)?;
-                Ok(value)
+        let txn_id = self.active_txn.unwrap_or(NULL_TXN);
+        let snapshot = crate::engine::isolation::Snapshot::new(
+            crate::engine::isolation::SnapshotId(0),
+            crate::engine::isolation::CommitSeq(u64::MAX),
+        );
+        let old_rid = match self.tree.get(&mut self.buffer_pool, key)? {
+            Some(r) => r,
+            None => {
+                if let Some(tid) = auto_txn {
+                    self.commit_txn_with_seq(tid, 0)?;
+                }
+                return Ok(None);
             }
-            None => Ok(None),
         };
 
-        if let Some(tid) = auto_txn {
-            self.commit_txn(tid)?;
+        match self.record_store.read_visible(
+            &mut self.buffer_pool,
+            old_rid,
+            self.active_txn,
+            &snapshot,
+        )? {
+            Some((_, mut old_meta, val)) => {
+                let commit_seq = self.allocate_commit_seq();
+                old_meta.xmax = Some(txn_id);
+                if auto_txn.is_some() {
+                    old_meta.deleted_at = Some(commit_seq);
+                }
+                self.record_store.update_version_metadata(
+                    &mut self.buffer_pool,
+                    old_rid,
+                    &old_meta,
+                )?;
+                if auto_txn.is_none() && txn_id != NULL_TXN {
+                    self.active_txn_deletes
+                        .entry(txn_id)
+                        .or_default()
+                        .push(old_rid);
+                }
+                if let Some(tid) = auto_txn {
+                    self.commit_txn_with_seq(tid, commit_seq.0)?;
+                }
+                Ok(Some(val))
+            }
+            None => {
+                if let Some(tid) = auto_txn {
+                    self.commit_txn_with_seq(tid, 0)?;
+                }
+                Ok(None)
+            }
         }
-
-        result
     }
 
     /// Performs an ordered range scan over keys in `[start, end)`, returning pairs of `(Key, Vec<u8>)`.
     pub fn scan(&mut self, start: Option<Key>, end: Option<Key>) -> Result<Vec<(Key, Vec<u8>)>> {
+        let snapshot = crate::engine::isolation::Snapshot::new(
+            crate::engine::isolation::SnapshotId(0),
+            crate::engine::isolation::CommitSeq(u64::MAX),
+        );
         let rids = self.tree.scan(&mut self.buffer_pool, start, end)?;
         let mut results = Vec::with_capacity(rids.len());
 
         for (k, rid) in rids {
-            if let Some(val) = self.record_store.get(&mut self.buffer_pool, rid)? {
+            if let Some(val) = self.record_store.read_visible_payload(
+                &mut self.buffer_pool,
+                rid,
+                self.active_txn,
+                &snapshot,
+            )? {
                 results.push((k, val));
             }
         }

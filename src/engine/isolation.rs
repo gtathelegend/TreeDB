@@ -330,6 +330,84 @@ impl CurrentVersionVisibility {
     }
 }
 
+/// Multi-version concurrency control (MVCC) snapshot visibility evaluator.
+///
+/// Rules:
+/// 1. Own writes:
+///    - If created by reader: visible, UNLESS deleted by reader (in which case invisible).
+/// 2. Other transactions:
+///    - If uncommitted by creator: invisible (dirty read protection).
+///    - If committed by creator after snapshot commit horizon: invisible (future write).
+///    - If deleted by reader: invisible.
+///    - If deleted and committed by another transaction at or before snapshot horizon: invisible (deleted in past).
+///    - Otherwise: visible!
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MvccVisibilityPolicy;
+
+impl MvccVisibilityPolicy {
+    /// Determines whether a version is visible to a reader with `reader_txn` and `snapshot`.
+    pub fn is_visible(
+        xmin: TxnId,
+        xmax: Option<TxnId>,
+        created_at: Option<CommitSeq>,
+        deleted_at: Option<CommitSeq>,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+    ) -> bool {
+        // 1. Transaction-Local Visibility (Own writes)
+        if let Some(rt) = reader_txn {
+            if xmin == rt && rt != crate::wal::lsn::NULL_TXN {
+                // Created by self in this active transaction
+                // If deleted by self in this active transaction -> invisible to self
+                if xmax == Some(rt) {
+                    return false;
+                }
+                // Otherwise visible to self (read-your-own-writes)
+                return true;
+            }
+        }
+
+        // 2. Created by another transaction (or bootstrap/system)
+        // Must be committed to be visible to others (no dirty reads)
+        let created_seq = match created_at {
+            Some(seq) => seq,
+            None => {
+                // If created by another uncommitted transaction -> invisible
+                if xmin == crate::wal::lsn::NULL_TXN {
+                    CommitSeq::ZERO
+                } else {
+                    return false;
+                }
+            }
+        };
+
+        // Must have committed at or before the reader's snapshot horizon
+        if created_seq.0 > snapshot.as_of_commit_seq.0 {
+            return false;
+        }
+
+        // 3. Deletion visibility
+        // Did the reader's own transaction delete this version?
+        if let Some(rt) = reader_txn {
+            if xmax == Some(rt) && rt != crate::wal::lsn::NULL_TXN {
+                // Deleted by self -> invisible to self
+                return false;
+            }
+        }
+
+        // Was it deleted and committed by another transaction?
+        if let Some(deleted_seq) = deleted_at {
+            // If the deletion committed at or before the reader's snapshot horizon -> deleted and invisible
+            if deleted_seq.0 <= snapshot.as_of_commit_seq.0 {
+                return false;
+            }
+        }
+
+        // Otherwise: created in the past, and not yet deleted in this snapshot horizon
+        true
+    }
+}
+
 /// Transaction write-set tracking local modifications for MVCC bookkeeping and rollback.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransactionWriteSet {
@@ -399,6 +477,21 @@ impl TransactionWriteSet {
     /// Returns the number of deleted records.
     pub fn deleted_count(&self) -> usize {
         self.deleted.len()
+    }
+
+    /// Returns a reference to all inserted record IDs.
+    pub fn inserted_records(&self) -> &HashSet<RecordId> {
+        &self.inserted
+    }
+
+    /// Returns a reference to all updated pre-image record IDs.
+    pub fn updated_records(&self) -> &HashSet<RecordId> {
+        &self.updated
+    }
+
+    /// Returns a reference to all deleted record IDs.
+    pub fn deleted_records(&self) -> &HashSet<RecordId> {
+        &self.deleted
     }
 
     /// Returns the total number of record mutations.

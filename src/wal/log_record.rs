@@ -41,8 +41,8 @@ impl LogRecordType {
 pub enum LogRecordBody {
     /// Transaction begin marker.
     Begin,
-    /// Transaction commit marker.
-    Commit,
+    /// Transaction commit marker carrying the durable allocated commit sequence.
+    Commit { commit_seq: u64 },
     /// Transaction abort marker.
     Abort,
     /// Physical byte delta applied to a page, containing both before and after images.
@@ -85,14 +85,19 @@ impl LogRecord {
         }
     }
 
-    /// Creates a new `Commit` log record.
+    /// Creates a new `Commit` log record with default zero sequence.
     pub fn new_commit(lsn: Lsn, prev_lsn: Lsn, txn_id: TxnId) -> Self {
+        Self::new_commit_with_seq(lsn, prev_lsn, txn_id, 0)
+    }
+
+    /// Creates a new `Commit` log record with an explicit commit sequence number.
+    pub fn new_commit_with_seq(lsn: Lsn, prev_lsn: Lsn, txn_id: TxnId, commit_seq: u64) -> Self {
         Self {
             lsn,
             prev_lsn,
             txn_id,
             record_type: LogRecordType::Commit,
-            body: LogRecordBody::Commit,
+            body: LogRecordBody::Commit { commit_seq },
         }
     }
 
@@ -178,7 +183,10 @@ impl LogRecord {
         content.push(self.record_type.to_u8());
 
         match &self.body {
-            LogRecordBody::Begin | LogRecordBody::Commit | LogRecordBody::Abort => {}
+            LogRecordBody::Begin | LogRecordBody::Abort => {}
+            LogRecordBody::Commit { commit_seq } => {
+                content.extend_from_slice(&commit_seq.to_le_bytes());
+            }
             LogRecordBody::PageDelta {
                 page_id,
                 offset,
@@ -270,7 +278,14 @@ impl LogRecord {
         let body_bytes = &content[25..];
         let body = match record_type {
             LogRecordType::Begin => LogRecordBody::Begin,
-            LogRecordType::Commit => LogRecordBody::Commit,
+            LogRecordType::Commit => {
+                let commit_seq = if body_bytes.len() >= 8 {
+                    u64::from_le_bytes(body_bytes[0..8].try_into().unwrap())
+                } else {
+                    0
+                };
+                LogRecordBody::Commit { commit_seq }
+            }
             LogRecordType::Abort => LogRecordBody::Abort,
             LogRecordType::PageDelta => {
                 if body_bytes.len() < 8 {

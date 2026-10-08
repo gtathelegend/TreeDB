@@ -1253,9 +1253,16 @@ impl Catalog {
 
         let mut entries_to_insert = Vec::new();
         let mut seen_keys = HashSet::new();
+        let snapshot = crate::engine::isolation::Snapshot::new(
+            crate::engine::isolation::SnapshotId(0),
+            crate::engine::isolation::CommitSeq(u64::MAX),
+        );
+        let reader_txn = buffer_pool.active_txn();
 
         for (_pk, rid) in rids {
-            if let Some(bytes) = record_store.get(buffer_pool, rid)? {
+            if let Some(bytes) =
+                record_store.read_visible_payload(buffer_pool, rid, reader_txn, &snapshot)?
+            {
                 let row = table_meta.schema.decode_tuple(&bytes)?;
                 let composite = CompositeIndexKey::from_row_columns(&row, &column_indices);
                 let idx_key = composite.to_index_key(column_indices.len());

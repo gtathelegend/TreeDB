@@ -1,0 +1,60 @@
+# MVCC Snapshot Visibility & Commit Sequence Architecture
+
+## 1. Overview
+
+TreeDB Phase 68 implements deterministic snapshot visibility for multi-version concurrency control (MVCC). By decoupling logical commit sequences (`CommitSeq`) from physical write-ahead log sequences (`Lsn`), TreeDB provides repeatable read and read committed snapshot isolation without locks or background threads.
+
+---
+
+## 2. Monotonic Commit Sequences (`CommitSeq`)
+
+A `CommitSeq` is a 64-bit monotonically increasing integer representing logical transaction ordering:
+- **Separation from LSN**: While `Lsn` tracks physical byte offsets in the WAL file, `CommitSeq` strictly orders transactional state changes.
+- **Allocation Invariant**: Each committed transaction allocates a strictly greater `CommitSeq`. Aborted transactions do not allocate or advance `CommitSeq`.
+- **Durability**: The highest durable commit sequence is stored on Page 0 in `DbHeader::max_commit_seq` and maintained in `BufferPool`. Upon restart, crash recovery re-establishes `next_commit_seq = max_commit_seq + 1`, guaranteeing that commit sequences never regress or collide across reboots.
+
+---
+
+## 3. Snapshot Abstraction
+
+A `Snapshot` represents an immutable point-in-time view of the database:
+- `SnapshotId`: Unique 64-bit monotonically allocated identifier for tracking and diagnostic registry purposes.
+- `as_of_commit_seq`: The upper commit horizon visible to the snapshot. Any mutation committed with `CommitSeq > as_of_commit_seq` is considered in the future and invisible.
+
+### Snapshot Registry
+`SnapshotRegistry` tracks active snapshots across active transactions in $O(1)$ time, calculating `oldest_active_snapshot()` to define the retention horizon for future vacuum implementations.
+
+---
+
+## 4. Formal Visibility Rules (`MvccVisibilityPolicy`)
+
+A version with `xmin`, optional `xmax`, `created_at`, and `deleted_at` is evaluated against a reader transaction `reader_txn` and snapshot `snapshot` using the following deterministic decision tree:
+
+### 1. Transaction-Local Visibility (Own Writes)
+If `xmin == reader_txn` (and `reader_txn != NULL_TXN`):
+- If `xmax == Some(reader_txn)`: The version was created and subsequently deleted within the current active transaction $\rightarrow$ **INVISIBLE**.
+- Otherwise: The version was created by the active transaction $\rightarrow$ **VISIBLE** (read-your-own-writes).
+
+### 2. Foreign Uncommitted Writes (Dirty Read Protection)
+If `xmin != reader_txn`:
+- If `created_at == None` (and `xmin != NULL_TXN`): The version is uncommitted by another transaction $\rightarrow$ **INVISIBLE**.
+
+### 3. Commit Horizon Enforcement
+- If `created_at > snapshot.as_of_commit_seq`: The version committed after the snapshot horizon $\rightarrow$ **INVISIBLE** (future write).
+
+### 4. Deletion Horizon Enforcement
+- If `xmax == Some(reader_txn)`: The version was deleted by the active transaction $\rightarrow$ **INVISIBLE**.
+- If `deleted_at` is present:
+  - If `deleted_at <= snapshot.as_of_commit_seq`: The version was deleted and committed before or at the snapshot horizon $\rightarrow$ **INVISIBLE**.
+  - If `deleted_at > snapshot.as_of_commit_seq`: The version was deleted after the snapshot horizon $\rightarrow$ **VISIBLE** (was still alive at snapshot time).
+- Otherwise $\rightarrow$ **VISIBLE**.
+
+---
+
+## 5. Isolation Levels
+
+### Read Committed (Default)
+Under `IsolationLevel::ReadCommitted`, each statement captures a fresh statement snapshot via `txn.statement_snapshot()`. Newly committed mutations from other transactions between statements become immediately visible.
+
+### Repeatable Read
+Under `IsolationLevel::RepeatableRead`, the snapshot captured at `db.begin()` remains immutable throughout the lifetime of the transaction. Successive queries observe identical data regardless of other concurrent commits.

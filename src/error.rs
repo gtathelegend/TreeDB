@@ -602,6 +602,30 @@ pub enum Error {
     /// Internal query execution engine invariant violation or error.
     #[error("Internal execution error: {0}")]
     InternalExecutionError(String),
+
+    /// Persistent MVCC version metadata is invalid or corrupt.
+    #[error("Invalid version metadata: {0}")]
+    InvalidVersionMetadata(String),
+
+    /// A cycle was detected while traversing a version chain.
+    #[error("Version chain cycle detected: {0}")]
+    VersionChainCycle(String),
+
+    /// Traversal depth exceeded the maximum allowed version chain limit.
+    #[error("Version chain traversal limit exceeded: depth {depth}, limit {max_depth}")]
+    VersionChainTooDeep { depth: usize, max_depth: usize },
+
+    /// Invalid or out-of-bounds record identifier.
+    #[error("Invalid record ID: {0:?}")]
+    InvalidRecordId(crate::index::node::RecordId),
+
+    /// An invalid or dangling version reference was encountered.
+    #[error("Invalid version reference: {0}")]
+    InvalidVersionReference(String),
+
+    /// MVCC storage or visibility corruption detected.
+    #[error("MVCC corruption detected: {0}")]
+    MvccCorruption(String),
 }
 
 impl From<crate::query::validation::PlanValidationError> for Error {
