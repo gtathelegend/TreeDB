@@ -488,6 +488,19 @@ impl TreeDb {
         Ok(result)
     }
 
+    /// Parses, binds, optimizes, and executes an SQL query using an explicit `ExecutionContext`
+    /// within an auto-committed transaction.
+    pub fn execute_sql_with_context(
+        &mut self,
+        sql: &str,
+        ctx: &mut crate::query::ExecutionContext,
+    ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.execute_sql_with_context(sql, ctx)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
     /// Prepares an SQL query string into a reusable `PreparedStatement` with inferred parameter metadata.
     pub fn prepare_sql(&mut self, sql: &str) -> Result<crate::sql::PreparedStatement> {
         let mut txn = self.begin_transaction()?;

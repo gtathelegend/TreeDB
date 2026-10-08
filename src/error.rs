@@ -550,6 +550,38 @@ pub enum Error {
     /// Corrupted or truncated temporary multi-index spill run file.
     #[error("External multi-index run corruption detected: {0}")]
     ExternalMultiIndexRunCorrupted(String),
+
+    /// Invalid operator lifecycle transition.
+    #[error(
+        "Invalid operator lifecycle state for {operator}: expected {expected}, found {actual}"
+    )]
+    InvalidOperatorLifecycleState {
+        operator: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// Execution resource limit exceeded.
+    #[error(
+        "Execution resource limit exceeded for {resource}: requested {requested}, limit is {limit}"
+    )]
+    ResourceLimitExceeded {
+        resource: String,
+        requested: usize,
+        limit: usize,
+    },
+
+    /// Query execution was cancelled.
+    #[error("Execution cancelled")]
+    ExecutionCancelled,
+
+    /// Execution cleanup error.
+    #[error("Execution cleanup error: {0}")]
+    ExecutionCleanup(String),
+
+    /// Internal query execution engine invariant violation or error.
+    #[error("Internal execution error: {0}")]
+    InternalExecutionError(String),
 }
 
 impl From<crate::query::validation::PlanValidationError> for Error {

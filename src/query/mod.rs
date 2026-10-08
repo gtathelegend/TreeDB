@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod cardinality;
 pub mod cost;
+pub mod execution;
 pub mod expr;
 pub mod external_aggregate;
 pub mod external_hash_join;
@@ -58,6 +59,13 @@ pub use cost::{
     CostModel, PlanCost, AGG_CPU_COST, BPLUS_TREE_HEIGHT_COST, FILTER_CPU_COST, JOIN_CPU_COST,
     PAGE_READ_COST, PK_LOOKUP_COST, RECORD_ID_SET_OP_CPU_COST, ROW_CPU_COST, SEC_INDEX_FETCH_COST,
     SEC_INDEX_LOOKUP_COST, SKIP_SCAN_PROBE_COST, SORT_CPU_COST, TUPLE_FETCH_COST, WINDOW_CPU_COST,
+};
+pub use execution::{
+    safe_close, validate_transition, ExecutionContext, ExecutionOperator, ExecutionResourceLimits,
+    ExecutionResourceManager, ExecutionTerminationStatus, FilterExecutionOperator,
+    MaterializedResultOperator, OffsetLimitExecutionOperator, OperatorLifecycleState,
+    PhysicalPlanExecutor, PhysicalScanOperator, ProjectExecutionOperator, SortExecutionOperator,
+    TopNExecutionOperator,
 };
 pub use expr::{
     AggregateExpr, AggregateFunction, BinaryOp, BoundWindowFrame, BoundWindowSpec, Expr, UnaryOp,

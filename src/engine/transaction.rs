@@ -3580,6 +3580,47 @@ impl<'db> Transaction<'db> {
         self.execute_validated_physical_plan_with_metrics(&validated)
     }
 
+    /// Executes a fully optimized `PhysicalPlan` against this transaction using an explicit `ExecutionContext`.
+    pub fn execute_physical_plan_with_context(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+        ctx: &mut crate::query::ExecutionContext,
+    ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
+        let validated = self.validate_physical_plan(plan)?;
+        self.execute_validated_physical_plan_with_context(&validated, ctx)
+    }
+
+    /// Executes a pre-validated `ValidatedPhysicalPlan` against this transaction using an explicit `ExecutionContext`.
+    pub fn execute_validated_physical_plan_with_context(
+        &mut self,
+        plan: &crate::query::ValidatedPhysicalPlan,
+        ctx: &mut crate::query::ExecutionContext,
+    ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
+        let mut cte_store = std::collections::HashMap::new();
+        self.execute_physical_plan_internal_with_context(plan.plan(), &[], &mut cte_store, ctx)
+    }
+
+    /// Executes an SQL query using an explicit `ExecutionContext`.
+    pub fn execute_sql_with_context(
+        &mut self,
+        sql: &str,
+        ctx: &mut crate::query::ExecutionContext,
+    ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
+        self.ensure_active()?;
+        let stmt = crate::sql::parse_statement(sql)?;
+        match stmt {
+            crate::sql::Statement::Select(select_stmt) => {
+                let plan = self.plan_select(&select_stmt)?;
+                self.execute_physical_plan_with_context(&plan, ctx)
+            }
+            crate::sql::Statement::SetQuery(set_stmt) => {
+                let plan = self.plan_set_query(&set_stmt)?;
+                self.execute_physical_plan_with_context(&plan, ctx)
+            }
+            _ => Err(Error::UnsupportedStatement(sql.to_string())),
+        }
+    }
+
     /// Executes a pre-validated `ValidatedPhysicalPlan` against this transaction, returning both query result and metrics.
     pub fn execute_validated_physical_plan_with_metrics(
         &mut self,
@@ -3606,7 +3647,19 @@ impl<'db> Transaction<'db> {
         outer_contexts: &[(&Row, &Schema)],
         cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
     ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
+        let mut ctx = crate::query::ExecutionContext::for_txn(self.txn_id);
+        self.execute_physical_plan_internal_with_context(plan, outer_contexts, cte_store, &mut ctx)
+    }
+
+    fn execute_physical_plan_internal_with_context(
+        &mut self,
+        plan: &crate::query::optimizer::PhysicalPlan,
+        outer_contexts: &[(&Row, &Schema)],
+        cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
+        ctx: &mut crate::query::ExecutionContext,
+    ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
         self.ensure_active()?;
+        ctx.check_cancellation()?;
         let op_start = std::time::Instant::now();
 
         // 0. Materialize any CTEs defined on this plan (in declaration order)
@@ -3628,10 +3681,11 @@ impl<'db> Transaction<'db> {
                                     decision,
                                     crate::query::materialize::MaterializationDecision::ExternalMaterialize
                                 );
-                            let (res, cte_op) = self.execute_physical_plan_internal_with_metrics(
+                            let (res, cte_op) = self.execute_physical_plan_internal_with_context(
                                 cte_plan,
                                 outer_contexts,
                                 cte_store,
+                                ctx,
                             )?;
                             let mat_id = materialize_id.unwrap_or(1);
                             let (storage, mat_metrics) =
@@ -3681,10 +3735,11 @@ impl<'db> Transaction<'db> {
                         max_rows,
                     } => {
                         let (anchor_res, anchor_op) = self
-                            .execute_physical_plan_internal_with_metrics(
+                            .execute_physical_plan_internal_with_context(
                                 anchor_plan,
                                 outer_contexts,
                                 cte_store,
+                                ctx,
                             )?;
                         let mut accumulated_rows = anchor_res.rows;
                         if accumulated_rows.len() > *max_rows {
@@ -3698,6 +3753,7 @@ impl<'db> Transaction<'db> {
                         let mut iterations = 0;
 
                         while !working_rows.is_empty() {
+                            ctx.check_cancellation()?;
                             iterations += 1;
                             if iterations > *max_iterations {
                                 return Err(Error::RecursiveCteIterationLimit {
@@ -3713,10 +3769,11 @@ impl<'db> Transaction<'db> {
                             );
 
                             let (next_res, _next_op) = self
-                                .execute_physical_plan_internal_with_metrics(
+                                .execute_physical_plan_internal_with_context(
                                     recursive_plan,
                                     outer_contexts,
                                     cte_store,
+                                    ctx,
                                 )?;
                             let next_working_rows = next_res.rows;
 
@@ -3762,15 +3819,17 @@ impl<'db> Transaction<'db> {
         self.pre_evaluate_uncorrelated_subqueries_internal(&mut plan, outer_contexts, cte_store)?;
 
         if let Some(set_op) = &plan.set_op {
-            let (left_res, left_op) = self.execute_physical_plan_internal_with_metrics(
+            let (left_res, left_op) = self.execute_physical_plan_internal_with_context(
                 &set_op.left,
                 outer_contexts,
                 cte_store,
+                ctx,
             )?;
-            let (right_res, right_op) = self.execute_physical_plan_internal_with_metrics(
+            let (right_res, right_op) = self.execute_physical_plan_internal_with_context(
                 &set_op.right,
                 outer_contexts,
                 cte_store,
+                ctx,
             )?;
             let left_count = left_res.rows.len();
             let right_count = right_res.rows.len();
@@ -3813,6 +3872,12 @@ impl<'db> Transaction<'db> {
                 sort_metric.counters.bytes_spilled = sort_metrics.bytes_spilled;
                 sort_metric.counters.merge_passes = sort_metrics.merge_passes;
                 sort_metric.counters.peak_memory_bytes = sort_metrics.peak_memory_bytes;
+                if sort_metrics.peak_memory_bytes > 0 {
+                    ctx.resource_manager
+                        .reserve_memory(sort_metrics.peak_memory_bytes)?;
+                    ctx.resource_manager
+                        .release_memory(sort_metrics.peak_memory_bytes);
+                }
                 sort_metric.counters.sort_required = true;
                 sort_metric.counters.sort_eliminated = false;
                 sort_metric.add_child(current_op);
@@ -3844,6 +3909,8 @@ impl<'db> Transaction<'db> {
                 current_op,
             ));
         }
+
+        ctx.check_cancellation()?;
 
         // 1. Execute base table scan
         let (mut current_schema, mut current_rows, mut current_op) = {
@@ -3916,10 +3983,11 @@ impl<'db> Transaction<'db> {
                 let (res, inner_op) = match &cte.kind {
                     crate::sql::BoundCteKind::NonRecursive {
                         plan: inner_plan, ..
-                    } => self.execute_physical_plan_internal_with_metrics(
+                    } => self.execute_physical_plan_internal_with_context(
                         inner_plan,
                         outer_contexts,
                         cte_store,
+                        ctx,
                     )?,
                     crate::sql::BoundCteKind::Recursive { .. } => {
                         return Err(Error::TableNotFound(plan.base_table.table_name.clone()));
@@ -4583,10 +4651,11 @@ impl<'db> Transaction<'db> {
                     let (res, inner_op) = match &cte.kind {
                         crate::sql::BoundCteKind::NonRecursive {
                             plan: inner_plan, ..
-                        } => self.execute_physical_plan_internal_with_metrics(
+                        } => self.execute_physical_plan_internal_with_context(
                             inner_plan,
                             outer_contexts,
                             cte_store,
+                            ctx,
                         )?,
                         crate::sql::BoundCteKind::Recursive { .. } => {
                             return Err(Error::TableNotFound(join.right.table_name.clone()));
@@ -5231,6 +5300,12 @@ impl<'db> Transaction<'db> {
                 top_n_metric.counters.top_n_early_terminated = top_n_metrics.early_terminated;
                 top_n_metric.counters.early_terminated = top_n_metrics.early_terminated;
                 top_n_metric.counters.peak_memory_bytes = top_n_metrics.peak_memory_bytes;
+                if top_n_metrics.peak_memory_bytes > 0 {
+                    ctx.resource_manager
+                        .reserve_memory(top_n_metrics.peak_memory_bytes)?;
+                    ctx.resource_manager
+                        .release_memory(top_n_metrics.peak_memory_bytes);
+                }
                 top_n_metric.counters.top_n_limit = top_n_metrics.limit.unwrap_or(0);
                 top_n_metric.counters.top_n_offset = top_n_metrics.offset.unwrap_or(0);
                 top_n_metric.counters.sort_required = true;
@@ -5256,6 +5331,12 @@ impl<'db> Transaction<'db> {
                 sort_metric.counters.bytes_spilled = sort_metrics.bytes_spilled;
                 sort_metric.counters.merge_passes = sort_metrics.merge_passes;
                 sort_metric.counters.peak_memory_bytes = sort_metrics.peak_memory_bytes;
+                if sort_metrics.peak_memory_bytes > 0 {
+                    ctx.resource_manager
+                        .reserve_memory(sort_metrics.peak_memory_bytes)?;
+                    ctx.resource_manager
+                        .release_memory(sort_metrics.peak_memory_bytes);
+                }
                 sort_metric.counters.sort_required = true;
                 sort_metric.counters.sort_eliminated = false;
                 sort_metric.add_child(current_op);
@@ -5311,6 +5392,22 @@ impl<'db> Transaction<'db> {
         // If CTEs were materialized in this plan, attach them to the top operator
         for cte_metric in cte_metrics {
             current_op.add_child(cte_metric);
+        }
+
+        if current_op
+            .find_first(&|m| m.counters.early_terminated)
+            .is_some()
+        {
+            ctx.termination_status = crate::query::ExecutionTerminationStatus::CompletedEarly;
+        }
+
+        if !ctx.resource_manager.is_clean() {
+            return Err(Error::InternalExecutionError(format!(
+                "Resource leak detected after execution: memory={} bytes, temp_files={}, temp_bytes={}",
+                ctx.resource_manager.active_memory_reservations(),
+                ctx.resource_manager.active_temp_files(),
+                ctx.resource_manager.active_temp_bytes(),
+            )));
         }
 
         Ok((
