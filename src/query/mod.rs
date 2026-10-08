@@ -19,6 +19,7 @@ pub mod operator;
 pub mod optimizer;
 pub mod physical_properties;
 pub mod plan_cache;
+pub mod reference;
 pub mod rewrite;
 pub mod runtime_filter;
 pub mod stats;
@@ -135,6 +136,9 @@ pub use optimizer::{
 pub use plan_cache::{
     extract_plan_references, ParamPlanningSignature, PlanCache, PlanCacheEntry, PlanCacheKey,
     PlanCacheStats, PlanValidity, ResourcePlanningSignature, DEFAULT_PLAN_CACHE_CAPACITY,
+};
+pub use reference::{
+    assert_differential_equivalence, CanonicalRow, DifferentialFailureReport, ReferenceEvaluator,
 };
 pub use rewrite::{QueryRewriter, RewriteResult};
 pub use stats::{

@@ -473,6 +473,14 @@ impl TreeDb {
         Ok(result)
     }
 
+    /// Parses, binds, and executes an SQL statement using unoptimized reference relational evaluation.
+    pub fn execute_sql_reference(&mut self, sql: &str) -> Result<crate::query::QueryResult> {
+        let mut txn = self.begin_transaction()?;
+        let result = txn.execute_sql_reference(sql)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
     /// Parses, binds, optimizes, and executes an SQL statement directly on the database engine,
     /// returning both the query result and runtime query execution metrics within an auto-committed transaction.
     pub fn execute_sql_with_metrics(

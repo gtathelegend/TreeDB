@@ -1235,13 +1235,35 @@ impl<'db> Transaction<'db> {
         self.plan_select_with_outer_ctes_and_params(ast, outer_ctes, None)
     }
 
-    /// Plans a parsed `SelectStatement` AST with in-scope outer CTE definitions and positional parameters.
-    pub fn plan_select_with_outer_ctes_and_params(
+    /// Validates and binds a parsed `SelectStatement` AST into a `BoundSelect`.
+    pub fn bind_select(
+        &mut self,
+        ast: &crate::sql::SelectStatement,
+    ) -> Result<crate::sql::binder::BoundSelect> {
+        self.bind_select_with_outer_ctes(ast, &[])
+    }
+
+    /// Validates and binds a parsed `SelectStatement` AST with in-scope outer CTE definitions.
+    pub fn bind_select_with_outer_ctes(
+        &mut self,
+        ast: &crate::sql::SelectStatement,
+        outer_ctes: &[crate::sql::BoundCte],
+    ) -> Result<crate::sql::binder::BoundSelect> {
+        let (bound, _, _) = self.bind_select_with_outer_ctes_and_params(ast, outer_ctes, None)?;
+        Ok(bound)
+    }
+
+    /// Validates and binds a parsed `SelectStatement` AST with in-scope outer CTE definitions and parameters.
+    pub fn bind_select_with_outer_ctes_and_params(
         &mut self,
         ast: &crate::sql::SelectStatement,
         outer_ctes: &[crate::sql::BoundCte],
         params: Option<&[Value]>,
-    ) -> Result<crate::query::optimizer::PhysicalPlan> {
+    ) -> Result<(
+        crate::sql::binder::BoundSelect,
+        Vec<crate::query::optimizer::TableOptInfo>,
+        Vec<String>,
+    )> {
         self.ensure_active()?;
         let mut visible_ctes: Vec<crate::sql::BoundCte> = outer_ctes.to_vec();
 
@@ -1386,6 +1408,19 @@ impl<'db> Transaction<'db> {
             params,
         )?;
         bound.ctes = visible_ctes;
+        Ok((bound, table_infos, rewrite_logs))
+    }
+
+    /// Plans a parsed `SelectStatement` AST with in-scope outer CTE definitions and positional parameters.
+    pub fn plan_select_with_outer_ctes_and_params(
+        &mut self,
+        ast: &crate::sql::SelectStatement,
+        outer_ctes: &[crate::sql::BoundCte],
+        params: Option<&[Value]>,
+    ) -> Result<crate::query::optimizer::PhysicalPlan> {
+        let (bound, table_infos, rewrite_logs) =
+            self.bind_select_with_outer_ctes_and_params(ast, outer_ctes, params)?;
+
         let param_sig = params.map(crate::query::ParamPlanningSignature::from_values);
         let res_sig = self.resource_planning_signature();
         let mut plan = crate::query::optimizer::Optimizer::optimize_with_resource_feedback(
@@ -1469,39 +1504,8 @@ impl<'db> Transaction<'db> {
 
         if !ast.order_by.is_empty() {
             let schema = self.derive_cte_output_schema(&plan, &visible_ctes)?;
-            let mut bound_order_by = Vec::with_capacity(ast.order_by.len());
-            for order_item in &ast.order_by {
-                let bound_expr = match &order_item.expr {
-                    crate::sql::SqlExpr::Identifier(ident) => {
-                        if schema.columns.iter().any(|c| &c.name == ident) {
-                            crate::query::expr::Expr::Column(ident.clone())
-                        } else {
-                            return Err(Error::ColumnNotFound(ident.clone()));
-                        }
-                    }
-                    _ => {
-                        let binding = crate::sql::TableBinding::new("", None, &schema);
-                        let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
-                        let catalog = TxnBufferPoolCatalog {
-                            bp: &bp_cell,
-                            ctes: Some(&visible_ctes),
-                        };
-                        let mut ctx = crate::sql::binder::BindingContext::with_parent_and_catalog(
-                            vec![binding],
-                            None,
-                            Some(&catalog),
-                        );
-                        ctx.params = params;
-                        crate::sql::binder::bind_expr(&order_item.expr, &ctx)?
-                    }
-                };
-                let direction = match order_item.direction {
-                    crate::sql::OrderDirection::Asc => crate::query::SortDirection::Ascending,
-                    crate::sql::OrderDirection::Desc => crate::query::SortDirection::Descending,
-                };
-                bound_order_by.push(crate::query::SortKey::new(bound_expr, direction));
-            }
-            plan.order_by = bound_order_by;
+            plan.order_by =
+                self.bind_order_by_for_schema(&schema, &ast.order_by, &visible_ctes, params)?;
             plan.order_by_sort_required = true;
         }
 
@@ -1536,6 +1540,49 @@ impl<'db> Transaction<'db> {
         plan.ctes = refined_ctes;
 
         Ok(plan)
+    }
+
+    /// Validates and binds a list of `OrderByExpr` AST elements against an output schema and catalog.
+    pub fn bind_order_by_for_schema(
+        &mut self,
+        schema: &Schema,
+        order_by: &[crate::sql::OrderByExpr],
+        visible_ctes: &[crate::sql::BoundCte],
+        params: Option<&[Value]>,
+    ) -> Result<Vec<crate::query::SortKey>> {
+        let mut bound_order_by = Vec::with_capacity(order_by.len());
+        for order_item in order_by {
+            let bound_expr = match &order_item.expr {
+                crate::sql::SqlExpr::Identifier(ident) => {
+                    if schema.columns.iter().any(|c| &c.name == ident) {
+                        crate::query::expr::Expr::Column(ident.clone())
+                    } else {
+                        return Err(Error::ColumnNotFound(ident.clone()));
+                    }
+                }
+                _ => {
+                    let binding = crate::sql::TableBinding::new("", None, schema);
+                    let bp_cell = std::cell::RefCell::new(&mut self.db.buffer_pool);
+                    let catalog = TxnBufferPoolCatalog {
+                        bp: &bp_cell,
+                        ctes: Some(visible_ctes),
+                    };
+                    let mut ctx = crate::sql::binder::BindingContext::with_parent_and_catalog(
+                        vec![binding],
+                        None,
+                        Some(&catalog),
+                    );
+                    ctx.params = params;
+                    crate::sql::binder::bind_expr(&order_item.expr, &ctx)?
+                }
+            };
+            let direction = match order_item.direction {
+                crate::sql::OrderDirection::Asc => crate::query::SortDirection::Ascending,
+                crate::sql::OrderDirection::Desc => crate::query::SortDirection::Descending,
+            };
+            bound_order_by.push(crate::query::SortKey::new(bound_expr, direction));
+        }
+        Ok(bound_order_by)
     }
 
     fn plan_set_query_body_with_params(
@@ -2057,6 +2104,14 @@ impl<'db> Transaction<'db> {
         self.ensure_active()?;
         let res = self.execute_statement(sql)?;
         res.into_query()
+    }
+
+    /// Parses, binds, and executes an SQL statement using unoptimized reference relational evaluation.
+    ///
+    /// Observes prior uncommitted mutations made within the same transaction.
+    pub fn execute_sql_reference(&mut self, sql: &str) -> Result<crate::query::QueryResult> {
+        self.ensure_active()?;
+        crate::query::reference::ReferenceEvaluator::execute_sql(self, sql)
     }
 
     /// Parses, binds, optimizes, and executes an SQL statement, returning both the query result
@@ -5943,7 +5998,7 @@ impl<'db> Transaction<'db> {
         self.evaluate_expr_with_outer_internal(expr, row, schema, outer_contexts, &mut cte_store)
     }
 
-    fn evaluate_expr_with_outer_internal(
+    pub(crate) fn evaluate_expr_with_outer_internal(
         &mut self,
         expr: &crate::query::expr::Expr,
         row: &Row,

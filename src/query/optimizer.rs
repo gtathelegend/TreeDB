@@ -616,6 +616,54 @@ impl PhysicalPlan {
         }
     }
 
+    /// Constructs a minimal valid dummy physical plan for a relation scan.
+    pub fn dummy(table_name: &str) -> Self {
+        Self {
+            ctes: Vec::new(),
+            base_table: PhysicalTableScan {
+                table_name: table_name.to_string(),
+                table_alias: None,
+                access_path: AccessPath::FullTableScan,
+                residual_filter: None,
+                estimated_rows: 0.0,
+                cost: 0.0,
+                row_goal: None,
+                estimated_rows_examined: None,
+                estimated_qualifying_rows: None,
+                early_termination_possible: false,
+                required_columns: Vec::new(),
+                pruned_columns: Vec::new(),
+                covered_columns: Vec::new(),
+                late_materialization: false,
+                index_covered_filter: None,
+                base_record_filter: None,
+            },
+            joins: Vec::new(),
+            post_join_filter: None,
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
+            aggregate_strategy: None,
+            having: None,
+            window_exprs: Vec::new(),
+            projections: Vec::new(),
+            order_by: Vec::new(),
+            order_by_sort_required: false,
+            order_by_top_n: false,
+            provided_ordering: None,
+            offset: None,
+            limit: None,
+            set_op: None,
+            logical_rewrites: Vec::new(),
+            inferred_predicates: Vec::new(),
+            row_goal: None,
+            estimated_rows_examined: None,
+            estimated_qualifying_rows: None,
+            row_goal_early_termination: false,
+            total_cost: 0.0,
+            estimated_rows: 0.0,
+        }
+    }
+
     /// Computes the deterministic physical plan fingerprint for this plan.
     pub fn fingerprint(&self) -> crate::query::fingerprint::PhysicalPlanFingerprint {
         crate::query::fingerprint::PhysicalPlanFingerprint::from_plan(self)
