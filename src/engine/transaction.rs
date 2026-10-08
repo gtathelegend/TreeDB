@@ -535,15 +535,45 @@ impl StatementResult {
     }
 }
 
-/// State of an explicit transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lifecycle states representing a transaction's progression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TxnState {
+    /// Transaction created, pending activation.
+    Created,
     /// Transaction is currently active and can accept reads and mutations.
+    #[default]
     Active,
     /// Transaction has successfully committed.
     Committed,
     /// Transaction has been aborted and rolled back.
     Aborted,
+}
+
+impl TxnState {
+    /// Validates and applies a transaction lifecycle state transition.
+    pub fn transition_to(&self, target: Self) -> Result<Self> {
+        match (self, target) {
+            (Self::Created, Self::Active) => Ok(Self::Active),
+            (Self::Created, Self::Aborted) => Ok(Self::Aborted),
+            (Self::Active, Self::Committed) => Ok(Self::Committed),
+            (Self::Active, Self::Aborted) => Ok(Self::Aborted),
+            (current, target) => Err(Error::InvalidTransactionState {
+                current: format!("{current}"),
+                action: format!("transition to {target}"),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for TxnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Created => write!(f, "Created"),
+            Self::Active => write!(f, "Active"),
+            Self::Committed => write!(f, "Committed"),
+            Self::Aborted => write!(f, "Aborted"),
+        }
+    }
 }
 
 /// An explicit atomic transaction handle coordinating operations across the B+ Tree index,
@@ -553,6 +583,8 @@ pub struct Transaction<'db> {
     db: &'db mut TreeDb,
     txn_id: TxnId,
     state: TxnState,
+    isolation_context: crate::engine::isolation::IsolationContext,
+    write_set: crate::engine::isolation::TransactionWriteSet,
     initial_root_page_id: PageId,
     initial_freelist_head: PageId,
     initial_free_page_count: u32,
@@ -561,9 +593,31 @@ pub struct Transaction<'db> {
 }
 
 impl<'db> Transaction<'db> {
+    #[allow(dead_code)]
     pub(crate) fn new(
         db: &'db mut TreeDb,
         txn_id: TxnId,
+        initial_root_page_id: PageId,
+        initial_freelist_head: PageId,
+        initial_free_page_count: u32,
+        initial_page_count: u32,
+    ) -> Self {
+        let isolation_context = crate::engine::isolation::IsolationContext::for_txn(txn_id);
+        Self::new_with_isolation(
+            db,
+            txn_id,
+            isolation_context,
+            initial_root_page_id,
+            initial_freelist_head,
+            initial_free_page_count,
+            initial_page_count,
+        )
+    }
+
+    pub(crate) fn new_with_isolation(
+        db: &'db mut TreeDb,
+        txn_id: TxnId,
+        isolation_context: crate::engine::isolation::IsolationContext,
         initial_root_page_id: PageId,
         initial_freelist_head: PageId,
         initial_free_page_count: u32,
@@ -573,6 +627,8 @@ impl<'db> Transaction<'db> {
             db,
             txn_id,
             state: TxnState::Active,
+            isolation_context,
+            write_set: crate::engine::isolation::TransactionWriteSet::new(),
             initial_root_page_id,
             initial_freelist_head,
             initial_free_page_count,
@@ -589,6 +645,41 @@ impl<'db> Transaction<'db> {
     /// Returns the current lifecycle state of the transaction.
     pub const fn state(&self) -> TxnState {
         self.state
+    }
+
+    /// Returns a reference to the immutable isolation context for this transaction.
+    pub fn isolation_context(&self) -> &crate::engine::isolation::IsolationContext {
+        &self.isolation_context
+    }
+
+    /// Returns a reference to the active point-in-time snapshot.
+    pub fn snapshot(&self) -> &crate::engine::isolation::Snapshot {
+        &self.isolation_context.snapshot
+    }
+
+    /// Returns the baseline single-version visibility policy.
+    pub fn visibility_policy(&self) -> crate::engine::isolation::CurrentVersionVisibility {
+        crate::engine::isolation::CurrentVersionVisibility
+    }
+
+    /// Returns a reference to the transaction-local write set.
+    pub fn write_set(&self) -> &crate::engine::isolation::TransactionWriteSet {
+        &self.write_set
+    }
+
+    /// Returns a mutable reference to the transaction-local write set.
+    pub fn write_set_mut(&mut self) -> &mut crate::engine::isolation::TransactionWriteSet {
+        &mut self.write_set
+    }
+
+    /// Refreshes the statement snapshot for statement-level isolation (e.g. READ COMMITTED).
+    pub fn statement_snapshot(&mut self) -> crate::engine::isolation::Snapshot {
+        let commit_seq = self.db.current_commit_seq();
+        let old_id = self.isolation_context.snapshot.snapshot_id;
+        self.db.snapshot_registry.release(old_id);
+        let new_snap = self.db.snapshot_registry.register(commit_seq);
+        self.isolation_context.snapshot = new_snap;
+        new_snap
     }
 
     /// Returns a reference to the underlying database.
@@ -634,6 +725,7 @@ impl<'db> Transaction<'db> {
             self.db
                 .record_store
                 .delete(&mut self.db.buffer_pool, old_rid)?;
+            self.write_set.record_update(old_rid, record_id);
         } else {
             let record_id = self
                 .db
@@ -642,6 +734,7 @@ impl<'db> Transaction<'db> {
             self.db
                 .tree
                 .insert(&mut self.db.buffer_pool, key, record_id)?;
+            self.write_set.record_insert(record_id);
         }
         Ok(())
     }
@@ -665,6 +758,7 @@ impl<'db> Transaction<'db> {
                 self.db
                     .record_store
                     .delete(&mut self.db.buffer_pool, record_id)?;
+                self.write_set.record_delete(record_id);
                 Ok(value)
             }
             None => Ok(None),
@@ -696,6 +790,7 @@ impl<'db> Transaction<'db> {
         let res =
             crate::engine::catalog::Catalog::create_table(&mut self.db.buffer_pool, name, schema);
         if res.is_ok() {
+            self.write_set.record_table_mutation(name);
             self.has_catalog_mutations = true;
             self.db.catalog_generation += 1;
             self.db.plan_cache.invalidate_all();
@@ -3702,7 +3797,10 @@ impl<'db> Transaction<'db> {
         outer_contexts: &[(&Row, &Schema)],
         cte_store: &mut std::collections::HashMap<String, (Schema, Vec<Row>)>,
     ) -> Result<(crate::query::QueryResult, crate::query::OperatorMetrics)> {
-        let mut ctx = crate::query::ExecutionContext::for_txn(self.txn_id);
+        let mut ctx = crate::query::ExecutionContext::for_txn_with_isolation(
+            self.txn_id,
+            self.isolation_context.clone(),
+        );
         self.execute_physical_plan_internal_with_context(plan, outer_contexts, cte_store, &mut ctx)
     }
 
@@ -7319,10 +7417,40 @@ impl<'db> Transaction<'db> {
         }
     }
 
-    /// Commits all mutations performed in this transaction, flushing the WAL through the commit LSN.
+    /// Commits all mutations performed in this transaction, flushing the WAL through the commit LSN
+    /// and allocating a monotonic logical commit sequence.
     pub fn commit(mut self) -> Result<()> {
-        self.ensure_active()?;
+        self.commit_in_place()
+    }
+
+    /// In-place commit validating lifecycle state transitions without consuming `self`.
+    pub fn commit_in_place(&mut self) -> Result<()> {
+        match self.state {
+            TxnState::Active => {}
+            TxnState::Committed => {
+                return Err(Error::InvalidTransactionState {
+                    current: "Committed".to_string(),
+                    action: "commit".to_string(),
+                });
+            }
+            TxnState::Aborted => {
+                return Err(Error::InvalidTransactionState {
+                    current: "Aborted".to_string(),
+                    action: "commit".to_string(),
+                });
+            }
+            TxnState::Created => {
+                return Err(Error::InvalidTransactionState {
+                    current: "Created".to_string(),
+                    action: "commit".to_string(),
+                });
+            }
+        }
         self.db.commit_txn(self.txn_id)?;
+        let _commit_seq = self.db.allocate_commit_seq();
+        self.db
+            .snapshot_registry
+            .release(self.isolation_context.snapshot.snapshot_id);
         self.state = TxnState::Committed;
         if self.has_catalog_mutations {
             self.db.catalog_generation += 1;
@@ -7334,9 +7462,52 @@ impl<'db> Transaction<'db> {
     /// Aborts all mutations performed in this transaction, rolling back physical page changes
     /// with Compensation Log Records (CLRs) and restoring pre-transaction database state.
     pub fn abort(mut self) -> Result<()> {
-        self.ensure_active()?;
+        self.abort_in_place()
+    }
+
+    /// In-place abort validating lifecycle state transitions without consuming `self`.
+    pub fn abort_in_place(&mut self) -> Result<()> {
+        match self.state {
+            TxnState::Active => {}
+            TxnState::Committed => {
+                return Err(Error::InvalidTransactionState {
+                    current: "Committed".to_string(),
+                    action: "abort".to_string(),
+                });
+            }
+            TxnState::Aborted => {
+                return Err(Error::InvalidTransactionState {
+                    current: "Aborted".to_string(),
+                    action: "abort".to_string(),
+                });
+            }
+            TxnState::Created => {
+                self.state = TxnState::Aborted;
+                return Ok(());
+            }
+        }
         self.abort_internal()?;
         Ok(())
+    }
+
+    /// Validates and applies an explicit transaction lifecycle state transition.
+    pub fn transition_state(&mut self, target: TxnState) -> Result<()> {
+        match (self.state, target) {
+            (TxnState::Created, TxnState::Active) => {
+                self.state = TxnState::Active;
+                Ok(())
+            }
+            (TxnState::Active, TxnState::Committed) => self.commit_in_place(),
+            (TxnState::Active, TxnState::Aborted) => self.abort_in_place(),
+            (TxnState::Created, TxnState::Aborted) => {
+                self.state = TxnState::Aborted;
+                Ok(())
+            }
+            (current, next) => Err(Error::InvalidTransactionState {
+                current: format!("{current}"),
+                action: format!("transition to {next}"),
+            }),
+        }
     }
 
     fn ensure_active(&self) -> Result<()> {
@@ -7344,12 +7515,19 @@ impl<'db> Transaction<'db> {
             TxnState::Active => Ok(()),
             TxnState::Committed => Err(Error::TransactionAlreadyCommitted(self.txn_id)),
             TxnState::Aborted => Err(Error::TransactionAlreadyAborted(self.txn_id)),
+            TxnState::Created => Err(Error::InvalidTransactionState {
+                current: "Created".to_string(),
+                action: "perform operation".to_string(),
+            }),
         }
     }
 
     fn abort_internal(&mut self) -> Result<()> {
         if self.state == TxnState::Active {
             self.db.abort_txn(self.txn_id)?;
+            self.db
+                .snapshot_registry
+                .release(self.isolation_context.snapshot.snapshot_id);
             // Restore initial header metadata and tree root
             self.db
                 .buffer_pool

@@ -111,6 +111,26 @@ pub enum Error {
     #[error("A transaction ({0}) is already active on the engine")]
     TransactionActive(crate::wal::lsn::TxnId),
 
+    /// Invalid isolation level specified or requested.
+    #[error("Invalid isolation level: {0}")]
+    InvalidIsolationLevel(String),
+
+    /// Invalid transaction state transition or action.
+    #[error("Invalid transaction state: cannot perform '{action}' while transaction is in '{current}' state")]
+    InvalidTransactionState { current: String, action: String },
+
+    /// Requested snapshot was not found in the snapshot registry.
+    #[error("Snapshot {0} not found")]
+    SnapshotNotFound(crate::engine::isolation::SnapshotId),
+
+    /// Commit sequence value is invalid or non-monotonic.
+    #[error("Invalid commit sequence: {0}")]
+    InvalidCommitSequence(String),
+
+    /// Visibility policy error.
+    #[error("Visibility evaluation error: {0}")]
+    VisibilityError(String),
+
     /// Table with the specified name already exists in the catalog.
     #[error("Table '{0}' already exists")]
     TableAlreadyExists(String),

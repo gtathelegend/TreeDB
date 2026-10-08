@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod isolation;
 pub mod table;
 pub mod transaction;
 pub mod types;
@@ -8,6 +9,11 @@ pub use crate::query::materialize::{MaterializeConfig, MaterializeOverride};
 pub use catalog::{
     Catalog, CatalogPage, IndexId, IndexMetadata, TableId, TableMetadata, CATALOG_MAGIC,
     CURRENT_CATALOG_VERSION, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
+};
+pub use isolation::{
+    CommitSeq, CurrentVersionVisibility, IsolationContext, IsolationLevel, IsolationStatus,
+    ReadSet, Snapshot, SnapshotId, SnapshotRegistry, TransactionCommitMetadata,
+    TransactionWriteSet, VisibilityPolicy,
 };
 pub use table::{MultiIndexScanStats, SkipScanStats, Table};
 pub use transaction::{StatementResult, Transaction, TxnState};
@@ -52,6 +58,8 @@ pub struct TreeDb {
     pub(crate) multi_index_config: MultiIndexConfig,
     pub(crate) materialize_config: MaterializeConfig,
     pub(crate) adaptive_config: AdaptiveSelectionConfig,
+    pub(crate) snapshot_registry: SnapshotRegistry,
+    pub(crate) next_commit_seq: u64,
 }
 
 impl TreeDb {
@@ -92,6 +100,8 @@ impl TreeDb {
             multi_index_config: MultiIndexConfig::default(),
             materialize_config: crate::query::materialize::MaterializeConfig::default(),
             adaptive_config: AdaptiveSelectionConfig::default(),
+            snapshot_registry: SnapshotRegistry::new(),
+            next_commit_seq: 1,
         })
     }
 
@@ -124,6 +134,8 @@ impl TreeDb {
             multi_index_config: MultiIndexConfig::default(),
             materialize_config: crate::query::materialize::MaterializeConfig::default(),
             adaptive_config: AdaptiveSelectionConfig::default(),
+            snapshot_registry: SnapshotRegistry::new(),
+            next_commit_seq: 1,
         })
     }
 
@@ -150,24 +162,42 @@ impl TreeDb {
             multi_index_config: MultiIndexConfig::default(),
             materialize_config: crate::query::materialize::MaterializeConfig::default(),
             adaptive_config: AdaptiveSelectionConfig::default(),
+            snapshot_registry: SnapshotRegistry::new(),
+            next_commit_seq: 1,
         }
     }
 
-    /// Begins an explicit atomic transaction.
+    /// Begins an explicit atomic transaction under default `ReadCommitted` isolation.
     ///
     /// # Errors
     /// * `Error::TransactionActive` if a transaction is already active on this database.
     pub fn begin(&mut self) -> Result<Transaction<'_>> {
+        self.begin_with_isolation(IsolationLevel::ReadCommitted)
+    }
+
+    /// Begins an explicit atomic transaction configured with the specified `IsolationLevel`.
+    ///
+    /// # Errors
+    /// * `Error::TransactionActive` if a transaction is already active on this database.
+    pub fn begin_with_isolation(
+        &mut self,
+        isolation_level: IsolationLevel,
+    ) -> Result<Transaction<'_>> {
         if let Some(active) = self.active_txn {
             return Err(Error::TransactionActive(active));
         }
 
         let txn_id = self.begin_txn()?;
+        let commit_seq = self.current_commit_seq();
+        let snapshot = self.snapshot_registry.register(commit_seq);
+        let isolation_context = IsolationContext::new(isolation_level, txn_id, snapshot);
+
         let header = self.buffer_pool.page_manager().header().clone();
 
-        Ok(Transaction::new(
+        Ok(Transaction::new_with_isolation(
             self,
             txn_id,
+            isolation_context,
             header.root_page_id,
             header.freelist_head,
             header.free_page_count,
@@ -178,6 +208,38 @@ impl TreeDb {
     /// Convenience alias for `begin()`.
     pub fn begin_transaction(&mut self) -> Result<Transaction<'_>> {
         self.begin()
+    }
+
+    /// Convenience alias for `begin_with_isolation()`.
+    pub fn begin_transaction_with_isolation(
+        &mut self,
+        isolation_level: IsolationLevel,
+    ) -> Result<Transaction<'_>> {
+        self.begin_with_isolation(isolation_level)
+    }
+
+    /// Returns the current logical commit sequence without incrementing it.
+    pub fn current_commit_seq(&self) -> CommitSeq {
+        CommitSeq(self.next_commit_seq)
+    }
+
+    /// Allocates and increments the next logical commit sequence number.
+    pub fn allocate_commit_seq(&mut self) -> CommitSeq {
+        let seq = CommitSeq(self.next_commit_seq);
+        self.next_commit_seq = self.next_commit_seq.saturating_add(1);
+        seq
+    }
+
+    /// Returns the oldest active snapshot ID if any transactions are active.
+    ///
+    /// Runs in O(1) time.
+    pub fn oldest_active_snapshot(&self) -> Option<SnapshotId> {
+        self.snapshot_registry.oldest_active_snapshot()
+    }
+
+    /// Returns the number of currently active registered snapshots.
+    pub fn active_snapshot_count(&self) -> usize {
+        self.snapshot_registry.active_count()
     }
 
     /// Begins a new transaction in the WAL stream.

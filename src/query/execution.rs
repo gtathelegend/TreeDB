@@ -298,6 +298,8 @@ impl ExecutionResourceManager {
     }
 }
 
+use crate::engine::isolation::{IsolationContext, IsolationLevel, Snapshot};
+
 /// Query execution context passed through the physical operator tree.
 #[derive(Debug)]
 pub struct ExecutionContext {
@@ -305,6 +307,8 @@ pub struct ExecutionContext {
     pub execution_id: u64,
     /// Owning transaction identifier.
     pub txn_id: TxnId,
+    /// Immutable transaction isolation and snapshot context for visibility evaluation.
+    pub isolation_context: IsolationContext,
     /// Centralized resource manager for this execution.
     pub resource_manager: ExecutionResourceManager,
     /// Flag signaling query cancellation.
@@ -320,11 +324,27 @@ pub struct ExecutionContext {
 }
 
 impl ExecutionContext {
-    /// Creates a fresh `ExecutionContext` for a new query execution.
+    /// Creates a fresh `ExecutionContext` for a new query execution under default transaction isolation.
     pub fn new(execution_id: u64, txn_id: TxnId, limits: ExecutionResourceLimits) -> Self {
+        Self::with_isolation(
+            execution_id,
+            txn_id,
+            IsolationContext::for_txn(txn_id),
+            limits,
+        )
+    }
+
+    /// Creates an `ExecutionContext` with an explicit `IsolationContext`.
+    pub fn with_isolation(
+        execution_id: u64,
+        txn_id: TxnId,
+        isolation_context: IsolationContext,
+        limits: ExecutionResourceLimits,
+    ) -> Self {
         Self {
             execution_id,
             txn_id,
+            isolation_context,
             resource_manager: ExecutionResourceManager::new(limits),
             cancellation_requested: false,
             termination_status: ExecutionTerminationStatus::CompletedNormally,
@@ -337,6 +357,31 @@ impl ExecutionContext {
     /// Creates an `ExecutionContext` for a given transaction with unlimited resource bounds.
     pub fn for_txn(txn_id: TxnId) -> Self {
         Self::new(txn_id.0, txn_id, ExecutionResourceLimits::unlimited())
+    }
+
+    /// Creates an `ExecutionContext` for a given transaction and isolation context with unlimited resource bounds.
+    pub fn for_txn_with_isolation(txn_id: TxnId, isolation_context: IsolationContext) -> Self {
+        Self::with_isolation(
+            txn_id.0,
+            txn_id,
+            isolation_context,
+            ExecutionResourceLimits::unlimited(),
+        )
+    }
+
+    /// Returns the isolation context carried by this execution.
+    pub fn isolation_context(&self) -> &IsolationContext {
+        &self.isolation_context
+    }
+
+    /// Returns the snapshot observed by this execution.
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.isolation_context.snapshot
+    }
+
+    /// Returns the isolation level configured for this execution.
+    pub fn isolation_level(&self) -> IsolationLevel {
+        self.isolation_context.isolation_level
     }
 
     /// Requests cancellation of this execution.
