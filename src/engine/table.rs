@@ -82,13 +82,13 @@ impl Default for MultiIndexScanStats {
 /// and automatic secondary index maintenance.
 #[derive(Debug)]
 pub struct Table<'a> {
-    metadata: TableMetadata,
-    tree: BPlusTree,
-    record_store: RecordStore,
-    indexes: Vec<(IndexMetadata, SecondaryIndex)>,
-    buffer_pool: &'a mut BufferPool,
-    isolation_context: Option<IsolationContext>,
-    write_set: Option<&'a mut TransactionWriteSet>,
+    pub(crate) metadata: TableMetadata,
+    pub(crate) tree: BPlusTree,
+    pub(crate) record_store: RecordStore,
+    pub(crate) indexes: Vec<(IndexMetadata, SecondaryIndex)>,
+    pub(crate) buffer_pool: &'a mut BufferPool,
+    pub(crate) isolation_context: Option<IsolationContext>,
+    pub(crate) write_set: Option<&'a mut TransactionWriteSet>,
 }
 
 impl<'a> Table<'a> {
@@ -1570,6 +1570,60 @@ impl<'a> Table<'a> {
         Ok(())
     }
 
+    /// Executes a vacuum pass on this table using the current transaction or snapshot horizon.
+    pub fn vacuum(
+        &mut self,
+        config: &crate::engine::vacuum::VacuumConfig,
+    ) -> Result<crate::engine::vacuum::VacuumResult> {
+        let horizon = match &self.isolation_context {
+            Some(ctx) => {
+                crate::engine::isolation::ReclamationHorizon::new(ctx.snapshot.as_of_commit_seq)
+            }
+            None => crate::engine::isolation::ReclamationHorizon::new(
+                crate::engine::isolation::CommitSeq(
+                    self.buffer_pool.durable_max_commit_seq().saturating_add(1),
+                ),
+            ),
+        };
+        self.vacuum_with_horizon(config, horizon)
+    }
+
+    /// Executes a vacuum pass on this table with an explicit reclamation horizon.
+    pub fn vacuum_with_horizon(
+        &mut self,
+        config: &crate::engine::vacuum::VacuumConfig,
+        horizon: crate::engine::isolation::ReclamationHorizon,
+    ) -> Result<crate::engine::vacuum::VacuumResult> {
+        crate::engine::vacuum::VacuumEngine::vacuum_table(self, config, horizon)
+    }
+
+    /// Validates the post-vacuum consistency of this table and its secondary indexes.
+    pub fn validate_vacuum_consistency(&mut self) -> Result<()> {
+        crate::engine::vacuum::VacuumEngine::validate_table_vacuum_consistency(self)
+    }
+
+    /// Returns true if a physical index entry exists for `pk` in the primary B+ Tree.
+    pub fn contains_primary_key_entry(&mut self, pk: &Value) -> Result<bool> {
+        self.validate_pk_type(pk)?;
+        let key = pk.encode_to_canonical_key()?;
+        Ok(self.tree.get(self.buffer_pool, key)?.is_some())
+    }
+
+    /// Returns the physical depth of the version chain originating at `pk` in this table.
+    pub fn version_chain_depth(&mut self, pk: &Value) -> Result<Option<usize>> {
+        self.validate_pk_type(pk)?;
+        let key = pk.encode_to_canonical_key()?;
+        match self.tree.get(self.buffer_pool, key)? {
+            Some(head_rid) => {
+                let depth = self
+                    .record_store
+                    .validate_version_chain(self.buffer_pool, head_rid)?;
+                Ok(Some(depth))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn validate_pk_type(&self, pk: &Value) -> Result<()> {
         let expected = self.metadata.schema.primary_key_column().data_type;
         let found = pk.data_type();
@@ -1591,7 +1645,7 @@ impl<'a> Table<'a> {
         Ok(())
     }
 
-    fn sync_metadata_if_needed(&mut self) -> Result<()> {
+    pub(crate) fn sync_metadata_if_needed(&mut self) -> Result<()> {
         let tree_root = self.tree.root_page_id();
         let rec_page = self.record_store.last_page_id();
         let mut changed = false;

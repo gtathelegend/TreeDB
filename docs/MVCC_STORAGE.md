@@ -95,3 +95,16 @@ Version chains follow a **newest-to-oldest** backward chaining topology:
 
 Slotted-page compaction in TreeDB (`RecordPage::compact`) packs active record payload bytes to reclaim fragmentation within a page without reallocating slot IDs or altering existing slot offsets. Since historical versions remain active slots (neither tombstoned nor marked deleted in the slotted-page header), compaction preserves `RecordId(page_id, slot_id)` stability. Free pages are only reclaimed when an entire table is dropped, preventing dangling version references.
 
+---
+
+## 8. Phase 70: MVCC Vacuum, Version Garbage Collection & Storage Reclamation
+
+Phase 70 introduces explicit, snapshot-safe physical reclamation of historical versions:
+- **Reclamation Horizon**: Derived from the active snapshot registry ($\min_{s \in \text{active}} s.\text{as\_of}$ or $\text{current\_commit\_seq}$ when no snapshots are active).
+- **Version-Chain Pruning**: Intermediate and tail versions superseded before the reclamation horizon are safely cut from `prev_version` chains (`cut_meta.prev_version = None`) and their slots deleted.
+- **Overflow Reclamation**: Overflow chains belonging to reclaimed versions are returned to the PageManager freelist via `RecordStore::delete_and_count`.
+- **Empty Page Recycling**: Completely empty slotted record pages are recycled back to the database freelist via `RecordStore::try_free_empty_record_page`.
+- **Index Cleanup**: Obsolete secondary and covering index entries referencing reclaimed `RecordId`s are removed atomically with the physical version.
+- Detailed architecture is documented in [MVCC_VACUUM.md](file:///d:/Projects/TreeDB/docs/MVCC_VACUUM.md).
+
+

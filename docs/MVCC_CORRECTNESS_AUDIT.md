@@ -162,8 +162,8 @@ All 9 crash injection scenarios pass deterministically.
 
 ## 11. Known Limitations & Explicitly Deferred Features
 
-The following capabilities are **explicitly deferred** beyond Phase 69:
+The following capabilities were explicitly deferred beyond Phase 69 and addressed in subsequent phases:
 1. **Concurrent Transactions & Multi-Threading**: Single-threaded transaction execution is maintained. No concurrent transaction execution or lock manager is introduced.
-2. **Historical Version Reclamation (Vacuum)**: Historical versions and their overflow pages are retained indefinitely. The `SnapshotRegistry` horizon is maintained for future vacuum phases, but no physical version garbage collection is performed.
+2. **Historical Version Reclamation (Vacuum)**: *Implemented in Phase 70.* Snapshot-safe version reclamation, version chain pruning, overflow page recycling, empty record page recycling, and secondary/covering index garbage collection are fully supported via `db.vacuum()` and `docs/MVCC_VACUUM.md`.
 3. **Serializable Conflict Detection (SSI)**: Serializable snapshot isolation (predicate locks, rw-antidependencies) is deferred to future isolation phases.
-4. **In-Memory Version Pruning**: Chains grow monotonically up to `MAX_VERSION_CHAIN_DEPTH = 1000`.
+4. **In-Memory Version Pruning**: Chains grow monotonically up to `MAX_VERSION_CHAIN_DEPTH = 1000` until reclaimed by `db.vacuum()`.

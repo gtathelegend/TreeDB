@@ -505,8 +505,19 @@ impl RecordStore {
     /// If the record is backed by an overflow chain, walks and frees all overflow pages,
     /// returning them to the persistent freelist.
     pub fn delete(&mut self, buffer_pool: &mut BufferPool, record_id: RecordId) -> Result<bool> {
+        self.delete_and_count(buffer_pool, record_id)
+            .map(|(deleted, _)| deleted)
+    }
+
+    /// Logically deletes the record associated with `record_id` and returns the number of
+    /// overflow pages reclaimed into the freelist.
+    pub fn delete_and_count(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        record_id: RecordId,
+    ) -> Result<(bool, u64)> {
         if record_id.page_id == INVALID_PAGE_ID {
-            return Ok(false);
+            return Ok((false, 0));
         }
 
         let mut record_page = {
@@ -536,7 +547,7 @@ impl RecordStore {
         };
 
         if !is_active {
-            return Ok(false);
+            return Ok((false, 0));
         }
 
         // 1. Delete slot in RecordPage
@@ -548,6 +559,7 @@ impl RecordStore {
         buffer_pool.unpin_page(record_id.page_id, true)?;
 
         // 2. If overflow-backed, reclaim all overflow pages into the freelist
+        let mut overflow_count = 0u64;
         if let Some(descriptor) = overflow_descriptor {
             let mut curr = descriptor.head_page_id;
             let mut visited = HashSet::new();
@@ -578,12 +590,54 @@ impl RecordStore {
                 curr = next;
             }
 
+            overflow_count = pages_to_free.len() as u64;
             for pid in pages_to_free {
                 buffer_pool.free_page(pid)?;
             }
         }
 
-        Ok(true)
+        Ok((true, overflow_count))
+    }
+
+    /// Reclaims an entirely empty `PageType::Record` page into the persistent freelist if all
+    /// slots are marked deleted.
+    ///
+    /// Returns `Ok(true)` if the page had zero active records and was successfully freed.
+    pub fn try_free_empty_record_page(
+        &mut self,
+        buffer_pool: &mut BufferPool,
+        page_id: PageId,
+    ) -> Result<bool> {
+        if is_reserved_page(page_id) || page_id >= buffer_pool.page_count() {
+            return Ok(false);
+        }
+
+        let is_empty = {
+            let page = buffer_pool.fetch_page(page_id)?;
+            if page.page_type() != PageType::Record {
+                let _ = buffer_pool.unpin_page(page_id, false);
+                return Ok(false);
+            }
+            let rp = match RecordPage::deserialize(page) {
+                Ok(rp) => rp,
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(page_id, false);
+                    return Err(e);
+                }
+            };
+            buffer_pool.unpin_page(page_id, false)?;
+            rp.active_record_count() == 0
+        };
+
+        if is_empty {
+            if self.last_page_id == page_id {
+                self.last_page_id = INVALID_PAGE_ID;
+            }
+            buffer_pool.free_page(page_id)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Defragments a specific record page by consolidating all live record payloads and descriptors.

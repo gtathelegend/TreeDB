@@ -121,13 +121,22 @@ impl RefEngine {
 
     /// Independent visibility evaluation without using production MvccVisibilityPolicy.
     pub fn is_version_visible(&self, v: &RefVersion, snap: &RefSnapshot) -> bool {
+        Self::eval_version_visible(&self.txns, v, snap)
+    }
+
+    /// Associated visibility evaluator using only transaction state map.
+    pub fn eval_version_visible(
+        txns: &HashMap<u64, RefTxnStatus>,
+        v: &RefVersion,
+        snap: &RefSnapshot,
+    ) -> bool {
         // 1. Evaluate creation (xmin)
         let created_visible = if v.xmin == snap.self_txn_id {
             true
         } else if snap.active_txns.contains(&v.xmin) {
             false
         } else {
-            match self.txns.get(&v.xmin) {
+            match txns.get(&v.xmin) {
                 Some(RefTxnStatus::Committed(cseq)) => *cseq <= snap.read_commit_seq,
                 _ => false,
             }
@@ -148,7 +157,7 @@ impl RefEngine {
                     // Deletion uncommitted at snapshot cut -> row still visible
                     true
                 } else {
-                    match self.txns.get(&del_tid) {
+                    match txns.get(&del_tid) {
                         Some(RefTxnStatus::Committed(del_cseq)) => *del_cseq > snap.read_commit_seq,
                         _ => {
                             // Deletion uncommitted or aborted -> still visible
@@ -225,6 +234,98 @@ impl RefEngine {
             .filter(|r| r.get(col_idx) == Some(val))
             .collect()
     }
+
+    /// Derives the reclamation horizon based on active snapshots.
+    pub fn reclamation_horizon(&self, active_snapshots: &[RefSnapshot]) -> u64 {
+        if active_snapshots.is_empty() {
+            self.txns
+                .values()
+                .filter_map(|s| match s {
+                    RefTxnStatus::Committed(seq) => Some(*seq),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+        } else {
+            active_snapshots
+                .iter()
+                .map(|s| s.read_commit_seq)
+                .min()
+                .unwrap_or(0)
+        }
+    }
+
+    /// Independent reference vacuum:
+    /// Reclaims versions that are provably unnecessary to any active snapshot and committed before horizon.
+    pub fn vacuum(&mut self, active_snapshots: &[RefSnapshot]) -> RefVacuumResult {
+        let horizon = self.reclamation_horizon(active_snapshots);
+        let mut result = RefVacuumResult::default();
+        let mut pks_to_remove = Vec::new();
+
+        for (&pk, record) in self.records.iter_mut() {
+            let total_versions = record.versions.len();
+            result.versions_examined += total_versions as u64;
+            let mut retained = Vec::new();
+
+            for (idx, v) in record.versions.iter().enumerate() {
+                let is_latest = idx + 1 == total_versions;
+
+                // 1. Aborted transaction versions
+                let is_aborted = matches!(self.txns.get(&v.xmin), Some(RefTxnStatus::Aborted));
+                if is_aborted {
+                    result.versions_reclaimed += 1;
+                    continue;
+                }
+
+                // 2. Needed by any active snapshot?
+                let needed_by_snap = active_snapshots
+                    .iter()
+                    .any(|s| Self::eval_version_visible(&self.txns, v, s));
+                if needed_by_snap {
+                    retained.push(v.clone());
+                    continue;
+                }
+
+                // 3. Superseded / deleted before horizon
+                if let Some(del_tid) = v.xmax {
+                    if let Some(RefTxnStatus::Committed(del_seq)) = self.txns.get(&del_tid) {
+                        if *del_seq <= horizon {
+                            result.versions_reclaimed += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                // 4. Live head
+                if is_latest && v.xmax.is_none() {
+                    retained.push(v.clone());
+                    continue;
+                }
+
+                retained.push(v.clone());
+            }
+
+            if retained.is_empty() {
+                pks_to_remove.push(pk);
+                result.records_reclaimed += 1;
+            } else {
+                record.versions = retained;
+            }
+        }
+
+        for pk in pks_to_remove {
+            self.records.remove(&pk);
+        }
+
+        result
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefVacuumResult {
+    pub versions_examined: u64,
+    pub versions_reclaimed: u64,
+    pub records_reclaimed: u64,
 }
 
 // =============================================================================
@@ -900,4 +1001,204 @@ fn test_plan_cache_key_isolation_and_index_lifecycle() {
         "Plan cache must miss after index lifecycle change"
     );
     tx3.commit().unwrap();
+}
+
+#[test]
+fn test_randomized_differential_mvcc_vacuum_and_active_snapshots() {
+    let ctx = TestContext::new("random_diff_vacuum");
+    let mut db = ctx.db();
+
+    db.execute_statement("CREATE TABLE records (id UINT64 PRIMARY KEY, val INT64, tag TEXT)")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_records_val ON records(val)")
+        .unwrap();
+
+    let mut ref_engine = RefEngine::new();
+    let seed = 987654321u64;
+    let mut rng = Rng::new(seed);
+
+    let mut active_pks: Vec<u64> = Vec::new();
+    let mut registered_snapshots: Vec<(treedb::engine::isolation::Snapshot, RefSnapshot)> =
+        Vec::new();
+
+    // Run 60 randomized operations with interleaved snapshots and vacuum calls
+    for op_i in 0..60 {
+        let op_type = rng.next_range(0, 5);
+        match op_type {
+            0 => {
+                // INSERT
+                let pk = rng.next_range(1, 20);
+                let val_int = rng.next_range(10, 99) as i64;
+                let tag_str = format!("tag_{}", rng.next_range(1, 5));
+
+                let is_dup = active_pks.contains(&pk);
+                let mut tx = db.begin_transaction().unwrap();
+                let ref_tid = ref_engine.begin_txn();
+
+                let res = tx.execute_statement(&format!(
+                    "INSERT INTO records VALUES ({pk}, {val_int}, '{tag_str}')"
+                ));
+
+                if is_dup {
+                    assert!(res.is_err());
+                    tx.abort().unwrap();
+                    ref_engine.abort_txn(ref_tid);
+                } else {
+                    assert!(res.is_ok());
+                    let should_commit = rng.next_range(0, 4) != 0;
+                    if should_commit {
+                        tx.commit().unwrap();
+                        ref_engine.commit_txn(ref_tid);
+                        let _ = ref_engine.insert(
+                            ref_tid,
+                            pk,
+                            vec![
+                                Value::UInt64(pk),
+                                Value::Int64(val_int),
+                                Value::String(tag_str),
+                            ],
+                        );
+                        active_pks.push(pk);
+                    } else {
+                        tx.abort().unwrap();
+                        ref_engine.abort_txn(ref_tid);
+                    }
+                }
+            }
+            1 => {
+                // UPDATE
+                if !active_pks.is_empty() {
+                    let idx = rng.next_range(0, active_pks.len() as u64 - 1) as usize;
+                    let pk = active_pks[idx];
+                    let new_val = rng.next_range(100, 999) as i64;
+                    let new_tag = format!("updated_{}", rng.next_range(1, 5));
+
+                    let mut tx = db.begin_transaction().unwrap();
+                    let ref_tid = ref_engine.begin_txn();
+
+                    let res = tx.execute_statement(&format!(
+                        "UPDATE records SET val = {new_val}, tag = '{new_tag}' WHERE id = {pk}"
+                    ));
+                    assert!(res.is_ok());
+
+                    let should_commit = rng.next_range(0, 4) != 0;
+                    if should_commit {
+                        tx.commit().unwrap();
+                        ref_engine.commit_txn(ref_tid);
+                        let _ = ref_engine.update(
+                            ref_tid,
+                            pk,
+                            vec![
+                                Value::UInt64(pk),
+                                Value::Int64(new_val),
+                                Value::String(new_tag),
+                            ],
+                        );
+                    } else {
+                        tx.abort().unwrap();
+                        ref_engine.abort_txn(ref_tid);
+                    }
+                }
+            }
+            2 => {
+                // DELETE
+                if !active_pks.is_empty() {
+                    let idx = rng.next_range(0, active_pks.len() as u64 - 1) as usize;
+                    let pk = active_pks.remove(idx);
+
+                    let mut tx = db.begin_transaction().unwrap();
+                    let ref_tid = ref_engine.begin_txn();
+
+                    let res = tx.execute_statement(&format!("DELETE FROM records WHERE id = {pk}"));
+                    assert!(res.is_ok());
+
+                    let should_commit = rng.next_range(0, 4) != 0;
+                    if should_commit {
+                        tx.commit().unwrap();
+                        ref_engine.commit_txn(ref_tid);
+                        let _ = ref_engine.delete(ref_tid, pk);
+                    } else {
+                        tx.abort().unwrap();
+                        ref_engine.abort_txn(ref_tid);
+                        active_pks.push(pk);
+                    }
+                }
+            }
+            3 => {
+                // CAPTURE SNAPSHOT
+                let db_snap = db.register_snapshot();
+                let ref_snap = ref_engine.make_snapshot(0);
+                registered_snapshots.push((db_snap, ref_snap));
+            }
+            4 => {
+                // RELEASE OLDEST SNAPSHOT IF ANY
+                if !registered_snapshots.is_empty() && rng.next_range(0, 2) == 0 {
+                    let (db_snap, _) = registered_snapshots.remove(0);
+                    db.release_snapshot(db_snap.snapshot_id);
+                }
+            }
+            _ => {
+                // RUN VACUUM & COMPARE OBSERVABLE STATE
+                let ref_snaps: Vec<RefSnapshot> = registered_snapshots
+                    .iter()
+                    .map(|(_, rs)| rs.clone())
+                    .collect();
+                let _ref_vac_res = ref_engine.vacuum(&ref_snaps);
+                let _db_vac_res = db
+                    .vacuum(&treedb::engine::vacuum::VacuumConfig::unlimited())
+                    .unwrap();
+
+                // Physical vacuum must never panic or violate consistency
+                db.validate_vacuum_consistency().unwrap();
+
+                // Verify observable rows across every registered snapshot match reference model
+                for (db_s, ref_s) in &registered_snapshots {
+                    let mut tx_check = db.begin_transaction().unwrap();
+                    tx_check.set_snapshot(*db_s);
+                    let mut table = tx_check.open_table("records").unwrap();
+                    let actual_rows = table.scan(None, None).unwrap();
+                    let expected_rows = ref_engine.scan_visible(ref_s);
+                    assert_rows_match(
+                        &actual_rows,
+                        &expected_rows,
+                        &format!("Op {op_i}: Snapshot {:?} verification after vacuum", db_s),
+                    );
+                    tx_check.commit().unwrap();
+                }
+
+                // Verify current live query results match reference model
+                let mut tx_curr = db.begin_transaction().unwrap();
+                let mut table = tx_curr.open_table("records").unwrap();
+                let curr_actual = table.scan(None, None).unwrap();
+                let curr_ref_snap = ref_engine.make_snapshot(0);
+                let curr_expected = ref_engine.scan_visible(&curr_ref_snap);
+                assert_rows_match(
+                    &curr_actual,
+                    &curr_expected,
+                    &format!("Op {op_i}: Current live verification after vacuum"),
+                );
+                tx_curr.commit().unwrap();
+            }
+        }
+    }
+
+    // Release all snapshots
+    for (db_s, _) in registered_snapshots {
+        db.release_snapshot(db_s.snapshot_id);
+    }
+
+    // Final vacuum with no active snapshots
+    let _final_vac = db
+        .vacuum(&treedb::engine::vacuum::VacuumConfig::unlimited())
+        .unwrap();
+    db.validate_vacuum_consistency().unwrap();
+
+    // Verify final state matches reference model
+    let mut tx_fin = db.begin_transaction().unwrap();
+    let mut table = tx_fin.open_table("records").unwrap();
+    let fin_actual = table.scan(None, None).unwrap();
+    let fin_ref_snap = ref_engine.make_snapshot(0);
+    let fin_expected = ref_engine.scan_visible(&fin_ref_snap);
+    assert_rows_match(&fin_actual, &fin_expected, "Final state after full vacuum");
+    tx_fin.commit().unwrap();
 }

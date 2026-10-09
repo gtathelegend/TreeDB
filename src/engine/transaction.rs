@@ -584,6 +584,7 @@ pub struct Transaction<'db> {
     txn_id: TxnId,
     state: TxnState,
     isolation_context: crate::engine::isolation::IsolationContext,
+    owned_snapshot_id: Option<crate::engine::isolation::SnapshotId>,
     write_set: crate::engine::isolation::TransactionWriteSet,
     initial_root_page_id: PageId,
     initial_freelist_head: PageId,
@@ -630,10 +631,12 @@ impl<'db> Transaction<'db> {
         initial_free_page_count: u32,
         initial_page_count: u32,
     ) -> Self {
+        let snap_id = isolation_context.snapshot.snapshot_id;
         Self {
             db,
             txn_id,
             state: TxnState::Active,
+            owned_snapshot_id: Some(snap_id),
             isolation_context,
             write_set: crate::engine::isolation::TransactionWriteSet::new(),
             initial_root_page_id,
@@ -666,6 +669,9 @@ impl<'db> Transaction<'db> {
 
     /// Sets the point-in-time snapshot for this transaction.
     pub fn set_snapshot(&mut self, snapshot: crate::engine::isolation::Snapshot) {
+        if let Some(owned) = self.owned_snapshot_id.take() {
+            self.db.snapshot_registry.release(owned);
+        }
         self.isolation_context.snapshot = snapshot;
     }
 
@@ -687,9 +693,11 @@ impl<'db> Transaction<'db> {
     /// Refreshes the statement snapshot for statement-level isolation (e.g. READ COMMITTED).
     pub fn statement_snapshot(&mut self) -> crate::engine::isolation::Snapshot {
         let commit_seq = self.db.current_commit_seq();
-        let old_id = self.isolation_context.snapshot.snapshot_id;
-        self.db.snapshot_registry.release(old_id);
+        if let Some(old_id) = self.owned_snapshot_id.take() {
+            self.db.snapshot_registry.release(old_id);
+        }
         let new_snap = self.db.snapshot_registry.register(commit_seq);
+        self.owned_snapshot_id = Some(new_snap.snapshot_id);
         self.isolation_context.snapshot = new_snap;
         new_snap
     }
@@ -888,6 +896,59 @@ impl<'db> Transaction<'db> {
             Some(self.isolation_context.clone()),
             Some(&mut self.write_set),
         ))
+    }
+
+    /// Executes a vacuum pass on a specific table within the context of this transaction.
+    pub fn vacuum_table(
+        &mut self,
+        table_name: &str,
+        config: &crate::engine::vacuum::VacuumConfig,
+    ) -> Result<crate::engine::vacuum::VacuumResult> {
+        self.ensure_active()?;
+        let mut table = self.open_table(table_name)?;
+        table.vacuum(config)
+    }
+
+    /// Executes a vacuum pass across all tables within the context of this transaction.
+    pub fn vacuum(
+        &mut self,
+        config: &crate::engine::vacuum::VacuumConfig,
+    ) -> Result<crate::engine::vacuum::VacuumResult> {
+        self.ensure_active()?;
+        let horizon = crate::engine::isolation::ReclamationHorizon::new(
+            self.isolation_context.snapshot.as_of_commit_seq,
+        );
+        let table_names: Vec<String> = {
+            let tables = crate::engine::catalog::Catalog::list_tables(&mut self.db.buffer_pool)?;
+            tables.into_iter().map(|t| t.name).collect()
+        };
+
+        let mut total_result = crate::engine::vacuum::VacuumResult {
+            reclamation_horizon: horizon.oldest_required_commit_seq,
+            active_snapshots: self.db.snapshot_registry.active_count(),
+            ..Default::default()
+        };
+
+        for tname in table_names {
+            if total_result.versions_examined >= config.max_versions as u64
+                || total_result.pages_examined >= config.max_pages as u64
+            {
+                break;
+            }
+            let remaining = crate::engine::vacuum::VacuumConfig {
+                max_versions: config
+                    .max_versions
+                    .saturating_sub(total_result.versions_examined as usize),
+                max_pages: config
+                    .max_pages
+                    .saturating_sub(total_result.pages_examined as usize),
+            };
+            let mut table = self.open_table(&tname)?;
+            let t_res = table.vacuum_with_horizon(&remaining, horizon)?;
+            total_result.merge(&t_res);
+        }
+
+        Ok(total_result)
     }
 
     /// Creates a new persistent secondary index within this transaction.
@@ -7525,9 +7586,9 @@ impl<'db> Transaction<'db> {
         // Now commit (WAL flush): active_txn is cleared here, after metadata is written.
         self.db.commit_txn_with_seq(self.txn_id, commit_seq.0)?;
 
-        self.db
-            .snapshot_registry
-            .release(self.isolation_context.snapshot.snapshot_id);
+        if let Some(owned_id) = self.owned_snapshot_id.take() {
+            self.db.snapshot_registry.release(owned_id);
+        }
         self.state = TxnState::Committed;
         if self.has_catalog_mutations {
             self.db.catalog_generation += 1;
@@ -7636,9 +7697,9 @@ impl<'db> Transaction<'db> {
             }
 
             self.db.abort_txn(self.txn_id)?;
-            self.db
-                .snapshot_registry
-                .release(self.isolation_context.snapshot.snapshot_id);
+            if let Some(owned_id) = self.owned_snapshot_id.take() {
+                self.db.snapshot_registry.release(owned_id);
+            }
             // Restore initial header metadata and tree root
             self.db
                 .buffer_pool

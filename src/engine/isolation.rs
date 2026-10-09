@@ -10,7 +10,7 @@
 //! 7. Conceptual `ReadSet` prepared for future serializable conflict detection (SSI/2PL).
 //! 8. Database-level `SnapshotRegistry` tracking active snapshots and calculating `oldest_active_snapshot()`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use crate::engine::transaction::TxnState;
@@ -561,10 +561,45 @@ impl ReadSet {
     }
 }
 
+/// Explicit reclamation horizon derived from active snapshots.
+///
+/// Defines the minimum `CommitSeq` required by any active or future snapshot.
+/// Physical versions with `deleted_at <= oldest_required_commit_seq` and no live
+/// snapshot references are eligible for reclamation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ReclamationHorizon {
+    /// Oldest commit sequence required by any active or future supported snapshot.
+    pub oldest_required_commit_seq: CommitSeq,
+}
+
+impl ReclamationHorizon {
+    /// Constructs a new `ReclamationHorizon`.
+    pub const fn new(oldest_required_commit_seq: CommitSeq) -> Self {
+        Self {
+            oldest_required_commit_seq,
+        }
+    }
+
+    /// Returns the raw commit sequence value.
+    pub const fn commit_seq(&self) -> CommitSeq {
+        self.oldest_required_commit_seq
+    }
+}
+
+impl fmt::Display for ReclamationHorizon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ReclamationHorizon({})",
+            self.oldest_required_commit_seq.0
+        )
+    }
+}
+
 /// Database-level snapshot registry tracking active transactions and oldest active snapshot horizon.
 #[derive(Debug, Clone)]
 pub struct SnapshotRegistry {
-    active_snapshots: BTreeSet<SnapshotId>,
+    active_snapshots: BTreeMap<SnapshotId, CommitSeq>,
     next_snapshot_id: u64,
 }
 
@@ -578,7 +613,7 @@ impl SnapshotRegistry {
     /// Creates a new `SnapshotRegistry`.
     pub fn new() -> Self {
         Self {
-            active_snapshots: BTreeSet::new(),
+            active_snapshots: BTreeMap::new(),
             next_snapshot_id: 1,
         }
     }
@@ -587,7 +622,7 @@ impl SnapshotRegistry {
     pub fn register(&mut self, as_of: CommitSeq) -> Snapshot {
         let sid = SnapshotId(self.next_snapshot_id);
         self.next_snapshot_id = self.next_snapshot_id.saturating_add(1);
-        self.active_snapshots.insert(sid);
+        self.active_snapshots.insert(sid, as_of);
         Snapshot::new(sid, as_of)
     }
 
@@ -598,9 +633,53 @@ impl SnapshotRegistry {
 
     /// Returns the oldest active snapshot ID if any snapshots are active.
     ///
-    /// Runs in O(1) time using `BTreeSet::iter().next()`.
+    /// Runs in O(1) time using `BTreeMap::keys().next()`.
     pub fn oldest_active_snapshot(&self) -> Option<SnapshotId> {
-        self.active_snapshots.iter().next().copied()
+        self.active_snapshots.keys().next().copied()
+    }
+
+    /// Returns the lowest commit sequence observed by any currently active snapshot.
+    pub fn oldest_active_commit_seq(&self) -> Option<CommitSeq> {
+        self.active_snapshots.values().min().copied()
+    }
+
+    /// Derives the formal reclamation horizon based on active snapshots and current commit sequence.
+    ///
+    /// If active snapshots exist:
+    ///   `horizon = min(s.as_of_commit_seq for s in active_snapshots)`
+    /// If no snapshots are active:
+    ///   The engine guarantees no future snapshot can be created earlier than `current_commit_seq`.
+    ///   Therefore `horizon = current_commit_seq`.
+    pub fn reclamation_horizon(&self, current_commit_seq: CommitSeq) -> ReclamationHorizon {
+        let oldest = self
+            .oldest_active_commit_seq()
+            .unwrap_or(current_commit_seq);
+        ReclamationHorizon::new(std::cmp::min(oldest, current_commit_seq))
+    }
+
+    /// Performs bookkeeping consistency checks to detect registry corruption or orphaned state.
+    pub fn validate_consistency(&self, current_commit_seq: CommitSeq) -> crate::error::Result<()> {
+        for (&sid, &cseq) in &self.active_snapshots {
+            if sid == SnapshotId::NULL {
+                return Err(crate::error::Error::SnapshotRegistryInconsistency(
+                    "registry contains NULL snapshot id".to_string(),
+                ));
+            }
+            if cseq.0 > current_commit_seq.0 {
+                return Err(crate::error::Error::SnapshotRegistryInconsistency(format!(
+                    "snapshot {sid} as_of {cseq} exceeds current commit sequence {current_commit_seq}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a list of all currently active snapshots.
+    pub fn active_snapshots(&self) -> Vec<Snapshot> {
+        self.active_snapshots
+            .iter()
+            .map(|(&sid, &cseq)| Snapshot::new(sid, cseq))
+            .collect()
     }
 
     /// Returns the number of currently active registered snapshots.
@@ -610,6 +689,11 @@ impl SnapshotRegistry {
 
     /// Returns `true` if the specified snapshot ID is currently registered and active.
     pub fn is_active(&self, sid: SnapshotId) -> bool {
-        self.active_snapshots.contains(&sid)
+        self.active_snapshots.contains_key(&sid)
+    }
+
+    /// Clears all registered snapshots (e.g., during database close/reopen).
+    pub fn clear(&mut self) {
+        self.active_snapshots.clear();
     }
 }

@@ -90,3 +90,14 @@ The execution engine monitors MVCC version traversal via `ExecutionResourceManag
 - `overflow_pages_read`: Number of overflow pages fetched for multi-page versions.
 - `corrupt_chains_detected`: Count of cycles or corrupt links intercepted.
 
+---
+
+## 9. Phase 70: Interaction with the Vacuum Reclamation Horizon
+
+In Phase 70, snapshot visibility forms the primary safety predicate for garbage collection:
+- `ReclamationHorizon`: $\min \{ s.\text{as\_of\_commit\_seq} \mid s \in \text{active\_snapshots} \}$.
+- Versions required by ANY active snapshot according to `MvccVisibilityPolicy` are strictly protected from reclamation.
+- Only versions whose deletion was committed at or before the reclamation horizon ($d_{\text{seq}} \le \text{Horizon}$) and are unneeded by every active snapshot are eligible for pruning.
+- See [MVCC_VACUUM.md](file:///d:/Projects/TreeDB/docs/MVCC_VACUUM.md) for complete details.
+
+

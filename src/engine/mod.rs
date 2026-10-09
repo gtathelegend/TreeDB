@@ -3,6 +3,7 @@ pub mod isolation;
 pub mod table;
 pub mod transaction;
 pub mod types;
+pub mod vacuum;
 
 pub use crate::query::external_multi_index::{MultiIndexConfig, MultiIndexExecutionMode};
 pub use crate::query::materialize::{MaterializeConfig, MaterializeOverride};
@@ -12,12 +13,13 @@ pub use catalog::{
 };
 pub use isolation::{
     CommitSeq, CurrentVersionVisibility, IsolationContext, IsolationLevel, IsolationStatus,
-    ReadSet, Snapshot, SnapshotId, SnapshotRegistry, TransactionCommitMetadata,
+    ReadSet, ReclamationHorizon, Snapshot, SnapshotId, SnapshotRegistry, TransactionCommitMetadata,
     TransactionWriteSet, VisibilityPolicy,
 };
 pub use table::{MultiIndexScanStats, SkipScanStats, Table};
 pub use transaction::{StatementResult, Transaction, TxnState};
 pub use types::{Column, DataType, Row, Schema, Value, MAX_COLUMN_NAME_LEN, TUPLE_FORMAT_VERSION};
+pub use vacuum::{VacuumConfig, VacuumResult, VersionReclamationEligibility};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -266,6 +268,144 @@ impl TreeDb {
     /// Returns the number of currently active registered snapshots.
     pub fn active_snapshot_count(&self) -> usize {
         self.snapshot_registry.active_count()
+    }
+
+    /// Returns the current formal reclamation horizon based on active snapshots.
+    pub fn reclamation_horizon(&self) -> ReclamationHorizon {
+        self.snapshot_registry
+            .reclamation_horizon(self.current_commit_seq())
+    }
+
+    /// Registers a standalone point-in-time snapshot observing the latest committed transaction.
+    pub fn register_snapshot(&mut self) -> Snapshot {
+        let commit_seq = CommitSeq(self.buffer_pool.durable_max_commit_seq());
+        self.snapshot_registry.register(commit_seq)
+    }
+
+    /// Registers a point-in-time snapshot observing a specific commit sequence horizon.
+    pub fn register_snapshot_as_of(&mut self, commit_seq: CommitSeq) -> Snapshot {
+        self.snapshot_registry.register(commit_seq)
+    }
+
+    /// Releases a registered snapshot by ID.
+    pub fn release_snapshot(&mut self, sid: SnapshotId) {
+        self.snapshot_registry.release(sid);
+    }
+
+    /// Executes a vacuum pass over the database (all tables and KV store).
+    pub fn vacuum(&mut self, config: &VacuumConfig) -> Result<VacuumResult> {
+        let commit_seq = self.current_commit_seq();
+        self.snapshot_registry.validate_consistency(commit_seq)?;
+        let horizon = self.snapshot_registry.reclamation_horizon(commit_seq);
+        let active_snapshots = self.snapshot_registry.active_count();
+
+        let mut total_result = VacuumResult {
+            active_snapshots,
+            reclamation_horizon: horizon.oldest_required_commit_seq,
+            blocked_by_oldest_snapshot: active_snapshots > 0
+                && horizon.oldest_required_commit_seq.0 < commit_seq.0,
+            ..Default::default()
+        };
+
+        let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
+            Some(self.begin_txn()?)
+        } else {
+            None
+        };
+
+        // 1. Vacuum all tables in catalog
+        let table_names: Vec<String> = {
+            let tables = Catalog::list_tables(&mut self.buffer_pool)?;
+            tables.into_iter().map(|t| t.name).collect()
+        };
+
+        for tname in table_names {
+            if total_result.versions_examined >= config.max_versions as u64
+                || total_result.pages_examined >= config.max_pages as u64
+            {
+                break;
+            }
+            let remaining_config = VacuumConfig {
+                max_versions: config
+                    .max_versions
+                    .saturating_sub(total_result.versions_examined as usize),
+                max_pages: config
+                    .max_pages
+                    .saturating_sub(total_result.pages_examined as usize),
+            };
+            let mut table = self.open_table(&tname)?;
+            let t_res = table.vacuum_with_horizon(&remaining_config, horizon)?;
+            total_result.merge(&t_res);
+        }
+
+        // 2. Vacuum default KV store
+        if total_result.versions_examined < config.max_versions as u64
+            && total_result.pages_examined < config.max_pages as u64
+        {
+            let remaining_config = VacuumConfig {
+                max_versions: config
+                    .max_versions
+                    .saturating_sub(total_result.versions_examined as usize),
+                max_pages: config
+                    .max_pages
+                    .saturating_sub(total_result.pages_examined as usize),
+            };
+            let kv_res = crate::engine::vacuum::VacuumEngine::vacuum_kv(
+                &mut self.tree,
+                &mut self.record_store,
+                &mut self.buffer_pool,
+                &remaining_config,
+                horizon,
+            )?;
+            total_result.merge(&kv_res);
+        }
+
+        if let Some(tid) = auto_txn {
+            let new_seq = self.allocate_commit_seq();
+            self.commit_txn_with_seq(tid, new_seq.0)?;
+        }
+
+        Ok(total_result)
+    }
+
+    /// Executes a vacuum pass on a specific named table.
+    pub fn vacuum_table(
+        &mut self,
+        table_name: &str,
+        config: &VacuumConfig,
+    ) -> Result<VacuumResult> {
+        let commit_seq = self.current_commit_seq();
+        self.snapshot_registry.validate_consistency(commit_seq)?;
+        let horizon = self.snapshot_registry.reclamation_horizon(commit_seq);
+        let active_snapshots = self.snapshot_registry.active_count();
+
+        let auto_txn = if self.active_txn.is_none() && self.buffer_pool.wal().is_some() {
+            Some(self.begin_txn()?)
+        } else {
+            None
+        };
+
+        let mut table = self.open_table(table_name)?;
+        let mut result = table.vacuum_with_horizon(config, horizon)?;
+        result.active_snapshots = active_snapshots;
+        result.reclamation_horizon = horizon.oldest_required_commit_seq;
+
+        if let Some(tid) = auto_txn {
+            let new_seq = self.allocate_commit_seq();
+            self.commit_txn_with_seq(tid, new_seq.0)?;
+        }
+
+        Ok(result)
+    }
+
+    /// Validates the post-vacuum consistency across the database.
+    pub fn validate_vacuum_consistency(&mut self) -> Result<()> {
+        crate::engine::vacuum::VacuumEngine::validate_db_vacuum_consistency(self)
+    }
+
+    /// Returns the number of free pages currently recorded in the database header.
+    pub fn free_page_count(&self) -> u32 {
+        self.buffer_pool.page_manager().header().free_page_count
     }
 
     /// Begins a new transaction in the WAL stream.

@@ -626,6 +626,26 @@ pub enum Error {
     /// MVCC storage or visibility corruption detected.
     #[error("MVCC corruption detected: {0}")]
     MvccCorruption(String),
+
+    /// Invalid reclamation horizon specified or derived.
+    #[error("Invalid reclamation horizon: {0}")]
+    InvalidReclamationHorizon(String),
+
+    /// Snapshot registry bookkeeping inconsistency detected.
+    #[error("Snapshot registry inconsistency: {0}")]
+    SnapshotRegistryInconsistency(String),
+
+    /// Vacuum consistency validation failed.
+    #[error("Vacuum consistency validation failed: {0}")]
+    VacuumValidation(String),
+
+    /// Vacuum resource limit reached during bounded execution.
+    #[error("Vacuum resource limit reached for {resource}: limit is {limit}")]
+    VacuumResourceLimitReached { resource: String, limit: usize },
+
+    /// General vacuum execution error.
+    #[error("Vacuum error: {0}")]
+    VacuumError(String),
 }
 
 impl From<crate::query::validation::PlanValidationError> for Error {
