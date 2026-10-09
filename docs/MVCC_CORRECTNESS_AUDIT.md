@@ -162,8 +162,8 @@ All 9 crash injection scenarios pass deterministically.
 
 ## 11. Known Limitations & Explicitly Deferred Features
 
-The following capabilities were explicitly deferred beyond Phase 69 and addressed in subsequent phases:
-1. **Concurrent Transactions & Multi-Threading**: Single-threaded transaction execution is maintained. No concurrent transaction execution or lock manager is introduced.
+The following capabilities were explicitly evaluated across phases:
+1. **Concurrent Transactions & Multi-Threading**: Single-threaded transaction execution is maintained. No concurrent transaction execution, lock manager, or deadlock detection is introduced.
 2. **Historical Version Reclamation (Vacuum)**: *Implemented in Phase 70.* Snapshot-safe version reclamation, version chain pruning, overflow page recycling, empty record page recycling, and secondary/covering index garbage collection are fully supported via `db.vacuum()` and `docs/MVCC_VACUUM.md`.
-3. **Serializable Conflict Detection (SSI)**: Serializable snapshot isolation (predicate locks, rw-antidependencies) is deferred to future isolation phases.
-4. **In-Memory Version Pruning**: Chains grow monotonically up to `MAX_VERSION_CHAIN_DEPTH = 1000` until reclaimed by `db.vacuum()`.
+3. **Transaction Conflict Detection & Commit-Time Validation**: *Implemented in Phase 71.* Formal write-intent tracking (`RowWriteIntent`), write-set validation against committed heads, 6 structured conflict categories (`WriteWriteConflict`, `StaleVersionWrite`, `ConcurrentLogicalKeyChange`, `UniqueIndexConflict`, `InvalidTransactionState`, `WriteSetValidationFailure`), and atomic failure rollbacks are documented in `docs/MVCC_CONFLICTS.md`.
+4. **Serializable Snapshot Isolation (SSI)**: Serializable snapshot isolation (predicate locks, rw-antidependencies) is deferred to future isolation phases.

@@ -107,4 +107,14 @@ Phase 70 introduces explicit, snapshot-safe physical reclamation of historical v
 - **Index Cleanup**: Obsolete secondary and covering index entries referencing reclaimed `RecordId`s are removed atomically with the physical version.
 - Detailed architecture is documented in [MVCC_VACUUM.md](file:///d:/Projects/TreeDB/docs/MVCC_VACUUM.md).
 
+---
+
+## 9. Phase 71: Transaction Conflict Detection & Commit Validation
+
+Phase 71 introduces an explicit write-intent tracking and commit-validation layer:
+- **Write-Set Tracking**: Transactions record `RowWriteIntent` records mapping logical rows `(table, key)` to operation kinds, targeted version IDs, and new version IDs.
+- **Commit Validation**: Before writing a `Commit` record to the WAL, write intents are validated against current committed head versions to detect write-write conflicts, stale version modifications, and unique index collisions.
+- **Atomic Abort on Conflict**: Conflicting transactions are automatically aborted without leaving uncommitted physical versions or corrupting version chain links.
+- Detailed architecture is documented in [MVCC_CONFLICTS.md](file:///d:/Projects/TreeDB/docs/MVCC_CONFLICTS.md).
+
 

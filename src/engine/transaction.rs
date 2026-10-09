@@ -738,6 +738,42 @@ impl<'db> Transaction<'db> {
         self.ensure_active()?;
         let prev_rid = self.db.tree.get(&mut self.db.buffer_pool, key)?;
         if let Some(old_rid) = prev_rid {
+            let (head_meta, _) = self
+                .db
+                .record_store
+                .read_version(&mut self.db.buffer_pool, old_rid)?
+                .ok_or(Error::InvalidRecordId(old_rid))?;
+            let created_by_self = head_meta.xmin == self.txn_id;
+
+            if !created_by_self {
+                if let Some(created_at) = head_meta.created_at {
+                    if created_at.0 > self.isolation_context.snapshot.as_of_commit_seq.0 {
+                        let conflict =
+                            crate::engine::isolation::TransactionConflict::WriteWriteConflict {
+                                table: "__kv__".to_string(),
+                                key: format!("{key}"),
+                                expected_version: None,
+                                observed_version: Some(old_rid),
+                            };
+                        self.write_set.record_conflict(conflict.clone());
+                        return Err(Error::TransactionConflict(conflict));
+                    }
+                }
+
+                if let Some(del_seq) = head_meta.deleted_at {
+                    if del_seq.0 > self.isolation_context.snapshot.as_of_commit_seq.0 {
+                        let conflict =
+                            crate::engine::isolation::TransactionConflict::StaleVersionWrite {
+                                table: "__kv__".to_string(),
+                                key: format!("{key}"),
+                                target_version: old_rid,
+                            };
+                        self.write_set.record_conflict(conflict.clone());
+                        return Err(Error::TransactionConflict(conflict));
+                    }
+                }
+            }
+
             let is_vis = self.db.record_store.is_record_visible(
                 &mut self.db.buffer_pool,
                 old_rid,
@@ -768,6 +804,14 @@ impl<'db> Transaction<'db> {
                     .tree
                     .update(&mut self.db.buffer_pool, key, new_rid)?;
                 self.write_set.record_update(old_rid, new_rid);
+                self.write_set.record_row_update(
+                    "__kv__",
+                    key,
+                    format!("{key}"),
+                    old_rid,
+                    new_rid,
+                    self.isolation_context.snapshot.as_of_commit_seq,
+                );
             } else {
                 let new_meta =
                     crate::storage::record_store::VersionMetadata::new(self.txn_id, Some(old_rid));
@@ -780,6 +824,13 @@ impl<'db> Transaction<'db> {
                     .tree
                     .update(&mut self.db.buffer_pool, key, new_rid)?;
                 self.write_set.record_insert(new_rid);
+                self.write_set.record_row_insert(
+                    "__kv__",
+                    key,
+                    format!("{key}"),
+                    new_rid,
+                    self.isolation_context.snapshot.as_of_commit_seq,
+                );
             }
         } else {
             let new_meta = crate::storage::record_store::VersionMetadata::new(self.txn_id, None);
@@ -791,6 +842,13 @@ impl<'db> Transaction<'db> {
                 .tree
                 .insert(&mut self.db.buffer_pool, key, new_rid)?;
             self.write_set.record_insert(new_rid);
+            self.write_set.record_row_insert(
+                "__kv__",
+                key,
+                format!("{key}"),
+                new_rid,
+                self.isolation_context.snapshot.as_of_commit_seq,
+            );
         }
         Ok(())
     }
@@ -807,13 +865,62 @@ impl<'db> Transaction<'db> {
         self.ensure_active()?;
         match self.db.tree.get(&mut self.db.buffer_pool, key)? {
             Some(old_rid) => {
+                let (head_meta, _) = self
+                    .db
+                    .record_store
+                    .read_version(&mut self.db.buffer_pool, old_rid)?
+                    .ok_or(Error::InvalidRecordId(old_rid))?;
+                let created_by_self = head_meta.xmin == self.txn_id;
+
+                if !created_by_self {
+                    if let Some(created_at) = head_meta.created_at {
+                        if created_at.0 > self.isolation_context.snapshot.as_of_commit_seq.0 {
+                            let conflict =
+                                crate::engine::isolation::TransactionConflict::WriteWriteConflict {
+                                    table: "__kv__".to_string(),
+                                    key: format!("{key}"),
+                                    expected_version: None,
+                                    observed_version: Some(old_rid),
+                                };
+                            self.write_set.record_conflict(conflict.clone());
+                            return Err(Error::TransactionConflict(conflict));
+                        }
+                    }
+
+                    if let Some(del_seq) = head_meta.deleted_at {
+                        if del_seq.0 > self.isolation_context.snapshot.as_of_commit_seq.0 {
+                            let conflict =
+                                crate::engine::isolation::TransactionConflict::StaleVersionWrite {
+                                    table: "__kv__".to_string(),
+                                    key: format!("{key}"),
+                                    target_version: old_rid,
+                                };
+                            self.write_set.record_conflict(conflict.clone());
+                            return Err(Error::TransactionConflict(conflict));
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                }
+
                 match self.db.record_store.read_visible(
                     &mut self.db.buffer_pool,
                     old_rid,
                     Some(self.txn_id),
                     &self.isolation_context.snapshot,
                 )? {
-                    Some((_, mut old_meta, val)) => {
+                    Some((visible_rid, mut old_meta, val)) => {
+                        if !created_by_self && visible_rid != old_rid {
+                            let conflict =
+                                crate::engine::isolation::TransactionConflict::WriteWriteConflict {
+                                    table: "__kv__".to_string(),
+                                    key: format!("{key}"),
+                                    expected_version: Some(visible_rid),
+                                    observed_version: Some(old_rid),
+                                };
+                            self.write_set.record_conflict(conflict.clone());
+                            return Err(Error::TransactionConflict(conflict));
+                        }
                         old_meta.xmax = Some(self.txn_id);
                         self.db.record_store.update_version_metadata(
                             &mut self.db.buffer_pool,
@@ -821,6 +928,13 @@ impl<'db> Transaction<'db> {
                             &old_meta,
                         )?;
                         self.write_set.record_delete(old_rid);
+                        self.write_set.record_row_delete(
+                            "__kv__",
+                            key,
+                            format!("{key}"),
+                            visible_rid,
+                            self.isolation_context.snapshot.as_of_commit_seq,
+                        );
                         Ok(Some(val))
                     }
                     None => Ok(None),
@@ -7504,6 +7618,210 @@ impl<'db> Transaction<'db> {
         }
     }
 
+    /// Validates all accumulated write intents against the latest committed database state
+    /// prior to applying the commit.
+    ///
+    /// Verifies:
+    /// 1. Transaction state is `Active`.
+    /// 2. No operation within this transaction has encountered a conflict.
+    /// 3. Each targeted logical row has not been superseded or modified by an intervening transaction.
+    /// 4. Unique constraints are satisfied by the final transaction state against the committed state.
+    /// 5. Record store version chains and index pointers remain structurally consistent.
+    pub fn validate_commit(&mut self) -> Result<()> {
+        if self.state != TxnState::Active {
+            return Err(Error::TransactionConflict(
+                crate::engine::isolation::TransactionConflict::InvalidTransactionState {
+                    txn_id: self.txn_id,
+                    current: format!("{}", self.state),
+                    action: "validate_commit".to_string(),
+                },
+            ));
+        }
+
+        if let Some(conflict) = self.write_set.conflict() {
+            return Err(Error::TransactionConflict(
+                crate::engine::isolation::TransactionConflict::WriteSetValidationFailure {
+                    txn_id: self.txn_id,
+                    reason: format!(
+                        "transaction encountered conflict during operation: {conflict}"
+                    ),
+                },
+            ));
+        }
+
+        let intents: Vec<crate::engine::isolation::RowWriteIntent> =
+            self.write_set.intents().values().cloned().collect();
+
+        for intent in intents {
+            if intent.table == "__kv__" {
+                match intent.op_kind {
+                    crate::engine::isolation::WriteOpKind::Insert => {
+                        if let Some(target) = intent.target_version {
+                            if let Ok(Some((target_meta, _))) = self
+                                .db
+                                .record_store
+                                .read_version(&mut self.db.buffer_pool, target)
+                            {
+                                if let Some(del_seq) = target_meta.deleted_at {
+                                    if del_seq.0 > intent.snapshot_commit_seq.0 {
+                                        return Err(Error::TransactionConflict(
+                                            crate::engine::isolation::TransactionConflict::ConcurrentLogicalKeyChange {
+                                                table: intent.table,
+                                                key: intent.key_repr,
+                                                detail: "target row was deleted by intervening transaction"
+                                                    .to_string(),
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    crate::engine::isolation::WriteOpKind::Update => {
+                        if let Some(target) = intent.target_version {
+                            if let Ok(Some((target_meta, _))) = self
+                                .db
+                                .record_store
+                                .read_version(&mut self.db.buffer_pool, target)
+                            {
+                                if let Some(del_seq) = target_meta.deleted_at {
+                                    if del_seq.0 > intent.snapshot_commit_seq.0 {
+                                        return Err(Error::TransactionConflict(
+                                            crate::engine::isolation::TransactionConflict::StaleVersionWrite {
+                                                table: intent.table,
+                                                key: intent.key_repr,
+                                                target_version: target,
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    crate::engine::isolation::WriteOpKind::Delete => {
+                        if let Some(target) = intent.target_version {
+                            if let Ok(Some((target_meta, _))) = self
+                                .db
+                                .record_store
+                                .read_version(&mut self.db.buffer_pool, target)
+                            {
+                                if let Some(del_seq) = target_meta.deleted_at {
+                                    if del_seq.0 > intent.snapshot_commit_seq.0 {
+                                        return Err(Error::TransactionConflict(
+                                            crate::engine::isolation::TransactionConflict::StaleVersionWrite {
+                                                table: intent.table,
+                                                key: intent.key_repr,
+                                                target_version: target,
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                let tbl_meta = match crate::engine::catalog::Catalog::get_table(
+                    &mut self.db.buffer_pool,
+                    &intent.table,
+                )? {
+                    Some(m) => m,
+                    None => continue,
+                };
+
+                let idx_metas = crate::engine::catalog::Catalog::list_indexes_for_table(
+                    &mut self.db.buffer_pool,
+                    tbl_meta.table_id,
+                )?;
+
+                match intent.op_kind {
+                    crate::engine::isolation::WriteOpKind::Insert
+                    | crate::engine::isolation::WriteOpKind::Update => {
+                        if let Some(new_rid) = intent.new_version {
+                            if let Ok(Some((_, bytes))) = self
+                                .db
+                                .record_store
+                                .read_version(&mut self.db.buffer_pool, new_rid)
+                            {
+                                if let Ok(row) = tbl_meta.schema.decode_tuple(&bytes) {
+                                    for idx in &idx_metas {
+                                        if idx.unique {
+                                            let sec_tree =
+                                                crate::index::secondary::SecondaryIndex::from_root(
+                                                    idx.root_page_id,
+                                                );
+                                            let idx_key = idx.extract_index_key(&row);
+                                            let matching_rids = sec_tree
+                                                .lookup(&mut self.db.buffer_pool, &idx_key)?;
+                                            for r in matching_rids {
+                                                if r != new_rid && intent.target_version != Some(r)
+                                                {
+                                                    if let Ok(Some((r_meta, _))) = self
+                                                        .db
+                                                        .record_store
+                                                        .read_version(&mut self.db.buffer_pool, r)
+                                                    {
+                                                        if r_meta.deleted_at.is_none()
+                                                            && r_meta.xmax != Some(self.txn_id)
+                                                        {
+                                                            let vals_str = idx
+                                                                .column_indices
+                                                                .iter()
+                                                                .map(|&i| {
+                                                                    format!("{}", row.values[i])
+                                                                })
+                                                                .collect::<Vec<_>>()
+                                                                .join(", ");
+                                                            let key_repr =
+                                                                if idx.column_indices.len() == 1 {
+                                                                    vals_str
+                                                                } else {
+                                                                    format!("({vals_str})")
+                                                                };
+                                                            return Err(Error::TransactionConflict(
+                                                                crate::engine::isolation::TransactionConflict::UniqueIndexConflict {
+                                                                    index_name: idx.name.clone(),
+                                                                    key: key_repr,
+                                                                },
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    crate::engine::isolation::WriteOpKind::Delete => {
+                        if let Some(target) = intent.target_version {
+                            if let Ok(Some((target_meta, _))) = self
+                                .db
+                                .record_store
+                                .read_version(&mut self.db.buffer_pool, target)
+                            {
+                                if let Some(del_seq) = target_meta.deleted_at {
+                                    if del_seq.0 > intent.snapshot_commit_seq.0 {
+                                        return Err(Error::TransactionConflict(
+                                            crate::engine::isolation::TransactionConflict::StaleVersionWrite {
+                                                table: intent.table,
+                                                key: intent.key_repr,
+                                                target_version: target,
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Commits all mutations performed in this transaction, flushing the WAL through the commit LSN
     /// and allocating a monotonic logical commit sequence.
     pub fn commit(mut self) -> Result<()> {
@@ -7533,6 +7851,13 @@ impl<'db> Transaction<'db> {
                 });
             }
         }
+
+        // Commit validation stage
+        if let Err(err) = self.validate_commit() {
+            let _ = self.abort_internal();
+            return Err(err);
+        }
+
         let commit_seq = self.db.allocate_commit_seq();
 
         // Stamp MVCC version metadata BEFORE calling commit_txn_with_seq.

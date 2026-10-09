@@ -205,3 +205,13 @@ When concurrent transactions and background vacuum threads are introduced in fut
 * Row-level or page-level read-write latches will be required to coordinate vacuum traversal with concurrent table updates.
 * Snapshot registration will require lock-free or read-copy-update (RCU) active snapshot tracking to avoid contention during horizon calculations.
 * Version-chain link rewriting must be made atomic using latch coupling or optimistic version validation.
+
+---
+
+## 15. Phase 71: Interaction with Transaction Conflict Detection
+
+Vacuum operations interact cleanly with Phase 71 commit validation:
+* **Horizon Protection**: Vacuum never reclaims versions within the active snapshot horizon, ensuring transactions can always read their targeted historical versions.
+* **Unique Index Hygiene**: By purging obsolete historical index entries, vacuum prevents false unique index collisions on key re-insertions while maintaining correct commit-validation checks for live versions.
+* **Validation Invariance**: Vacuum runs do not mutate live committed head versions; consequently, an in-progress transaction validating against the committed head state remains consistent across vacuum runs.
+* See [MVCC_CONFLICTS.md](file:///d:/Projects/TreeDB/docs/MVCC_CONFLICTS.md) for complete details.

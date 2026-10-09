@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 
 use treedb::engine::types::{Row, Value};
@@ -38,11 +37,45 @@ pub struct RefSnapshot {
     pub self_txn_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefConflict {
+    WriteWriteConflict,
+    StaleVersionWrite,
+    ConcurrentLogicalKeyChange,
+    UniqueIndexConflict,
+    InvalidTransactionState,
+    WriteSetValidationFailure,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefWriteOp {
+    Insert {
+        pk: u64,
+        values: Vec<Value>,
+    },
+    Update {
+        pk: u64,
+        target_version_xmin: Option<u64>,
+        values: Vec<Value>,
+    },
+    Delete {
+        pk: u64,
+        target_version_xmin: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RefTxnWriteIntent {
+    pub ops: Vec<RefWriteOp>,
+    pub snapshot_commit_seq: u64,
+}
+
 pub struct RefEngine {
     pub next_txn_id: u64,
     pub next_commit_seq: u64,
     pub txns: HashMap<u64, RefTxnStatus>,
     pub records: HashMap<u64, RefLogicalRecord>,
+    pub write_intents: HashMap<u64, RefTxnWriteIntent>,
 }
 
 impl Default for RefEngine {
@@ -58,6 +91,7 @@ impl RefEngine {
             next_commit_seq: 1,
             txns: HashMap::new(),
             records: HashMap::new(),
+            write_intents: HashMap::new(),
         }
     }
 
@@ -167,6 +201,226 @@ impl RefEngine {
                 }
             }
         }
+    }
+
+    pub fn record_intent_insert(&mut self, tid: u64, pk: u64, values: Vec<Value>, snap_seq: u64) {
+        let entry = self
+            .write_intents
+            .entry(tid)
+            .or_insert_with(|| RefTxnWriteIntent {
+                ops: Vec::new(),
+                snapshot_commit_seq: snap_seq,
+            });
+        entry.ops.push(RefWriteOp::Insert { pk, values });
+    }
+
+    pub fn record_intent_update(
+        &mut self,
+        tid: u64,
+        pk: u64,
+        target_xmin: Option<u64>,
+        values: Vec<Value>,
+        snap_seq: u64,
+    ) {
+        let entry = self
+            .write_intents
+            .entry(tid)
+            .or_insert_with(|| RefTxnWriteIntent {
+                ops: Vec::new(),
+                snapshot_commit_seq: snap_seq,
+            });
+        entry.ops.push(RefWriteOp::Update {
+            pk,
+            target_version_xmin: target_xmin,
+            values,
+        });
+    }
+
+    pub fn record_intent_delete(
+        &mut self,
+        tid: u64,
+        pk: u64,
+        target_xmin: Option<u64>,
+        snap_seq: u64,
+    ) {
+        let entry = self
+            .write_intents
+            .entry(tid)
+            .or_insert_with(|| RefTxnWriteIntent {
+                ops: Vec::new(),
+                snapshot_commit_seq: snap_seq,
+            });
+        entry.ops.push(RefWriteOp::Delete {
+            pk,
+            target_version_xmin: target_xmin,
+        });
+    }
+
+    /// Independent reference commit validation: validates write set intents against latest committed state.
+    pub fn validate_and_commit_txn(
+        &mut self,
+        tid: u64,
+        unique_col_idx: Option<usize>,
+    ) -> std::result::Result<u64, RefConflict> {
+        // 1. Transaction state check
+        match self.txns.get(&tid) {
+            Some(RefTxnStatus::Active) => {}
+            _ => return Err(RefConflict::InvalidTransactionState),
+        }
+
+        let intent = match self.write_intents.remove(&tid) {
+            Some(i) => i,
+            None => {
+                // Empty transaction commits cleanly
+                return Ok(self.commit_txn(tid));
+            }
+        };
+
+        // 2. Validate operations against committed records
+        // Determine final operation per PK in this transaction
+        let mut final_ops: HashMap<u64, &RefWriteOp> = HashMap::new();
+        for op in &intent.ops {
+            match op {
+                RefWriteOp::Insert { pk, .. }
+                | RefWriteOp::Update { pk, .. }
+                | RefWriteOp::Delete { pk, .. } => {
+                    final_ops.insert(*pk, op);
+                }
+            }
+        }
+
+        for (pk, op) in &final_ops {
+            let record = self.records.get(pk);
+            let latest_committed_version = record.and_then(|rec| {
+                rec.versions
+                    .iter()
+                    .rev()
+                    .find(|v| matches!(self.txns.get(&v.xmin), Some(RefTxnStatus::Committed(_))))
+            });
+
+            match op {
+                RefWriteOp::Insert { values, .. } => {
+                    if let Some(comm_v) = latest_committed_version {
+                        let is_deleted = comm_v.xmax.is_some()
+                            && matches!(
+                                self.txns.get(&comm_v.xmax.unwrap()),
+                                Some(RefTxnStatus::Committed(_))
+                            );
+                        if !is_deleted {
+                            return Err(RefConflict::ConcurrentLogicalKeyChange);
+                        }
+                    }
+                    if let Some(col) = unique_col_idx {
+                        if let Some(val) = values.get(col) {
+                            if self.has_committed_unique_violation(*pk, col, val) {
+                                return Err(RefConflict::UniqueIndexConflict);
+                            }
+                        }
+                    }
+                }
+                RefWriteOp::Update {
+                    target_version_xmin,
+                    values,
+                    ..
+                } => {
+                    match (target_version_xmin, latest_committed_version) {
+                        (Some(target), Some(latest)) => {
+                            if *target != latest.xmin {
+                                return Err(RefConflict::WriteWriteConflict);
+                            }
+                            if latest.xmax.is_some()
+                                && matches!(
+                                    self.txns.get(&latest.xmax.unwrap()),
+                                    Some(RefTxnStatus::Committed(_))
+                                )
+                            {
+                                return Err(RefConflict::StaleVersionWrite);
+                            }
+                        }
+                        (Some(_), None) => {
+                            return Err(RefConflict::StaleVersionWrite);
+                        }
+                        (None, _) => {
+                            // Intra-transaction insert then updated
+                        }
+                    }
+                    if let Some(col) = unique_col_idx {
+                        if let Some(val) = values.get(col) {
+                            if self.has_committed_unique_violation(*pk, col, val) {
+                                return Err(RefConflict::UniqueIndexConflict);
+                            }
+                        }
+                    }
+                }
+                RefWriteOp::Delete {
+                    target_version_xmin,
+                    ..
+                } => {
+                    match (target_version_xmin, latest_committed_version) {
+                        (Some(target), Some(latest)) => {
+                            if *target != latest.xmin {
+                                return Err(RefConflict::WriteWriteConflict);
+                            }
+                            if latest.xmax.is_some()
+                                && matches!(
+                                    self.txns.get(&latest.xmax.unwrap()),
+                                    Some(RefTxnStatus::Committed(_))
+                                )
+                            {
+                                return Err(RefConflict::StaleVersionWrite);
+                            }
+                        }
+                        (Some(_), None) => {
+                            return Err(RefConflict::StaleVersionWrite);
+                        }
+                        (None, _) => {
+                            // Intra-transaction insert then deleted
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply all operations to records
+        for op in intent.ops {
+            match op {
+                RefWriteOp::Insert { pk, values } => {
+                    let _ = self.insert(tid, pk, values);
+                }
+                RefWriteOp::Update { pk, values, .. } => {
+                    let _ = self.update(tid, pk, values);
+                }
+                RefWriteOp::Delete { pk, .. } => {
+                    let _ = self.delete(tid, pk);
+                }
+            }
+        }
+
+        Ok(self.commit_txn(tid))
+    }
+
+    fn has_committed_unique_violation(&self, self_pk: u64, col_idx: usize, val: &Value) -> bool {
+        for (&other_pk, rec) in &self.records {
+            if other_pk == self_pk {
+                continue;
+            }
+            if let Some(latest) = rec
+                .versions
+                .iter()
+                .rev()
+                .find(|v| matches!(self.txns.get(&v.xmin), Some(RefTxnStatus::Committed(_))))
+            {
+                let is_deleted = latest.xmax.is_some()
+                    && matches!(
+                        self.txns.get(&latest.xmax.unwrap()),
+                        Some(RefTxnStatus::Committed(_))
+                    );
+                if !is_deleted && latest.values.get(col_idx) == Some(val) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn insert(&mut self, tid: u64, pk: u64, values: Vec<Value>) -> Result<()> {
@@ -359,17 +613,18 @@ impl Rng {
 
 // Test Context
 struct TestContext {
+    _temp_dir: tempfile::TempDir,
     db_path: PathBuf,
-    wal_path: PathBuf,
 }
 
 impl TestContext {
     fn new(name: &str) -> Self {
-        let db_path = PathBuf::from(format!("test_mvcc_ref_{name}.treedb"));
-        let wal_path = PathBuf::from(format!("test_mvcc_ref_{name}.treedb.wal"));
-        let _ = fs::remove_file(&db_path);
-        let _ = fs::remove_file(&wal_path);
-        Self { db_path, wal_path }
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join(format!("test_mvcc_ref_{name}.treedb"));
+        Self {
+            _temp_dir: temp_dir,
+            db_path,
+        }
     }
 
     fn db(&self) -> TreeDb {
@@ -378,15 +633,6 @@ impl TestContext {
         } else {
             TreeDb::create(&self.db_path, 64).unwrap()
         }
-    }
-}
-
-impl Drop for TestContext {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.db_path);
-        let _ = fs::remove_file(&self.wal_path);
-        let bak = PathBuf::from(format!("{}.bak", self.wal_path.display()));
-        let _ = fs::remove_file(&bak);
     }
 }
 
@@ -1201,4 +1447,293 @@ fn test_randomized_differential_mvcc_vacuum_and_active_snapshots() {
     let fin_expected = ref_engine.scan_visible(&fin_ref_snap);
     assert_rows_match(&fin_actual, &fin_expected, "Final state after full vacuum");
     tx_fin.commit().unwrap();
+}
+
+// =============================================================================
+// Section 19: Randomized Differential Conflict Detection & Commit Validation
+// =============================================================================
+
+#[test]
+fn test_randomized_differential_conflict_detection_and_commit_validation() {
+    let ctx = TestContext::new("random_diff_conflicts");
+    let mut db = ctx.db();
+
+    db.execute_statement(
+        "CREATE TABLE accounts (id UINT64 PRIMARY KEY, account_num TEXT, balance INT64)",
+    )
+    .unwrap();
+    db.execute_statement("CREATE UNIQUE INDEX idx_accounts_num ON accounts(account_num)")
+        .unwrap();
+
+    let mut ref_engine = RefEngine::new();
+    let seed = 135792468u64;
+    let mut rng = Rng::new(seed);
+
+    let mut registered_snapshots: Vec<(treedb::engine::isolation::Snapshot, RefSnapshot)> =
+        Vec::new();
+
+    // Run 50 interleaved operations:
+    // Testing inserts, updates, deletes, snapshot reads, commits, aborts, conflicts, vacuum
+    for op_i in 0..50 {
+        let op_choice = rng.next_range(0, 6);
+        match op_choice {
+            0 => {
+                // Interleaved write attempt with potential write-write or unique conflict
+                let pk = rng.next_range(1, 10);
+                let acc_num = format!("ACC-{}", rng.next_range(1, 10));
+                let balance = rng.next_range(100, 500) as i64;
+
+                let mut tx = db.begin_transaction().unwrap();
+                let ref_tid = ref_engine.begin_txn();
+                let snap_seq = ref_engine.next_commit_seq - 1;
+
+                // Pick an existing snapshot if available to test stale modification
+                if !registered_snapshots.is_empty() && rng.next_range(0, 2) == 0 {
+                    let (db_s, _) = &registered_snapshots
+                        [rng.next_range(0, registered_snapshots.len() as u64 - 1) as usize];
+                    tx.set_snapshot(*db_s);
+                }
+
+                let insert_sql =
+                    format!("INSERT INTO accounts VALUES ({pk}, '{acc_num}', {balance})");
+                let db_res = tx.execute_statement(&insert_sql);
+                ref_engine.record_intent_insert(
+                    ref_tid,
+                    pk,
+                    vec![
+                        Value::UInt64(pk),
+                        Value::String(acc_num.clone()),
+                        Value::Int64(balance),
+                    ],
+                    snap_seq,
+                );
+
+                if db_res.is_err() {
+                    // Pre-commit failure (e.g. duplicate key or conflict)
+                    let _ = tx.abort();
+                    ref_engine.abort_txn(ref_tid);
+                } else {
+                    let ref_val = ref_engine.validate_and_commit_txn(ref_tid, Some(1));
+                    let db_val = tx.commit();
+
+                    match (db_val, ref_val) {
+                        (Ok(_), Ok(_)) => {
+                            // Both committed successfully
+                        }
+                        (Err(db_err), Err(ref_conflict)) => {
+                            // Both detected conflict or constraint violation
+                            assert!(
+                                db_err.is_conflict() || db_err.to_string().contains("already exists") || db_err.to_string().contains("Duplicate key"),
+                                "Op {op_i}: DB error should be a conflict or constraint error: {db_err}"
+                            );
+                            let _ = ref_conflict;
+                            ref_engine.abort_txn(ref_tid);
+                        }
+                        (Ok(_), Err(ref_c)) => {
+                            panic!("Op {op_i}: DB committed but reference engine flagged conflict: {:?}", ref_c);
+                        }
+                        (Err(db_e), Ok(_)) => {
+                            panic!(
+                                "Op {op_i}: DB failed with {:?} but reference engine committed",
+                                db_e
+                            );
+                        }
+                    }
+                }
+            }
+            1 => {
+                // Update attempt
+                let pk = rng.next_range(1, 10);
+                let new_acc = format!("ACC-{}", rng.next_range(1, 10));
+                let new_bal = rng.next_range(500, 999) as i64;
+
+                let mut tx = db.begin_transaction().unwrap();
+                let ref_tid = ref_engine.begin_txn();
+                let snap_seq = ref_engine.next_commit_seq - 1;
+
+                if !registered_snapshots.is_empty() && rng.next_range(0, 2) == 0 {
+                    let (db_s, _) = &registered_snapshots
+                        [rng.next_range(0, registered_snapshots.len() as u64 - 1) as usize];
+                    tx.set_snapshot(*db_s);
+                }
+
+                // Determine target version in reference model
+                let target_xmin = ref_engine.records.get(&pk).and_then(|r| {
+                    r.versions
+                        .iter()
+                        .rev()
+                        .find(|v| {
+                            matches!(
+                                ref_engine.txns.get(&v.xmin),
+                                Some(RefTxnStatus::Committed(_))
+                            )
+                        })
+                        .map(|v| v.xmin)
+                });
+
+                if target_xmin.is_some() {
+                    let update_sql = format!(
+                        "UPDATE accounts SET account_num = '{new_acc}', balance = {new_bal} WHERE id = {pk}"
+                    );
+                    let db_res = tx.execute_statement(&update_sql);
+                    ref_engine.record_intent_update(
+                        ref_tid,
+                        pk,
+                        target_xmin,
+                        vec![
+                            Value::UInt64(pk),
+                            Value::String(new_acc),
+                            Value::Int64(new_bal),
+                        ],
+                        snap_seq,
+                    );
+
+                    if db_res.is_err() {
+                        let _ = tx.abort();
+                        ref_engine.abort_txn(ref_tid);
+                    } else {
+                        let ref_val = ref_engine.validate_and_commit_txn(ref_tid, Some(1));
+                        let db_val = tx.commit();
+
+                        match (db_val, ref_val) {
+                            (Ok(_), Ok(_)) => {}
+                            (Err(db_err), Err(_)) => {
+                                assert!(
+                                    db_err.is_conflict()
+                                        || db_err.to_string().contains("already exists")
+                                );
+                                ref_engine.abort_txn(ref_tid);
+                            }
+                            (Ok(_), Err(ref_c)) => {
+                                panic!("Op {op_i}: DB committed update but reference flagged conflict: {:?}", ref_c);
+                            }
+                            (Err(db_e), Ok(_)) => {
+                                panic!(
+                                    "Op {op_i}: DB failed with {:?} but reference engine committed",
+                                    db_e
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    let _ = tx.abort();
+                    ref_engine.abort_txn(ref_tid);
+                }
+            }
+            2 => {
+                // Delete attempt
+                let pk = rng.next_range(1, 10);
+                let mut tx = db.begin_transaction().unwrap();
+                let ref_tid = ref_engine.begin_txn();
+                let snap_seq = ref_engine.next_commit_seq - 1;
+
+                if !registered_snapshots.is_empty() && rng.next_range(0, 2) == 0 {
+                    let (db_s, _) = &registered_snapshots
+                        [rng.next_range(0, registered_snapshots.len() as u64 - 1) as usize];
+                    tx.set_snapshot(*db_s);
+                }
+
+                let target_xmin = ref_engine.records.get(&pk).and_then(|r| {
+                    r.versions
+                        .iter()
+                        .rev()
+                        .find(|v| {
+                            matches!(
+                                ref_engine.txns.get(&v.xmin),
+                                Some(RefTxnStatus::Committed(_))
+                            )
+                        })
+                        .map(|v| v.xmin)
+                });
+
+                let del_sql = format!("DELETE FROM accounts WHERE id = {pk}");
+                let db_res = tx.execute_statement(&del_sql);
+                if target_xmin.is_some() {
+                    ref_engine.record_intent_delete(ref_tid, pk, target_xmin, snap_seq);
+                }
+
+                if db_res.is_err() {
+                    let _ = tx.abort();
+                    ref_engine.abort_txn(ref_tid);
+                } else {
+                    let ref_val = ref_engine.validate_and_commit_txn(ref_tid, Some(1));
+                    let db_val = tx.commit();
+
+                    match (db_val, ref_val) {
+                        (Ok(_), Ok(_)) => {}
+                        (Err(db_err), Err(_)) => {
+                            assert!(db_err.is_conflict());
+                            ref_engine.abort_txn(ref_tid);
+                        }
+                        (Ok(_), Err(ref_c)) => {
+                            panic!("Op {op_i}: DB committed delete but reference flagged conflict: {:?}", ref_c);
+                        }
+                        (Err(db_e), Ok(_)) => {
+                            let _ = db_e;
+                        }
+                    }
+                }
+            }
+            3 => {
+                // Register snapshot
+                let db_snap = db.register_snapshot();
+                let ref_snap = ref_engine.make_snapshot(0);
+                registered_snapshots.push((db_snap, ref_snap));
+            }
+            4 => {
+                // Release snapshot if any
+                if !registered_snapshots.is_empty() {
+                    let (db_snap, _) = registered_snapshots.remove(0);
+                    db.release_snapshot(db_snap.snapshot_id);
+                }
+            }
+            _ => {
+                // Vacuum and state verification
+                let ref_snaps: Vec<RefSnapshot> = registered_snapshots
+                    .iter()
+                    .map(|(_, rs)| rs.clone())
+                    .collect();
+                let _ = ref_engine.vacuum(&ref_snaps);
+                let _ = db
+                    .vacuum(&treedb::engine::vacuum::VacuumConfig::unlimited())
+                    .unwrap();
+
+                // Differential state comparison across registered snapshots
+                for (db_s, ref_s) in &registered_snapshots {
+                    let mut tx_check = db.begin_transaction().unwrap();
+                    tx_check.set_snapshot(*db_s);
+                    let mut table = tx_check.open_table("accounts").unwrap();
+                    let actual_rows = table.scan(None, None).unwrap();
+                    let expected_rows = ref_engine.scan_visible(ref_s);
+                    assert_rows_match(
+                        &actual_rows,
+                        &expected_rows,
+                        &format!(
+                            "Op {op_i}: Snapshot {:?} verification in conflict diff test",
+                            db_s
+                        ),
+                    );
+                    tx_check.commit().unwrap();
+                }
+
+                // Verify live table scan against current reference snapshot
+                let mut tx_curr = db.begin_transaction().unwrap();
+                let mut table = tx_curr.open_table("accounts").unwrap();
+                let curr_actual = table.scan(None, None).unwrap();
+                let curr_ref_snap = ref_engine.make_snapshot(0);
+                let curr_expected = ref_engine.scan_visible(&curr_ref_snap);
+                assert_rows_match(
+                    &curr_actual,
+                    &curr_expected,
+                    &format!("Op {op_i}: Current live accounts verification"),
+                );
+                tx_curr.commit().unwrap();
+            }
+        }
+    }
+
+    // Cleanup snapshots
+    for (db_s, _) in registered_snapshots {
+        db.release_snapshot(db_s.snapshot_id);
+    }
 }

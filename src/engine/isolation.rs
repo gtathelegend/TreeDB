@@ -15,8 +15,138 @@ use std::fmt;
 
 use crate::engine::transaction::TxnState;
 use crate::index::RecordId;
-use crate::storage::page::PageId;
+use crate::storage::page::{Key, PageId};
 use crate::wal::lsn::TxnId;
+
+/// Formal transaction conflict categories and diagnostic context.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TransactionConflict {
+    /// Write-write conflict: a transaction attempts to update or delete a logical row whose
+    /// current committed version no longer matches the version it originally targeted.
+    #[error("Write-write conflict on table '{table}', key '{key}': expected version {expected_version:?}, observed version {observed_version:?}")]
+    WriteWriteConflict {
+        /// Logical table name.
+        table: String,
+        /// Canonical representation of the key.
+        key: String,
+        /// Physical version originally targeted or expected by the transaction.
+        expected_version: Option<RecordId>,
+        /// Current committed physical version observed in the database.
+        observed_version: Option<RecordId>,
+    },
+
+    /// Stale-version write: a transaction tries to modify a historical version that has already been superseded.
+    #[error("Stale-version write on table '{table}', key '{key}': target version {target_version:?} has already been superseded")]
+    StaleVersionWrite {
+        /// Logical table name.
+        table: String,
+        /// Canonical representation of the key.
+        key: String,
+        /// Physical version that was superseded.
+        target_version: RecordId,
+    },
+
+    /// Concurrent logical-key change: the transaction's intended primary-key operation conflicts
+    /// with an intervening committed change.
+    #[error("Concurrent logical-key change on table '{table}', key '{key}': intervening committed change detected: {detail}")]
+    ConcurrentLogicalKeyChange {
+        /// Logical table name.
+        table: String,
+        /// Canonical representation of the key.
+        key: String,
+        /// Diagnostic detail about the conflicting key mutation.
+        detail: String,
+    },
+
+    /// Unique-index conflict: an insert or indexed-key update would violate a unique constraint
+    /// under the engine's documented uniqueness semantics.
+    #[error(
+        "Unique-index conflict on index '{index_name}', key '{key}': violates unique constraint"
+    )]
+    UniqueIndexConflict {
+        /// Unique secondary index name.
+        index_name: String,
+        /// Conflicting indexed key representation.
+        key: String,
+    },
+
+    /// Invalid transaction state: the transaction attempts to commit after aborting, commit twice,
+    /// or otherwise perform an invalid state transition.
+    #[error("Invalid transaction state: cannot perform '{action}' while transaction {txn_id} is in '{current}' state")]
+    InvalidTransactionState {
+        /// Transaction identifier.
+        txn_id: TxnId,
+        /// Current lifecycle state.
+        current: String,
+        /// Attempted action or transition.
+        action: String,
+    },
+
+    /// Write-set validation failure: the transaction's accumulated write intent cannot be safely
+    /// applied at commit time.
+    #[error("Write-set validation failure for transaction {txn_id}: {reason}")]
+    WriteSetValidationFailure {
+        /// Transaction identifier.
+        txn_id: TxnId,
+        /// Reason the write-set cannot be safely committed.
+        reason: String,
+    },
+}
+
+impl TransactionConflict {
+    /// Returns the canonical category name of this conflict.
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::WriteWriteConflict { .. } => "WriteWriteConflict",
+            Self::StaleVersionWrite { .. } => "StaleVersionWrite",
+            Self::ConcurrentLogicalKeyChange { .. } => "ConcurrentLogicalKeyChange",
+            Self::UniqueIndexConflict { .. } => "UniqueIndexConflict",
+            Self::InvalidTransactionState { .. } => "InvalidTransactionState",
+            Self::WriteSetValidationFailure { .. } => "WriteSetValidationFailure",
+        }
+    }
+}
+
+/// Logical write operation kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WriteOpKind {
+    /// Insertion of a new logical row.
+    Insert,
+    /// Modification of an existing logical row.
+    Update,
+    /// Deletion of an existing logical row.
+    Delete,
+}
+
+impl fmt::Display for WriteOpKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Insert => write!(f, "INSERT"),
+            Self::Update => write!(f, "UPDATE"),
+            Self::Delete => write!(f, "DELETE"),
+        }
+    }
+}
+
+/// Explicit record of a transaction's intended modification on a logical row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowWriteIntent {
+    /// Logical table name (or `__kv__` for key-value store).
+    pub table: String,
+    /// Canonical primary key integer.
+    pub key: Key,
+    /// Diagnostic string representation of the key.
+    pub key_repr: String,
+    /// The physical version originally targeted by the operation (visible under snapshot).
+    /// `None` if the row was created as a new insert.
+    pub target_version: Option<RecordId>,
+    /// The newly created physical version, or `None` if the final intended state is deleted.
+    pub new_version: Option<RecordId>,
+    /// The snapshot commit sequence under which the target version was identified.
+    pub snapshot_commit_seq: CommitSeq,
+    /// The final intended logical operation kind.
+    pub op_kind: WriteOpKind,
+}
 
 /// Explicit SQL transaction isolation levels supported or prepared in TreeDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -415,6 +545,8 @@ pub struct TransactionWriteSet {
     updated: HashSet<RecordId>,
     deleted: HashSet<RecordId>,
     modified_tables: HashSet<String>,
+    intents: BTreeMap<(String, Key), RowWriteIntent>,
+    conflict: Option<TransactionConflict>,
 }
 
 impl TransactionWriteSet {
@@ -442,6 +574,143 @@ impl TransactionWriteSet {
     /// Records a modified table name.
     pub fn record_table_mutation(&mut self, table: &str) {
         self.modified_tables.insert(table.to_string());
+    }
+
+    /// Returns the recorded conflict if any operation encountered a conflict.
+    pub fn conflict(&self) -> Option<&TransactionConflict> {
+        self.conflict.as_ref()
+    }
+
+    /// Records a conflict on this write set.
+    pub fn record_conflict(&mut self, conflict: TransactionConflict) {
+        if self.conflict.is_none() {
+            self.conflict = Some(conflict);
+        }
+    }
+
+    /// Returns `true` if this write set has encountered a conflict.
+    pub fn has_conflict(&self) -> bool {
+        self.conflict.is_some()
+    }
+
+    /// Returns an immutable reference to all row write intents in deterministic order.
+    pub fn intents(&self) -> &BTreeMap<(String, Key), RowWriteIntent> {
+        &self.intents
+    }
+
+    /// Returns the write intent for a specific table and key.
+    pub fn get_intent(&self, table: &str, key: Key) -> Option<&RowWriteIntent> {
+        self.intents.get(&(table.to_string(), key))
+    }
+
+    /// Records an intended row insert.
+    pub fn record_row_insert(
+        &mut self,
+        table: &str,
+        key: Key,
+        key_repr: String,
+        new_rid: RecordId,
+        snapshot_seq: CommitSeq,
+    ) {
+        let entry_key = (table.to_string(), key);
+        if let Some(existing) = self.intents.get_mut(&entry_key) {
+            match existing.op_kind {
+                WriteOpKind::Delete => {
+                    existing.new_version = Some(new_rid);
+                    if existing.target_version.is_some() {
+                        existing.op_kind = WriteOpKind::Update;
+                    } else {
+                        existing.op_kind = WriteOpKind::Insert;
+                    }
+                }
+                _ => {
+                    existing.new_version = Some(new_rid);
+                }
+            }
+        } else {
+            self.intents.insert(
+                entry_key,
+                RowWriteIntent {
+                    table: table.to_string(),
+                    key,
+                    key_repr,
+                    target_version: None,
+                    new_version: Some(new_rid),
+                    snapshot_commit_seq: snapshot_seq,
+                    op_kind: WriteOpKind::Insert,
+                },
+            );
+        }
+    }
+
+    /// Records an intended row update.
+    pub fn record_row_update(
+        &mut self,
+        table: &str,
+        key: Key,
+        key_repr: String,
+        old_rid: RecordId,
+        new_rid: RecordId,
+        snapshot_seq: CommitSeq,
+    ) {
+        let entry_key = (table.to_string(), key);
+        if let Some(existing) = self.intents.get_mut(&entry_key) {
+            match existing.op_kind {
+                WriteOpKind::Delete => {
+                    existing.new_version = Some(new_rid);
+                    if existing.target_version.is_some() {
+                        existing.op_kind = WriteOpKind::Update;
+                    } else {
+                        existing.op_kind = WriteOpKind::Insert;
+                    }
+                }
+                _ => {
+                    existing.new_version = Some(new_rid);
+                }
+            }
+        } else {
+            self.intents.insert(
+                entry_key,
+                RowWriteIntent {
+                    table: table.to_string(),
+                    key,
+                    key_repr,
+                    target_version: Some(old_rid),
+                    new_version: Some(new_rid),
+                    snapshot_commit_seq: snapshot_seq,
+                    op_kind: WriteOpKind::Update,
+                },
+            );
+        }
+    }
+
+    /// Records an intended row delete.
+    pub fn record_row_delete(
+        &mut self,
+        table: &str,
+        key: Key,
+        key_repr: String,
+        old_rid: RecordId,
+        snapshot_seq: CommitSeq,
+    ) {
+        let entry_key = (table.to_string(), key);
+        if let Some(existing) = self.intents.get_mut(&entry_key) {
+            existing.new_version = None;
+            existing.op_kind = WriteOpKind::Delete;
+        } else {
+            self.intents.insert(
+                entry_key,
+                RowWriteIntent {
+                    table: table.to_string(),
+                    key,
+                    key_repr,
+                    target_version: Some(old_rid),
+                    new_version: None,
+                    snapshot_commit_seq: snapshot_seq,
+                    op_kind: WriteOpKind::Delete,
+                },
+            );
+        }
     }
 
     /// Returns `true` if the specified `RecordId` was affected by this transaction.
@@ -505,6 +774,8 @@ impl TransactionWriteSet {
             && self.updated.is_empty()
             && self.deleted.is_empty()
             && self.modified_tables.is_empty()
+            && self.intents.is_empty()
+            && self.conflict.is_none()
     }
 
     /// Clears all recorded writes.
@@ -513,6 +784,8 @@ impl TransactionWriteSet {
         self.updated.clear();
         self.deleted.clear();
         self.modified_tables.clear();
+        self.intents.clear();
+        self.conflict = None;
     }
 }
 

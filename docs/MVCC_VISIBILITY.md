@@ -100,4 +100,14 @@ In Phase 70, snapshot visibility forms the primary safety predicate for garbage 
 - Only versions whose deletion was committed at or before the reclamation horizon ($d_{\text{seq}} \le \text{Horizon}$) and are unneeded by every active snapshot are eligible for pruning.
 - See [MVCC_VACUUM.md](file:///d:/Projects/TreeDB/docs/MVCC_VACUUM.md) for complete details.
 
+---
+
+## 10. Phase 71: Decoupling Snapshot Visibility from Write Validation
+
+Phase 71 explicitly decouples snapshot visibility from commit validation:
+- **Visibility**: Dictates which version an active transaction can observe during read queries based on its snapshot sequence ($xmin \le S < xmax$).
+- **Write Validation**: Dictates whether a proposed modification remains valid at commit time based on the latest committed state ($C_{\text{head}}$).
+- Reading an older version under a valid historical snapshot is permitted, but attempting to commit a write that supersedes or modifies that stale row will trigger a `WriteWriteConflict` or `StaleVersionWrite`.
+- See [MVCC_CONFLICTS.md](file:///d:/Projects/TreeDB/docs/MVCC_CONFLICTS.md) for complete details.
+
 

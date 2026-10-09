@@ -189,6 +189,7 @@ impl<'a> Table<'a> {
     pub fn insert(&mut self, row: &Row) -> Result<()> {
         self.metadata.schema.validate_row(row)?;
         let key = self.metadata.schema.extract_primary_key(row)?;
+        let pk_val = &row.values[self.metadata.schema.primary_key_idx];
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
 
@@ -200,12 +201,51 @@ impl<'a> Table<'a> {
                 reader_txn,
                 &snapshot,
             )? {
-                let pk_val = &row.values[self.metadata.schema.primary_key_idx];
                 return Err(Error::DuplicatePrimaryKey(format!("{pk_val}")));
+            } else if let Ok(Some((existing_meta, _))) = self
+                .record_store
+                .read_version(self.buffer_pool, existing_rid)
+            {
+                let is_self_write =
+                    reader_txn.is_some() && existing_meta.xmin == reader_txn.unwrap();
+                let is_self_delete = reader_txn.is_some() && existing_meta.xmax == reader_txn;
+                if is_self_write {
+                    if !is_self_delete {
+                        return Err(Error::DuplicatePrimaryKey(format!("{pk_val}")));
+                    }
+                } else if is_self_delete {
+                    // Deleted by this active transaction earlier; overwriting is permitted.
+                } else if existing_meta.deleted_at.is_none() {
+                    let conflict =
+                        crate::engine::isolation::TransactionConflict::ConcurrentLogicalKeyChange {
+                            table: self.metadata.name.clone(),
+                            key: format!("{pk_val}"),
+                            detail: "primary key already committed by an intervening transaction"
+                                .to_string(),
+                        };
+                    if let Some(ws) = &mut self.write_set {
+                        ws.record_conflict(conflict.clone());
+                    }
+                    return Err(Error::TransactionConflict(conflict));
+                } else if let Some(del_seq) = existing_meta.deleted_at {
+                    if del_seq.0 > snapshot.as_of_commit_seq.0 {
+                        let conflict =
+                            crate::engine::isolation::TransactionConflict::ConcurrentLogicalKeyChange {
+                                table: self.metadata.name.clone(),
+                                key: format!("{pk_val}"),
+                                detail: "primary key was modified by an intervening transaction"
+                                    .to_string(),
+                            };
+                        if let Some(ws) = &mut self.write_set {
+                            ws.record_conflict(conflict.clone());
+                        }
+                        return Err(Error::TransactionConflict(conflict));
+                    }
+                }
             }
         }
 
-        // Validate unique secondary index constraints against visible entries
+        // Validate unique secondary index constraints against visible entries and committed entries
         for (meta, sec_idx) in &self.indexes {
             if meta.unique {
                 let idx_key = meta.extract_index_key(row);
@@ -230,6 +270,33 @@ impl<'a> Table<'a> {
                                 format!("({vals_str})")
                             },
                         ));
+                    } else if let Ok(Some((ver_meta, _))) =
+                        self.record_store.read_version(self.buffer_pool, r)
+                    {
+                        let is_self = reader_txn.is_some() && ver_meta.xmin == reader_txn.unwrap();
+                        let is_self_del = reader_txn.is_some() && ver_meta.xmax == reader_txn;
+                        if !is_self && !is_self_del && ver_meta.deleted_at.is_none() {
+                            let vals_str = meta
+                                .column_indices
+                                .iter()
+                                .map(|&i| format!("{}", row.values[i]))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let key_repr = if meta.column_indices.len() == 1 {
+                                vals_str
+                            } else {
+                                format!("({vals_str})")
+                            };
+                            let conflict =
+                                crate::engine::isolation::TransactionConflict::UniqueIndexConflict {
+                                    index_name: meta.name.clone(),
+                                    key: key_repr,
+                                };
+                            if let Some(ws) = &mut self.write_set {
+                                ws.record_conflict(conflict.clone());
+                            }
+                            return Err(Error::TransactionConflict(conflict));
+                        }
                     }
                 }
             }
@@ -243,6 +310,14 @@ impl<'a> Table<'a> {
                 .insert_version(self.buffer_pool, &meta, &tuple_bytes)?;
             if let Some(ws) = &mut self.write_set {
                 ws.record_insert(rid);
+                ws.record_table_mutation(&self.metadata.name);
+                ws.record_row_insert(
+                    &self.metadata.name,
+                    key,
+                    format!("{pk_val}"),
+                    rid,
+                    snapshot.as_of_commit_seq,
+                );
             }
             rid
         } else {
@@ -301,6 +376,7 @@ impl<'a> Table<'a> {
     pub fn update(&mut self, row: &Row) -> Result<()> {
         self.metadata.schema.validate_row(row)?;
         let key = self.metadata.schema.extract_primary_key(row)?;
+        let pk_val = &row.values[self.metadata.schema.primary_key_idx];
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
 
@@ -309,40 +385,124 @@ impl<'a> Table<'a> {
             .get(self.buffer_pool, key)?
             .ok_or(Error::RowNotFound)?;
 
-        let (_, old_meta, old_bytes) = self
+        let (head_meta, _) = self
+            .record_store
+            .read_version(self.buffer_pool, old_rid)?
+            .ok_or(Error::RowNotFound)?;
+
+        let created_by_self = reader_txn.is_some() && head_meta.xmin == reader_txn.unwrap();
+
+        if !created_by_self {
+            if let Some(created_at) = head_meta.created_at {
+                if created_at.0 > snapshot.as_of_commit_seq.0 {
+                    let conflict =
+                        crate::engine::isolation::TransactionConflict::WriteWriteConflict {
+                            table: self.metadata.name.clone(),
+                            key: format!("{pk_val}"),
+                            expected_version: None,
+                            observed_version: Some(old_rid),
+                        };
+                    if let Some(ws) = &mut self.write_set {
+                        ws.record_conflict(conflict.clone());
+                    }
+                    return Err(Error::TransactionConflict(conflict));
+                }
+            }
+
+            if let Some(del_seq) = head_meta.deleted_at {
+                if del_seq.0 > snapshot.as_of_commit_seq.0 {
+                    let conflict =
+                        crate::engine::isolation::TransactionConflict::StaleVersionWrite {
+                            table: self.metadata.name.clone(),
+                            key: format!("{pk_val}"),
+                            target_version: old_rid,
+                        };
+                    if let Some(ws) = &mut self.write_set {
+                        ws.record_conflict(conflict.clone());
+                    }
+                    return Err(Error::TransactionConflict(conflict));
+                } else {
+                    return Err(Error::RowNotFound);
+                }
+            }
+        }
+
+        let (visible_rid, old_meta, old_bytes) = self
             .record_store
             .read_visible(self.buffer_pool, old_rid, reader_txn, &snapshot)?
             .ok_or(Error::RowNotFound)?;
+
+        if !created_by_self && visible_rid != old_rid {
+            let conflict = crate::engine::isolation::TransactionConflict::WriteWriteConflict {
+                table: self.metadata.name.clone(),
+                key: format!("{pk_val}"),
+                expected_version: Some(visible_rid),
+                observed_version: Some(old_rid),
+            };
+            if let Some(ws) = &mut self.write_set {
+                ws.record_conflict(conflict.clone());
+            }
+            return Err(Error::TransactionConflict(conflict));
+        }
+
         let old_row = self.metadata.schema.decode_tuple(&old_bytes)?;
 
-        // Validate uniqueness on changed indexed values against visible records
+        // Validate uniqueness on changed indexed values against visible records and committed live records
         for (meta, sec_idx) in &self.indexes {
             let old_key = meta.extract_index_key(&old_row);
             let new_key = meta.extract_index_key(row);
             if meta.unique && old_key != new_key {
                 let existing = sec_idx.lookup(self.buffer_pool, &new_key)?;
                 for r in existing {
-                    if r != old_rid
-                        && self.record_store.is_version_visible(
+                    if r != visible_rid {
+                        if self.record_store.is_version_visible(
                             self.buffer_pool,
                             r,
                             reader_txn,
                             &snapshot,
-                        )?
-                    {
-                        let vals_str = meta
-                            .column_indices
-                            .iter()
-                            .map(|&i| format!("{}", row.values[i]))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        return Err(Error::DuplicateIndexKey(
-                            if meta.column_indices.len() == 1 {
-                                vals_str
-                            } else {
-                                format!("({vals_str})")
-                            },
-                        ));
+                        )? {
+                            let vals_str = meta
+                                .column_indices
+                                .iter()
+                                .map(|&i| format!("{}", row.values[i]))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(Error::DuplicateIndexKey(
+                                if meta.column_indices.len() == 1 {
+                                    vals_str
+                                } else {
+                                    format!("({vals_str})")
+                                },
+                            ));
+                        } else if let Ok(Some((ver_meta, _))) =
+                            self.record_store.read_version(self.buffer_pool, r)
+                        {
+                            let is_self =
+                                reader_txn.is_some() && ver_meta.xmin == reader_txn.unwrap();
+                            let is_self_del = reader_txn.is_some() && ver_meta.xmax == reader_txn;
+                            if !is_self && !is_self_del && ver_meta.deleted_at.is_none() {
+                                let vals_str = meta
+                                    .column_indices
+                                    .iter()
+                                    .map(|&i| format!("{}", row.values[i]))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let key_repr = if meta.column_indices.len() == 1 {
+                                    vals_str
+                                } else {
+                                    format!("({vals_str})")
+                                };
+                                let conflict =
+                                    crate::engine::isolation::TransactionConflict::UniqueIndexConflict {
+                                        index_name: meta.name.clone(),
+                                        key: key_repr,
+                                    };
+                                if let Some(ws) = &mut self.write_set {
+                                    ws.record_conflict(conflict.clone());
+                                }
+                                return Err(Error::TransactionConflict(conflict));
+                            }
+                        }
                     }
                 }
             }
@@ -361,6 +521,15 @@ impl<'a> Table<'a> {
                     .insert_version(self.buffer_pool, &new_meta, &tuple_bytes)?;
             if let Some(ws) = &mut self.write_set {
                 ws.record_update(old_rid, new_rid);
+                ws.record_table_mutation(&self.metadata.name);
+                ws.record_row_update(
+                    &self.metadata.name,
+                    key,
+                    format!("{pk_val}"),
+                    visible_rid,
+                    new_rid,
+                    snapshot.as_of_commit_seq,
+                );
             }
             new_rid
         } else {
@@ -382,10 +551,6 @@ impl<'a> Table<'a> {
         self.tree.update(self.buffer_pool, key, new_rid)?;
 
         // Maintain secondary indexes by inserting new version mapping.
-        // We preserve historical version entries in secondary indexes so that
-        // historical snapshots continue to observe prior versions through index scans.
-        // For unique indexes where the key did not change, replace the old version
-        // pointer with the new version pointer to preserve the unique B+ Tree invariant.
         for (meta, sec_idx) in &mut self.indexes {
             let old_key = meta.extract_index_key(&old_row);
             let new_key = meta.extract_index_key(row);
@@ -414,7 +579,49 @@ impl<'a> Table<'a> {
             None => return Ok(None),
         };
 
-        let (_, old_meta, old_bytes) = match self.record_store.read_visible(
+        let (head_meta, _) = match self.record_store.read_version(self.buffer_pool, old_rid)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let created_by_self = reader_txn.is_some() && head_meta.xmin == reader_txn.unwrap();
+
+        if !created_by_self {
+            if let Some(created_at) = head_meta.created_at {
+                if created_at.0 > snapshot.as_of_commit_seq.0 {
+                    let conflict =
+                        crate::engine::isolation::TransactionConflict::WriteWriteConflict {
+                            table: self.metadata.name.clone(),
+                            key: format!("{pk}"),
+                            expected_version: None,
+                            observed_version: Some(old_rid),
+                        };
+                    if let Some(ws) = &mut self.write_set {
+                        ws.record_conflict(conflict.clone());
+                    }
+                    return Err(Error::TransactionConflict(conflict));
+                }
+            }
+
+            if let Some(del_seq) = head_meta.deleted_at {
+                if del_seq.0 > snapshot.as_of_commit_seq.0 {
+                    let conflict =
+                        crate::engine::isolation::TransactionConflict::StaleVersionWrite {
+                            table: self.metadata.name.clone(),
+                            key: format!("{pk}"),
+                            target_version: old_rid,
+                        };
+                    if let Some(ws) = &mut self.write_set {
+                        ws.record_conflict(conflict.clone());
+                    }
+                    return Err(Error::TransactionConflict(conflict));
+                } else {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let (visible_rid, old_meta, old_bytes) = match self.record_store.read_visible(
             self.buffer_pool,
             old_rid,
             reader_txn,
@@ -423,6 +630,19 @@ impl<'a> Table<'a> {
             Some(v) => v,
             None => return Ok(None),
         };
+
+        if !created_by_self && visible_rid != old_rid {
+            let conflict = crate::engine::isolation::TransactionConflict::WriteWriteConflict {
+                table: self.metadata.name.clone(),
+                key: format!("{pk}"),
+                expected_version: Some(visible_rid),
+                observed_version: Some(old_rid),
+            };
+            if let Some(ws) = &mut self.write_set {
+                ws.record_conflict(conflict.clone());
+            }
+            return Err(Error::TransactionConflict(conflict));
+        }
 
         let row = self.metadata.schema.decode_tuple(&old_bytes)?;
 
@@ -433,6 +653,14 @@ impl<'a> Table<'a> {
                 .update_version_metadata(self.buffer_pool, old_rid, &updated_old)?;
             if let Some(ws) = &mut self.write_set {
                 ws.record_delete(old_rid);
+                ws.record_table_mutation(&self.metadata.name);
+                ws.record_row_delete(
+                    &self.metadata.name,
+                    key,
+                    format!("{pk}"),
+                    visible_rid,
+                    snapshot.as_of_commit_seq,
+                );
             }
         } else {
             let commit_seq = CommitSeq(self.buffer_pool.durable_max_commit_seq().saturating_add(1));
@@ -443,10 +671,6 @@ impl<'a> Table<'a> {
                 .update_version_metadata(self.buffer_pool, old_rid, &updated_old)?;
             let _ = self.buffer_pool.set_max_commit_seq(commit_seq.0);
         }
-
-        // In delete, historical version entries are preserved in secondary indexes
-        // so that eligible historical snapshots can continue observing the deleted row.
-        // Invisible historical versions are filtered out dynamically during index scans.
 
         self.sync_metadata_if_needed()?;
         Ok(Some(row))

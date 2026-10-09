@@ -646,10 +646,33 @@ pub enum Error {
     /// General vacuum execution error.
     #[error("Vacuum error: {0}")]
     VacuumError(String),
+
+    /// Transaction conflict detected during execution or commit validation.
+    #[error("Transaction conflict: {0}")]
+    TransactionConflict(#[from] crate::engine::isolation::TransactionConflict),
 }
 
 impl From<crate::query::validation::PlanValidationError> for Error {
     fn from(err: crate::query::validation::PlanValidationError) -> Self {
         Error::PlanValidation(Box::new(err))
+    }
+}
+
+impl Error {
+    /// Returns true if this error represents a transaction conflict or invalid state transition.
+    pub fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            Error::TransactionConflict(_) | Error::InvalidTransactionState { .. }
+        )
+    }
+
+    /// Returns the transaction conflict category if this is a conflict error.
+    pub fn conflict_category(&self) -> Option<&'static str> {
+        match self {
+            Error::TransactionConflict(c) => Some(c.category()),
+            Error::InvalidTransactionState { .. } => Some("InvalidTransactionState"),
+            _ => None,
+        }
     }
 }
