@@ -36,6 +36,38 @@ pub const VERSION_HEADER_SIZE: usize = 46;
 /// Maximum allowable version chain traversal depth before rejecting as pathological.
 pub const MAX_VERSION_CHAIN_DEPTH: usize = 1000;
 
+/// Strongly-typed identifier representing a specific physical version of a record.
+///
+/// Distinct from logical record identity (which in TreeDB is established by the table's
+/// primary key in the primary B+ Tree). Each physical version allocated in `RecordStore`
+/// has a unique `VersionId` corresponding to its physical `RecordId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VersionId(pub RecordId);
+
+impl VersionId {
+    /// Creates a new `VersionId` wrapping a physical `RecordId`.
+    pub const fn new(page_id: PageId, slot_id: u32) -> Self {
+        Self(RecordId::new(page_id, slot_id))
+    }
+
+    /// Returns the underlying `RecordId`.
+    pub const fn record_id(&self) -> RecordId {
+        self.0
+    }
+}
+
+impl From<RecordId> for VersionId {
+    fn from(rid: RecordId) -> Self {
+        Self(rid)
+    }
+}
+
+impl From<VersionId> for RecordId {
+    fn from(vid: VersionId) -> Self {
+        vid.0
+    }
+}
+
 /// Persistent MVCC record version metadata describing creation, deletion, and version history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionMetadata {
@@ -815,7 +847,14 @@ impl RecordStore {
             }
 
             match metadata.prev_version {
-                Some(prev) => curr_rid = prev,
+                Some(prev) => {
+                    if prev == curr_rid {
+                        return Err(Error::VersionChainCycle(format!(
+                            "self-referencing previous pointer at {curr_rid:?}"
+                        )));
+                    }
+                    curr_rid = prev;
+                }
                 None => break,
             }
         }
@@ -847,6 +886,60 @@ impl RecordStore {
         Ok(self
             .read_visible(buffer_pool, head_rid, reader_txn, snapshot)?
             .is_some())
+    }
+
+    /// Checks whether a specific physical version is visible to `snapshot` and `reader_txn`.
+    ///
+    /// Unlike `is_record_visible`, this does NOT traverse `prev_version` links;
+    /// it checks only whether the exact physical record identified by `rid` is visible.
+    pub fn is_version_visible(
+        &self,
+        buffer_pool: &mut BufferPool,
+        rid: RecordId,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+    ) -> Result<bool> {
+        let (metadata, _) = match self.read_version(buffer_pool, rid)? {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+        Ok(MvccVisibilityPolicy::is_visible(
+            metadata.xmin,
+            metadata.xmax,
+            metadata.created_at,
+            metadata.deleted_at,
+            reader_txn,
+            snapshot,
+        ))
+    }
+
+    /// Reads an individual physical MVCC version and returns its metadata and payload
+    /// ONLY if that exact version is visible to `snapshot` and `reader_txn`.
+    ///
+    /// Unlike `read_visible`, this does NOT traverse `prev_version` links.
+    pub fn read_exact_version_if_visible(
+        &self,
+        buffer_pool: &mut BufferPool,
+        rid: RecordId,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+    ) -> Result<Option<(VersionMetadata, Vec<u8>)>> {
+        let (metadata, payload) = match self.read_version(buffer_pool, rid)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if MvccVisibilityPolicy::is_visible(
+            metadata.xmin,
+            metadata.xmax,
+            metadata.created_at,
+            metadata.deleted_at,
+            reader_txn,
+            snapshot,
+        ) {
+            Ok(Some((metadata, payload)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Validates the entire version chain starting from `head_rid`.

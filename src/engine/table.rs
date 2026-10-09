@@ -211,7 +211,7 @@ impl<'a> Table<'a> {
                 let idx_key = meta.extract_index_key(row);
                 let existing = sec_idx.lookup(self.buffer_pool, &idx_key)?;
                 for r in existing {
-                    if self.record_store.is_record_visible(
+                    if self.record_store.is_version_visible(
                         self.buffer_pool,
                         r,
                         reader_txn,
@@ -323,7 +323,7 @@ impl<'a> Table<'a> {
                 let existing = sec_idx.lookup(self.buffer_pool, &new_key)?;
                 for r in existing {
                     if r != old_rid
-                        && self.record_store.is_record_visible(
+                        && self.record_store.is_version_visible(
                             self.buffer_pool,
                             r,
                             reader_txn,
@@ -381,13 +381,19 @@ impl<'a> Table<'a> {
 
         self.tree.update(self.buffer_pool, key, new_rid)?;
 
-        // Maintain secondary indexes by replacing old version mapping with new version mapping
+        // Maintain secondary indexes by inserting new version mapping.
+        // We preserve historical version entries in secondary indexes so that
+        // historical snapshots continue to observe prior versions through index scans.
+        // For unique indexes where the key did not change, replace the old version
+        // pointer with the new version pointer to preserve the unique B+ Tree invariant.
         for (meta, sec_idx) in &mut self.indexes {
             let old_key = meta.extract_index_key(&old_row);
             let new_key = meta.extract_index_key(row);
             let new_payload = meta.extract_covered_payload(row)?;
 
-            sec_idx.delete(self.buffer_pool, &old_key, old_rid)?;
+            if meta.unique && old_key == new_key {
+                sec_idx.delete(self.buffer_pool, &old_key, old_rid)?;
+            }
             sec_idx.insert_with_payload(self.buffer_pool, &new_key, &new_payload, new_rid)?;
         }
 
@@ -438,11 +444,9 @@ impl<'a> Table<'a> {
             let _ = self.buffer_pool.set_max_commit_seq(commit_seq.0);
         }
 
-        // Remove from secondary indexes
-        for (meta, sec_idx) in &mut self.indexes {
-            let idx_key = meta.extract_index_key(&row);
-            sec_idx.delete(self.buffer_pool, &idx_key, old_rid)?;
-        }
+        // In delete, historical version entries are preserved in secondary indexes
+        // so that eligible historical snapshots can continue observing the deleted row.
+        // Invisible historical versions are filtered out dynamically during index scans.
 
         self.sync_metadata_if_needed()?;
         Ok(Some(row))
@@ -488,11 +492,11 @@ impl<'a> Table<'a> {
 
     /// Performs a point lookup on a secondary index, returning all matching rows.
     pub fn index_lookup(&mut self, index_name: &str, value: &Value) -> Result<Vec<Row>> {
-        let sec_idx = self
+        let (meta, sec_idx) = self
             .indexes
             .iter()
             .find(|(m, _)| m.name == index_name)
-            .map(|(_, s)| *s)
+            .map(|(m, s)| (m.clone(), *s))
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
         let idx_key = IndexKey::from_value(value);
@@ -502,7 +506,7 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
 
         for rid in rids {
-            if let Some(bytes) = self.record_store.read_visible_payload(
+            if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
                 self.buffer_pool,
                 rid,
                 reader_txn,
@@ -510,6 +514,16 @@ impl<'a> Table<'a> {
             )? {
                 let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
+            } else if meta.unique {
+                if let Some((_, _, bytes)) =
+                    self.record_store
+                        .read_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
+                {
+                    let row = self.metadata.schema.decode_tuple(&bytes)?;
+                    if meta.extract_index_key(&row) == idx_key {
+                        rows.push(row);
+                    }
+                }
             }
         }
 
@@ -518,25 +532,49 @@ impl<'a> Table<'a> {
 
     /// Performs a point lookup on a secondary index, returning matching record IDs without decoding tuples.
     pub fn index_lookup_rids(&mut self, index_name: &str, value: &Value) -> Result<Vec<RecordId>> {
-        let sec_idx = self
+        let (meta, sec_idx) = self
             .indexes
             .iter()
             .find(|(m, _)| m.name == index_name)
-            .map(|(_, s)| *s)
+            .map(|(m, s)| (m.clone(), *s))
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
         let idx_key = IndexKey::from_value(value);
-        sec_idx.lookup(self.buffer_pool, &idx_key)
+        let rids = sec_idx.lookup(self.buffer_pool, &idx_key)?;
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+        let mut visible = Vec::with_capacity(rids.len());
+        for rid in rids {
+            if self
+                .record_store
+                .is_version_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
+            {
+                visible.push(rid);
+            } else if meta.unique {
+                if let Some((vis_rid, _, bytes)) =
+                    self.record_store
+                        .read_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
+                {
+                    let row = self.metadata.schema.decode_tuple(&bytes)?;
+                    if meta.extract_index_key(&row) == idx_key {
+                        visible.push(vis_rid);
+                    }
+                }
+            }
+        }
+        Ok(visible)
     }
 
     /// Fetches and decodes a row tuple given its record storage ID.
     pub fn get_row_by_rid(&mut self, rid: RecordId) -> Result<Option<Row>> {
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
-        if let Some(bytes) =
-            self.record_store
-                .read_visible_payload(self.buffer_pool, rid, reader_txn, &snapshot)?
-        {
+        if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
+            self.buffer_pool,
+            rid,
+            reader_txn,
+            &snapshot,
+        )? {
             let row = self.metadata.schema.decode_tuple(&bytes)?;
             Ok(Some(row))
         } else {
@@ -567,7 +605,7 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
 
         for (_k, rid) in entries {
-            if let Some(bytes) = self.record_store.read_visible_payload(
+            if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
                 self.buffer_pool,
                 rid,
                 reader_txn,
@@ -600,10 +638,10 @@ impl<'a> Table<'a> {
             ));
         }
 
-        if prefix_values.len() == meta.column_indices.len() {
+        let raw_rids = if prefix_values.len() == meta.column_indices.len() {
             let key = crate::index::composite::CompositeIndexKey::from_values(prefix_values)
                 .to_index_key(meta.column_indices.len());
-            sec_idx.lookup(self.buffer_pool, &key)
+            sec_idx.lookup(self.buffer_pool, &key)?
         } else {
             let start_bytes = crate::index::composite::CompositeIndexKey::encode_prefix_values(
                 prefix_values,
@@ -614,8 +652,21 @@ impl<'a> Table<'a> {
             let start_key = IndexKey::new(start_bytes);
             let end_key = end_bytes.map(IndexKey::new);
             let entries = sec_idx.scan(self.buffer_pool, Some(&start_key), end_key.as_ref())?;
-            Ok(entries.into_iter().map(|(_k, rid)| rid).collect())
+            entries.into_iter().map(|(_k, rid)| rid).collect()
+        };
+
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+        let mut visible = Vec::with_capacity(raw_rids.len());
+        for rid in raw_rids {
+            if self
+                .record_store
+                .is_version_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
+            {
+                visible.push(rid);
+            }
         }
+        Ok(visible)
     }
 
     /// Performs a composite point or prefix lookup on a secondary index, returning all matching rows.
@@ -629,7 +680,7 @@ impl<'a> Table<'a> {
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
         for rid in rids {
-            if let Some(bytes) = self.record_store.read_visible_payload(
+            if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
                 self.buffer_pool,
                 rid,
                 reader_txn,
@@ -662,7 +713,7 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
 
         for (_k, rid) in entries {
-            if let Some(bytes) = self.record_store.read_visible_payload(
+            if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
                 self.buffer_pool,
                 rid,
                 reader_txn,
@@ -691,7 +742,49 @@ impl<'a> Table<'a> {
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
         let entries = sec_idx.scan(self.buffer_pool, start_key, end_key)?;
-        Ok(entries.into_iter().map(|(_k, rid)| rid).collect())
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+        let mut visible = Vec::with_capacity(entries.len());
+        for (_k, rid) in entries {
+            if self
+                .record_store
+                .is_version_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
+            {
+                visible.push(rid);
+            }
+        }
+        Ok(visible)
+    }
+
+    /// Performs a range scan on a secondary index, returning matching (Value, RecordId) pairs visible to the current snapshot.
+    pub fn scan_index_entries(
+        &mut self,
+        index_name: &str,
+        start_key: Option<&IndexKey>,
+        end_key: Option<&IndexKey>,
+    ) -> Result<Vec<(Value, RecordId)>> {
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let col_type = self.metadata.schema.columns[meta.column_indices[0]].data_type;
+        let entries = sec_idx.scan(self.buffer_pool, start_key, end_key)?;
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+        let mut visible = Vec::with_capacity(entries.len());
+        for (k, rid) in entries {
+            if self
+                .record_store
+                .is_version_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
+            {
+                let val = k.to_value(col_type)?;
+                visible.push((val, rid));
+            }
+        }
+        Ok(visible)
     }
 
     /// Performs an index-only scan on a secondary index, reconstructing rows directly
@@ -785,7 +878,7 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
 
         for entry in entries {
-            if !self.record_store.is_record_visible(
+            if !self.record_store.is_version_visible(
                 self.buffer_pool,
                 entry.rid,
                 reader_txn,
@@ -830,10 +923,12 @@ impl<'a> Table<'a> {
     pub fn get_by_rid(&mut self, rid: RecordId) -> Result<Option<Row>> {
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
-        if let Some(bytes) =
-            self.record_store
-                .read_visible_payload(self.buffer_pool, rid, reader_txn, &snapshot)?
-        {
+        if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
+            self.buffer_pool,
+            rid,
+            reader_txn,
+            &snapshot,
+        )? {
             let row = self.metadata.schema.decode_tuple(&bytes)?;
             Ok(Some(row))
         } else {
@@ -1011,7 +1106,7 @@ impl<'a> Table<'a> {
             let reader_txn = self.reader_txn();
             let snapshot = self.current_snapshot();
             for entry in entries {
-                if let Some(bytes) = self.record_store.read_visible_payload(
+                if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
                     self.buffer_pool,
                     entry.rid,
                     reader_txn,
@@ -1095,7 +1190,7 @@ impl<'a> Table<'a> {
             stats.index_entries_examined += entries.len();
 
             for entry in entries {
-                if !self.record_store.is_record_visible(
+                if !self.record_store.is_version_visible(
                     self.buffer_pool,
                     entry.rid,
                     reader_txn,
@@ -1187,8 +1282,17 @@ impl<'a> Table<'a> {
             };
 
             entries_examined += entries.len();
+            let reader_txn = self.reader_txn();
+            let snapshot = self.current_snapshot();
             for entry in entries {
-                rids.push(entry.rid);
+                if self.record_store.is_version_visible(
+                    self.buffer_pool,
+                    entry.rid,
+                    reader_txn,
+                    &snapshot,
+                )? {
+                    rids.push(entry.rid);
+                }
             }
         }
 
@@ -1211,17 +1315,13 @@ impl<'a> Table<'a> {
 
         match scan_type {
             crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
-                if meta.column_indices.len() == 1 {
-                    let key = IndexKey::from_value(val);
-                    let rids = sec_idx.lookup(self.buffer_pool, &key)?;
-                    let count = rids.len();
-                    Ok((rids, count))
+                let rids = if meta.column_indices.len() == 1 {
+                    self.index_lookup_rids(index_name, val)?
                 } else {
-                    let rids =
-                        self.composite_index_lookup_rids(index_name, std::slice::from_ref(val))?;
-                    let count = rids.len();
-                    Ok((rids, count))
-                }
+                    self.composite_index_lookup_rids(index_name, std::slice::from_ref(val))?
+                };
+                let count = rids.len();
+                Ok((rids, count))
             }
             crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals)
             | crate::query::optimizer::SecondaryScanType::PrefixScan(vals) => {
@@ -1235,7 +1335,19 @@ impl<'a> Table<'a> {
                 let entries =
                     sec_idx.scan(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?;
                 let count = entries.len();
-                let rids = entries.into_iter().map(|(_k, rid)| rid).collect();
+                let reader_txn = self.reader_txn();
+                let snapshot = self.current_snapshot();
+                let mut rids = Vec::with_capacity(count);
+                for (_k, rid) in entries {
+                    if self.record_store.is_version_visible(
+                        self.buffer_pool,
+                        rid,
+                        reader_txn,
+                        &snapshot,
+                    )? {
+                        rids.push(rid);
+                    }
+                }
                 Ok((rids, count))
             }
             crate::query::optimizer::SecondaryScanType::SkipScan {

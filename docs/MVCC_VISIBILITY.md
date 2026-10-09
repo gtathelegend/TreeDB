@@ -58,3 +58,35 @@ Under `IsolationLevel::ReadCommitted`, each statement captures a fresh statement
 
 ### Repeatable Read
 Under `IsolationLevel::RepeatableRead`, the snapshot captured at `db.begin()` remains immutable throughout the lifetime of the transaction. Successive queries observe identical data regardless of other concurrent commits.
+
+---
+
+## 6. Exact Version Visibility vs. Chain Traversal
+
+In Phase 69, visibility checking is separated into two modes:
+1. **Chain Traversal (`RecordStore::read_visible`)**:
+   Used for primary-key lookups and sequential table scans starting from the logical head version. It follows `prev_version` links backward until finding a visible version.
+2. **Exact Version Visibility (`RecordStore::is_version_visible` / `read_exact_version_if_visible`)**:
+   Used for secondary index lookups and covering index scans. Since each secondary index entry points to a specific physical version (`VersionId`), the engine evaluates whether that exact version is visible to the transaction snapshot without traversing `prev_version` links. This prevents version confusion, duplicate rows, and covering payload leakage.
+
+---
+
+## 7. Plan Cache and Prepared Statement Snapshot Independence
+
+Physical execution plans cached in `PlanCache` are strictly independent of transaction and snapshot state:
+- `PlanCacheKey` comprises SQL text, normalized parameter types, schema/catalog generation, index generation, statistics generation, and resource planning signatures.
+- `PlanCacheKey` and physical plans contain **no** `TxnId`, `SnapshotId`, or `CommitSeq`.
+- A single cached physical plan can be executed sequentially or concurrently across distinct transactions; every execution evaluates visibility using the active transaction's runtime snapshot.
+
+---
+
+## 8. Resource Accounting & Metrics
+
+The execution engine monitors MVCC version traversal via `ExecutionResourceManager` and `QueryExecutionMetrics`:
+- `versions_examined`: Total number of physical version records inspected.
+- `max_chain_depth`: Deepest version chain traversed during query execution.
+- `historical_versions_skipped`: Number of historical versions skipped due to invisibility.
+- `version_reads`: Number of physical version records read from disk/cache.
+- `overflow_pages_read`: Number of overflow pages fetched for multi-page versions.
+- `corrupt_chains_detected`: Count of cycles or corrupt links intercepted.
+

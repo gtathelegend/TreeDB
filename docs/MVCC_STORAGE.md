@@ -2,13 +2,22 @@
 
 ## 1. Overview
 
-TreeDB Phase 68 introduces persistent multi-version record storage (MVCC) without physical background vacuuming or concurrent thread locking. Every physical slotted record in the database is wrapped with a canonical **46-byte persistent version header** (`VersionMetadata`), enabling point-in-time snapshot isolation, non-blocking readers, and durable transaction rollback.
+TreeDB Phases 68 and 69 implement persistent multi-version record storage (MVCC) without background vacuuming or concurrent thread locking. Every physical slotted record in the database is wrapped with a canonical **46-byte persistent version header** (`VersionMetadata`), enabling point-in-time snapshot isolation, non-blocking readers, and durable transaction rollback.
 
-Primary index B+ Trees and secondary indexes point to physical `RecordId`s representing either the head (newest) version or specific indexed versions. Historical versions are preserved immutably in singly-linked backward chains (`prev_version`) within the record store.
+Primary index B+ Trees point to the newest physical `RecordId` representing the logical record head. Secondary indexes point to specific physical versions (`VersionId`), retaining entries for historical versions to satisfy point-in-time snapshots. Historical versions are preserved immutably in singly-linked backward chains (`prev_version`) within the record store.
 
 ---
 
-## 2. On-Disk Version Header Layout
+## 2. Logical Record vs. Physical Version Identity
+
+Phase 69 establishes a clean architectural separation between logical records and physical versions:
+- **Logical Record Identity**: Identified by table primary key (or row identity). In the primary B+ Tree, the primary key maps to the current head version `RecordId`.
+- **Physical Version Identity (`VersionId`)**: Strongly-typed newtype `VersionId(pub RecordId)` representing a specific physical snapshot version on a specific page and slot.
+- **Secondary Index References**: Secondary index entries store the physical `VersionId` (`RecordId`) of the version that created the indexed value. During query execution, secondary indexes filter candidates using `is_version_visible` or fetch exact payloads using `read_exact_version_if_visible`, ensuring older snapshots read the exact historical version without traversing `prev_version` links.
+
+---
+
+## 3. On-Disk Version Header Layout
 
 Every record written to a `PageType::Record` page contains the 46-byte version header prepended to the user payload bytes:
 
@@ -36,7 +45,7 @@ Total fixed header overhead: **46 bytes** (`VERSION_HEADER_SIZE`).
 
 ---
 
-## 3. Storage Compatibility & Overflow Handling
+## 4. Storage Compatibility & Overflow Handling
 
 ### Inline Records
 Records where `VERSION_HEADER_SIZE + payload.len() <= MAX_RECORD_SIZE` (4070 bytes) are stored contiguously in a single slot on a `PageType::Record` page.
@@ -47,9 +56,12 @@ Records where `VERSION_HEADER_SIZE + payload.len() > MAX_RECORD_SIZE` are stored
 2. The 46-byte `VersionMetadata` stored at the beginning of the `head_page_id` `PageType::Overflow` payload area.
 3. The remaining user payload distributed across the singly-linked chain of `PageType::Overflow` pages.
 
+### Overflow Preservation
+Because MVCC updates and deletes only update `xmax` and `deleted_at` metadata rather than invoking `RecordStore::delete()`, historical overflow pages and multi-page chains are never reclaimed or returned to the freelist prematurely.
+
 ---
 
-## 4. In-Place Version Metadata Updates
+## 5. In-Place Version Metadata Updates
 
 When a transaction updates or deletes an existing record:
 1. The existing record's `xmax` is stamped with the active `TxnId`.
@@ -59,7 +71,7 @@ When a transaction updates or deletes an existing record:
 
 ---
 
-## 5. Version Chaining Mechanism
+## 6. Version Chaining & Traversal Semantics
 
 Version chains follow a **newest-to-oldest** backward chaining topology:
 - When a row is inserted:
@@ -70,8 +82,16 @@ Version chains follow a **newest-to-oldest** backward chaining topology:
   - A new version `new_rid` is inserted with `prev_version = Some(old_rid)`.
   - The B+ Tree is updated to point to `new_rid`.
   - The chain forms: `new_rid -> old_rid -> oldest_rid -> None`.
-- Readers traverse the chain via `prev_version` until finding the version visible to their snapshot horizon.
+- Primary key lookups and sequential table scans traverse the chain via `prev_version` until finding the version visible to the snapshot horizon.
+- Secondary index lookups point directly to physical `VersionId` entries and evaluate `read_exact_version_if_visible`, bypassing chain traversal.
 
 ### Guardrails
-- **Cycle Detection**: Traversal tracks visited `RecordId`s in a `HashSet`. If a cycle is detected, `Error::VersionChainCycle` is returned.
-- **Depth Limit**: Traversal enforces `MAX_VERSION_CHAIN_DEPTH = 1000`. If a version chain exceeds 1000 versions, `Error::VersionChainTooDeep` is returned to prevent pathological stack usage.
+- **Cycle Detection**: Traversal tracks visited `RecordId`s in a `HashSet` and checks for immediate self-referential links (`prev == curr_rid`). If a cycle is detected, structured `Error::VersionChainCycle` is returned.
+- **Depth Limit**: Traversal enforces `MAX_VERSION_CHAIN_DEPTH = 1000`. If a version chain exceeds 1000 versions, `Error::VersionChainTooDeep` is returned.
+
+---
+
+## 7. Page Compaction and Reuse Safety
+
+Slotted-page compaction in TreeDB (`RecordPage::compact`) packs active record payload bytes to reclaim fragmentation within a page without reallocating slot IDs or altering existing slot offsets. Since historical versions remain active slots (neither tombstoned nor marked deleted in the slotted-page header), compaction preserves `RecordId(page_id, slot_id)` stability. Free pages are only reclaimed when an entire table is dropped, preventing dangling version references.
+

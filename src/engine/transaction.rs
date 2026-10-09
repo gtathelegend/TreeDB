@@ -1001,21 +1001,8 @@ impl<'db> Transaction<'db> {
         value: &crate::engine::types::Value,
     ) -> Result<Vec<crate::index::node::RecordId>> {
         self.ensure_active()?;
-        let idx_meta =
-            crate::engine::catalog::Catalog::get_index(&mut self.db.buffer_pool, index_name)?
-                .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
-        let table =
-            crate::engine::catalog::Catalog::get_table(&mut self.db.buffer_pool, table_name)?
-                .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
-        if idx_meta.table_id != table.table_id {
-            return Err(Error::IndexTableMismatch {
-                index: index_name.to_string(),
-                table: table_name.to_string(),
-            });
-        }
-        let sec_tree = crate::index::secondary::SecondaryIndex::from_root(idx_meta.root_page_id);
-        let idx_key = crate::index::secondary::IndexKey::from_value(value);
-        sec_tree.lookup(&mut self.db.buffer_pool, &idx_key)
+        let mut table = self.open_table(table_name)?;
+        table.index_lookup_rids(index_name, value)
     }
 
     /// Performs a secondary index range scan returning matching `(Value, RecordId)` pairs.
@@ -1027,35 +1014,10 @@ impl<'db> Transaction<'db> {
         end: Option<&crate::engine::types::Value>,
     ) -> Result<Vec<(crate::engine::types::Value, crate::index::node::RecordId)>> {
         self.ensure_active()?;
-        let idx_meta =
-            crate::engine::catalog::Catalog::get_index(&mut self.db.buffer_pool, index_name)?
-                .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
-        let table =
-            crate::engine::catalog::Catalog::get_table(&mut self.db.buffer_pool, table_name)?
-                .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
-        if idx_meta.table_id != table.table_id {
-            return Err(Error::IndexTableMismatch {
-                index: index_name.to_string(),
-                table: table_name.to_string(),
-            });
-        }
-        let col_type = table.schema.columns[idx_meta.column_idx].data_type;
-        let sec_tree = crate::index::secondary::SecondaryIndex::from_root(idx_meta.root_page_id);
-
         let start_key = start.map(crate::index::secondary::IndexKey::from_value);
         let end_key = end.map(crate::index::secondary::IndexKey::from_value);
-
-        let entries = sec_tree.scan(
-            &mut self.db.buffer_pool,
-            start_key.as_ref(),
-            end_key.as_ref(),
-        )?;
-        let mut results = Vec::with_capacity(entries.len());
-        for (k, rid) in entries {
-            let val = k.to_value(col_type)?;
-            results.push((val, rid));
-        }
-        Ok(results)
+        let mut table = self.open_table(table_name)?;
+        table.scan_index_entries(index_name, start_key.as_ref(), end_key.as_ref())
     }
 
     /// Validates the structural invariants of a named secondary index.

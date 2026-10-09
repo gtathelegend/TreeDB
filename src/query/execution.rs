@@ -184,6 +184,12 @@ pub struct ExecutionResourceManager {
     peak_temp_bytes: usize,
     active_temp_files: usize,
     peak_temp_files: usize,
+    pub versions_examined: usize,
+    pub max_chain_depth: usize,
+    pub historical_versions_skipped: usize,
+    pub version_reads: usize,
+    pub overflow_pages_read: usize,
+    pub corrupt_chains_detected: usize,
 }
 
 impl ExecutionResourceManager {
@@ -197,6 +203,12 @@ impl ExecutionResourceManager {
             peak_temp_bytes: 0,
             active_temp_files: 0,
             peak_temp_files: 0,
+            versions_examined: 0,
+            max_chain_depth: 0,
+            historical_versions_skipped: 0,
+            version_reads: 0,
+            overflow_pages_read: 0,
+            corrupt_chains_detected: 0,
         }
     }
 
@@ -288,6 +300,66 @@ impl ExecutionResourceManager {
     /// Returns peak temporary files open during this execution.
     pub fn peak_temp_files(&self) -> usize {
         self.peak_temp_files
+    }
+
+    /// Records that an MVCC version was examined during visibility evaluation.
+    pub fn record_version_examined(&mut self) {
+        self.versions_examined += 1;
+    }
+
+    /// Records the observed depth of a version chain traversal.
+    pub fn record_chain_depth(&mut self, depth: usize) {
+        self.max_chain_depth = self.max_chain_depth.max(depth);
+    }
+
+    /// Records that a historical MVCC version was skipped because it was invisible to the active snapshot.
+    pub fn record_version_skipped(&mut self) {
+        self.historical_versions_skipped += 1;
+    }
+
+    /// Records a physical record version read.
+    pub fn record_version_read(&mut self) {
+        self.version_reads += 1;
+    }
+
+    /// Records an overflow page read during record reassembly.
+    pub fn record_overflow_page_read(&mut self) {
+        self.overflow_pages_read += 1;
+    }
+
+    /// Records that a corrupt version chain was detected.
+    pub fn record_corrupt_chain(&mut self) {
+        self.corrupt_chains_detected += 1;
+    }
+
+    /// Returns the total number of versions examined.
+    pub fn versions_examined(&self) -> usize {
+        self.versions_examined
+    }
+
+    /// Returns the maximum version chain depth encountered.
+    pub fn max_chain_depth(&self) -> usize {
+        self.max_chain_depth
+    }
+
+    /// Returns the total historical versions skipped.
+    pub fn historical_versions_skipped(&self) -> usize {
+        self.historical_versions_skipped
+    }
+
+    /// Returns total physical version reads.
+    pub fn version_reads(&self) -> usize {
+        self.version_reads
+    }
+
+    /// Returns total overflow pages read.
+    pub fn overflow_pages_read(&self) -> usize {
+        self.overflow_pages_read
+    }
+
+    /// Returns total corrupt chains detected.
+    pub fn corrupt_chains_detected(&self) -> usize {
+        self.corrupt_chains_detected
     }
 
     /// Returns `true` if all active reservations have been completely released.

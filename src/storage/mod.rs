@@ -22,4 +22,7 @@ pub use record_page::{
     OverflowDescriptor, RecordLocation, RecordPage, Slot, MAX_RECORD_SIZE,
     OVERFLOW_DESCRIPTOR_SIZE, OVERFLOW_FLAG, RECORD_PAGE_HEADER_SIZE, SLOT_SIZE,
 };
-pub use record_store::RecordStore;
+pub use record_store::{
+    RecordStore, VersionId, VersionMetadata, MAX_VERSION_CHAIN_DEPTH, MVCC_VERSION_FORMAT,
+    VERSION_HEADER_SIZE,
+};
