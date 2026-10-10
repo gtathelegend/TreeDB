@@ -138,6 +138,14 @@ impl<'a> Table<'a> {
         self.isolation_context = ctx;
     }
 
+    /// Sets or clears a deterministic test failure injection point.
+    pub fn set_test_failure_point(
+        &mut self,
+        point: Option<crate::engine::failure::StorageFailurePoint>,
+    ) {
+        self.buffer_pool.set_test_failure_point(point);
+    }
+
     /// Returns a reference to the active transactional isolation context, if any.
     pub fn isolation_context(&self) -> Option<&IsolationContext> {
         self.isolation_context.as_ref()
@@ -187,6 +195,8 @@ impl<'a> Table<'a> {
 
     /// Inserts a new row into the table as an MVCC version and updates all attached secondary indexes.
     pub fn insert(&mut self, row: &Row) -> Result<()> {
+        self.buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::BeforeFirstMutation)?;
         self.metadata.schema.validate_row(row)?;
         let key = self.metadata.schema.extract_primary_key(row)?;
         let pk_val = &row.values[self.metadata.schema.primary_key_idx];
@@ -335,6 +345,8 @@ impl<'a> Table<'a> {
         } else {
             self.tree.insert(self.buffer_pool, key, rid)?;
         }
+        self.buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::AfterPrimaryIndexModified)?;
 
         // Maintain secondary indexes
         for (meta, sec_idx) in &mut self.indexes {
@@ -342,6 +354,9 @@ impl<'a> Table<'a> {
             let payload = meta.extract_covered_payload(row)?;
             sec_idx.insert_with_payload(self.buffer_pool, &idx_key, &payload, rid)?;
         }
+        self.buffer_pool.check_fault(
+            crate::engine::failure::StorageFailurePoint::AfterSecondaryIndexModified,
+        )?;
 
         self.sync_metadata_if_needed()?;
 
@@ -374,6 +389,8 @@ impl<'a> Table<'a> {
 
     /// Updates an existing row matching the primary key in `row` by creating a new version chained to the previous version.
     pub fn update(&mut self, row: &Row) -> Result<()> {
+        self.buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::BeforeFirstMutation)?;
         self.metadata.schema.validate_row(row)?;
         let key = self.metadata.schema.extract_primary_key(row)?;
         let pk_val = &row.values[self.metadata.schema.primary_key_idx];
@@ -549,6 +566,8 @@ impl<'a> Table<'a> {
         };
 
         self.tree.update(self.buffer_pool, key, new_rid)?;
+        self.buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::AfterPrimaryIndexModified)?;
 
         // Maintain secondary indexes by inserting new version mapping.
         for (meta, sec_idx) in &mut self.indexes {
@@ -561,6 +580,9 @@ impl<'a> Table<'a> {
             }
             sec_idx.insert_with_payload(self.buffer_pool, &new_key, &new_payload, new_rid)?;
         }
+        self.buffer_pool.check_fault(
+            crate::engine::failure::StorageFailurePoint::AfterSecondaryIndexModified,
+        )?;
 
         self.sync_metadata_if_needed()?;
 
@@ -569,6 +591,8 @@ impl<'a> Table<'a> {
 
     /// Deletes a row matching `pk` by marking it with deletion metadata rather than physical deletion.
     pub fn delete(&mut self, pk: &Value) -> Result<Option<Row>> {
+        self.buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::BeforeFirstMutation)?;
         self.validate_pk_type(pk)?;
         let key = pk.encode_to_canonical_key()?;
         let reader_txn = self.reader_txn();

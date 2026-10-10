@@ -167,3 +167,15 @@ The following capabilities were explicitly evaluated across phases:
 2. **Historical Version Reclamation (Vacuum)**: *Implemented in Phase 70.* Snapshot-safe version reclamation, version chain pruning, overflow page recycling, empty record page recycling, and secondary/covering index garbage collection are fully supported via `db.vacuum()` and `docs/MVCC_VACUUM.md`.
 3. **Transaction Conflict Detection & Commit-Time Validation**: *Implemented in Phase 71.* Formal write-intent tracking (`RowWriteIntent`), write-set validation against committed heads, 6 structured conflict categories (`WriteWriteConflict`, `StaleVersionWrite`, `ConcurrentLogicalKeyChange`, `UniqueIndexConflict`, `InvalidTransactionState`, `WriteSetValidationFailure`), and atomic failure rollbacks are documented in `docs/MVCC_CONFLICTS.md`.
 4. **Serializable Snapshot Isolation (SSI)**: Serializable snapshot isolation (predicate locks, rw-antidependencies) is deferred to future isolation phases.
+
+---
+
+## 12. Phase 72: Transaction Atomicity, Failure Injection & Recovery Audit
+
+Phase 72 executes a comprehensive correctness and hardening audit of TreeDB's transactional storage engine under deterministic failure injection:
+- **Atomicity Protocol**: Formalized exact durable commit point (WAL commit flush) and verified pre-commit abort vs post-commit durability.
+- **16 Failure Boundaries**: Tested failure injection covering before mutation, version allocation, payload logging, metadata updates, primary/secondary index modification, overflow page allocation, record slot reclamation, freelist updates, WAL commit logging, durable flush, header persistence, and vacuum phases.
+- **Matrix & Differential Suite**: Dedicated integration suite (`tests/transaction_atomicity.rs`, 34 tests) with independent differential reference model running 4 fixed seeds (`42`, `1337`, `2026`, `9999`) across 25 transaction rounds each.
+- **Idempotency**: Repeated recovery validated as strictly idempotent without `CommitSeq` regression.
+- Complete documentation is available in [TRANSACTION_ATOMICITY.md](file:///d:/Projects/TreeDB/docs/TRANSACTION_ATOMICITY.md).
+

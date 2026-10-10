@@ -12,10 +12,10 @@ pub use engine::{
     Catalog, CatalogPage, Column, CommitSeq, CurrentVersionVisibility, DataType, IndexId,
     IndexMetadata, IsolationContext, IsolationLevel, IsolationStatus, MultiIndexScanStats, ReadSet,
     ReclamationHorizon, Row, Schema, Snapshot, SnapshotId, SnapshotRegistry, StatementResult,
-    Table, TableId, TableMetadata, Transaction, TransactionCommitMetadata, TransactionWriteSet,
-    TreeDb, TxnState, VacuumConfig, VacuumResult, Value, VersionReclamationEligibility,
-    VisibilityPolicy, CATALOG_MAGIC, CURRENT_CATALOG_VERSION, MAX_COLUMN_NAME_LEN,
-    MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN, TUPLE_FORMAT_VERSION,
+    StorageFailurePoint, Table, TableId, TableMetadata, Transaction, TransactionCommitMetadata,
+    TransactionWriteSet, TreeDb, TxnState, VacuumConfig, VacuumResult, Value,
+    VersionReclamationEligibility, VisibilityPolicy, CATALOG_MAGIC, CURRENT_CATALOG_VERSION,
+    MAX_COLUMN_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN, TUPLE_FORMAT_VERSION,
 };
 pub use error::{Error, Result};
 pub use index::{

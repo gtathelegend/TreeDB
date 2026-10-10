@@ -87,6 +87,7 @@ pub struct BufferPool {
     active_txn: Option<TxnId>,
     access_counter: u64,
     stats: BufferPoolStats,
+    test_failure_point: Option<crate::engine::failure::StorageFailurePoint>,
 }
 
 impl BufferPool {
@@ -116,6 +117,7 @@ impl BufferPool {
                 capacity,
                 ..Default::default()
             },
+            test_failure_point: None,
         })
     }
 
@@ -159,6 +161,33 @@ impl BufferPool {
     /// Clears the active transaction ID.
     pub fn clear_active_txn(&mut self) {
         self.active_txn = None;
+    }
+
+    /// Sets or clears a deterministic test failure injection point.
+    pub fn set_test_failure_point(
+        &mut self,
+        point: Option<crate::engine::failure::StorageFailurePoint>,
+    ) {
+        self.test_failure_point = point;
+        self.page_manager.set_test_failure_point(point);
+    }
+
+    /// Returns the currently active test failure injection point, if any.
+    pub fn test_failure_point(&self) -> Option<crate::engine::failure::StorageFailurePoint> {
+        self.test_failure_point
+    }
+
+    /// Evaluates if the current failure injection point matches `target` and triggers `Error::InjectedFault`.
+    pub fn check_fault(
+        &mut self,
+        target: crate::engine::failure::StorageFailurePoint,
+    ) -> Result<()> {
+        if self.test_failure_point == Some(target) {
+            self.test_failure_point = None;
+            self.page_manager.set_test_failure_point(None);
+            return Err(Error::InjectedFault(target));
+        }
+        Ok(())
     }
 
     /// Returns the currently active transaction ID, if set.
@@ -238,6 +267,11 @@ impl BufferPool {
                                     after_slice,
                                 )?;
                                 page.set_lsn(lsn);
+                                if self.test_failure_point == Some(crate::engine::failure::StorageFailurePoint::AfterRecordPayloadLogged) {
+                                    self.test_failure_point = None;
+                                    self.page_manager.set_test_failure_point(None);
+                                    return Err(Error::InjectedFault(crate::engine::failure::StorageFailurePoint::AfterRecordPayloadLogged));
+                                }
                             }
                             frame.before_image = Some(cur_bytes);
                         }
@@ -528,6 +562,7 @@ impl BufferPool {
         self.page_manager.write_page(&free_page)?;
 
         // 7. Update DbHeader
+        self.check_fault(crate::engine::failure::StorageFailurePoint::DuringFreelistUpdate)?;
         self.page_manager.header_mut().freelist_head = page_id;
         self.page_manager.header_mut().free_page_count += 1;
         self.page_manager.write_header_to_disk()?;

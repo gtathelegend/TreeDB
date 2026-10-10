@@ -239,14 +239,52 @@ impl LogManager {
 
     /// Appends a `Commit` log record for `txn_id` with an explicit commit sequence and flushes the WAL.
     pub fn commit_txn_with_seq(&mut self, txn_id: TxnId, commit_seq: u64) -> Result<Lsn> {
+        self.commit_txn_with_seq_and_fault(txn_id, commit_seq, None)
+    }
+
+    /// Appends a `Commit` log record for `txn_id` with an explicit commit sequence and optional fault injection.
+    pub fn commit_txn_with_seq_and_fault(
+        &mut self,
+        txn_id: TxnId,
+        commit_seq: u64,
+        fault: Option<crate::engine::failure::StorageFailurePoint>,
+    ) -> Result<Lsn> {
+        if fault == Some(crate::engine::failure::StorageFailurePoint::BeforeCommitRecordLogged) {
+            return Err(Error::InjectedFault(
+                crate::engine::failure::StorageFailurePoint::BeforeCommitRecordLogged,
+            ));
+        }
+
         let prev_lsn = self.txn_prev_lsn.get(&txn_id).copied().unwrap_or(NULL_LSN);
         let lsn = self.allocate_lsn();
         let record = LogRecord::new_commit_with_seq(lsn, prev_lsn, txn_id, commit_seq);
+        let current_pos = self.file.stream_position()?;
         self.append_record(&record)?;
+
+        if fault
+            == Some(crate::engine::failure::StorageFailurePoint::AfterCommitRecordLoggedBeforeFlush)
+        {
+            // An un-flushed commit record before a crash does not reach durable physical media.
+            // Truncate the file back to simulate the unflushed tail being lost on crash.
+            self.file.set_len(current_pos)?;
+            self.file.seek(SeekFrom::Start(current_pos))?;
+            return Err(Error::InjectedFault(
+                crate::engine::failure::StorageFailurePoint::AfterCommitRecordLoggedBeforeFlush,
+            ));
+        }
 
         self.txn_first_lsn.remove(&txn_id);
         self.txn_prev_lsn.remove(&txn_id);
+
         self.flush(lsn)?;
+
+        if fault == Some(crate::engine::failure::StorageFailurePoint::AfterDurableCommitRecordFlush)
+        {
+            return Err(Error::InjectedFault(
+                crate::engine::failure::StorageFailurePoint::AfterDurableCommitRecordFlush,
+            ));
+        }
+
         Ok(lsn)
     }
 

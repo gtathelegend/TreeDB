@@ -393,6 +393,9 @@ impl VacuumEngine {
         // Try freeing any completely empty RecordPage encountered during this pass
         for page_id in touched_record_pages {
             result.pages_examined += 1;
+            table.buffer_pool.check_fault(
+                crate::engine::failure::StorageFailurePoint::DuringVacuumFreelistUpdate,
+            )?;
             if table
                 .record_store
                 .try_free_empty_record_page(table.buffer_pool, page_id)?
@@ -586,6 +589,9 @@ impl VacuumEngine {
         };
 
         // 1. Remove obsolete entries from secondary and covering indexes
+        table
+            .buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::DuringVacuumIndexCleanup)?;
         if let Some(ref row) = decoded_row {
             for (meta, sec_idx) in &mut table.indexes {
                 let idx_key = meta.extract_index_key(row);
@@ -596,6 +602,9 @@ impl VacuumEngine {
         }
 
         // 2. Reclaim record slot and overflow pages
+        table
+            .buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::DuringVacuumRecordReclaim)?;
         let (deleted, overflow_count) = table
             .record_store
             .delete_and_count(table.buffer_pool, rid)?;

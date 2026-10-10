@@ -290,6 +290,9 @@ impl RecordStore {
                 record_page.serialize(page_mut)?;
             }
             buffer_pool.unpin_page(target_page_id, true)?;
+            buffer_pool.check_fault(
+                crate::engine::failure::StorageFailurePoint::AfterRecordVersionAllocated,
+            )?;
 
             return Ok(RecordId::new(target_page_id, slot_id));
         }
@@ -301,6 +304,9 @@ impl RecordStore {
         // 1. Allocate all required overflow pages from the BufferPool
         let mut allocated_pages = Vec::with_capacity(overflow_pages_needed);
         for _ in 0..overflow_pages_needed {
+            buffer_pool.check_fault(
+                crate::engine::failure::StorageFailurePoint::DuringOverflowPageAlloc,
+            )?;
             let pid = buffer_pool.allocate_page(PageType::Overflow)?;
             buffer_pool.unpin_page(pid, true)?;
             allocated_pages.push(pid);
@@ -340,6 +346,9 @@ impl RecordStore {
             record_page.serialize(page_mut)?;
         }
         buffer_pool.unpin_page(target_page_id, true)?;
+        buffer_pool.check_fault(
+            crate::engine::failure::StorageFailurePoint::AfterRecordVersionAllocated,
+        )?;
 
         Ok(RecordId::new(target_page_id, slot_id))
     }
@@ -549,6 +558,9 @@ impl RecordStore {
         if !is_active {
             return Ok((false, 0));
         }
+
+        buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::DuringRecordSlotReclaim)?;
 
         // 1. Delete slot in RecordPage
         record_page.delete(record_id.slot_id);
@@ -852,6 +864,10 @@ impl RecordStore {
             op.serialize(page_mut)?;
             buffer_pool.unpin_page(head_page_id, true)?;
         }
+
+        buffer_pool.check_fault(
+            crate::engine::failure::StorageFailurePoint::AfterVersionMetadataChanged,
+        )?;
 
         Ok(())
     }

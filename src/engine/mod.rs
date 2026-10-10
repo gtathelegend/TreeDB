@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod failure;
 pub mod isolation;
 pub mod table;
 pub mod transaction;
@@ -11,6 +12,7 @@ pub use catalog::{
     Catalog, CatalogPage, IndexId, IndexMetadata, TableId, TableMetadata, CATALOG_MAGIC,
     CURRENT_CATALOG_VERSION, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
 };
+pub use failure::StorageFailurePoint;
 pub use isolation::{
     CommitSeq, CurrentVersionVisibility, IsolationContext, IsolationLevel, IsolationStatus,
     ReadSet, ReclamationHorizon, Snapshot, SnapshotId, SnapshotRegistry, TransactionCommitMetadata,
@@ -276,6 +278,21 @@ impl TreeDb {
             .reclamation_horizon(self.current_commit_seq())
     }
 
+    /// Sets or clears a deterministic test failure injection point.
+    pub fn set_test_failure_point(&mut self, point: Option<StorageFailurePoint>) {
+        self.buffer_pool.set_test_failure_point(point);
+    }
+
+    /// Returns the currently active test failure injection point, if any.
+    pub fn test_failure_point(&self) -> Option<StorageFailurePoint> {
+        self.buffer_pool.test_failure_point()
+    }
+
+    /// Validates the structural integrity of the persistent freelist.
+    pub fn validate_freelist(&mut self) -> Result<()> {
+        self.buffer_pool.validate_freelist()
+    }
+
     /// Registers a standalone point-in-time snapshot observing the latest committed transaction.
     pub fn register_snapshot(&mut self) -> Snapshot {
         let commit_seq = CommitSeq(self.buffer_pool.durable_max_commit_seq());
@@ -480,8 +497,9 @@ impl TreeDb {
             }
         }
 
+        let fault = self.buffer_pool.test_failure_point();
         if let Some(wal) = self.buffer_pool.wal_mut() {
-            let lsn = wal.commit_txn_with_seq(txn_id, seq.0)?;
+            let lsn = wal.commit_txn_with_seq_and_fault(txn_id, seq.0, fault)?;
             if self.active_txn == Some(txn_id) {
                 self.active_txn = None;
                 self.buffer_pool.clear_active_txn();

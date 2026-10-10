@@ -166,3 +166,14 @@ Horizon = min(Active Snapshots' Read Commit Sequences)
 - **Lock Management**: No row-level or table-level lock managers.
 - **Deadlock Detection**: No lock wait graphs or deadlock resolution.
 - **Serializable Snapshot Isolation (SSI)**: No tracking of rw-antidependencies or SIREAD locks.
+
+---
+
+## 9. Phase 72: Transaction Atomicity Audit & Crash Recovery Invariants
+
+Phase 72 verifies that transaction commit validation and conflict aborts compose reliably with ARIES crash recovery and failure injection:
+- **Pre-Commit Abort Durability**: An aborted or conflicting transaction never logs a `Commit` record. Crash recovery safely undoes any partial mutations.
+- **Post-Commit Durability**: Once the commit record is flushed to storage, all changes remain durable across restarts, with secondary and unique indexes intact.
+- **Failure-Injection Matrix**: Tested across 16 deterministic failure boundaries including before mutation, after version allocation, during slot reclaim, before/after commit flush, and during vacuum.
+- Complete documentation is available in [TRANSACTION_ATOMICITY.md](file:///d:/Projects/TreeDB/docs/TRANSACTION_ATOMICITY.md).
+

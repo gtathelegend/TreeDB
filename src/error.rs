@@ -75,6 +75,10 @@ pub enum Error {
     #[error("Recovery interrupted: {0}")]
     RecoveryInterrupted(String),
 
+    /// Storage or transaction operation interrupted by simulated failure injection.
+    #[error("Injected fault at boundary: {0:?}")]
+    InjectedFault(crate::engine::failure::StorageFailurePoint),
+
     /// WAL corruption detected during recovery scan.
     #[error("WAL corruption detected: {0}")]
     WalCorruption(String),

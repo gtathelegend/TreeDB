@@ -16,6 +16,7 @@ pub struct PageManager {
     file: File,
     path: PathBuf,
     header: DbHeader,
+    test_failure_point: Option<crate::engine::failure::StorageFailurePoint>,
 }
 
 impl PageManager {
@@ -44,6 +45,7 @@ impl PageManager {
             file,
             path: path_buf,
             header,
+            test_failure_point: None,
         })
     }
 
@@ -81,6 +83,7 @@ impl PageManager {
             file,
             path: path_buf,
             header,
+            test_failure_point: None,
         })
     }
 
@@ -202,8 +205,29 @@ impl PageManager {
         Ok(())
     }
 
+    /// Sets or clears a deterministic test failure injection point.
+    pub fn set_test_failure_point(
+        &mut self,
+        point: Option<crate::engine::failure::StorageFailurePoint>,
+    ) {
+        self.test_failure_point = point;
+    }
+
+    /// Returns the currently active test failure injection point, if any.
+    pub fn test_failure_point(&self) -> Option<crate::engine::failure::StorageFailurePoint> {
+        self.test_failure_point
+    }
+
     /// Writes the serialized header directly to Page 0 on disk.
     pub fn write_header_to_disk(&mut self) -> Result<()> {
+        if self.test_failure_point
+            == Some(crate::engine::failure::StorageFailurePoint::DuringHeaderPersistence)
+        {
+            self.test_failure_point = None;
+            return Err(Error::InjectedFault(
+                crate::engine::failure::StorageFailurePoint::DuringHeaderPersistence,
+            ));
+        }
         let header_bytes = self.header.serialize();
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&header_bytes)?;

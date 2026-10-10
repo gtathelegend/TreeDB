@@ -657,6 +657,19 @@ impl<'db> Transaction<'db> {
         self.state
     }
 
+    /// Sets or clears a deterministic test failure injection point.
+    pub fn set_test_failure_point(
+        &mut self,
+        point: Option<crate::engine::failure::StorageFailurePoint>,
+    ) {
+        self.db.set_test_failure_point(point);
+    }
+
+    /// Returns the currently active test failure injection point, if any.
+    pub fn test_failure_point(&self) -> Option<crate::engine::failure::StorageFailurePoint> {
+        self.db.test_failure_point()
+    }
+
     /// Returns a reference to the immutable isolation context for this transaction.
     pub fn isolation_context(&self) -> &crate::engine::isolation::IsolationContext {
         &self.isolation_context
@@ -736,6 +749,9 @@ impl<'db> Transaction<'db> {
     /// Inserts or updates a key-value mapping within this transaction.
     pub fn put(&mut self, key: Key, value: &[u8]) -> Result<()> {
         self.ensure_active()?;
+        self.db
+            .buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::BeforeFirstMutation)?;
         let prev_rid = self.db.tree.get(&mut self.db.buffer_pool, key)?;
         if let Some(old_rid) = prev_rid {
             let (head_meta, _) = self
@@ -850,6 +866,9 @@ impl<'db> Transaction<'db> {
                 self.isolation_context.snapshot.as_of_commit_seq,
             );
         }
+        self.db
+            .buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::AfterPrimaryIndexModified)?;
         Ok(())
     }
 
@@ -863,6 +882,9 @@ impl<'db> Transaction<'db> {
     /// Returns `Ok(Some(Vec<u8>))` with the deleted value bytes if present, or `Ok(None)` if absent.
     pub fn delete(&mut self, key: Key) -> Result<Option<Vec<u8>>> {
         self.ensure_active()?;
+        self.db
+            .buffer_pool
+            .check_fault(crate::engine::failure::StorageFailurePoint::BeforeFirstMutation)?;
         match self.db.tree.get(&mut self.db.buffer_pool, key)? {
             Some(old_rid) => {
                 let (head_meta, _) = self
@@ -7909,17 +7931,36 @@ impl<'db> Transaction<'db> {
         }
 
         // Now commit (WAL flush): active_txn is cleared here, after metadata is written.
-        self.db.commit_txn_with_seq(self.txn_id, commit_seq.0)?;
-
-        if let Some(owned_id) = self.owned_snapshot_id.take() {
-            self.db.snapshot_registry.release(owned_id);
+        let commit_res = self.db.commit_txn_with_seq(self.txn_id, commit_seq.0);
+        match commit_res {
+            Ok(_) => {
+                if let Some(owned_id) = self.owned_snapshot_id.take() {
+                    self.db.snapshot_registry.release(owned_id);
+                }
+                self.state = TxnState::Committed;
+                if self.has_catalog_mutations {
+                    self.db.catalog_generation += 1;
+                    self.db.plan_cache.invalidate_all();
+                }
+                Ok(())
+            }
+            Err(Error::InjectedFault(
+                crate::engine::failure::StorageFailurePoint::AfterDurableCommitRecordFlush,
+            )) => {
+                if let Some(owned_id) = self.owned_snapshot_id.take() {
+                    self.db.snapshot_registry.release(owned_id);
+                }
+                self.state = TxnState::Committed;
+                if self.has_catalog_mutations {
+                    self.db.catalog_generation += 1;
+                    self.db.plan_cache.invalidate_all();
+                }
+                Err(Error::InjectedFault(
+                    crate::engine::failure::StorageFailurePoint::AfterDurableCommitRecordFlush,
+                ))
+            }
+            Err(e) => Err(e),
         }
-        self.state = TxnState::Committed;
-        if self.has_catalog_mutations {
-            self.db.catalog_generation += 1;
-            self.db.plan_cache.invalidate_all();
-        }
-        Ok(())
     }
 
     /// Aborts all mutations performed in this transaction, rolling back physical page changes
