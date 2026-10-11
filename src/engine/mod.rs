@@ -11,9 +11,11 @@ pub mod verification;
 pub use crate::query::external_multi_index::{MultiIndexConfig, MultiIndexExecutionMode};
 pub use crate::query::materialize::{MaterializeConfig, MaterializeOverride};
 pub use backup::{
-    resolve_source_wal_path, BackupConfig, BackupError, BackupManifest, BackupReport,
-    BackupValidationReport, Crc32Hasher, RestoreConfig, RestoreReport, BACKUP_MANIFEST_MAGIC,
-    CURRENT_BACKUP_VERSION, MANIFEST_FILE_NAME,
+    is_safe_file_name, recover_journal, resolve_source_wal_path, restore_journal_path,
+    BackupAuditStatus, BackupConfig, BackupError, BackupManifest, BackupReport,
+    BackupValidationReport, Crc32Hasher, RestoreConfig, RestoreJournal, RestoreJournalState,
+    RestoreReport, BACKUP_MANIFEST_MAGIC, CURRENT_BACKUP_VERSION, CURRENT_RESTORE_JOURNAL_VERSION,
+    MANIFEST_FILE_NAME, RESTORE_JOURNAL_MAGIC,
 };
 pub use catalog::{
     Catalog, CatalogPage, IndexId, IndexMetadata, TableId, TableMetadata, CATALOG_MAGIC,
@@ -86,6 +88,13 @@ impl TreeDb {
     /// Opens an existing TreeDB database file, recovering any pending WAL records if present.
     pub fn open(path: impl AsRef<Path>, pool_capacity: usize) -> Result<Self> {
         let db_path = path.as_ref();
+
+        // Check and recover any interrupted restore publication first
+        let journal_path = backup::restore_journal_path(db_path);
+        if journal_path.exists() {
+            let _ = backup::recover_journal(&journal_path);
+        }
+
         let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
 
         let mut page_manager = PageManager::open(db_path)?;
@@ -135,7 +144,8 @@ impl TreeDb {
     /// Opens an existing TreeDB database file without executing crash recovery.
     ///
     /// Used for strictly read-only inspection of raw pre-recovery disk images (such as Phase 73/74
-    /// consistency verification and diagnostic audits), avoiding silent recovery side effects.
+    /// consistency verification and diagnostic audits), avoiding silent recovery side effects and
+    /// preserving disk immutability by not creating WAL files if absent.
     pub fn open_read_only_unrecovered(
         path: impl AsRef<Path>,
         pool_capacity: usize,
@@ -144,19 +154,20 @@ impl TreeDb {
         let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
 
         let page_manager = PageManager::open(db_path)?;
-        let (log_manager, max_commit_seq) = if wal_path.exists() {
+        let (mut buffer_pool, max_commit_seq) = if wal_path.exists() {
             let log_mgr = LogManager::open(&wal_path)?;
             let max_seq = page_manager.header().max_commit_seq;
-            (log_mgr, max_seq)
+            let pool = BufferPool::with_wal(pool_capacity, page_manager, log_mgr)?;
+            (pool, max_seq)
         } else {
             let max_seq = page_manager.header().max_commit_seq;
-            (LogManager::create(&wal_path)?, max_seq)
+            let pool = BufferPool::new(pool_capacity, page_manager)?;
+            (pool, max_seq)
         };
 
-        let next_commit_seq = max_commit_seq.saturating_add(1);
-        let root_page_id = page_manager.header().root_page_id;
-        let mut buffer_pool = BufferPool::with_wal(pool_capacity, page_manager, log_manager)?;
         let _ = buffer_pool.set_max_commit_seq(max_commit_seq);
+        let next_commit_seq = max_commit_seq.saturating_add(1);
+        let root_page_id = buffer_pool.page_manager().header().root_page_id;
         let tree = BPlusTree::from_root(root_page_id);
         let record_store = RecordStore::new();
 
@@ -183,6 +194,17 @@ impl TreeDb {
             active_txn_updates: HashMap::new(),
             active_txn_deletes: HashMap::new(),
         })
+    }
+
+    /// Diagnoses and recovers an interrupted restore publication protocol using a durable journal.
+    ///
+    /// Returns `Ok(true)` if an interrupted restore journal was recovered, or `Ok(false)` if none was present.
+    pub fn recover_interrupted_restore(
+        destination_db_path: impl AsRef<Path>,
+    ) -> std::result::Result<bool, crate::engine::backup::BackupError> {
+        let journal_path =
+            crate::engine::backup::restore_journal_path(destination_db_path.as_ref());
+        crate::engine::backup::recover_journal(&journal_path)
     }
 
     /// Creates and initializes a new TreeDB database file with an associated WAL.

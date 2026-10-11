@@ -17,8 +17,8 @@ use treedb::engine::isolation::{CommitSeq, Snapshot, SnapshotId};
 use treedb::engine::types::{Column, DataType, Row, Schema, Value};
 use treedb::engine::vacuum::VacuumConfig;
 use treedb::{
-    BackupConfig, BackupError, RestoreConfig, StorageFailurePoint, TreeDb, CURRENT_BACKUP_VERSION,
-    MANIFEST_FILE_NAME,
+    restore_journal_path, BackupAuditStatus, BackupConfig, BackupError, RestoreConfig,
+    StorageFailurePoint, TreeDb, CURRENT_BACKUP_VERSION, MANIFEST_FILE_NAME,
 };
 
 // =============================================================================
@@ -1252,4 +1252,473 @@ fn test_metamorphic_seed_2026() {
 #[test]
 fn test_metamorphic_seed_9999() {
     run_metamorphic_backup_restore_test(9999);
+}
+
+// =============================================================================
+// Phase 76: Hardening, Source States, Restore Journal, & Lifecycle Regressions
+// =============================================================================
+
+fn insert_rows(db: &mut TreeDb, rows: &[Row]) {
+    let mut txn = db.begin().unwrap();
+    {
+        let mut tbl = txn.open_table("accounts").unwrap();
+        for r in rows {
+            tbl.insert(r).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+}
+
+#[test]
+fn test_stage2_unflushed_committed_changes_survive_backup_restore() {
+    let (mut db, _src_dir, db_path) = setup_test_db("unflushed_src");
+    let mut model = LogicalModel::default();
+
+    // 1. Initial rows checkpointed cleanly
+    let mut init_rows = Vec::new();
+    for i in 1..=10 {
+        let row = make_test_row(
+            i,
+            &format!("ACC_{i:04}"),
+            i * 100,
+            "INIT",
+            vec![i as u8; 32],
+        );
+        init_rows.push(row);
+        model.insert(
+            i,
+            &format!("ACC_{i:04}"),
+            i * 100,
+            "INIT",
+            vec![i as u8; 32],
+        );
+    }
+    insert_rows(&mut db, &init_rows);
+    db.checkpoint_and_truncate_wal().unwrap();
+
+    // 2. Additional committed transaction WITHOUT checkpointing:
+    // Page deltas and commit record are flushed to WAL, but dirty pages in buffer pool
+    // are not flushed to PageManager.
+    let mut txn = db.begin().unwrap();
+    {
+        let mut tbl = txn.open_table("accounts").unwrap();
+        for i in 11..=20 {
+            let row = make_test_row(
+                i,
+                &format!("ACC_{i:04}"),
+                i * 100,
+                "UNFLUSHED",
+                vec![i as u8; 32],
+            );
+            tbl.insert(&row).unwrap();
+            model.insert(
+                i,
+                &format!("ACC_{i:04}"),
+                i * 100,
+                "UNFLUSHED",
+                vec![i as u8; 32],
+            );
+        }
+    }
+    txn.commit().unwrap();
+
+    // Drop database instance without running a checkpoint so dirty in-memory pages are evicted
+    drop(db);
+
+    // 3. Create offline backup with checkpoint_before_backup disabled:
+    // Packages database file (with old checkpoint) and companion WAL (with redo tail).
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    let bkp_config = BackupConfig {
+        fault_point: None,
+        checkpoint_before_backup: false,
+        verify_image: true,
+    };
+    let bkp_report = TreeDb::backup_database(&db_path, &bkp_path, &bkp_config).unwrap();
+    assert!(bkp_report.manifest.has_wal);
+
+    // Bounded validation must identify the unapplied WAL tail as RecoverablePendingRecovery
+    let val_report = TreeDb::validate_backup(&bkp_path, &bkp_config).unwrap();
+    assert_eq!(
+        val_report.status,
+        BackupAuditStatus::RecoverablePendingRecovery
+    );
+    assert!(val_report.is_valid);
+
+    // 4. Restore into fresh independent destination
+    let rest_dir = tempdir().unwrap();
+    let rest_db_path = rest_dir.path().join("restored.treedb");
+    let rest_config = RestoreConfig {
+        allow_overwrite: false,
+        fault_point: None,
+        validate_before_restore: true,
+        verify_after_restore: true,
+        buffer_pool_size: 64,
+    };
+    let rest_rep = TreeDb::restore_backup(&bkp_path, &rest_db_path, &rest_config).unwrap();
+    assert!(rest_rep.consistency_checked);
+
+    // 5. Open restored database: RecoveryEngine replays WAL redo records.
+    let mut restored_db = TreeDb::open(&rest_db_path, 64).unwrap();
+    model.assert_matches_database(&mut restored_db, "stage2_unflushed_survived");
+
+    let consistency = restored_db.verify_consistency().unwrap();
+    assert!(
+        consistency.is_healthy(),
+        "Restored consistency not healthy: {:?}",
+        consistency.issues
+    );
+}
+
+#[test]
+fn test_stage4_publication_failure_db_publish_rolls_back_original_destination() {
+    let (mut orig_db, _orig_dir, orig_db_path) = setup_test_db("dest_db_publish_fault");
+    let mut orig_model = LogicalModel::default();
+    let mut orig_rows = Vec::new();
+    for i in 1..=10 {
+        let row = make_test_row(i, &format!("ORIG_{i:04}"), i * 10, "OLD", vec![i as u8; 16]);
+        orig_rows.push(row);
+        orig_model.insert(i, &format!("ORIG_{i:04}"), i * 10, "OLD", vec![i as u8; 16]);
+    }
+    insert_rows(&mut orig_db, &orig_rows);
+    orig_db.checkpoint_and_truncate_wal().unwrap();
+    drop(orig_db);
+
+    // Create a new backup to restore over original
+    let (mut new_db, _new_dir, new_db_path) = setup_test_db("new_backup_src");
+    let mut new_rows = Vec::new();
+    for i in 100..=120 {
+        let row = make_test_row(i, &format!("NEW_{i:04}"), i * 20, "NEW", vec![i as u8; 16]);
+        new_rows.push(row);
+    }
+    insert_rows(&mut new_db, &new_rows);
+    new_db.checkpoint_and_truncate_wal().unwrap();
+    drop(new_db);
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    TreeDb::backup_database(&new_db_path, &bkp_path, &BackupConfig::default()).unwrap();
+
+    // Inject failure at DuringRestoreDbPublish
+    let rest_config = RestoreConfig {
+        allow_overwrite: true,
+        fault_point: Some(StorageFailurePoint::DuringRestoreDbPublish),
+        validate_before_restore: true,
+        verify_after_restore: false,
+        buffer_pool_size: 64,
+    };
+    let err = TreeDb::restore_backup(&bkp_path, &orig_db_path, &rest_config).unwrap_err();
+    assert!(matches!(
+        err,
+        BackupError::InjectedFault(StorageFailurePoint::DuringRestoreDbPublish)
+    ));
+
+    // Verify on disk: journal was preserved in ExistingBackedUp state
+    let journal_path = restore_journal_path(&orig_db_path);
+    assert!(journal_path.exists());
+
+    // Recover interrupted publication
+    let recovered = TreeDb::recover_interrupted_restore(&orig_db_path).unwrap();
+    assert!(recovered);
+    assert!(!journal_path.exists());
+
+    // Original destination was rolled back completely
+    let mut reopened_db = TreeDb::open(&orig_db_path, 64).unwrap();
+    orig_model.assert_matches_database(&mut reopened_db, "orig_after_db_publish_fault");
+    let rep = reopened_db.verify_consistency().unwrap();
+    assert!(rep.is_healthy());
+}
+
+#[test]
+fn test_stage4_publication_failure_wal_publish_completes_forward() {
+    let (mut orig_db, _orig_dir, orig_db_path) = setup_test_db("dest_wal_publish_fault");
+    let mut orig_rows = Vec::new();
+    for i in 1..=5 {
+        let row = make_test_row(i, &format!("ORIG_{i:04}"), i * 10, "OLD", vec![i as u8; 16]);
+        orig_rows.push(row);
+    }
+    insert_rows(&mut orig_db, &orig_rows);
+    orig_db.checkpoint_and_truncate_wal().unwrap();
+    drop(orig_db);
+
+    // Create a new backup that HAS a companion WAL
+    let (mut new_db, _new_dir, new_db_path) = setup_test_db("new_backup_with_wal");
+    let mut new_model = LogicalModel::default();
+    let mut batch1 = Vec::new();
+    for i in 50..=60 {
+        let row = make_test_row(
+            i,
+            &format!("NEW_{i:04}"),
+            i * 50,
+            "NEW_WAL",
+            vec![i as u8; 16],
+        );
+        batch1.push(row);
+        new_model.insert(
+            i,
+            &format!("NEW_{i:04}"),
+            i * 50,
+            "NEW_WAL",
+            vec![i as u8; 16],
+        );
+    }
+    insert_rows(&mut new_db, &batch1);
+    new_db.checkpoint_and_truncate_wal().unwrap();
+
+    let mut txn = new_db.begin().unwrap();
+    {
+        let mut tbl = txn.open_table("accounts").unwrap();
+        for i in 61..=70 {
+            let row = make_test_row(
+                i,
+                &format!("NEW_{i:04}"),
+                i * 50,
+                "NEW_WAL",
+                vec![i as u8; 16],
+            );
+            tbl.insert(&row).unwrap();
+            new_model.insert(
+                i,
+                &format!("NEW_{i:04}"),
+                i * 50,
+                "NEW_WAL",
+                vec![i as u8; 16],
+            );
+        }
+    }
+    txn.commit().unwrap();
+    drop(new_db);
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    let bkp_config = BackupConfig {
+        fault_point: None,
+        checkpoint_before_backup: false,
+        verify_image: true,
+    };
+    let bkp_rep = TreeDb::backup_database(&new_db_path, &bkp_path, &bkp_config).unwrap();
+    assert!(bkp_rep.manifest.has_wal);
+
+    // Inject failure at DuringRestoreWalPublish (after DB has been published to dest)
+    let rest_config = RestoreConfig {
+        allow_overwrite: true,
+        fault_point: Some(StorageFailurePoint::DuringRestoreWalPublish),
+        validate_before_restore: true,
+        verify_after_restore: false,
+        buffer_pool_size: 64,
+    };
+    let err = TreeDb::restore_backup(&bkp_path, &orig_db_path, &rest_config).unwrap_err();
+    assert!(matches!(
+        err,
+        BackupError::InjectedFault(StorageFailurePoint::DuringRestoreWalPublish)
+    ));
+
+    // Verify on disk: journal exists in DbPublished state
+    let journal_path = restore_journal_path(&orig_db_path);
+    assert!(journal_path.exists());
+
+    // Recover interrupted publication: moves forward and publishes WAL
+    let recovered = TreeDb::recover_interrupted_restore(&orig_db_path).unwrap();
+    assert!(recovered);
+    assert!(!journal_path.exists());
+
+    // Reopening destination reflects the newly restored data completely
+    let mut reopened_db = TreeDb::open(&orig_db_path, 64).unwrap();
+    new_model.assert_matches_database(&mut reopened_db, "restored_forward_after_wal_publish_fault");
+    let rep = reopened_db.verify_consistency().unwrap();
+    assert!(rep.is_healthy());
+}
+
+#[test]
+fn test_stage4_open_automatically_recovers_interrupted_journal() {
+    let (mut orig_db, _orig_dir, orig_db_path) = setup_test_db("dest_auto_recover");
+    let mut orig_model = LogicalModel::default();
+    let mut orig_rows = Vec::new();
+    for i in 1..=5 {
+        let row = make_test_row(i, &format!("ORIG_{i:04}"), i * 10, "OLD", vec![i as u8; 16]);
+        orig_rows.push(row);
+        orig_model.insert(i, &format!("ORIG_{i:04}"), i * 10, "OLD", vec![i as u8; 16]);
+    }
+    insert_rows(&mut orig_db, &orig_rows);
+    orig_db.checkpoint_and_truncate_wal().unwrap();
+    drop(orig_db);
+
+    let (mut new_db, _new_dir, new_db_path) = setup_test_db("new_auto_src");
+    let mut new_rows = Vec::new();
+    for i in 1..=5 {
+        let row = make_test_row(i, &format!("NEW_{i:04}"), i * 20, "NEW", vec![i as u8; 16]);
+        new_rows.push(row);
+    }
+    insert_rows(&mut new_db, &new_rows);
+    new_db.checkpoint_and_truncate_wal().unwrap();
+    drop(new_db);
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    TreeDb::backup_database(&new_db_path, &bkp_path, &BackupConfig::default()).unwrap();
+
+    let rest_config = RestoreConfig {
+        allow_overwrite: true,
+        fault_point: Some(StorageFailurePoint::DuringRestoreDbPublish),
+        validate_before_restore: true,
+        verify_after_restore: false,
+        buffer_pool_size: 64,
+    };
+    let _ = TreeDb::restore_backup(&bkp_path, &orig_db_path, &rest_config);
+    let journal_path = restore_journal_path(&orig_db_path);
+    assert!(journal_path.exists());
+
+    // TreeDb::open should automatically recover the journal before initializing
+    let mut reopened = TreeDb::open(&orig_db_path, 64).unwrap();
+    assert!(!journal_path.exists());
+    orig_model.assert_matches_database(&mut reopened, "auto_recovered_orig");
+}
+
+#[test]
+fn test_stage5_backup_failure_points_validation_and_sync() {
+    let (mut db, _dir, db_path) = setup_test_db("bkp_faults");
+    let mut rows = Vec::new();
+    for i in 1..=5 {
+        let row = make_test_row(i, &format!("ACC_{i:04}"), i * 10, "BKP", vec![i as u8; 16]);
+        rows.push(row);
+    }
+    insert_rows(&mut db, &rows);
+    db.checkpoint_and_truncate_wal().unwrap();
+    drop(db);
+
+    let bkp_dir = tempdir().unwrap();
+
+    // 1. Failure at DuringBackupValidation
+    let bkp_path_1 = bkp_dir.path().join("bkp_val");
+    let cfg_val = BackupConfig {
+        fault_point: Some(StorageFailurePoint::DuringBackupValidation),
+        checkpoint_before_backup: true,
+        verify_image: true,
+    };
+    let err = TreeDb::backup_database(&db_path, &bkp_path_1, &cfg_val).unwrap_err();
+    assert!(matches!(
+        err,
+        BackupError::InjectedFault(StorageFailurePoint::DuringBackupValidation)
+    ));
+    assert!(!bkp_path_1.exists());
+
+    // 2. Failure at DuringBackupSync
+    let bkp_path_2 = bkp_dir.path().join("bkp_sync");
+    let cfg_sync = BackupConfig {
+        fault_point: Some(StorageFailurePoint::DuringBackupSync),
+        checkpoint_before_backup: true,
+        verify_image: true,
+    };
+    let err = TreeDb::backup_database(&db_path, &bkp_path_2, &cfg_sync).unwrap_err();
+    assert!(matches!(
+        err,
+        BackupError::InjectedFault(StorageFailurePoint::DuringBackupSync)
+    ));
+    assert!(!bkp_path_2.exists());
+}
+
+#[test]
+fn test_stage6_manifest_bounds_and_path_traversal_rejection() {
+    let (mut db, _dir, db_path) = setup_test_db("manifest_bounds_db");
+    let row = make_test_row(1, "ACC_1", 100, "BOUNDS", vec![1; 16]);
+    insert_rows(&mut db, &[row]);
+    db.checkpoint_and_truncate_wal().unwrap();
+    drop(db);
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    TreeDb::backup_database(&db_path, &bkp_path, &BackupConfig::default()).unwrap();
+
+    let manifest_path = bkp_path.join(MANIFEST_FILE_NAME);
+
+    // 1. Manifest length > 64KB
+    let oversized = vec![0u8; 65537];
+    fs::write(&manifest_path, &oversized).unwrap();
+    let err = TreeDb::inspect_backup_manifest(&bkp_path).unwrap_err();
+    assert!(matches!(err, BackupError::InvalidManifest(_)));
+
+    // 2. Path traversal in db_file_name
+    let mut manifest = TreeDb::backup_database(&db_path, &bkp_path, &BackupConfig::default())
+        .unwrap()
+        .manifest;
+    manifest.db_file_name = "../traversal.db".to_string();
+    let bytes = manifest.serialize();
+    fs::write(&manifest_path, &bytes).unwrap();
+    let err = TreeDb::inspect_backup_manifest(&bkp_path).unwrap_err();
+    assert!(matches!(err, BackupError::InvalidManifest(_)));
+
+    // Windows backslash traversal
+    manifest.db_file_name = "..\\traversal.db".to_string();
+    let bytes = manifest.serialize();
+    fs::write(&manifest_path, &bytes).unwrap();
+    let err = TreeDb::inspect_backup_manifest(&bkp_path).unwrap_err();
+    assert!(matches!(err, BackupError::InvalidManifest(_)));
+}
+
+#[test]
+fn test_stage6_open_read_only_unrecovered_does_not_mutate_disk() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("immutability_test.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+    db.create_table("accounts", make_test_schema()).unwrap();
+    db.checkpoint_and_truncate_wal().unwrap();
+    drop(db);
+
+    let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
+    let _ = fs::remove_file(&wal_path);
+    assert!(!wal_path.exists());
+
+    // Open read-only unrecovered
+    let unrecovered = TreeDb::open_read_only_unrecovered(&db_path, 64).unwrap();
+    // Must NOT have created a WAL file on disk
+    assert!(!wal_path.exists());
+    drop(unrecovered);
+    assert!(!wal_path.exists());
+}
+
+#[test]
+fn test_stage8_persistence_lifecycle_regressions() {
+    let (mut db, _src_dir, _db_path) = setup_test_db("lifecycle_db");
+    let mut rows = Vec::new();
+    for i in 1..=10 {
+        let row = make_test_row(i, &format!("ACC_{i:04}"), i * 10, "LIFE", vec![i as u8; 16]);
+        rows.push(row);
+    }
+    insert_rows(&mut db, &rows);
+    db.checkpoint_and_truncate_wal().unwrap();
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    let bkp_rep = db
+        .create_backup(&bkp_path, &BackupConfig::default())
+        .unwrap();
+    assert_eq!(
+        bkp_rep.validation.as_ref().unwrap().status,
+        BackupAuditStatus::FullyHealthy
+    );
+
+    // 1. Restore -> reopen -> new write
+    let rest_dir = tempdir().unwrap();
+    let rest_db_path = rest_dir.path().join("restored.treedb");
+    TreeDb::restore_backup(&bkp_path, &rest_db_path, &RestoreConfig::default()).unwrap();
+
+    let mut restored_db = TreeDb::open(&rest_db_path, 64).unwrap();
+    let new_row = make_test_row(100, "ACC_0100", 1000, "NEW_WRITE", vec![100; 16]);
+    insert_rows(&mut restored_db, &[new_row]);
+    let rep = restored_db.verify_consistency().unwrap();
+    assert!(rep.is_healthy());
+
+    // 2. Restore -> checkpoint -> reopen
+    restored_db.checkpoint_and_truncate_wal().unwrap();
+    drop(restored_db);
+    let mut reopened_db = TreeDb::open(&rest_db_path, 64).unwrap();
+    let rep2 = reopened_db.verify_consistency().unwrap();
+    assert!(rep2.is_healthy());
+
+    // 3. Vacuum -> reopen
+    let vac_res = reopened_db.vacuum(&VacuumConfig::default()).unwrap();
+    assert!(vac_res.pages_examined > 0);
+    drop(reopened_db);
+    let mut reopened_db2 = TreeDb::open(&rest_db_path, 64).unwrap();
+    assert!(reopened_db2.verify_consistency().unwrap().is_healthy());
 }

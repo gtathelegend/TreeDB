@@ -63,16 +63,32 @@ pub enum StorageFailurePoint {
     DuringBackupWalCopy,
     /// During backup manifest writing to disk.
     DuringBackupManifestWrite,
+    /// During non-destructive validation of staged backup before publication.
+    DuringBackupValidation,
+    /// During file and metadata synchronization of backup artifacts.
+    DuringBackupSync,
     /// Immediately before final publication (atomic rename) of the backup directory.
     BeforeBackupPublication,
     /// Before validation of the source backup prior to restore.
     BeforeRestoreValidation,
+    /// During pre-restore manifest or image validation.
+    DuringRestoreValidation,
     /// During database image file copying to restore staging.
     DuringRestoreDbCopy,
     /// During WAL file copying to restore staging.
     DuringRestoreWalCopy,
+    /// During backup of existing destination files to temporary staging.
+    DuringRestoreDestinationBackup,
+    /// During writing or synchronization of the durable restore journal.
+    DuringRestoreJournalSync,
     /// Immediately before final publication (atomic replacement) of the restored database.
     BeforeRestorePublication,
+    /// During publication (rename) of the primary restored database file.
+    DuringRestoreDbPublish,
+    /// During publication (rename) of the companion restored WAL file.
+    DuringRestoreWalPublish,
+    /// During cleanup of obsolete temporary and backup artifacts after publication.
+    DuringRestoreCleanup,
 }
 
 impl StorageFailurePoint {
@@ -106,11 +122,19 @@ impl StorageFailurePoint {
             Self::DuringBackupDbCopy => "DuringBackupDbCopy",
             Self::DuringBackupWalCopy => "DuringBackupWalCopy",
             Self::DuringBackupManifestWrite => "DuringBackupManifestWrite",
+            Self::DuringBackupValidation => "DuringBackupValidation",
+            Self::DuringBackupSync => "DuringBackupSync",
             Self::BeforeBackupPublication => "BeforeBackupPublication",
             Self::BeforeRestoreValidation => "BeforeRestoreValidation",
+            Self::DuringRestoreValidation => "DuringRestoreValidation",
             Self::DuringRestoreDbCopy => "DuringRestoreDbCopy",
             Self::DuringRestoreWalCopy => "DuringRestoreWalCopy",
+            Self::DuringRestoreDestinationBackup => "DuringRestoreDestinationBackup",
+            Self::DuringRestoreJournalSync => "DuringRestoreJournalSync",
             Self::BeforeRestorePublication => "BeforeRestorePublication",
+            Self::DuringRestoreDbPublish => "DuringRestoreDbPublish",
+            Self::DuringRestoreWalPublish => "DuringRestoreWalPublish",
+            Self::DuringRestoreCleanup => "DuringRestoreCleanup",
         }
     }
 }

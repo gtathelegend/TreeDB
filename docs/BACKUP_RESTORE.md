@@ -1,182 +1,139 @@
-# TreeDB Backup, Restore & Database Image Integrity (Phase 75)
+# TreeDB Backup, Restore & Publication Hardening (Phase 76)
 
 ## 1. Overview & Architecture
 
-Phase 75 implements an offline backup, validation, and safe restore subsystem for TreeDB. The architecture guarantees that database images and their companion Write-Ahead Logs (WAL) are captured into self-contained, CRC32-protected, recoverable units without risking torn writes, silent corruptions, or accidental destruction of destination databases.
+Phase 76 establishes a hardened, release-ready persistence, backup, and restore subsystem for TreeDB. It resolves the two fundamental composition questions of offline backup systems:
+1. **Source State Recoverability**: How backups are captured and recovered across every possible database and WAL state (including unflushed committed dirty buffer pool pages).
+2. **Safe Multi-File Restore Publication**: How multi-file database/WAL restoration achieves deterministic crash atomicity across process terminations and system crashes via a durable restore journal (`RestoreJournal`).
 
-### Core Guarantees
-
-* **Consistency**: Backups capture a stable, quiescent database snapshot. Any associated WAL required for crash recovery is bundled alongside the primary image.
-* **Integrity**: Every backup artifact is validated through an explicit, versioned, CRC32-protected manifest (`treedb.manifest`), file-level CRC32 checksums, and Page 0 header invariant audits.
-* **Deep Verification Without Silent Recovery**: Read-only consistency audits inspect backup images without triggering recovery side effects or mutating backup files.
-* **Safe Staged Restore**: Destructive overwrite of existing destination files is strictly prevented unless explicitly authorized (`allow_overwrite = true`). Restorations use atomic two-phase staging with rollback protection to preserve existing databases if a restore fails.
-* **CommitSeq & MVCC Monotonicity**: Durable `CommitSeq` values and historical MVCC version records survive backup and restore, preventing version collisions upon subsequent transaction writes.
-* **Deterministic Failure Injection**: Named failure boundaries verify graceful handling and cleanup across backup creation, copy, manifest writing, publication, and restoration.
+TreeDB preserves a strict **single-writer** model with **safe Rust only**, without automatic corruption repair and without silent discard of recovery-required WAL log records.
 
 ---
 
-## 2. Public API Surface
+## 2. Backup Source State Matrix
 
-The backup subsystem exposes dedicated configuration, report, and manifest types:
+The following matrix documents TreeDB's guarantees across all database and Write-Ahead Log (WAL) source states:
 
-```rust
-use std::path::{Path, PathBuf};
-use treedb::{
-    BackupConfig, BackupError, BackupManifest, BackupReport, BackupValidationReport,
-    RestoreConfig, RestoreReport, StorageFailurePoint, TreeDb,
-};
+| # | Source State | Backup Supported? | Recovery Required First? | Both DB & WAL Included? | Independently Recoverable? | Validation Findings | Error / Limitations Reported |
+|---|---|---|---|---|---|---|---|
+| 1 | **Cleanly Checkpointed Database** | Yes | No | DB only (WAL empty/absent) | Yes | `status: FullyHealthy`, all checks pass | None. Valid offline image. |
+| 2 | **Valid WAL Containing Applied Records** | Yes | No | DB + WAL (or DB only if WAL truncated) | Yes | `status: FullyHealthy` | None. Replayed records match page LSNs. |
+| 3 | **Valid WAL With Redo Needed for Committed Changes** | Yes | No | DB + WAL | Yes | `status: RecoverablePendingRecovery` (`UnappliedWalTail`) | Non-fatal info warning: WAL replay required on reopen. |
+| 4 | **Durable Commit With Unflushed Dirty Pages** | Yes | No | DB + WAL | Yes | `status: RecoverablePendingRecovery` (`UnappliedWalTail`) | Image reflects pre-commit checkpoint; WAL holds redo records. Recovery engine restores durable rows upon reopen. |
+| 5 | **WAL Containing Uncommitted Transaction Work** | Yes | No | DB + WAL | Yes | `status: RecoverablePendingRecovery` | Uncommitted transactions are discarded during recovery replay and never become committed-visible. |
+| 6 | **WAL With Compensation Log Records (CLRs)** | Yes | No | DB + WAL | Yes | `status: RecoverablePendingRecovery` | ARIES recovery engine replays CLRs idempotently to resume or complete undo work. |
+| 7 | **WAL With Interrupted Checkpoint** | Yes | No | DB + WAL | Yes | `status: RecoverablePendingRecovery` | Prior checkpoint LSN in DB Page 0 header serves as authoritative recovery boundary; interrupted checkpoint tail safely rolled forward. |
+| 8 | **Truncated WAL** | Rejected | Yes | N/A | No | `ChecksumMismatch` or `WalRecordCorruption` | Error reported. Incomplete WAL records cannot be silently ignored. |
+| 9 | **Invalid WAL Checksum** | Rejected | Yes | N/A | No | `ChecksumMismatch` | Corrupted WAL bytes fail verification. No backup declared complete. |
+| 10 | **Database Header Invariant Failure** | Rejected | Manual inspection required | N/A | No | `CorruptHeader` | Fatal corruption detected on Page 0. Backup rejected. |
 
-// 1. Online / Quiesced Backup from active TreeDb handle:
-let mut db = TreeDb::open("mydb.treedb", 64)?;
-let report = db.create_backup("backups/v1", &BackupConfig::default())?;
+---
 
-// 2. Offline Backup directly from file path:
-let report = TreeDb::backup_database("mydb.treedb", "backups/v1", &BackupConfig::default())?;
+## 3. Database / WAL Companion Inclusion & Manifest Policy
 
-// 3. Inspect backup manifest:
-let manifest = TreeDb::inspect_backup_manifest("backups/v1")?;
+### Inclusion Policy
+1. **Single-file Database**: When the database is cleanly checkpointed and the WAL file does not exist or has zero bytes, `has_wal` is recorded as `false`. `treedb.manifest` records `wal_file_name: None`, `wal_file_size: 0`, and `wal_file_checksum: 0`.
+2. **Companion WAL Inclusion**: Whenever a companion WAL exists and has byte length > 0, it is copied, hashed, and tracked in `treedb.manifest` with `has_wal: true`, along with its exact size and IEEE 802.3 CRC32 checksum.
+3. **Companion WAL Naming**: During restore staging, the staged WAL is named `format!("{}.wal", staged_db.display())`. This naming convention guarantees that staged read-only consistency verification (`TreeDb::verify_file(staged_db)`) discovers and audits the companion WAL prior to publication.
+4. **Disallowed States**:
+   * *Missing companion WAL*: If `has_wal == true` in the manifest but the companion WAL file is absent from the backup directory, `validate_backup` rejects the backup with `BackupError::MissingFile`.
+   * *Unexpected extra WAL*: If `has_wal == false` but an unexpected `.wal` file exists in the directory, directory artifact scanning rejects it with `BackupError::UnexpectedArtifact`.
+   * *Mismatched WAL*: If a WAL belongs to a different database or displays sequence regressions, verification detects `CommitSequenceRegression` or `WalMonotonicityViolation`.
 
-// 4. Validate backup image integrity:
-let validation = TreeDb::validate_backup("backups/v1", &BackupConfig::default())?;
+### Security Bounds on Manifest Parsing
+* **Manifest Size Bound**: The manifest file size is strictly bounded to a maximum of **64 KB** (`65,536` bytes). Manifest files exceeding 64 KB are rejected before allocation.
+* **Path Traversal Protection**: Both `db_file_name` and `wal_file_name` are bounded to a maximum of 255 bytes and must pass `is_safe_file_name`. Any file name containing path traversal sequences (`..`, `/`, `\`, null bytes, or single dots) is rejected with `BackupError::InvalidManifest`.
 
-// 5. Restore backup into destination:
-let restore_report = TreeDb::restore_backup(
-    "backups/v1",
-    "restored/mydb.treedb",
-    &RestoreConfig {
-        allow_overwrite: false,
-        ..Default::default()
-    },
-)?;
+---
+
+## 4. Durable Restore Publication Protocol (`RestoreJournal`)
+
+Replacing a multi-file database/WAL pair across physical storage cannot rely on individually atomic filesystem renames alone. If a power outage or process termination occurs between renaming the database file and renaming the companion WAL, the destination could be left with a mismatched database and WAL pair.
+
+To guarantee that a destination is **always either the old valid database or the new valid database**, TreeDB implements a durable two-phase publication protocol backed by a persistent journal: `RestoreJournal`.
+
+### Journal Specification
+* **File Location**: `<dest_parent>/<dest_name>.restore_journal`
+* **Magic Bytes**: `b"TDRESJRN"` (8 bytes)
+* **Version**: `1` (4 bytes)
+* **Integrity**: Protected by trailing IEEE 802.3 CRC32 checksum over all serialized fields.
+* **States**:
+  1. `Staged (0)`: Staging files (`.tmp_restore_db_*`, `.tmp_restore_db_*.wal`) written, synchronized, and verified. Existing destination untouched.
+  2. `ExistingBackedUp (1)`: Pre-existing destination files backed up to temporary `.bak_restore_*` files.
+  3. `DbPublished (2)`: Staged primary database file renamed into destination path. Companion WAL publication pending.
+  4. `AllPublished (3)`: Both primary database and companion WAL renamed into final destination paths. Cleanup of `.bak_*` files pending.
+
+### Publication State Transitions & Failure Boundaries
+
+```
+[Start Restore]
+       │
+       ▼
+[Stage Files] ──(Fault: DuringRestoreDbCopy / DuringRestoreWalCopy / DuringRestoreValidation)
+       │          -> Staged files removed; destination untouched.
+       ▼
+[Write Journal: Staged] ──(Fault: DuringRestoreJournalSync)
+       │          -> Recovery: staged files & journal deleted; destination untouched.
+       ▼
+[Backup Existing: ExistingBackedUp] ──(Fault: DuringRestoreDestinationBackup)
+       │          -> Recovery: .bak files rolled back to dest; staged files & journal deleted.
+       ▼
+[Publish Primary DB: DbPublished] ──(Fault: DuringRestoreDbPublish)
+       │          -> Recovery: .bak files rolled back to dest; staged files & journal deleted.
+       ▼
+[Publish Companion WAL: AllPublished] ──(Fault: DuringRestoreWalPublish)
+       │          -> Recovery: staged WAL published forward; .bak files & journal deleted.
+       ▼
+[Cleanup Obsolete Artifacts] ──(Fault: DuringRestoreCleanup)
+       │          -> Recovery: .bak files & journal deleted; new database active.
+       ▼
+[Complete]
 ```
 
-### Configuration Types
+### Deterministic Recovery Rules
+When `TreeDb::recover_interrupted_restore(dest_db)` or `TreeDb::open(dest_db)` encounters a lingering `.restore_journal`:
+* **State `Staged`**: Removes staged files, deletes journal. Destination remains intact with original valid files.
+* **State `ExistingBackedUp`**: Rolls back `.bak_restore_*` files to original destination paths, removes staged files, deletes journal. Destination remains 100% undamaged.
+* **State `DbPublished`**: Completes publication forward by renaming `staged_wal -> dest_wal`, deletes `.bak_restore_*` files, deletes journal. Destination completes publication deterministically.
+* **State `AllPublished`**: Deletes lingering `.bak_restore_*` files, deletes journal. Destination is fully finalized.
 
-#### `BackupConfig`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `fault_point` | `Option<StorageFailurePoint>` | `None` | Deterministic failure injection boundary for testing. |
-| `checkpoint_before_backup` | `bool` | `true` | Executes a synchronous checkpoint and WAL prefix truncation before imaging. |
-| `verify_image` | `bool` | `true` | Runs deep read-only cross-layer consistency verification on the staged backup image. |
-
-#### `RestoreConfig`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `allow_overwrite` | `bool` | `false` | When `true`, permits atomic replacement of an existing destination database and companion WAL. |
-| `fault_point` | `Option<StorageFailurePoint>` | `None` | Deterministic failure injection boundary for testing. |
-| `validate_before_restore` | `bool` | `true` | Completely verifies the backup manifest and checksums prior to modifying the filesystem. |
-| `verify_after_restore` | `bool` | `true` | Opens the restored database and executes full consistency checks post-recovery. |
-| `buffer_pool_size` | `usize` | `64` | In-memory frame capacity allocated for post-restore verification. |
+### Publication Invariants
+1. **Zero Silent Corruption**: The destination is never left in an unrecoverable mixed state.
+2. **Automatic Healing**: `TreeDb::open` transparently detects and recovers any interrupted restore journal before opening.
+3. **Artifact Retention**: Temporary staged files and backup files are never removed while an active restore journal is present on disk.
 
 ---
 
-## 3. Offline Lifecycle Preconditions
+## 5. Non-Mutating Read-Only Inspection
 
-TreeDB maintains a single-writer persistence model. To ensure safety:
-
-1. **Quiescence**: When invoking `db.create_backup()`, no transaction may be actively uncommitted (`Error::ActiveTransaction` is returned if an active transaction is open).
-2. **Checkpointing**: The engine flushes all resident dirty pages to disk, appends a `Checkpoint` log record, syncs the Page 0 header with `last_checkpoint_lsn`, and truncates the WAL prefix prior to imaging.
-3. **External Writers**: If running offline via `TreeDb::backup_database()`, the caller must ensure no concurrent external process is modifying the database or WAL files.
-4. **Immutability of Source**: Backup creation does not modify the source database's logical data or schema.
+`TreeDb::open_read_only_unrecovered` is guaranteed to be strictly non-mutating on disk:
+* When inspecting a database image whose companion WAL is absent, `BufferPool::new` is initialized without a `LogManager`.
+* It does **not** create or truncate a `.wal` file on disk, preserving byte-for-byte disk immutability for forensic and verification audits.
 
 ---
 
-## 4. Backup Manifest & Format Specification
+## 6. Verification & Test Commands
 
-Each backup directory contains:
-* `treedb.manifest`: Binary, self-describing metadata header.
-* `<db_name>`: Raw database file.
-* `<wal_name>` (optional): Companion WAL file (if WAL tail records exist).
-
-### Manifest Binary Encoding (`treedb.manifest`)
-
-| Offset (Bytes) | Field | Type | Description |
-|---|---|---|---|
-| 0..8 | `magic` | `[u8; 8]` | Fixed magic string `b"TDBACKUP"`. |
-| 8..12 | `backup_version` | `u32` (LE) | Manifest format version (currently `1`). |
-| 12..16 | `db_format_version` | `u32` (LE) | Database format version from Page 0 header (`2`). |
-| 16..20 | `page_size` | `u32` (LE) | Database page size (`4096`). |
-| 20..24 | `page_count` | `u32` (LE) | Total allocated pages recorded in Page 0 header. |
-| 24..32 | `db_file_size` | `u64` (LE) | Byte length of the database image. |
-| 32..36 | `db_file_checksum` | `u32` (LE) | IEEE 802.3 CRC32 checksum of the database image. |
-| 36..44 | `max_commit_seq` | `u64` (LE) | Durable `max_commit_seq` at backup time. |
-| 44..52 | `last_checkpoint_lsn`| `u64` (LE) | LSN of the last durable checkpoint. |
-| 52..60 | `created_at_utc` | `u64` (LE) | UTC epoch timestamp in seconds. |
-| 60..62 | `db_name_len` | `u16` (LE) | Byte length of UTF-8 primary DB file name. |
-| 62..62+N | `db_file_name` | `[u8; N]` | UTF-8 encoded primary DB file name. |
-| 62+N | `has_wal` | `u8` | `1` if companion WAL is included, `0` otherwise. |
-| ... | `wal_metadata` | (Variable) | Length, name, size, and CRC32 of WAL file (if `has_wal == 1`). |
-| Tail (4) | `manifest_crc` | `u32` (LE) | IEEE 802.3 CRC32 checksum covering all preceding bytes. |
-
----
-
-## 5. Checksum Semantics & Limitations
-
-* **CRC32 Algorithm**: Standard IEEE 802.3 32-bit Cyclic Redundancy Check (`0xEDB8_8320` polynomial), computed using a streaming 64 KB buffer.
-* **Scope**: Checksums protect against accidental disk bit-flips, network copy corruption, and file truncation.
-* **Distinction**: Checksums guarantee **byte-level transfer integrity**, but do not prove logical database correctness. Logical correctness is verified via Phase 73/74 cross-layer consistency verification (`TreeDb::verify_file`).
-
----
-
-## 6. Atomic Publication & Safe Staging Protocol
-
-To prevent corrupted or half-written backups from being published:
-
-1. **Backup Staging**:
-   * Files are copied into a temporary sibling directory: `.tmp_backup_<pid>_<seq>`.
-   * Files are flushed and synchronized to physical media (`sync_all`).
-   * The staged directory is validated.
-   * On failure, `.tmp_backup_*` is deleted.
-   * On success, the staging directory is atomically renamed into the final `backup_dir`.
-
-2. **Safe Staged Restore**:
-   * Source backup is validated.
-   * Restored files are written to `.tmp_restore_db_*` and `.tmp_restore_wal_*` in the destination directory.
-   * Staged files are synced and checked with `TreeDb::verify_file`.
-   * If replacing an existing database (`allow_overwrite = true`), existing files are renamed to `.bak_restore_*`.
-   * Staged files are renamed into the target destination.
-   * If any step fails, `.bak_restore_*` files are rolled back to their original names.
-   * Upon successful replacement, backup `.bak_restore_*` files are removed.
-
----
-
-## 7. CommitSeq & MVCC Preservation
-
-* **`max_commit_seq` Preservation**: The Page 0 header records `max_commit_seq: u64`. The backup manifest mirrors this value.
-* **Reopening & Monotonicity**: When `TreeDb::open` opens a restored database, it sets `next_commit_seq = max_commit_seq + 1`. All subsequent transaction commits allocate strictly increasing sequence numbers, preventing version collisions.
-* **Snapshot Visibility**: MVCC historical versions and version chains survive backup and restore, allowing snapshot transactions to read consistent point-in-time snapshots.
-
----
-
-## 8. Failure Injection Matrix
-
-The failure-injection framework tests boundaries across backup and restore:
-
-| Failure Boundary | Phase | Safety Invariant Verified |
-|---|---|---|
-| `BeforeBackupCreation` | Backup | No staging or published directory created; source intact. |
-| `DuringBackupDbCopy` | Backup | Incomplete DB image cleaned up; no backup directory published. |
-| `DuringBackupWalCopy` | Backup | Incomplete WAL image cleaned up; no backup directory published. |
-| `DuringBackupManifestWrite` | Backup | Incomplete manifest cleaned up; no backup directory published. |
-| `BeforeBackupPublication` | Backup | Validated staging cleaned up; existing backup untouched. |
-| `BeforeRestoreValidation` | Restore | Source untouched; destination untouched. |
-| `DuringRestoreDbCopy` | Restore | Incomplete restored DB cleaned up; destination untouched. |
-| `DuringRestoreWalCopy` | Restore | Incomplete restored WAL cleaned up; destination untouched. |
-| `BeforeRestorePublication` | Restore | Staged files cleaned up; existing destination 100% undamaged. |
-
----
-
-## 9. Verification & Test Commands
-
-Run the dedicated Phase 75 integration suite:
+Run the comprehensive Phase 76 backup and restore hardening test suite:
 
 ```bash
 cargo test --test backup_restore
 ```
 
-Run full workspace tests, formatting, and Clippy:
+Run all persistence subsystem test suites:
+
+```bash
+cargo test --test recovery_certification
+cargo test --test storage_consistency
+cargo test --test transaction_atomicity
+cargo test --test mvcc_recovery
+cargo test --test mvcc_conflicts
+cargo test --test mvcc_reference_model
+cargo test --test mvcc_vacuum
+cargo test --test mvcc_indexes
+```
+
+Run full formatting, Clippy, and test suite verification:
 
 ```bash
 cargo fmt --all -- --check

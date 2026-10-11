@@ -228,6 +228,17 @@ impl Default for RestoreConfig {
     }
 }
 
+/// Validates that a file name does not contain illegal characters, path traversal, or exceed length bounds.
+pub fn is_safe_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && name != "."
+        && name != ".."
+}
+
 /// Self-describing, CRC32-protected metadata manifest for a database backup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupManifest {
@@ -299,6 +310,12 @@ impl BackupManifest {
 
     /// Deserializes and validates a binary backup manifest buffer.
     pub fn deserialize(bytes: &[u8]) -> std::result::Result<Self, BackupError> {
+        if bytes.len() > 65536 {
+            return Err(BackupError::InvalidManifest(
+                "manifest buffer exceeds 64KB limit".into(),
+            ));
+        }
+
         if bytes.len() < 8 + 4 + 4 + 4 + 4 + 8 + 4 + 8 + 8 + 8 + 2 + 1 + 4 {
             return Err(BackupError::InvalidManifest(
                 "manifest buffer is too short".into(),
@@ -377,6 +394,11 @@ impl BackupManifest {
                 BackupError::InvalidManifest(format!("invalid UTF-8 in db_file_name: {e}"))
             })?
             .to_string();
+        if !is_safe_file_name(&db_file_name) {
+            return Err(BackupError::InvalidManifest(
+                "db_file_name contains invalid or unsafe path characters".into(),
+            ));
+        }
         cursor += db_name_len;
 
         if cursor >= payload_len {
@@ -405,6 +427,11 @@ impl BackupManifest {
                     BackupError::InvalidManifest(format!("invalid UTF-8 in wal_file_name: {e}"))
                 })?
                 .to_string();
+            if !is_safe_file_name(&wal_name) {
+                return Err(BackupError::InvalidManifest(
+                    "wal_file_name contains invalid or unsafe path characters".into(),
+                ));
+            }
             cursor += wal_name_len;
 
             let wal_size = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
@@ -436,9 +463,24 @@ impl BackupManifest {
     }
 }
 
+/// Overall audit and health classification for a validated backup image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupAuditStatus {
+    /// Database image and companion WAL are fully verified and logically clean.
+    FullyHealthy,
+    /// Backup is valid and recoverable, but contains unapplied WAL records requiring crash recovery upon reopen.
+    RecoverablePendingRecovery,
+    /// Backup exhibits structural, header, checksum, or integrity inconsistencies.
+    StructurallyInconsistent,
+    /// Audit is incomplete or inconclusive because required checks were skipped or bounded.
+    Inconclusive,
+}
+
 /// Structured report returned upon comprehensive validation of a backup image.
 #[derive(Debug, Clone)]
 pub struct BackupValidationReport {
+    /// Overall audit and health classification for the backup image.
+    pub status: BackupAuditStatus,
     /// Whether the backup passed all integrity, format, and consistency checks.
     pub is_valid: bool,
     /// Backup format version.
@@ -501,6 +543,327 @@ pub struct RestoreReport {
     pub restored_page_count: u32,
     /// Whether post-restore consistency verification succeeded.
     pub consistency_checked: bool,
+}
+
+/// Persistent state machine states for the two-phase restore publication protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RestoreJournalState {
+    /// Staging files copied and validated. Existing destination untouched.
+    Staged = 0,
+    /// Existing destination files backed up to temporary .bak_* files.
+    ExistingBackedUp = 1,
+    /// Primary database file published into destination path. WAL publication pending.
+    DbPublished = 2,
+    /// Both database and companion WAL files published into destination paths.
+    AllPublished = 3,
+}
+
+impl TryFrom<u8> for RestoreJournalState {
+    type Error = BackupError;
+
+    fn try_from(val: u8) -> std::result::Result<Self, Self::Error> {
+        match val {
+            0 => Ok(Self::Staged),
+            1 => Ok(Self::ExistingBackedUp),
+            2 => Ok(Self::DbPublished),
+            3 => Ok(Self::AllPublished),
+            other => Err(BackupError::InvalidManifest(format!(
+                "invalid restore journal state tag: {other}"
+            ))),
+        }
+    }
+}
+
+/// Magic identifier bytes for restore journals.
+pub const RESTORE_JOURNAL_MAGIC: &[u8; 8] = b"TDRESJRN";
+
+/// Format version for restore journals.
+pub const CURRENT_RESTORE_JOURNAL_VERSION: u32 = 1;
+
+/// Durable journal tracking multi-file publication progress across crash boundaries.
+#[derive(Debug, Clone)]
+pub struct RestoreJournal {
+    /// Physical path to the journal file on disk.
+    pub journal_path: PathBuf,
+    /// Current publication state machine state.
+    pub state: RestoreJournalState,
+    /// Destination primary database path.
+    pub dest_db_path: PathBuf,
+    /// Destination companion WAL path, if present.
+    pub dest_wal_path: Option<PathBuf>,
+    /// Staged primary database path.
+    pub staged_db_path: PathBuf,
+    /// Staged companion WAL path, if present.
+    pub staged_wal_path: Option<PathBuf>,
+    /// Backup file path for pre-existing database.
+    pub bak_db_path: Option<PathBuf>,
+    /// Backup file path for pre-existing companion WAL.
+    pub bak_wal_path: Option<PathBuf>,
+    /// Whether destination had an existing database file before restore.
+    pub dest_had_db: bool,
+    /// Whether destination had an existing WAL file before restore.
+    pub dest_had_wal: bool,
+}
+
+impl RestoreJournal {
+    /// Serializes the journal into a CRC32-protected binary payload.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(RESTORE_JOURNAL_MAGIC);
+        buf.extend_from_slice(&CURRENT_RESTORE_JOURNAL_VERSION.to_le_bytes());
+        buf.push(self.state as u8);
+
+        let mut flags = 0u8;
+        if self.dest_had_db {
+            flags |= 1 << 0;
+        }
+        if self.dest_had_wal {
+            flags |= 1 << 1;
+        }
+        if self.dest_wal_path.is_some() {
+            flags |= 1 << 2;
+        }
+        if self.staged_wal_path.is_some() {
+            flags |= 1 << 3;
+        }
+        if self.bak_db_path.is_some() {
+            flags |= 1 << 4;
+        }
+        if self.bak_wal_path.is_some() {
+            flags |= 1 << 5;
+        }
+        buf.push(flags);
+
+        fn write_string(buf: &mut Vec<u8>, s: &str) {
+            let bytes = s.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+
+        write_string(&mut buf, &self.dest_db_path.to_string_lossy());
+        if let Some(ref p) = self.dest_wal_path {
+            write_string(&mut buf, &p.to_string_lossy());
+        }
+        write_string(&mut buf, &self.staged_db_path.to_string_lossy());
+        if let Some(ref p) = self.staged_wal_path {
+            write_string(&mut buf, &p.to_string_lossy());
+        }
+        if let Some(ref p) = self.bak_db_path {
+            write_string(&mut buf, &p.to_string_lossy());
+        }
+        if let Some(ref p) = self.bak_wal_path {
+            write_string(&mut buf, &p.to_string_lossy());
+        }
+
+        let crc = crate::wal::crc32(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Deserializes and validates a binary restore journal buffer.
+    pub fn deserialize(
+        bytes: &[u8],
+        journal_path: PathBuf,
+    ) -> std::result::Result<Self, BackupError> {
+        if bytes.len() < 8 + 4 + 1 + 1 + 2 + 2 + 4 {
+            return Err(BackupError::InvalidManifest(
+                "restore journal buffer too short".into(),
+            ));
+        }
+        let payload_len = bytes.len() - 4;
+        let expected_crc = u32::from_le_bytes(bytes[payload_len..].try_into().unwrap());
+        let computed_crc = crate::wal::crc32(&bytes[..payload_len]);
+        if computed_crc != expected_crc {
+            return Err(BackupError::ChecksumMismatch {
+                file: "restore_journal".into(),
+                expected: expected_crc,
+                computed: computed_crc,
+            });
+        }
+        if &bytes[0..8] != RESTORE_JOURNAL_MAGIC {
+            return Err(BackupError::InvalidManifest(
+                "invalid restore journal magic identifier".into(),
+            ));
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if version != CURRENT_RESTORE_JOURNAL_VERSION {
+            return Err(BackupError::InvalidManifest(format!(
+                "unsupported restore journal version: {version}"
+            )));
+        }
+        let state = RestoreJournalState::try_from(bytes[12])?;
+        let flags = bytes[13];
+        let dest_had_db = (flags & (1 << 0)) != 0;
+        let dest_had_wal = (flags & (1 << 1)) != 0;
+        let has_dest_wal = (flags & (1 << 2)) != 0;
+        let has_staged_wal = (flags & (1 << 3)) != 0;
+        let has_bak_db = (flags & (1 << 4)) != 0;
+        let has_bak_wal = (flags & (1 << 5)) != 0;
+
+        let mut cursor = 14;
+        fn read_string(
+            bytes: &[u8],
+            cursor: &mut usize,
+            max: usize,
+        ) -> std::result::Result<String, BackupError> {
+            if *cursor + 2 > max {
+                return Err(BackupError::InvalidManifest(
+                    "truncated string length in restore journal".into(),
+                ));
+            }
+            let len = u16::from_le_bytes(bytes[*cursor..*cursor + 2].try_into().unwrap()) as usize;
+            *cursor += 2;
+            if *cursor + len > max {
+                return Err(BackupError::InvalidManifest(
+                    "truncated string payload in restore journal".into(),
+                ));
+            }
+            let s = std::str::from_utf8(&bytes[*cursor..*cursor + len])
+                .map_err(|e| {
+                    BackupError::InvalidManifest(format!("invalid UTF-8 in restore journal: {e}"))
+                })?
+                .to_string();
+            *cursor += len;
+            Ok(s)
+        }
+
+        let dest_db_path = PathBuf::from(read_string(bytes, &mut cursor, payload_len)?);
+        let dest_wal_path = if has_dest_wal {
+            Some(PathBuf::from(read_string(bytes, &mut cursor, payload_len)?))
+        } else {
+            None
+        };
+        let staged_db_path = PathBuf::from(read_string(bytes, &mut cursor, payload_len)?);
+        let staged_wal_path = if has_staged_wal {
+            Some(PathBuf::from(read_string(bytes, &mut cursor, payload_len)?))
+        } else {
+            None
+        };
+        let bak_db_path = if has_bak_db {
+            Some(PathBuf::from(read_string(bytes, &mut cursor, payload_len)?))
+        } else {
+            None
+        };
+        let bak_wal_path = if has_bak_wal {
+            Some(PathBuf::from(read_string(bytes, &mut cursor, payload_len)?))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            journal_path,
+            state,
+            dest_db_path,
+            dest_wal_path,
+            staged_db_path,
+            staged_wal_path,
+            bak_db_path,
+            bak_wal_path,
+            dest_had_db,
+            dest_had_wal,
+        })
+    }
+
+    /// Atomically writes and flushes the journal state to disk.
+    pub fn write_to_disk(&self) -> std::result::Result<(), BackupError> {
+        let bytes = self.serialize();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.journal_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Deletes the journal file from disk upon successful publication completion.
+    pub fn delete_from_disk(&self) {
+        let _ = fs::remove_file(&self.journal_path);
+    }
+
+    /// Executes deterministic crash recovery of an interrupted restore publication.
+    pub fn execute_recovery(&self) -> std::result::Result<(), BackupError> {
+        match self.state {
+            RestoreJournalState::Staged => {
+                let _ = fs::remove_file(&self.staged_db_path);
+                if let Some(ref p) = self.staged_wal_path {
+                    let _ = fs::remove_file(p);
+                }
+                self.delete_from_disk();
+            }
+            RestoreJournalState::ExistingBackedUp => {
+                if self.dest_had_db {
+                    if let Some(ref bak) = self.bak_db_path {
+                        if bak.exists() {
+                            fs::rename(bak, &self.dest_db_path)?;
+                        }
+                    }
+                }
+                if self.dest_had_wal {
+                    if let (Some(ref bak), Some(ref dest_wal)) =
+                        (&self.bak_wal_path, &self.dest_wal_path)
+                    {
+                        if bak.exists() {
+                            fs::rename(bak, dest_wal)?;
+                        }
+                    }
+                }
+                let _ = fs::remove_file(&self.staged_db_path);
+                if let Some(ref p) = self.staged_wal_path {
+                    let _ = fs::remove_file(p);
+                }
+                self.delete_from_disk();
+            }
+            RestoreJournalState::DbPublished => {
+                if let (Some(ref staged_wal), Some(ref dest_wal)) =
+                    (&self.staged_wal_path, &self.dest_wal_path)
+                {
+                    if staged_wal.exists() {
+                        fs::rename(staged_wal, dest_wal)?;
+                    }
+                }
+                if let Some(ref bak) = self.bak_db_path {
+                    let _ = fs::remove_file(bak);
+                }
+                if let Some(ref bak) = self.bak_wal_path {
+                    let _ = fs::remove_file(bak);
+                }
+                self.delete_from_disk();
+            }
+            RestoreJournalState::AllPublished => {
+                if let Some(ref bak) = self.bak_db_path {
+                    let _ = fs::remove_file(bak);
+                }
+                if let Some(ref bak) = self.bak_wal_path {
+                    let _ = fs::remove_file(bak);
+                }
+                let _ = fs::remove_file(&self.staged_db_path);
+                if let Some(ref p) = self.staged_wal_path {
+                    let _ = fs::remove_file(p);
+                }
+                self.delete_from_disk();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resolves the standard restore journal path for a target destination database.
+pub fn restore_journal_path(dest_db: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.restore_journal", dest_db.display()))
+}
+
+/// Recovers any pending restore journal at `journal_path`. Returns true if a journal was recovered.
+pub fn recover_journal(journal_path: &Path) -> std::result::Result<bool, BackupError> {
+    if !journal_path.exists() {
+        return Ok(false);
+    }
+    let bytes = fs::read(journal_path)?;
+    let journal = RestoreJournal::deserialize(&bytes, journal_path.to_path_buf())?;
+    journal.execute_recovery()?;
+    Ok(true)
 }
 
 // =============================================================================
@@ -609,6 +972,14 @@ fn check_path_collision(src: &Path, dst: &Path) -> std::result::Result<(), Backu
 
     // Check if dst is directly inside src (if src is a dir)
     if norm_dst.starts_with(&norm_src) && norm_src.is_dir() {
+        return Err(BackupError::PathCollision {
+            source_path: src.to_path_buf(),
+            destination_path: dst.to_path_buf(),
+        });
+    }
+
+    // Check if src is directly inside dst (if dst is a dir)
+    if norm_src.starts_with(&norm_dst) && norm_dst.is_dir() {
         return Err(BackupError::PathCollision {
             source_path: src.to_path_buf(),
             destination_path: dst.to_path_buf(),
@@ -803,6 +1174,11 @@ impl TreeDb {
         )?;
 
         // 5. Non-destructive validation of the staged backup
+        check_fault(
+            config.fault_point,
+            StorageFailurePoint::DuringBackupValidation,
+        )?;
+
         let validation_report = Self::validate_backup(staging_dir, config)?;
         if !validation_report.is_valid {
             return Err(BackupError::ConsistencyFailure(format!(
@@ -810,6 +1186,8 @@ impl TreeDb {
                 validation_report.issues
             )));
         }
+
+        check_fault(config.fault_point, StorageFailurePoint::DuringBackupSync)?;
 
         check_fault(
             config.fault_point,
@@ -851,6 +1229,12 @@ impl TreeDb {
         if !manifest_path.exists() {
             return Err(BackupError::MissingFile(MANIFEST_FILE_NAME.into()));
         }
+        let meta = fs::metadata(&manifest_path)?;
+        if meta.len() > 65536 {
+            return Err(BackupError::InvalidManifest(
+                "manifest file exceeds 64KB limit".into(),
+            ));
+        }
         let bytes = fs::read(&manifest_path)?;
         BackupManifest::deserialize(&bytes)
     }
@@ -876,12 +1260,17 @@ impl TreeDb {
         }
 
         let mut checks_passed = Vec::new();
-        let issues = Vec::new();
 
         // 1. Manifest verification
         let manifest_path = dir.join(MANIFEST_FILE_NAME);
         if !manifest_path.exists() {
             return Err(BackupError::MissingFile(MANIFEST_FILE_NAME.into()));
+        }
+        let meta = fs::metadata(&manifest_path)?;
+        if meta.len() > 65536 {
+            return Err(BackupError::InvalidManifest(
+                "manifest file exceeds 64KB limit".into(),
+            ));
         }
         let manifest_bytes = fs::read(&manifest_path)?;
         let manifest = BackupManifest::deserialize(&manifest_bytes)?;
@@ -1003,7 +1392,9 @@ impl TreeDb {
         }
 
         // 7. Non-destructive read-only consistency verification
-        if config.verify_image {
+        let (status, issues) = if !config.verify_image {
+            (BackupAuditStatus::Inconclusive, Vec::new())
+        } else {
             let verify_report = Self::verify_file(&db_path)
                 .map_err(|e| BackupError::ConsistencyFailure(format!("verify_file failed: {e}")))?;
 
@@ -1013,11 +1404,39 @@ impl TreeDb {
                     verify_report.issues
                 )));
             }
+
+            let audit_status = if verify_report
+                .issues
+                .iter()
+                .any(|i| i.severity >= crate::engine::verification::ConsistencySeverity::Error)
+            {
+                BackupAuditStatus::StructurallyInconsistent
+            } else if verify_report.issues.iter().any(|i| {
+                matches!(
+                    i.kind,
+                    crate::engine::verification::ConsistencyIssueKind::UnappliedWalTail { .. }
+                )
+            }) {
+                BackupAuditStatus::RecoverablePendingRecovery
+            } else if !verify_report.skipped_checks.is_empty() || verify_report.truncated {
+                BackupAuditStatus::Inconclusive
+            } else {
+                BackupAuditStatus::FullyHealthy
+            };
+
+            let mut issue_strs = Vec::new();
+            for issue in &verify_report.issues {
+                issue_strs.push(issue.to_string());
+            }
             checks_passed.push("storage_consistency_audit".into());
-        }
+            (audit_status, issue_strs)
+        };
+
+        let is_valid = status != BackupAuditStatus::StructurallyInconsistent;
 
         Ok(BackupValidationReport {
-            is_valid: true,
+            status,
+            is_valid,
             backup_version: manifest.backup_version,
             db_format_version: manifest.db_format_version,
             page_size: manifest.page_size,
@@ -1090,7 +1509,7 @@ impl TreeDb {
         let restore_seq = BACKUP_COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
         let staged_db = dest_parent.join(format!(".tmp_restore_db_{}_{}", pid, restore_seq));
-        let staged_wal = dest_parent.join(format!(".tmp_restore_wal_{}_{}", pid, restore_seq));
+        let staged_wal = PathBuf::from(format!("{}.wal", staged_db.display()));
 
         let res = Self::stage_restore_internal(
             bkp_dir,
@@ -1104,9 +1523,12 @@ impl TreeDb {
             val_report,
         );
 
-        // Always clean up staging files if they still exist
-        let _ = fs::remove_file(&staged_db);
-        let _ = fs::remove_file(&staged_wal);
+        // Clean up staging files only if no active restore journal was left behind
+        let journal_path = restore_journal_path(dest_db);
+        if !journal_path.exists() {
+            let _ = fs::remove_file(&staged_db);
+            let _ = fs::remove_file(&staged_wal);
+        }
 
         res
     }
@@ -1123,6 +1545,11 @@ impl TreeDb {
         config: &RestoreConfig,
         _val_report: Option<BackupValidationReport>,
     ) -> std::result::Result<RestoreReport, BackupError> {
+        let journal_path = restore_journal_path(dest_db);
+        if journal_path.exists() {
+            let _ = recover_journal(&journal_path)?;
+        }
+
         let src_db_path = bkp_dir.join(&manifest.db_file_name);
 
         // Copy DB image to staged location
@@ -1178,6 +1605,11 @@ impl TreeDb {
             (0, None)
         };
 
+        check_fault(
+            config.fault_point,
+            StorageFailurePoint::DuringRestoreValidation,
+        )?;
+
         // Validate staged image
         let verify_res = Self::verify_file(staged_db).map_err(|e| {
             BackupError::ConsistencyFailure(format!("staged restore verify_file failed: {e}"))
@@ -1189,17 +1621,52 @@ impl TreeDb {
             )));
         }
 
-        check_fault(
-            config.fault_point,
-            StorageFailurePoint::BeforeRestorePublication,
-        )?;
-
-        // Safe two-phase publication with rollback protection
+        // Safe two-phase publication with durable restore journal
         let dest_parent = dest_db.parent().unwrap_or_else(|| Path::new("."));
         let pid = std::process::id();
         let seq = BACKUP_COUNTER.fetch_add(1, Ordering::SeqCst);
         let bak_db = dest_parent.join(format!(".bak_restore_db_{}_{}", pid, seq));
         let bak_wal = dest_parent.join(format!(".bak_restore_wal_{}_{}", pid, seq));
+
+        let mut journal = RestoreJournal {
+            journal_path: journal_path.clone(),
+            state: RestoreJournalState::Staged,
+            dest_db_path: dest_db.to_path_buf(),
+            dest_wal_path: if manifest.has_wal {
+                Some(dest_wal.to_path_buf())
+            } else {
+                None
+            },
+            staged_db_path: staged_db.to_path_buf(),
+            staged_wal_path: if manifest.has_wal {
+                Some(staged_wal.to_path_buf())
+            } else {
+                None
+            },
+            bak_db_path: if dest_db.exists() {
+                Some(bak_db.clone())
+            } else {
+                None
+            },
+            bak_wal_path: if dest_wal.exists() {
+                Some(bak_wal.clone())
+            } else {
+                None
+            },
+            dest_had_db: dest_db.exists(),
+            dest_had_wal: dest_wal.exists(),
+        };
+
+        journal.write_to_disk()?;
+        check_fault(
+            config.fault_point,
+            StorageFailurePoint::DuringRestoreJournalSync,
+        )?;
+
+        check_fault(
+            config.fault_point,
+            StorageFailurePoint::DuringRestoreDestinationBackup,
+        )?;
 
         if dest_exists {
             if dest_db.exists() {
@@ -1210,29 +1677,45 @@ impl TreeDb {
             }
         }
 
-        // Rename staged into destination
-        let publish_result = (|| -> std::io::Result<()> {
-            fs::rename(staged_db, dest_db)?;
-            if manifest.has_wal {
-                fs::rename(staged_wal, dest_wal)?;
-            }
-            Ok(())
-        })();
+        journal.state = RestoreJournalState::ExistingBackedUp;
+        journal.write_to_disk()?;
 
-        if let Err(e) = publish_result {
-            // Rollback original files if publication failed
-            if bak_db.exists() {
-                let _ = fs::rename(&bak_db, dest_db);
-            }
-            if bak_wal.exists() {
-                let _ = fs::rename(&bak_wal, dest_wal);
-            }
-            return Err(BackupError::Io(e));
+        check_fault(
+            config.fault_point,
+            StorageFailurePoint::BeforeRestorePublication,
+        )?;
+        check_fault(
+            config.fault_point,
+            StorageFailurePoint::DuringRestoreDbPublish,
+        )?;
+
+        fs::rename(staged_db, dest_db)?;
+        journal.state = RestoreJournalState::DbPublished;
+        journal.write_to_disk()?;
+
+        if manifest.has_wal {
+            check_fault(
+                config.fault_point,
+                StorageFailurePoint::DuringRestoreWalPublish,
+            )?;
+            fs::rename(staged_wal, dest_wal)?;
         }
 
-        // Publication succeeded; remove backup files
-        let _ = fs::remove_file(&bak_db);
-        let _ = fs::remove_file(&bak_wal);
+        journal.state = RestoreJournalState::AllPublished;
+        journal.write_to_disk()?;
+
+        check_fault(
+            config.fault_point,
+            StorageFailurePoint::DuringRestoreCleanup,
+        )?;
+
+        if bak_db.exists() {
+            let _ = fs::remove_file(&bak_db);
+        }
+        if bak_wal.exists() {
+            let _ = fs::remove_file(&bak_wal);
+        }
+        journal.delete_from_disk();
 
         // Optional post-restore verification with full recovery replay
         if config.verify_after_restore {
