@@ -55,6 +55,24 @@ pub enum StorageFailurePoint {
     DuringCheckpointWalTruncation,
     /// Immediately after checkpoint and WAL truncation completes.
     AfterCheckpointCompleted,
+    /// Before starting backup creation or staging directory preparation.
+    BeforeBackupCreation,
+    /// During database image file copying to backup staging.
+    DuringBackupDbCopy,
+    /// During WAL file copying to backup staging.
+    DuringBackupWalCopy,
+    /// During backup manifest writing to disk.
+    DuringBackupManifestWrite,
+    /// Immediately before final publication (atomic rename) of the backup directory.
+    BeforeBackupPublication,
+    /// Before validation of the source backup prior to restore.
+    BeforeRestoreValidation,
+    /// During database image file copying to restore staging.
+    DuringRestoreDbCopy,
+    /// During WAL file copying to restore staging.
+    DuringRestoreWalCopy,
+    /// Immediately before final publication (atomic replacement) of the restored database.
+    BeforeRestorePublication,
 }
 
 impl StorageFailurePoint {
@@ -84,6 +102,15 @@ impl StorageFailurePoint {
             Self::BeforeCheckpointWalTruncation => "BeforeCheckpointWalTruncation",
             Self::DuringCheckpointWalTruncation => "DuringCheckpointWalTruncation",
             Self::AfterCheckpointCompleted => "AfterCheckpointCompleted",
+            Self::BeforeBackupCreation => "BeforeBackupCreation",
+            Self::DuringBackupDbCopy => "DuringBackupDbCopy",
+            Self::DuringBackupWalCopy => "DuringBackupWalCopy",
+            Self::DuringBackupManifestWrite => "DuringBackupManifestWrite",
+            Self::BeforeBackupPublication => "BeforeBackupPublication",
+            Self::BeforeRestoreValidation => "BeforeRestoreValidation",
+            Self::DuringRestoreDbCopy => "DuringRestoreDbCopy",
+            Self::DuringRestoreWalCopy => "DuringRestoreWalCopy",
+            Self::BeforeRestorePublication => "BeforeRestorePublication",
         }
     }
 }

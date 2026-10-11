@@ -163,3 +163,5 @@ cargo test --all
    - Recovery restores transactions from WAL; it does not attempt heuristic repair of corrupted files.
 3. **Orphaned Page Classification**:
    - When a transaction allocates overflow pages but crashes before commit, the pages are unlinked from active tables and classified as orphan warnings (`ConsistencySeverity::Warning`) until reclaimed by vacuum. This is an expected physical allocation state and does not constitute corruption.
+4. **Offline Backup & Recovery Bundling (Phase 75)**:
+   - Consistent database images are captured alongside their companion WAL file into a CRC32-verified backup bundle (`docs/BACKUP_RESTORE.md`). Restoring a database replays the bundled WAL through standard recovery, preserving `CommitSeq` monotonicity and cross-layer consistency without manual intervention.

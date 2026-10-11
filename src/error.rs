@@ -654,6 +654,10 @@ pub enum Error {
     /// Transaction conflict detected during execution or commit validation.
     #[error("Transaction conflict: {0}")]
     TransactionConflict(#[from] crate::engine::isolation::TransactionConflict),
+
+    /// Backup or restore operation failed.
+    #[error("Backup or restore error: {0}")]
+    Backup(#[from] crate::engine::backup::BackupError),
 }
 
 impl From<crate::query::validation::PlanValidationError> for Error {

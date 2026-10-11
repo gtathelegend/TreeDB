@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod catalog;
 pub mod failure;
 pub mod isolation;
@@ -9,6 +10,11 @@ pub mod verification;
 
 pub use crate::query::external_multi_index::{MultiIndexConfig, MultiIndexExecutionMode};
 pub use crate::query::materialize::{MaterializeConfig, MaterializeOverride};
+pub use backup::{
+    resolve_source_wal_path, BackupConfig, BackupError, BackupManifest, BackupReport,
+    BackupValidationReport, Crc32Hasher, RestoreConfig, RestoreReport, BACKUP_MANIFEST_MAGIC,
+    CURRENT_BACKUP_VERSION, MANIFEST_FILE_NAME,
+};
 pub use catalog::{
     Catalog, CatalogPage, IndexId, IndexMetadata, TableId, TableMetadata, CATALOG_MAGIC,
     CURRENT_CATALOG_VERSION, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,

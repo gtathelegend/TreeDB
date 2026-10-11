@@ -9,15 +9,17 @@ pub mod storage;
 pub mod wal;
 
 pub use engine::{
-    Catalog, CatalogPage, Column, CommitSeq, ConsistencyCheckConfig, ConsistencyIssue,
-    ConsistencyIssueKind, ConsistencyReport, ConsistencySeverity, ConsistencyStatistics,
-    CurrentVersionVisibility, DataType, IndexId, IndexMetadata, IsolationContext, IsolationLevel,
-    IsolationStatus, MultiIndexScanStats, ReadSet, ReclamationHorizon, Row, Schema, Snapshot,
-    SnapshotId, SnapshotRegistry, StatementResult, StorageFailurePoint, Table, TableId,
-    TableMetadata, Transaction, TransactionCommitMetadata, TransactionWriteSet, TreeDb, TxnState,
-    VacuumConfig, VacuumResult, Value, VersionReclamationEligibility, VisibilityPolicy,
-    CATALOG_MAGIC, CURRENT_CATALOG_VERSION, MAX_COLUMN_NAME_LEN, MAX_INDEX_NAME_LEN,
-    MAX_TABLE_NAME_LEN, TUPLE_FORMAT_VERSION,
+    resolve_source_wal_path, BackupConfig, BackupError, BackupManifest, BackupReport,
+    BackupValidationReport, Catalog, CatalogPage, Column, CommitSeq, ConsistencyCheckConfig,
+    ConsistencyIssue, ConsistencyIssueKind, ConsistencyReport, ConsistencySeverity,
+    ConsistencyStatistics, Crc32Hasher, CurrentVersionVisibility, DataType, IndexId, IndexMetadata,
+    IsolationContext, IsolationLevel, IsolationStatus, MultiIndexScanStats, ReadSet,
+    ReclamationHorizon, RestoreConfig, RestoreReport, Row, Schema, Snapshot, SnapshotId,
+    SnapshotRegistry, StatementResult, StorageFailurePoint, Table, TableId, TableMetadata,
+    Transaction, TransactionCommitMetadata, TransactionWriteSet, TreeDb, TxnState, VacuumConfig,
+    VacuumResult, Value, VersionReclamationEligibility, VisibilityPolicy, BACKUP_MANIFEST_MAGIC,
+    CATALOG_MAGIC, CURRENT_BACKUP_VERSION, CURRENT_CATALOG_VERSION, MANIFEST_FILE_NAME,
+    MAX_COLUMN_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN, TUPLE_FORMAT_VERSION,
 };
 pub use error::{Error, Result};
 pub use index::{
