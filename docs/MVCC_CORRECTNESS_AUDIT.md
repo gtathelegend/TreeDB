@@ -179,3 +179,18 @@ Phase 72 executes a comprehensive correctness and hardening audit of TreeDB's tr
 - **Idempotency**: Repeated recovery validated as strictly idempotent without `CommitSeq` regression.
 - Complete documentation is available in [TRANSACTION_ATOMICITY.md](file:///d:/Projects/TreeDB/docs/TRANSACTION_ATOMICITY.md).
 
+---
+
+## 13. Phase 73: Storage Consistency Verification & Cross-Layer Invariant Enforcement
+
+Phase 73 completes a unified cross-layer consistency verification engine (`TreeDb::check_consistency`, `TreeDb::verify_consistency`, `TreeDb::check_file`, `TreeDb::verify_file`):
+- **Structured Verification API**: `ConsistencyReport` provides fine-grained categorization (`ConsistencySeverity`, `ConsistencyIssueKind`), detailed statistics (`ConsistencyStatistics`), and truncation flags without requiring callers to parse diagnostic strings.
+- **Bi-Directional Cross-Layer Checks**:
+  - Primary Index $\leftrightarrow$ RecordStore: Live primary index heads point to valid record slots; all committed live rows are indexed in the primary B+ Tree.
+  - Secondary/Covering Indexes $\leftrightarrow$ RecordStore: Secondary keys match decoded record column values; covering payloads match projected tuple columns; unique index constraints are not violated by live rows.
+  - Allocation & Ownership Graph $\leftrightarrow$ Freelist: Classifies every page into its operational role; detects duplicate ownership, freelist cycles, and pages simultaneously free and referenced.
+  - MVCC Chains & Overflow Pages: Validates `xmin`/`xmax`/`created_at`/`deleted_at` monotonic invariants, `prev_version` links, absence of cycles, and overflow page chain integrity.
+  - WAL & Commit Sequences: Verifies WAL record decodability, CRC32 integrity, LSN ordering, and non-regressing `CommitSeq` sequences without silently applying recovery.
+- **Read-Only Invariant**: Enforces zero persistent side-effects; verified by byte-for-byte file equality across verification runs.
+- Complete documentation is available in [STORAGE_CONSISTENCY.md](file:///d:/Projects/TreeDB/docs/STORAGE_CONSISTENCY.md).
+

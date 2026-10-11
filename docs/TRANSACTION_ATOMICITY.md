@@ -147,7 +147,17 @@ After any crash recovery scenario, the following structural invariants are verif
 
 ---
 
-## 6. Known Unsupported Boundaries & Remaining Limitations
+## 6. Consistency Verification Integration
+
+Phase 73 provides programmatic read-only consistency verification (`TreeDb::check_consistency`, `TreeDb::verify_file`) to systematically validate the above atomicity, recovery, and index invariants:
+
+* Invariant checks are non-destructive and strictly read-only (100% byte-for-byte file preservation).
+* Cross-layer audits detect contradictions between primary index heads, version chains, secondary indexes, and the freelist.
+* Any unapplied WAL tail beyond the checkpoint is flagged as a recovery prerequisite rather than silently applied.
+
+---
+
+## 7. Known Unsupported Boundaries & Remaining Limitations
 
 1. **Single Writer Execution**:
    - TreeDB supports concurrent readers with MVCC snapshots, but writer transactions must execute sequentially. Concurrent writer execution, multithreading, and distributed transactions remain explicitly disabled.

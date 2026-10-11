@@ -5,6 +5,7 @@ pub mod table;
 pub mod transaction;
 pub mod types;
 pub mod vacuum;
+pub mod verification;
 
 pub use crate::query::external_multi_index::{MultiIndexConfig, MultiIndexExecutionMode};
 pub use crate::query::materialize::{MaterializeConfig, MaterializeOverride};
@@ -22,6 +23,10 @@ pub use table::{MultiIndexScanStats, SkipScanStats, Table};
 pub use transaction::{StatementResult, Transaction, TxnState};
 pub use types::{Column, DataType, Row, Schema, Value, MAX_COLUMN_NAME_LEN, TUPLE_FORMAT_VERSION};
 pub use vacuum::{VacuumConfig, VacuumResult, VersionReclamationEligibility};
+pub use verification::{
+    ConsistencyCheckConfig, ConsistencyIssue, ConsistencyIssueKind, ConsistencyReport,
+    ConsistencySeverity, ConsistencyStatistics,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -418,6 +423,35 @@ impl TreeDb {
     /// Validates the post-vacuum consistency across the database.
     pub fn validate_vacuum_consistency(&mut self) -> Result<()> {
         crate::engine::vacuum::VacuumEngine::validate_db_vacuum_consistency(self)
+    }
+
+    /// Performs a comprehensive, read-only cross-layer consistency verification on the database
+    /// using the provided configuration and resource bounds.
+    pub fn check_consistency(
+        &mut self,
+        config: &ConsistencyCheckConfig,
+    ) -> Result<ConsistencyReport> {
+        verification::ConsistencyVerifier::verify(self, config)
+    }
+
+    /// Performs a default comprehensive, read-only cross-layer consistency verification.
+    pub fn verify_consistency(&mut self) -> Result<ConsistencyReport> {
+        self.check_consistency(&ConsistencyCheckConfig::default())
+    }
+
+    /// Performs consistency verification directly on a database file by path.
+    ///
+    /// Can inspect corrupted files whose headers or file bounds would prevent normal `TreeDb::open`.
+    pub fn check_file(
+        path: impl AsRef<Path>,
+        config: &ConsistencyCheckConfig,
+    ) -> Result<ConsistencyReport> {
+        verification::ConsistencyVerifier::verify_file(path, config)
+    }
+
+    /// Performs default consistency verification directly on a database file by path.
+    pub fn verify_file(path: impl AsRef<Path>) -> Result<ConsistencyReport> {
+        Self::check_file(path, &ConsistencyCheckConfig::default())
     }
 
     /// Returns the number of free pages currently recorded in the database header.

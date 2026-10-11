@@ -126,6 +126,13 @@ Phase 72 verifies the physical storage and allocator invariants across crash bou
 - **Overflow Chain Consistency**: Interrupted multi-page overflow allocations or deallocations leave no dangling chains, unreferenced overflow pages, or freelist leaks.
 - **Page Allocator Integrity**: Recovery reconciles `PageManager` freelist headers with physical page types on disk; no page is simultaneously allocated and free.
 - Detailed architecture is documented in [TRANSACTION_ATOMICITY.md](file:///d:/Projects/TreeDB/docs/TRANSACTION_ATOMICITY.md).
+---
 
+## 11. Phase 73: Storage Consistency Verification & Cross-Layer Invariant Enforcement
 
-
+Phase 73 implements a non-mutating, cross-layer consistency verification engine for TreeDB:
+- **Audit Coverage**: Checks structural and logical invariants across database files, header metadata, page allocations, B+ Tree primary/secondary/covering indexes, slotted record pages, MVCC version chains, overflow page chains, freelists, and WAL commit history.
+- **Strict Read-Only Guarantee**: Verification never modifies persistent database bytes, records, headers, or version chains (enforced by byte-for-byte file equality checks).
+- **Cross-Layer Invariants**: Validates bi-directional consistency between primary B+ Tree live heads and `RecordStore` versions, secondary index entries and referenced record column values, covering index payload projections, and ensures no page is simultaneously free and referenced by a live structure.
+- **Resource Bounds & Bounded Audits**: Configurable resource budgets (`max_pages`, `max_records`, `max_index_entries`, `max_version_chain_depth`, `max_overflow_chain_depth`, `max_issues`) prevent runaway verification on corrupted or infinite-loop chains.
+- Detailed architecture is documented in [STORAGE_CONSISTENCY.md](file:///d:/Projects/TreeDB/docs/STORAGE_CONSISTENCY.md).

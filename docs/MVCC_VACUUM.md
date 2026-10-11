@@ -225,3 +225,13 @@ Phase 72 verifies that vacuum operations behave atomically under simulated failu
 * **Interrupted Record Reclamation**: If vacuum is interrupted while reclaiming record slots or overflow chains (`DuringVacuumRecordReclaim`), physical pages and version chain cuts remain structurally valid.
 * **Interrupted Freelist Update**: If vacuum encounters a crash while returning empty record pages to the freelist (`DuringVacuumFreelistUpdate`), recovery safely reconciles disk state without freelist cycles or duplicate pages.
 * See [TRANSACTION_ATOMICITY.md](file:///d:/Projects/TreeDB/docs/TRANSACTION_ATOMICITY.md) for full failure injection details.
+
+---
+
+## 17. Phase 73: Cross-Layer Consistency Verification Integration
+
+Phase 73 introduces non-destructive, read-only cross-layer consistency verification (`TreeDb::check_consistency`, `TreeDb::verify_file`) that thoroughly checks post-vacuum state:
+* Confirms that vacuum-reclaimed versions are no longer referenced by live primary or secondary index entries.
+* Confirms that reclaimed record and overflow pages added to the freelist do not appear in any active table ownership graph.
+* Guarantees that running consistency verification after vacuum never modifies the database file or triggers unintended vacuum side effects.
+* See [STORAGE_CONSISTENCY.md](file:///d:/Projects/TreeDB/docs/STORAGE_CONSISTENCY.md) for complete details.
