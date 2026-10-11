@@ -417,15 +417,26 @@ impl BufferPool {
     ///
     /// Returns the durable checkpoint LSN.
     pub fn checkpoint(&mut self) -> Result<Lsn> {
+        self.check_fault(crate::engine::failure::StorageFailurePoint::BeforeCheckpointInitiation)?;
+
         // 1. Flush all dirty pages to PageManager, enforcing PageLSN <= durable WAL LSN
+        self.check_fault(
+            crate::engine::failure::StorageFailurePoint::DuringCheckpointDirtyPageFlush,
+        )?;
         self.flush_all()?;
 
         let checkpoint_lsn = if let Some(ref mut wal) = self.wal {
             // 2. Query currently active uncommitted transactions
             let active_txns = wal.active_txns();
 
-            // 3. Append Checkpoint log record
-            let lsn = wal.append_checkpoint(active_txns)?;
+            // 3. Append Checkpoint log record with optional WAL flush failure injection
+            let fault = self.test_failure_point;
+            let lsn = wal.append_checkpoint_with_fault(active_txns, fault)?;
+            if self.test_failure_point
+                == Some(crate::engine::failure::StorageFailurePoint::DuringCheckpointWalFlush)
+            {
+                self.test_failure_point = None;
+            }
 
             // 4. Flush WAL through checkpoint LSN
             wal.flush(lsn)?;
@@ -435,8 +446,13 @@ impl BufferPool {
         };
 
         // 5. Update Database Header on Page 0 with last_checkpoint_lsn and sync
+        self.check_fault(
+            crate::engine::failure::StorageFailurePoint::DuringCheckpointHeaderPersistence,
+        )?;
         self.page_manager.set_last_checkpoint_lsn(checkpoint_lsn)?;
         self.page_manager.sync()?;
+
+        self.check_fault(crate::engine::failure::StorageFailurePoint::AfterCheckpointCompleted)?;
 
         Ok(checkpoint_lsn)
     }
@@ -458,9 +474,17 @@ impl BufferPool {
     /// and truncates WAL prefix prior to this boundary.
     pub fn checkpoint_and_truncate_wal(&mut self) -> Result<Lsn> {
         let checkpoint_lsn = self.checkpoint()?;
-        if let Some(ref mut wal) = self.wal {
-            let retention_lsn = wal.calculate_retention_lsn(checkpoint_lsn);
-            wal.truncate_prefix(retention_lsn)?;
+        self.check_fault(
+            crate::engine::failure::StorageFailurePoint::BeforeCheckpointWalTruncation,
+        )?;
+        if self.wal.is_some() {
+            self.check_fault(
+                crate::engine::failure::StorageFailurePoint::DuringCheckpointWalTruncation,
+            )?;
+            if let Some(ref mut wal) = self.wal {
+                let retention_lsn = wal.calculate_retention_lsn(checkpoint_lsn);
+                wal.truncate_prefix(retention_lsn)?;
+            }
         }
         Ok(checkpoint_lsn)
     }

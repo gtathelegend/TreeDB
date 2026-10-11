@@ -147,13 +147,10 @@ After any crash recovery scenario, the following structural invariants are verif
 
 ---
 
-## 6. Consistency Verification Integration
+## 6. Consistency Verification & Recovery Certification Integration
 
-Phase 73 provides programmatic read-only consistency verification (`TreeDb::check_consistency`, `TreeDb::verify_file`) to systematically validate the above atomicity, recovery, and index invariants:
-
-* Invariant checks are non-destructive and strictly read-only (100% byte-for-byte file preservation).
-* Cross-layer audits detect contradictions between primary index heads, version chains, secondary indexes, and the freelist.
-* Any unapplied WAL tail beyond the checkpoint is flagged as a recovery prerequisite rather than silently applied.
+* **Phase 73 Consistency Verification**: Programmatic read-only consistency verification (`TreeDb::check_consistency`, `TreeDb::verify_file`) systematically validates cross-layer structural and logical invariants with 100% byte-for-byte file preservation.
+* **Phase 74 Recovery Certification**: Comprehensive checkpoint crash matrix validates all 8 persistence boundaries (before checkpoint, during dirty-page flush, during WAL flush, during header sync, before/during WAL truncation, after completion, active transaction spanning checkpoint) and certifies recovery idempotency. See [RECOVERY_CERTIFICATION.md](file:///d:/Projects/TreeDB/docs/RECOVERY_CERTIFICATION.md).
 
 ---
 

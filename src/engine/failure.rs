@@ -41,6 +41,20 @@ pub enum StorageFailurePoint {
     DuringVacuumRecordReclaim,
     /// During vacuum freelist updates.
     DuringVacuumFreelistUpdate,
+    /// Before checkpoint initiation (before flushing dirty pages).
+    BeforeCheckpointInitiation,
+    /// During checkpoint dirty page flushing.
+    DuringCheckpointDirtyPageFlush,
+    /// During checkpoint WAL record flushing.
+    DuringCheckpointWalFlush,
+    /// During checkpoint database header persistence to disk.
+    DuringCheckpointHeaderPersistence,
+    /// After checkpoint header persistence but before WAL truncation.
+    BeforeCheckpointWalTruncation,
+    /// During checkpoint WAL prefix truncation.
+    DuringCheckpointWalTruncation,
+    /// Immediately after checkpoint and WAL truncation completes.
+    AfterCheckpointCompleted,
 }
 
 impl StorageFailurePoint {
@@ -63,6 +77,13 @@ impl StorageFailurePoint {
             Self::DuringVacuumIndexCleanup => "DuringVacuumIndexCleanup",
             Self::DuringVacuumRecordReclaim => "DuringVacuumRecordReclaim",
             Self::DuringVacuumFreelistUpdate => "DuringVacuumFreelistUpdate",
+            Self::BeforeCheckpointInitiation => "BeforeCheckpointInitiation",
+            Self::DuringCheckpointDirtyPageFlush => "DuringCheckpointDirtyPageFlush",
+            Self::DuringCheckpointWalFlush => "DuringCheckpointWalFlush",
+            Self::DuringCheckpointHeaderPersistence => "DuringCheckpointHeaderPersistence",
+            Self::BeforeCheckpointWalTruncation => "BeforeCheckpointWalTruncation",
+            Self::DuringCheckpointWalTruncation => "DuringCheckpointWalTruncation",
+            Self::AfterCheckpointCompleted => "AfterCheckpointCompleted",
         }
     }
 }

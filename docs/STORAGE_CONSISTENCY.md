@@ -176,3 +176,14 @@ To ensure predictability under corrupt or adversarial database files:
 1. **Non-Durable In-Memory Uncommitted State**: Transactions active only in memory and uncommitted to WAL/disk are not tracked by offline or file-based audits.
 2. **Semantic Interpretation of Raw Blobs**: Columns typed as arbitrary bytes (`DataType::Bytes`) cannot be checked for user-level application semantics beyond schema tuple layout.
 3. **Unreferenced Reclaimed Slots**: Fragmented space in slotted record pages is inspected for offset validity, but semantic historical contents of reclaimed holes are inaccessible by design.
+
+---
+
+## 11. Phase 74: Recovery Certification & Pre-Recovery Inspection Integration
+
+Phase 74 enhances offline file verification (`TreeDb::check_file`, `TreeDb::verify_file`):
+* **True Read-Only Pre-Recovery Inspection**: `verify_file` opens files via `TreeDb::open_read_only_unrecovered`, avoiding silent ARIES recovery side effects when inspecting raw pre-recovery disk images.
+* **Unapplied WAL Tail Detection**: When a database has suffered an ungraceful crash, `verify_file` detects unapplied log records beyond `last_checkpoint_lsn` and flags `ConsistencyIssueKind::UnappliedWalTail` with `ConsistencySeverity::Info`, explicitly documenting crash recovery as a prerequisite for offline consistency.
+* **Dual WAL Path Resolution**: Supports both `format!("{}.wal", db_path.display())` and `db_path.with_extension("wal")` conventions.
+* Detailed recovery certification architecture is documented in [RECOVERY_CERTIFICATION.md](file:///d:/Projects/TreeDB/docs/RECOVERY_CERTIFICATION.md).
+

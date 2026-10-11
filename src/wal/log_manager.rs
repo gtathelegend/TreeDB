@@ -355,9 +355,30 @@ impl LogManager {
 
     /// Appends a `Checkpoint` log record capturing currently active transactions.
     pub fn append_checkpoint(&mut self, active_txns: Vec<(TxnId, Lsn)>) -> Result<Lsn> {
+        self.append_checkpoint_with_fault(active_txns, None)
+    }
+
+    /// Appends a `Checkpoint` log record capturing currently active transactions with optional failure injection.
+    pub fn append_checkpoint_with_fault(
+        &mut self,
+        active_txns: Vec<(TxnId, Lsn)>,
+        fault: Option<crate::engine::failure::StorageFailurePoint>,
+    ) -> Result<Lsn> {
         let lsn = self.allocate_lsn();
         let record = LogRecord::new_checkpoint(lsn, active_txns);
+        let current_pos = self.file.stream_position()?;
         self.append_record(&record)?;
+
+        if fault == Some(crate::engine::failure::StorageFailurePoint::DuringCheckpointWalFlush) {
+            // An un-flushed checkpoint record before a crash does not reach durable physical media.
+            // Truncate the file back to simulate the unflushed tail being lost on crash.
+            self.file.set_len(current_pos)?;
+            self.file.seek(SeekFrom::Start(current_pos))?;
+            return Err(Error::InjectedFault(
+                crate::engine::failure::StorageFailurePoint::DuringCheckpointWalFlush,
+            ));
+        }
+
         self.flush(lsn)?;
         Ok(lsn)
     }

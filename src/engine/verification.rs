@@ -675,8 +675,8 @@ impl<'a> ConsistencyVerifier<'a> {
             });
         }
 
-        // Now open with TreeDb::open and run verify
-        let mut db = match TreeDb::open(p, 64) {
+        // Now open with TreeDb::open_read_only_unrecovered to inspect raw state without silent recovery
+        let mut db = match TreeDb::open_read_only_unrecovered(p, 64) {
             Ok(db) => db,
             Err(Error::WalCorruption(msg)) => {
                 return Ok(ConsistencyReport {
@@ -2357,7 +2357,15 @@ impl<'a> ConsistencyVerifier<'a> {
     // -------------------------------------------------------------------------
     fn verify_wal_state(&mut self) -> Result<()> {
         let db_path = self.db.buffer_pool.page_manager().path();
-        let wal_path = db_path.with_extension("wal");
+        let wal_path_candidate1 = std::path::PathBuf::from(format!("{}.wal", db_path.display()));
+        let wal_path_candidate2 = db_path.with_extension("wal");
+        let wal_path = if wal_path_candidate1.exists() {
+            wal_path_candidate1
+        } else if wal_path_candidate2.exists() {
+            wal_path_candidate2
+        } else {
+            wal_path_candidate1
+        };
 
         if !wal_path.exists() {
             self.passed_checks.push("wal_state".to_string());

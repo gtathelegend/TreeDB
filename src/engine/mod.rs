@@ -126,6 +126,59 @@ impl TreeDb {
         })
     }
 
+    /// Opens an existing TreeDB database file without executing crash recovery.
+    ///
+    /// Used for strictly read-only inspection of raw pre-recovery disk images (such as Phase 73/74
+    /// consistency verification and diagnostic audits), avoiding silent recovery side effects.
+    pub fn open_read_only_unrecovered(
+        path: impl AsRef<Path>,
+        pool_capacity: usize,
+    ) -> Result<Self> {
+        let db_path = path.as_ref();
+        let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
+
+        let page_manager = PageManager::open(db_path)?;
+        let (log_manager, max_commit_seq) = if wal_path.exists() {
+            let log_mgr = LogManager::open(&wal_path)?;
+            let max_seq = page_manager.header().max_commit_seq;
+            (log_mgr, max_seq)
+        } else {
+            let max_seq = page_manager.header().max_commit_seq;
+            (LogManager::create(&wal_path)?, max_seq)
+        };
+
+        let next_commit_seq = max_commit_seq.saturating_add(1);
+        let root_page_id = page_manager.header().root_page_id;
+        let mut buffer_pool = BufferPool::with_wal(pool_capacity, page_manager, log_manager)?;
+        let _ = buffer_pool.set_max_commit_seq(max_commit_seq);
+        let tree = BPlusTree::from_root(root_page_id);
+        let record_store = RecordStore::new();
+
+        Ok(Self {
+            tree,
+            record_store,
+            buffer_pool,
+            active_txn: None,
+            stats: StatsRegistry::new(),
+            catalog_generation: 1,
+            index_generation: 1,
+            statistics_generation: 1,
+            plan_cache: PlanCache::new(),
+            feedback_registry: FeedbackRegistry::new(),
+            sort_config: SortConfig::default(),
+            aggregate_config: AggregateConfig::default(),
+            join_config: JoinConfig::default(),
+            multi_index_config: MultiIndexConfig::default(),
+            materialize_config: crate::query::materialize::MaterializeConfig::default(),
+            adaptive_config: AdaptiveSelectionConfig::default(),
+            snapshot_registry: SnapshotRegistry::new(),
+            next_commit_seq,
+            active_txn_inserts: HashMap::new(),
+            active_txn_updates: HashMap::new(),
+            active_txn_deletes: HashMap::new(),
+        })
+    }
+
     /// Creates and initializes a new TreeDB database file with an associated WAL.
     pub fn create(path: impl AsRef<Path>, pool_capacity: usize) -> Result<Self> {
         let db_path = path.as_ref();
