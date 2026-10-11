@@ -92,7 +92,9 @@ impl TreeDb {
         // Check and recover any interrupted restore publication first
         let journal_path = backup::restore_journal_path(db_path);
         if journal_path.exists() {
-            let _ = backup::recover_journal(&journal_path);
+            backup::recover_journal(&journal_path).map_err(|e| {
+                Error::InvalidDatabase(format!("interrupted restore journal recovery failed: {e}"))
+            })?;
         }
 
         let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
@@ -151,6 +153,13 @@ impl TreeDb {
         pool_capacity: usize,
     ) -> Result<Self> {
         let db_path = path.as_ref();
+        let journal_path = backup::restore_journal_path(db_path);
+        if journal_path.exists() {
+            return Err(Error::InvalidDatabase(
+                "cannot open database in read-only mode: interrupted restore publication is pending; call recover_interrupted_restore first".into(),
+            ));
+        }
+
         let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
 
         let page_manager = PageManager::open(db_path)?;

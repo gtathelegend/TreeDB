@@ -797,17 +797,29 @@ impl RestoreJournal {
                 if self.dest_had_db {
                     if let Some(ref bak) = self.bak_db_path {
                         if bak.exists() {
+                            if self.dest_db_path.exists() {
+                                let _ = fs::remove_file(&self.dest_db_path);
+                            }
                             fs::rename(bak, &self.dest_db_path)?;
                         }
                     }
+                } else if self.dest_db_path.exists() {
+                    let _ = fs::remove_file(&self.dest_db_path);
                 }
                 if self.dest_had_wal {
                     if let (Some(ref bak), Some(ref dest_wal)) =
                         (&self.bak_wal_path, &self.dest_wal_path)
                     {
                         if bak.exists() {
+                            if dest_wal.exists() {
+                                let _ = fs::remove_file(dest_wal);
+                            }
                             fs::rename(bak, dest_wal)?;
                         }
+                    }
+                } else if let Some(ref dest_wal) = self.dest_wal_path {
+                    if dest_wal.exists() {
+                        let _ = fs::remove_file(dest_wal);
                     }
                 }
                 let _ = fs::remove_file(&self.staged_db_path);
@@ -821,7 +833,43 @@ impl RestoreJournal {
                     (&self.staged_wal_path, &self.dest_wal_path)
                 {
                     if staged_wal.exists() {
+                        if dest_wal.exists() {
+                            let _ = fs::remove_file(dest_wal);
+                        }
                         fs::rename(staged_wal, dest_wal)?;
+                    } else if !dest_wal.exists() {
+                        // Neither staged_wal nor dest_wal exists!
+                        // If previous destination was backed up, roll back rather than leaving a published DB without its WAL!
+                        if self.dest_had_db {
+                            if let Some(ref bak) = self.bak_db_path {
+                                if bak.exists() {
+                                    if self.dest_db_path.exists() {
+                                        let _ = fs::remove_file(&self.dest_db_path);
+                                    }
+                                    fs::rename(bak, &self.dest_db_path)?;
+                                }
+                            }
+                            if self.dest_had_wal {
+                                if let (Some(ref bak), Some(ref dest_wal)) =
+                                    (&self.bak_wal_path, &self.dest_wal_path)
+                                {
+                                    if bak.exists() {
+                                        if dest_wal.exists() {
+                                            let _ = fs::remove_file(dest_wal);
+                                        }
+                                        fs::rename(bak, dest_wal)?;
+                                    }
+                                }
+                            }
+                            self.delete_from_disk();
+                            return Err(BackupError::MissingFile(
+                                "staged WAL missing during DbPublished roll-forward; rolled back to previous destination".into(),
+                            ));
+                        } else {
+                            return Err(BackupError::MissingFile(
+                                "staged WAL missing during DbPublished roll-forward".into(),
+                            ));
+                        }
                     }
                 }
                 if let Some(ref bak) = self.bak_db_path {
@@ -829,6 +877,10 @@ impl RestoreJournal {
                 }
                 if let Some(ref bak) = self.bak_wal_path {
                     let _ = fs::remove_file(bak);
+                }
+                let _ = fs::remove_file(&self.staged_db_path);
+                if let Some(ref p) = self.staged_wal_path {
+                    let _ = fs::remove_file(p);
                 }
                 self.delete_from_disk();
             }
@@ -1493,6 +1545,12 @@ impl TreeDb {
         };
 
         let manifest = Self::inspect_backup_manifest(bkp_dir)?;
+
+        // Check and recover any lingering restore journal before evaluating destination existence
+        let journal_path = restore_journal_path(dest_db);
+        if journal_path.exists() {
+            let _ = recover_journal(&journal_path)?;
+        }
 
         // 2. Destination check
         let dest_wal = PathBuf::from(format!("{}.wal", dest_db.display()));

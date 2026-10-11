@@ -39,6 +39,7 @@ The audit performed an in-depth code and behavioral review across the following 
 
 ## 3. Confirmed Defects Found
 
+### Phase 76 Audit Findings
 | Defect ID | Severity | Component | Description |
 |---|---|---|---|
 | **DEF-76-01** | High | `TreeDb::restore_backup` | **Non-Atomic Multi-File Replacement**: Sequential individual renames of `.tmp_restore_db_*` and `.tmp_restore_wal_*` risked leaving the destination in an unrecoverable mixed state if interrupted by a process kill or system crash between renames. |
@@ -48,10 +49,21 @@ The audit performed an in-depth code and behavioral review across the following 
 | **DEF-76-05** | Medium | `BackupManifest::deserialize` | **Unbounded Allocations & Traversal Vulnerability**: Manifest parsing did not enforce a maximum manifest buffer size or validate `db_file_name` and `wal_file_name` against directory traversal sequences (`..`, `/`, `\`). |
 | **DEF-76-06** | Low | `BackupValidationReport` | **Ambiguous Audit Reporting**: Valid backups containing unapplied WAL tails were reported with the same unqualified boolean `is_valid: true` as cleanly checkpointed images, obscuring whether recovery replay was required. |
 
+### Phase 77 Audit Findings
+| Defect ID | Severity | Component | Description |
+|---|---|---|---|
+| **DEF-77-01** | High | `TreeDb::open` | **Silent Error Suppression on Journal Recovery**: `TreeDb::open` used `let _ = backup::recover_journal(&journal_path)`, ignoring errors from corrupted journals and attempting to open unrecovered or half-published database files. |
+| **DEF-77-02** | High | `TreeDb::restore_backup` | **Premature Destination Existence Evaluation**: Destination existence was evaluated before recovering lingering restore journals, which could bypass `allow_overwrite: false` when an interrupted restore had moved the destination database to `.bak_*`. |
+| **DEF-77-03** | High | `RestoreJournal::execute_recovery` | **Orphaned Partial Database on Fresh Destination Rollback**: In `ExistingBackedUp` state, when `dest_had_db = false`, rollback failed to delete the partially written `dest_db`, leaving behind an orphaned database file. |
+| **DEF-77-04** | High | `RestoreJournal::execute_recovery` | **Unsafe Destruction of Valid Destination on Missing Staged WAL**: In `DbPublished` state, if roll-forward failed due to a missing staged WAL, recovery deleted `.bak_*` files, destroying the only valid copy of the database. |
+| **DEF-77-05** | Medium | `RestoreJournal::execute_recovery` | **Cross-Platform Rename Collision on Windows**: Rollback renaming `bak -> dest_db` failed on Windows if `dest_db` already existed from a prior partial step, failing recovery. |
+| **DEF-77-06** | Medium | `TreeDb::open_read_only_unrecovered` | **Unsafe Inspection of Pending Restores**: `open_read_only_unrecovered` did not reject paths with active restore journals, permitting inspection of half-published images without running publication recovery. |
+
 ---
 
 ## 4. Fixes Implemented
 
+### Phase 76 Fixes
 1. **Durable Restore Journal Protocol (`RestoreJournal`)**:
    * Introduced binary, CRC32-checksummed journal tracking publication state:
      * `Staged (0)` -> `ExistingBackedUp (1)` -> `DbPublished (2)` -> `AllPublished (3)`.
@@ -68,6 +80,20 @@ The audit performed an in-depth code and behavioral review across the following 
    * Added `is_safe_file_name` to reject filenames exceeding 255 bytes, containing path separators (`/`, `\`), null bytes, or `..`.
 6. **Explicit `BackupAuditStatus` Classification**:
    * Added `status: BackupAuditStatus` (`FullyHealthy`, `RecoverablePendingRecovery`, `StructurallyInconsistent`, `Inconclusive`) to `BackupValidationReport`.
+
+### Phase 77 Fixes
+7. **Strict Journal Recovery Error Propagation**:
+   * Updated `TreeDb::open` to propagate errors from `recover_journal` as `Error::InvalidDatabase`, halting initialization if a journal fails checksum or format verification.
+8. **Pre-Evaluation Journal Recovery in `restore_backup`**:
+   * Recovers any lingering journal before evaluating `dest_exists`, guaranteeing that `allow_overwrite: false` is strictly enforced even across crashed prior operations.
+9. **Clean Orphan Removal on Fresh Destination Rollback**:
+   * Added explicit removal of `dest_db_path` and `dest_wal_path` in `ExistingBackedUp` when `!dest_had_db` / `!dest_had_wal`.
+10. **Safe Rollback Fallback on Missing Staged WAL**:
+    * If staged WAL is missing during `DbPublished` roll-forward and previous destination backups exist, recovery rolls back to `bak_db` and `bak_wal` instead of deleting them.
+11. **Collision-Free Cross-Platform Rename**:
+    * Added preemptive removal of destination files before executing `fs::rename` during journal recovery to prevent `AlreadyExists` errors on Windows.
+12. **Protection Against Pending Restores in Read-Only Mode**:
+    * Updated `open_read_only_unrecovered` to immediately return `Error::InvalidDatabase` if a `.restore_journal` exists.
 
 ---
 

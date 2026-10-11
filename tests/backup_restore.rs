@@ -18,7 +18,8 @@ use treedb::engine::types::{Column, DataType, Row, Schema, Value};
 use treedb::engine::vacuum::VacuumConfig;
 use treedb::{
     restore_journal_path, BackupAuditStatus, BackupConfig, BackupError, RestoreConfig,
-    StorageFailurePoint, TreeDb, CURRENT_BACKUP_VERSION, MANIFEST_FILE_NAME,
+    RestoreJournal, RestoreJournalState, StorageFailurePoint, TreeDb, CURRENT_BACKUP_VERSION,
+    MANIFEST_FILE_NAME, RESTORE_JOURNAL_MAGIC,
 };
 
 // =============================================================================
@@ -1721,4 +1722,422 @@ fn test_stage8_persistence_lifecycle_regressions() {
     drop(reopened_db);
     let mut reopened_db2 = TreeDb::open(&rest_db_path, 64).unwrap();
     assert!(reopened_db2.verify_consistency().unwrap().is_healthy());
+}
+
+#[test]
+fn test_stage2_corrupt_journal_rejected_without_destructive_cleanup() {
+    let (mut db, _dir, db_path) = setup_test_db("corrupt_journal_db");
+    let mut model = LogicalModel::default();
+    let row = make_test_row(1, "ACC_0001", 500, "CORRUPT_TEST", vec![1; 16]);
+    insert_rows(&mut db, &[row]);
+    model.insert(1, "ACC_0001", 500, "CORRUPT_TEST", vec![1; 16]);
+    db.checkpoint_and_truncate_wal().unwrap();
+    drop(db);
+
+    // Place a corrupted restore journal at <db_path>.restore_journal
+    let journal_path = restore_journal_path(&db_path);
+    let mut corrupt_bytes = Vec::new();
+    corrupt_bytes.extend_from_slice(RESTORE_JOURNAL_MAGIC);
+    corrupt_bytes.extend_from_slice(&[1, 0, 0, 0]); // version 1
+    corrupt_bytes.extend_from_slice(&[0xFF; 20]); // garbage payload with invalid CRC
+    fs::write(&journal_path, &corrupt_bytes).unwrap();
+
+    // 1. Explicit recover_interrupted_restore must reject corrupt journal
+    let err = TreeDb::recover_interrupted_restore(&db_path).unwrap_err();
+    assert!(matches!(
+        err,
+        BackupError::ChecksumMismatch { .. } | BackupError::InvalidManifest(_)
+    ));
+    // Journal file and database file must NOT be deleted
+    assert!(journal_path.exists());
+    assert!(db_path.exists());
+
+    // 2. TreeDb::open must also propagate error and not silently destroy disk
+    let open_err = TreeDb::open(&db_path, 64).err().unwrap();
+    let err_str = open_err.to_string();
+    assert!(err_str.contains("interrupted restore journal recovery failed"));
+
+    // Remove the corrupt journal manually so we can verify the DB itself was never destroyed
+    let _ = fs::remove_file(&journal_path);
+    let mut reopened = TreeDb::open(&db_path, 64).unwrap();
+    model.assert_matches_database(&mut reopened, "corrupt_journal_safe");
+}
+
+#[test]
+fn test_stage2_existing_backed_up_fresh_destination_cleans_orphaned_files() {
+    let (mut src_db, _src_dir, src_db_path) = setup_test_db("fresh_src_db");
+    let row = make_test_row(1, "SRC_001", 100, "FRESH", vec![1; 16]);
+    insert_rows(&mut src_db, &[row]);
+    src_db.checkpoint_and_truncate_wal().unwrap();
+    drop(src_db);
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    TreeDb::backup_database(&src_db_path, &bkp_path, &BackupConfig::default()).unwrap();
+
+    // Fresh destination that does NOT exist beforehand
+    let dest_dir = tempdir().unwrap();
+    let dest_db_path = dest_dir.path().join("fresh_dest.treedb");
+    assert!(!dest_db_path.exists());
+
+    let rest_cfg = RestoreConfig {
+        allow_overwrite: false,
+        fault_point: Some(StorageFailurePoint::DuringRestoreDbPublish),
+        validate_before_restore: true,
+        verify_after_restore: false,
+        buffer_pool_size: 64,
+    };
+    let err = TreeDb::restore_backup(&bkp_path, &dest_db_path, &rest_cfg).unwrap_err();
+    assert!(matches!(
+        err,
+        BackupError::InjectedFault(StorageFailurePoint::DuringRestoreDbPublish)
+    ));
+
+    let journal_path = restore_journal_path(&dest_db_path);
+    assert!(journal_path.exists());
+
+    // Recovery rolls back: since destination was fresh and had no existing DB,
+    // dest_db_path must be removed and not left as an orphaned file!
+    let recovered = TreeDb::recover_interrupted_restore(&dest_db_path).unwrap();
+    assert!(recovered);
+    assert!(!journal_path.exists());
+    assert!(!dest_db_path.exists());
+}
+
+#[test]
+fn test_stage2_db_published_missing_wal_rolls_back_to_valid_destination() {
+    let (mut orig_db, _orig_dir, orig_db_path) = setup_test_db("orig_rollback_db");
+    let mut orig_model = LogicalModel::default();
+    let row = make_test_row(1, "ORIG_1", 200, "ORIG", vec![2; 16]);
+    insert_rows(&mut orig_db, &[row]);
+    orig_model.insert(1, "ORIG_1", 200, "ORIG", vec![2; 16]);
+    orig_db.checkpoint_and_truncate_wal().unwrap();
+    drop(orig_db);
+
+    // Create a backup with a companion WAL
+    let (mut new_db, _new_dir, new_db_path) = setup_test_db("new_wal_src_db");
+    let row2 = make_test_row(2, "NEW_1", 300, "NEW", vec![3; 16]);
+    insert_rows(&mut new_db, &[row2]);
+    new_db.checkpoint_and_truncate_wal().unwrap();
+    // Commit uncheckpointed transaction to force WAL inclusion in backup
+    let mut txn = new_db.begin().unwrap();
+    {
+        let mut tbl = txn.open_table("accounts").unwrap();
+        let row3 = make_test_row(3, "NEW_2", 400, "NEW", vec![4; 16]);
+        tbl.insert(&row3).unwrap();
+    }
+    txn.commit().unwrap();
+    drop(new_db);
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    let bkp_rep = TreeDb::backup_database(
+        &new_db_path,
+        &bkp_path,
+        &BackupConfig {
+            fault_point: None,
+            checkpoint_before_backup: false,
+            verify_image: true,
+        },
+    )
+    .unwrap();
+    assert!(bkp_rep.manifest.has_wal);
+
+    // Restore with DuringRestoreWalPublish fault
+    let rest_cfg = RestoreConfig {
+        allow_overwrite: true,
+        fault_point: Some(StorageFailurePoint::DuringRestoreWalPublish),
+        validate_before_restore: true,
+        verify_after_restore: false,
+        buffer_pool_size: 64,
+    };
+    let _ = TreeDb::restore_backup(&bkp_path, &orig_db_path, &rest_cfg);
+
+    let journal_path = restore_journal_path(&orig_db_path);
+    assert!(journal_path.exists());
+    let bytes = fs::read(&journal_path).unwrap();
+    let journal = RestoreJournal::deserialize(&bytes, journal_path.clone()).unwrap();
+    assert_eq!(journal.state, RestoreJournalState::DbPublished);
+
+    // Now delete the staged WAL, simulating physical file loss/corruption during crash
+    if let Some(ref staged_wal) = journal.staged_wal_path {
+        if staged_wal.exists() {
+            fs::remove_file(staged_wal).unwrap();
+        }
+    }
+
+    // Now recovery cannot roll forward because staged_wal is gone!
+    // It must roll back to the previous valid destination (bak_db) rather than
+    // destroying bak_db and leaving a broken DB without its companion WAL!
+    let rec_res = TreeDb::recover_interrupted_restore(&orig_db_path);
+    assert!(rec_res.is_err());
+    assert!(!journal_path.exists());
+
+    // Reopen original destination: must be completely intact with original 1 row!
+    let mut reopened = TreeDb::open(&orig_db_path, 64).unwrap();
+    orig_model.assert_matches_database(&mut reopened, "rolled_back_after_missing_wal");
+}
+
+#[test]
+fn test_stage2_repeated_journal_recovery_is_idempotent() {
+    let (mut db, _dir, db_path) = setup_test_db("idempotent_recovery_db");
+    let row = make_test_row(1, "ACC_1", 100, "IDEM", vec![1; 16]);
+    insert_rows(&mut db, &[row]);
+    db.checkpoint_and_truncate_wal().unwrap();
+    drop(db);
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    TreeDb::backup_database(&db_path, &bkp_path, &BackupConfig::default()).unwrap();
+
+    let rest_dir = tempdir().unwrap();
+    let dest_db_path = rest_dir.path().join("dest.treedb");
+
+    let rest_cfg = RestoreConfig {
+        allow_overwrite: false,
+        fault_point: Some(StorageFailurePoint::DuringRestoreDbPublish),
+        validate_before_restore: true,
+        verify_after_restore: false,
+        buffer_pool_size: 64,
+    };
+    let _ = TreeDb::restore_backup(&bkp_path, &dest_db_path, &rest_cfg);
+
+    // First recovery pass
+    let r1 = TreeDb::recover_interrupted_restore(&dest_db_path).unwrap();
+    assert!(r1);
+
+    // Second recovery pass: journal is gone, must safely return Ok(false)
+    let r2 = TreeDb::recover_interrupted_restore(&dest_db_path).unwrap();
+    assert!(!r2);
+
+    // Third recovery pass
+    let r3 = TreeDb::recover_interrupted_restore(&dest_db_path).unwrap();
+    assert!(!r3);
+}
+
+#[test]
+fn test_stage3_end_to_end_lifecycle_with_independent_model() {
+    let (mut db, _dir, _db_path) = setup_test_db("e2e_lifecycle_db");
+    let mut model = LogicalModel::default();
+
+    // 1. Initial Inserts
+    let mut rows = Vec::new();
+    for i in 1..=20 {
+        let row = make_test_row(
+            i,
+            &format!("ACC_{i:04}"),
+            i * 50,
+            "INITIAL",
+            vec![i as u8; 32],
+        );
+        rows.push(row);
+        model.insert(
+            i,
+            &format!("ACC_{i:04}"),
+            i * 50,
+            "INITIAL",
+            vec![i as u8; 32],
+        );
+    }
+    insert_rows(&mut db, &rows);
+    model.assert_matches_database(&mut db, "after_initial_inserts");
+
+    // 2. Updates & Deletes
+    let mut txn = db.begin().unwrap();
+    {
+        let mut tbl = txn.open_table("accounts").unwrap();
+        // Update first 5 rows
+        for i in 1..=5 {
+            let updated =
+                make_test_row(i, &format!("ACC_{i:04}"), i * 999, "UPDATED", vec![99; 32]);
+            tbl.update(&updated).unwrap();
+            model.update(i, &format!("ACC_{i:04}"), i * 999, "UPDATED", vec![99; 32]);
+        }
+        // Delete rows 15..20
+        for i in 15..=20 {
+            tbl.delete(&Value::Int64(i)).unwrap();
+            model.delete(i);
+        }
+    }
+    txn.commit().unwrap();
+    model.assert_matches_database(&mut db, "after_updates_and_deletes");
+
+    // 3. Overflow Record (8 KB payload)
+    let mut txn2 = db.begin().unwrap();
+    {
+        let mut tbl = txn2.open_table("accounts").unwrap();
+        let overflow_row = make_test_row(25, "ACC_OVERFLOW", 12345, "OVERFLOW", vec![0xAB; 8192]);
+        tbl.insert(&overflow_row).unwrap();
+        model.insert(25, "ACC_OVERFLOW", 12345, "OVERFLOW", vec![0xAB; 8192]);
+    }
+    txn2.commit().unwrap();
+    model.assert_matches_database(&mut db, "after_overflow_insert");
+
+    // 4. Aborted Transaction
+    let mut txn_abort = db.begin().unwrap();
+    {
+        let mut tbl = txn_abort.open_table("accounts").unwrap();
+        let abort_row = make_test_row(99, "ACC_ABORT", 9999, "ABORTED", vec![0xFF; 16]);
+        tbl.insert(&abort_row).unwrap();
+    }
+    txn_abort.abort().unwrap();
+    model.assert_matches_database(&mut db, "after_aborted_transaction");
+
+    // 5. Checkpoint
+    db.checkpoint_and_truncate_wal().unwrap();
+    let rep_chk = db.verify_consistency().unwrap();
+    assert!(rep_chk.is_healthy());
+    assert!(!rep_chk.truncated);
+    assert!(rep_chk.skipped_checks.is_empty());
+
+    // 6. Vacuum
+    let vac_rep = db.vacuum(&VacuumConfig::default()).unwrap();
+    assert!(vac_rep.pages_examined > 0);
+    let rep_vac = db.verify_consistency().unwrap();
+    assert!(rep_vac.is_healthy());
+
+    // 7. Backup Creation
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    let bkp_rep = db
+        .create_backup(&bkp_path, &BackupConfig::default())
+        .unwrap();
+    assert_eq!(
+        bkp_rep.validation.as_ref().unwrap().status,
+        BackupAuditStatus::FullyHealthy
+    );
+
+    // 8. Restore into Fresh Destination
+    let rest_dir = tempdir().unwrap();
+    let rest_db_path = rest_dir.path().join("restored_e2e.treedb");
+    TreeDb::restore_backup(&bkp_path, &rest_db_path, &RestoreConfig::default()).unwrap();
+
+    // 9. Reopen Restored DB & Verify against independent model
+    let mut restored_db = TreeDb::open(&rest_db_path, 64).unwrap();
+    model.assert_matches_database(&mut restored_db, "restored_database");
+    let rep_rest = restored_db.verify_consistency().unwrap();
+    assert!(rep_rest.is_healthy());
+
+    // 10. New writes on restored DB
+    let mut txn3 = restored_db.begin().unwrap();
+    {
+        let mut tbl = txn3.open_table("accounts").unwrap();
+        for i in 101..=105 {
+            let row = make_test_row(
+                i,
+                &format!("NEW_{i:04}"),
+                i * 100,
+                "POST_RESTORE",
+                vec![i as u8; 16],
+            );
+            tbl.insert(&row).unwrap();
+            model.insert(
+                i,
+                &format!("NEW_{i:04}"),
+                i * 100,
+                "POST_RESTORE",
+                vec![i as u8; 16],
+            );
+        }
+    }
+    txn3.commit().unwrap();
+    model.assert_matches_database(&mut restored_db, "post_restore_writes");
+
+    // 11. Final Reopen & Checkpoint
+    restored_db.checkpoint_and_truncate_wal().unwrap();
+    drop(restored_db);
+    let mut final_db = TreeDb::open(&rest_db_path, 64).unwrap();
+    model.assert_matches_database(&mut final_db, "final_reopened_state");
+    let final_rep = final_db.verify_consistency().unwrap();
+    assert!(final_rep.is_healthy());
+    assert!(!final_rep.truncated);
+    assert!(final_rep.skipped_checks.is_empty());
+}
+
+#[test]
+fn test_stage7_stale_journal_prevents_unauthorized_overwrite() {
+    let (mut orig_db, _dir, orig_db_path) = setup_test_db("stale_journal_overwrite_db");
+    let row = make_test_row(1, "ORIG_1", 100, "ORIG", vec![1; 16]);
+    insert_rows(&mut orig_db, &[row]);
+    orig_db.checkpoint_and_truncate_wal().unwrap();
+    drop(orig_db);
+
+    let (mut new_db, _new_dir, new_db_path) = setup_test_db("new_backup_src_db");
+    let row2 = make_test_row(2, "NEW_1", 200, "NEW", vec![2; 16]);
+    insert_rows(&mut new_db, &[row2]);
+    new_db.checkpoint_and_truncate_wal().unwrap();
+    drop(new_db);
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    TreeDb::backup_database(&new_db_path, &bkp_path, &BackupConfig::default()).unwrap();
+
+    // Start restore with overwrite: true, but inject fault at DuringRestoreDbPublish
+    // This moves orig_db_path to .bak_* and creates a journal in ExistingBackedUp state
+    let rest_cfg = RestoreConfig {
+        allow_overwrite: true,
+        fault_point: Some(StorageFailurePoint::DuringRestoreDbPublish),
+        validate_before_restore: true,
+        verify_after_restore: false,
+        buffer_pool_size: 64,
+    };
+    let _ = TreeDb::restore_backup(&bkp_path, &orig_db_path, &rest_cfg);
+    let journal_path = restore_journal_path(&orig_db_path);
+    assert!(journal_path.exists());
+
+    // Now attempt a subsequent restore with allow_overwrite: false
+    // Restore must recover the journal (restoring original DB from .bak) and then REJECT
+    // because destination exists and overwrite was not allowed!
+    let rest_cfg_disallowed = RestoreConfig {
+        allow_overwrite: false,
+        fault_point: None,
+        validate_before_restore: true,
+        verify_after_restore: false,
+        buffer_pool_size: 64,
+    };
+    let err = TreeDb::restore_backup(&bkp_path, &orig_db_path, &rest_cfg_disallowed).unwrap_err();
+    assert!(matches!(err, BackupError::DestinationExists(_)));
+
+    // Verify original DB is operational and undamaged
+    let mut reopened = TreeDb::open(&orig_db_path, 64).unwrap();
+    let rep = reopened.verify_consistency().unwrap();
+    assert!(rep.is_healthy());
+}
+
+#[test]
+fn test_stage7_open_read_only_unrecovered_rejects_pending_journal() {
+    let (mut db, _dir, db_path) = setup_test_db("read_only_journal_reject_db");
+    let row = make_test_row(1, "RO_1", 100, "RO", vec![1; 16]);
+    insert_rows(&mut db, &[row]);
+    db.checkpoint_and_truncate_wal().unwrap();
+    drop(db);
+
+    // Place a journal file
+    let journal_path = restore_journal_path(&db_path);
+    let journal = RestoreJournal {
+        journal_path: journal_path.clone(),
+        state: RestoreJournalState::Staged,
+        dest_db_path: db_path.clone(),
+        dest_wal_path: None,
+        staged_db_path: PathBuf::from("fake_staged.db"),
+        staged_wal_path: None,
+        bak_db_path: None,
+        bak_wal_path: None,
+        dest_had_db: true,
+        dest_had_wal: false,
+    };
+    journal.write_to_disk().unwrap();
+
+    // open_read_only_unrecovered must reject because pending restore publication is unresolved
+    let err = TreeDb::open_read_only_unrecovered(&db_path, 64)
+        .err()
+        .unwrap();
+    assert!(err
+        .to_string()
+        .contains("interrupted restore publication is pending"));
+
+    // Remove journal and verify normal open succeeds
+    let _ = fs::remove_file(&journal_path);
+    let unrecovered = TreeDb::open_read_only_unrecovered(&db_path, 64).unwrap();
+    drop(unrecovered);
 }
