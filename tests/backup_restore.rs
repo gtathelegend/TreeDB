@@ -2141,3 +2141,142 @@ fn test_stage7_open_read_only_unrecovered_rejects_pending_journal() {
     let unrecovered = TreeDb::open_read_only_unrecovered(&db_path, 64).unwrap();
     drop(unrecovered);
 }
+
+#[test]
+fn test_stage3_journal_all_published_crash_before_cleanup_recovers_cleanly() {
+    let (mut orig_db, _dir, orig_db_path) = setup_test_db("all_pub_crash_orig");
+    let row = make_test_row(1, "ORIG_1", 100, "ORIG", vec![1; 16]);
+    insert_rows(&mut orig_db, &[row]);
+    orig_db.checkpoint_and_truncate_wal().unwrap();
+    drop(orig_db);
+
+    let (mut new_db, _new_dir, new_db_path) = setup_test_db("all_pub_crash_new");
+    let mut new_model = LogicalModel::default();
+    let row2 = make_test_row(2, "NEW_1", 200, "NEW", vec![2; 16]);
+    insert_rows(&mut new_db, &[row2]);
+    new_model.insert(2, "NEW_1", 200, "NEW", vec![2; 16]);
+    new_db.checkpoint_and_truncate_wal().unwrap();
+    drop(new_db);
+
+    let bkp_dir = tempdir().unwrap();
+    let bkp_path = bkp_dir.path().join("backup");
+    TreeDb::backup_database(&new_db_path, &bkp_path, &BackupConfig::default()).unwrap();
+
+    // Restore with fault at DuringRestoreCleanup
+    let rest_cfg = RestoreConfig {
+        allow_overwrite: true,
+        fault_point: Some(StorageFailurePoint::DuringRestoreCleanup),
+        validate_before_restore: true,
+        verify_after_restore: false,
+        buffer_pool_size: 64,
+    };
+    let err = TreeDb::restore_backup(&bkp_path, &orig_db_path, &rest_cfg).unwrap_err();
+    assert!(matches!(
+        err,
+        BackupError::InjectedFault(StorageFailurePoint::DuringRestoreCleanup)
+    ));
+
+    // Verify on disk: journal exists in AllPublished state
+    let journal_path = restore_journal_path(&orig_db_path);
+    assert!(journal_path.exists());
+    let bytes = fs::read(&journal_path).unwrap();
+    let journal = RestoreJournal::deserialize(&bytes, journal_path.clone()).unwrap();
+    assert_eq!(journal.state, RestoreJournalState::AllPublished);
+
+    // TreeDb::open must automatically finish cleanup and open the new database
+    let mut reopened = TreeDb::open(&orig_db_path, 64).unwrap();
+    assert!(!journal_path.exists());
+    new_model.assert_matches_database(&mut reopened, "all_published_recovered");
+    let rep = reopened.verify_consistency().unwrap();
+    assert!(rep.is_healthy());
+}
+
+#[test]
+fn test_stage3_journal_unsupported_state_rejected_without_cleanup() {
+    let (mut db, _dir, db_path) = setup_test_db("unsupported_journal_state_db");
+    let row = make_test_row(1, "ACC_1", 100, "UNSUPPORTED", vec![1; 16]);
+    insert_rows(&mut db, &[row]);
+    db.checkpoint_and_truncate_wal().unwrap();
+    drop(db);
+
+    let journal_path = restore_journal_path(&db_path);
+    let journal = RestoreJournal {
+        journal_path: journal_path.clone(),
+        state: RestoreJournalState::Staged,
+        dest_db_path: db_path.clone(),
+        dest_wal_path: None,
+        staged_db_path: PathBuf::from("fake_staged.db"),
+        staged_wal_path: None,
+        bak_db_path: None,
+        bak_wal_path: None,
+        dest_had_db: true,
+        dest_had_wal: false,
+    };
+    let mut bytes = journal.serialize();
+    // Overwrite state byte (index 12) with unsupported value 99
+    bytes[12] = 99;
+    // Recompute CRC32
+    let payload_len = bytes.len() - 4;
+    let crc = treedb::crc32(&bytes[..payload_len]);
+    bytes[payload_len..].copy_from_slice(&crc.to_le_bytes());
+    fs::write(&journal_path, &bytes).unwrap();
+
+    // recover_interrupted_restore must reject unsupported state without deleting database or journal
+    let err = TreeDb::recover_interrupted_restore(&db_path).unwrap_err();
+    assert!(matches!(err, BackupError::InvalidManifest(_)));
+    assert!(journal_path.exists());
+    assert!(db_path.exists());
+
+    // Clean up journal file and verify database remains operational
+    let _ = fs::remove_file(&journal_path);
+    let mut reopened = TreeDb::open(&db_path, 64).unwrap();
+    let rep = reopened.verify_consistency().unwrap();
+    assert!(rep.is_healthy());
+}
+
+#[test]
+fn test_stage5_verify_file_on_pending_journal_reports_fatal_and_preserves_disk() {
+    let (mut db, _dir, db_path) = setup_test_db("verify_file_immutability_db");
+    let row = make_test_row(1, "ACC_1", 100, "IMMUTABLE", vec![1; 16]);
+    insert_rows(&mut db, &[row]);
+    db.checkpoint_and_truncate_wal().unwrap();
+    drop(db);
+
+    let db_bytes_before = fs::read(&db_path).unwrap();
+
+    // Place a pending restore journal
+    let journal_path = restore_journal_path(&db_path);
+    let journal = RestoreJournal {
+        journal_path: journal_path.clone(),
+        state: RestoreJournalState::Staged,
+        dest_db_path: db_path.clone(),
+        dest_wal_path: None,
+        staged_db_path: PathBuf::from("fake_staged.db"),
+        staged_wal_path: None,
+        bak_db_path: None,
+        bak_wal_path: None,
+        dest_had_db: true,
+        dest_had_wal: false,
+    };
+    journal.write_to_disk().unwrap();
+    let journal_bytes_before = fs::read(&journal_path).unwrap();
+
+    // verify_file must report fatal error and not mutate any files
+    let rep = TreeDb::verify_file(&db_path).unwrap();
+    assert!(!rep.is_healthy());
+    assert!(rep.has_fatal());
+
+    let db_bytes_after = fs::read(&db_path).unwrap();
+    let journal_bytes_after = fs::read(&journal_path).unwrap();
+
+    assert_eq!(
+        db_bytes_before, db_bytes_after,
+        "database bytes must be unchanged"
+    );
+    assert_eq!(
+        journal_bytes_before, journal_bytes_after,
+        "journal bytes must be unchanged"
+    );
+
+    let _ = fs::remove_file(&journal_path);
+}
