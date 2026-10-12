@@ -515,80 +515,117 @@ impl BufferPool {
     /// Reclaims an unlinked page into the persistent freelist, logging deltas if a transaction is active.
     ///
     /// # Errors
-    /// * `Error::CannotFreeReservedPage` if attempting to free Page 0 or Page 1.
+    /// * `Error::CannotFreeReservedPage` if attempting to free Page 0 (Header) or Page 1 (Metadata).
     /// * `Error::InvalidPage` if `page_id >= page_count`.
+    /// * `Error::PageAlreadyFree` if the target page is already in the freelist.
     /// * `Error::PageCorruption` if the page is resident and actively pinned.
     pub fn free_page(&mut self, page_id: PageId) -> Result<()> {
-        if crate::storage::metadata::is_reserved_page(page_id) {
-            return Err(Error::CannotFreeReservedPage(page_id));
-        }
-        if page_id >= self.page_manager.page_count() {
-            return Err(Error::InvalidPage(page_id));
+        self.free_pages(&[page_id])
+    }
+
+    /// Reclaims a batch of unlinked pages into the persistent freelist in LIFO order,
+    /// logging deltas for each page if a transaction is active and updating the database
+    /// header freelist state in a single atomic batch.
+    pub fn free_pages(&mut self, pages: &[PageId]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
         }
 
-        // 1. If page is resident in buffer pool, ensure it is unpinned and extract its before-image
-        let before_bytes = if let Some(&frame_id) = self.page_table.get(&page_id) {
-            let frame = &mut self.frames[frame_id];
-            if frame.pin_count > 0 {
-                return Err(Error::PageCorruption {
-                    page_id,
-                    reason: "cannot free currently pinned page",
-                });
+        // 1. Validate all pages before performing any mutation
+        for &page_id in pages {
+            if crate::storage::metadata::is_reserved_page(page_id) {
+                return Err(Error::CannotFreeReservedPage(page_id));
             }
-            let bytes = frame.page.as_ref().map(|p| *p.as_bytes());
-            self.page_table.remove(&page_id);
-            frame.page_id = None;
-            frame.page = None;
-            frame.before_image = None;
-            frame.pin_count = 0;
-            frame.dirty = false;
-            bytes
-        } else {
-            None
-        };
-
-        // 2. Check if already in freelist to reject double-free
-        if crate::storage::freelist::FreePageManager::is_free(&mut self.page_manager, page_id)? {
-            return Err(Error::PageAlreadyFree(page_id));
-        }
-
-        // 3. Read current page before-bytes from disk if not resident
-        let before = match before_bytes {
-            Some(b) => b,
-            None => *self.page_manager.read_page(page_id)?.as_bytes(),
-        };
-
-        // 4. Construct Free page
-        let curr_head = self.page_manager.header().freelist_head;
-        let mut free_page = Page::new(page_id, PageType::Free);
-        crate::storage::freelist::FreePageLayout::write_next_free(&mut free_page, curr_head);
-
-        // 5. If active transaction and WAL exist, append PageDelta and stamp LSN
-        if let Some(txn_id) = self.active_txn {
-            if let Some(ref mut wal) = self.wal {
-                let lsn = wal.append_page_delta(
-                    txn_id,
-                    page_id,
-                    0,
-                    before.to_vec(),
-                    free_page.as_bytes().to_vec(),
-                )?;
-                free_page.set_lsn(lsn);
-            }
-        } else if let Some(ref wal) = self.wal {
-            let next_lsn = wal.next_lsn();
-            if next_lsn.is_valid() {
-                free_page.set_lsn(next_lsn);
+            if page_id >= self.page_manager.page_count() {
+                return Err(Error::InvalidPage(page_id));
             }
         }
 
-        // 6. Write free page to disk
-        self.page_manager.write_page(&free_page)?;
+        // Check for internal duplicates within the batch
+        let mut unique_check = std::collections::HashSet::with_capacity(pages.len());
+        for &page_id in pages {
+            if !unique_check.insert(page_id) {
+                return Err(Error::PageAlreadyFree(page_id));
+            }
+        }
 
-        // 7. Update DbHeader
+        // 2. Validate residency, unpin status, extract before-images, and verify not already free
+        let mut before_images = Vec::with_capacity(pages.len());
+        for &page_id in pages {
+            let before_bytes = if let Some(&frame_id) = self.page_table.get(&page_id) {
+                let frame = &mut self.frames[frame_id];
+                if frame.pin_count > 0 {
+                    return Err(Error::PageCorruption {
+                        page_id,
+                        reason: "cannot free currently pinned page",
+                    });
+                }
+                if let Some(ref p) = frame.page {
+                    if p.page_type() == PageType::Free {
+                        return Err(Error::PageAlreadyFree(page_id));
+                    }
+                }
+                let bytes = frame.page.as_ref().map(|p| *p.as_bytes());
+                self.page_table.remove(&page_id);
+                frame.page_id = None;
+                frame.page = None;
+                frame.before_image = None;
+                frame.pin_count = 0;
+                frame.dirty = false;
+                bytes
+            } else {
+                None
+            };
+
+            let before = match before_bytes {
+                Some(b) => b,
+                None => {
+                    if crate::storage::freelist::FreePageManager::is_free(
+                        &mut self.page_manager,
+                        page_id,
+                    )? {
+                        return Err(Error::PageAlreadyFree(page_id));
+                    }
+                    *self.page_manager.read_page(page_id)?.as_bytes()
+                }
+            };
+            before_images.push(before);
+        }
+
+        // 3. Link pages in LIFO sequence: pages[0] points to old head, pages[i] points to pages[i-1]
+        let old_head = self.page_manager.header().freelist_head;
+        for (i, &page_id) in pages.iter().enumerate() {
+            let next_free = if i == 0 { old_head } else { pages[i - 1] };
+
+            let mut free_page = Page::new(page_id, PageType::Free);
+            crate::storage::freelist::FreePageLayout::write_next_free(&mut free_page, next_free);
+
+            // Append WAL delta if active transaction exists
+            if let Some(txn_id) = self.active_txn {
+                if let Some(ref mut wal) = self.wal {
+                    let lsn = wal.append_page_delta(
+                        txn_id,
+                        page_id,
+                        0,
+                        before_images[i].to_vec(),
+                        free_page.as_bytes().to_vec(),
+                    )?;
+                    free_page.set_lsn(lsn);
+                }
+            } else if let Some(ref wal) = self.wal {
+                let next_lsn = wal.next_lsn();
+                if next_lsn.is_valid() {
+                    free_page.set_lsn(next_lsn);
+                }
+            }
+
+            self.page_manager.write_page(&free_page)?;
+        }
+
+        // 4. Update DbHeader in a single batch
         self.check_fault(crate::engine::failure::StorageFailurePoint::DuringFreelistUpdate)?;
-        self.page_manager.header_mut().freelist_head = page_id;
-        self.page_manager.header_mut().free_page_count += 1;
+        self.page_manager.header_mut().freelist_head = pages[pages.len() - 1];
+        self.page_manager.header_mut().free_page_count += pages.len() as u32;
         self.page_manager.write_header_to_disk()?;
 
         Ok(())

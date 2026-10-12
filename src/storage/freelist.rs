@@ -32,6 +32,17 @@ pub struct FreePageManager;
 impl FreePageManager {
     /// Checks if a page ID is currently in the freelist.
     pub fn is_free(page_manager: &mut PageManager, page_id: PageId) -> Result<bool> {
+        if is_reserved_page(page_id) || page_id >= page_manager.page_count() {
+            return Ok(false);
+        }
+
+        // Fast path: inspect the target page on disk. If its page_type is not Free,
+        // it cannot belong to the persistent freelist.
+        let target_page = page_manager.read_page(page_id)?;
+        if target_page.page_type() != PageType::Free {
+            return Ok(false);
+        }
+
         let mut curr = page_manager.header().freelist_head;
         let total_pages = page_manager.page_count();
         let mut visited = HashSet::new();
@@ -53,6 +64,53 @@ impl FreePageManager {
         Ok(false)
     }
 
+    /// Reclaims a batch of unlinked pages into the persistent freelist in LIFO order,
+    /// updating the persistent freelist head and header free page count in a single operation.
+    pub fn free_pages(page_manager: &mut PageManager, pages: &[PageId]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Validate all page IDs
+        for &page_id in pages {
+            if is_reserved_page(page_id) {
+                return Err(Error::CannotFreeReservedPage(page_id));
+            }
+
+            if page_id >= page_manager.page_count() {
+                return Err(Error::InvalidPage(page_id));
+            }
+
+            if Self::is_free(page_manager, page_id)? {
+                return Err(Error::PageAlreadyFree(page_id));
+            }
+        }
+
+        // 2. Reject internal duplicates within the batch
+        let mut unique_check = HashSet::with_capacity(pages.len());
+        for &page_id in pages {
+            if !unique_check.insert(page_id) {
+                return Err(Error::PageAlreadyFree(page_id));
+            }
+        }
+
+        // 3. Link pages in LIFO sequence: pages[0] points to old head, pages[i] points to pages[i-1]
+        let old_head = page_manager.header().freelist_head;
+        for (i, &page_id) in pages.iter().enumerate() {
+            let next_free = if i == 0 { old_head } else { pages[i - 1] };
+            let mut free_page = Page::new(page_id, PageType::Free);
+            FreePageLayout::write_next_free(&mut free_page, next_free);
+            page_manager.write_page(&free_page)?;
+        }
+
+        // 4. Update DbHeader in a single disk write
+        page_manager.header_mut().freelist_head = pages[pages.len() - 1];
+        page_manager.header_mut().free_page_count += pages.len() as u32;
+        page_manager.write_header_to_disk()?;
+
+        Ok(())
+    }
+
     /// Reclaims an unlinked page into the persistent freelist.
     ///
     /// # Errors
@@ -60,29 +118,7 @@ impl FreePageManager {
     /// * `Error::InvalidPage` if `page_id >= page_count`.
     /// * `Error::PageAlreadyFree` if the target page is already in the freelist.
     pub fn free_page(page_manager: &mut PageManager, page_id: PageId) -> Result<()> {
-        if is_reserved_page(page_id) {
-            return Err(Error::CannotFreeReservedPage(page_id));
-        }
-
-        if page_id >= page_manager.page_count() {
-            return Err(Error::InvalidPage(page_id));
-        }
-
-        if Self::is_free(page_manager, page_id)? {
-            return Err(Error::PageAlreadyFree(page_id));
-        }
-
-        let curr_head = page_manager.header().freelist_head;
-
-        let mut free_page = Page::new(page_id, PageType::Free);
-        FreePageLayout::write_next_free(&mut free_page, curr_head);
-        page_manager.write_page(&free_page)?;
-
-        page_manager.header_mut().freelist_head = page_id;
-        page_manager.header_mut().free_page_count += 1;
-        page_manager.write_header_to_disk()?;
-
-        Ok(())
+        Self::free_pages(page_manager, &[page_id])
     }
 
     /// Reuses a free page from the freelist head if available.

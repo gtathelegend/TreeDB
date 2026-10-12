@@ -150,6 +150,11 @@ impl PageManager {
         crate::storage::freelist::FreePageManager::free_page(self, page_id)
     }
 
+    /// Reclaims a batch of pages into the persistent freelist in LIFO order.
+    pub fn free_pages(&mut self, pages: &[PageId]) -> Result<()> {
+        crate::storage::freelist::FreePageManager::free_pages(self, pages)
+    }
+
     /// Validates the structural integrity of the persistent freelist.
     pub fn validate_freelist(&mut self) -> Result<()> {
         crate::storage::freelist::FreePageManager::validate(self)

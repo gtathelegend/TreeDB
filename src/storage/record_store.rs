@@ -603,9 +603,7 @@ impl RecordStore {
             }
 
             overflow_count = pages_to_free.len() as u64;
-            for pid in pages_to_free {
-                buffer_pool.free_page(pid)?;
-            }
+            buffer_pool.free_pages(&pages_to_free)?;
         }
 
         Ok((true, overflow_count))
