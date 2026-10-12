@@ -10,6 +10,7 @@ repository = "https://github.com/gtathelegend/TreeDB"
 exclude = [
     ".github",
 ]
+autobenches = false
 
 [dependencies]
 thiserror = "2.0"
@@ -21,3 +22,7 @@ tempfile = "3.17"
 name = "treedb"
 path = "src/bin/treedb.rs"
 required-features = []
+
+[[bench]]
+name = "benchmark_suite"
+harness = false
