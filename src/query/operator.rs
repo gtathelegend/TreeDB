@@ -407,7 +407,7 @@ impl JoinOperator {
                 config.clone(),
             )
             .with_row_goal(row_goal);
-            joiner.execute(left_rows, right_rows.to_vec())
+            joiner.execute_ref(&left_rows, right_rows)
         } else {
             if join_type == JoinType::Semi || join_type == JoinType::Anti {
                 let mut combined_columns =

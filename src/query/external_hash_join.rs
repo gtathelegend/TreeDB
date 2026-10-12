@@ -12,8 +12,8 @@ use crate::query::operator::CanonicalValue;
 use crate::query::optimizer::{recombine_conjunction, split_conjunction};
 use crate::sql::ast::JoinType;
 
-/// Default in-memory hash join build budget before spilling: 64 KB.
-pub const DEFAULT_JOIN_MEMORY_BUDGET_BYTES: usize = 64 * 1024;
+/// Default in-memory hash join build budget before spilling: 2 MB.
+pub const DEFAULT_JOIN_MEMORY_BUDGET_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default maximum number of temporary partition files open concurrently during external join.
 pub const DEFAULT_MAX_TEMP_FILES: usize = 32;
@@ -217,6 +217,96 @@ pub struct JoinExecutionMetrics {
     pub duplicate_runs_processed: usize,
 }
 
+/// Representation of matching build row indices for a join key.
+/// Optimizes single-match keys (e.g. PK-FK joins) without heap vector allocation.
+#[derive(Debug, Clone)]
+pub enum MatchList {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl MatchList {
+    #[inline]
+    pub fn push(&mut self, idx: usize) {
+        match self {
+            MatchList::One(first) => {
+                let v = vec![*first, idx];
+                *self = MatchList::Many(v);
+            }
+            MatchList::Many(v) => {
+                v.push(idx);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[usize] {
+        match self {
+            MatchList::One(idx) => std::slice::from_ref(idx),
+            MatchList::Many(v) => v.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            MatchList::One(_) => 1,
+            MatchList::Many(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+/// Pre-compiled join key expression enabling direct column index extraction without string resolution.
+#[derive(Debug, Clone)]
+pub enum CompiledKeyExpr {
+    ColumnIndex(usize),
+    General(Expr),
+}
+
+impl CompiledKeyExpr {
+    pub fn compile(expr: &Expr, schema: &Schema) -> Self {
+        match expr {
+            Expr::Column(name) => {
+                if let Some((idx, _)) = resolve_column_in_schema(schema, name) {
+                    CompiledKeyExpr::ColumnIndex(idx)
+                } else {
+                    CompiledKeyExpr::General(expr.clone())
+                }
+            }
+            _ => CompiledKeyExpr::General(expr.clone()),
+        }
+    }
+
+    pub fn compile_all(exprs: &[Expr], schema: &Schema) -> Vec<Self> {
+        exprs.iter().map(|e| Self::compile(e, schema)).collect()
+    }
+
+    #[inline]
+    pub fn extract(&self, row: &Row, schema: &Schema) -> Result<CanonicalValue> {
+        match self {
+            CompiledKeyExpr::ColumnIndex(idx) => {
+                if *idx < row.values.len() {
+                    Ok(CanonicalValue::from_value(&row.values[*idx]))
+                } else {
+                    Err(Error::ColumnCountMismatch {
+                        expected: *idx + 1,
+                        found: row.values.len(),
+                    })
+                }
+            }
+            CompiledKeyExpr::General(expr) => {
+                let val = expr.evaluate(row, schema)?;
+                Ok(CanonicalValue::from_value(&val))
+            }
+        }
+    }
+}
+
 /// Composite join key constructed from evaluated equi-join expressions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JoinKey(pub Vec<CanonicalValue>);
@@ -228,6 +318,20 @@ impl JoinKey {
         for expr in exprs {
             let val = expr.evaluate(row, schema)?;
             canonical_keys.push(CanonicalValue::from_value(&val));
+        }
+        Ok(JoinKey(canonical_keys))
+    }
+
+    /// Evaluates pre-compiled key expressions on a row to construct a `JoinKey`.
+    #[inline]
+    pub fn from_row_compiled(
+        row: &Row,
+        schema: &Schema,
+        compiled: &[CompiledKeyExpr],
+    ) -> Result<Self> {
+        let mut canonical_keys = Vec::with_capacity(compiled.len());
+        for c in compiled {
+            canonical_keys.push(c.extract(row, schema)?);
         }
         Ok(JoinKey(canonical_keys))
     }
@@ -734,8 +838,8 @@ pub struct ExternalHashJoiner<'a> {
     left_schema: &'a Schema,
     right_schema: &'a Schema,
     join_type: JoinType,
-    left_keys: Vec<Expr>,
-    right_keys: Vec<Expr>,
+    compiled_left_keys: Vec<CompiledKeyExpr>,
+    compiled_right_keys: Vec<CompiledKeyExpr>,
     residual_predicate: Option<Expr>,
     config: JoinConfig,
     row_goal: Option<usize>,
@@ -750,12 +854,14 @@ impl<'a> ExternalHashJoiner<'a> {
         equi_plan: EquiJoinPlan,
         config: JoinConfig,
     ) -> Self {
+        let compiled_left_keys = CompiledKeyExpr::compile_all(&equi_plan.left_keys, left_schema);
+        let compiled_right_keys = CompiledKeyExpr::compile_all(&equi_plan.right_keys, right_schema);
         Self {
             left_schema,
             right_schema,
             join_type,
-            left_keys: equi_plan.left_keys,
-            right_keys: equi_plan.right_keys,
+            compiled_left_keys,
+            compiled_right_keys,
             residual_predicate: equi_plan.residual_predicate,
             config,
             row_goal: None,
@@ -768,11 +874,11 @@ impl<'a> ExternalHashJoiner<'a> {
         self
     }
 
-    /// Executes the join between `left_rows` and `right_rows`.
-    pub fn execute(
+    /// Executes the join between borrowed `left_rows` and `right_rows`.
+    pub fn execute_ref(
         &self,
-        left_rows: Vec<Row>,
-        right_rows: Vec<Row>,
+        left_rows: &[Row],
+        right_rows: &[Row],
     ) -> Result<(Schema, Vec<Row>, JoinExecutionMetrics)> {
         let joined_schema =
             create_joined_schema(self.left_schema, self.right_schema, self.join_type);
@@ -804,7 +910,7 @@ impl<'a> ExternalHashJoiner<'a> {
             if self.join_type == JoinType::Anti {
                 metrics.rows_output = left_rows.len();
                 metrics.unmatched_outer_rows = left_rows.len();
-                return Ok((joined_schema, left_rows, metrics));
+                return Ok((joined_schema, left_rows.to_vec(), metrics));
             } else if self.join_type == JoinType::Semi {
                 metrics.unmatched_outer_rows = left_rows.len();
                 return Ok((joined_schema, Vec::new(), metrics));
@@ -826,15 +932,15 @@ impl<'a> ExternalHashJoiner<'a> {
 
         // Estimate memory required to build the right-side hash table
         let mut estimated_build_mem = 0;
-        for row in &right_rows {
+        for row in right_rows {
             estimated_build_mem += estimate_row_memory(row) + 64;
         }
 
         // In-memory fast path: Build side fits in memory
         if estimated_build_mem < self.config.memory_budget_bytes {
             let (out_rows, peak_mem) = self.join_in_memory(
-                &left_rows,
-                &right_rows,
+                left_rows,
+                right_rows,
                 &joined_schema,
                 crate::query::runtime_filter::RuntimeFilterScope::Global,
                 &mut metrics,
@@ -855,6 +961,15 @@ impl<'a> ExternalHashJoiner<'a> {
         Ok((joined_schema, out_rows, metrics))
     }
 
+    /// Executes the join between `left_rows` and `right_rows`.
+    pub fn execute(
+        &self,
+        left_rows: Vec<Row>,
+        right_rows: Vec<Row>,
+    ) -> Result<(Schema, Vec<Row>, JoinExecutionMetrics)> {
+        self.execute_ref(&left_rows, &right_rows)
+    }
+
     /// Executes an in-memory hash join between `left_rows` and `right_rows` (Right as build, Left as probe).
     fn join_in_memory(
         &self,
@@ -864,10 +979,15 @@ impl<'a> ExternalHashJoiner<'a> {
         scope: crate::query::runtime_filter::RuntimeFilterScope,
         metrics: &mut JoinExecutionMetrics,
     ) -> Result<(Vec<Row>, usize)> {
-        let mut build_map: HashMap<JoinKey, Vec<(usize, Row)>> = HashMap::new();
+        let mut build_map: HashMap<JoinKey, MatchList> = HashMap::with_capacity(right_rows.len());
         let mut build_mem = 0;
         let mut peak_mem = 0;
-        let mut right_matched = vec![false; right_rows.len()];
+        let mut right_matched =
+            if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
+                vec![false; right_rows.len()]
+            } else {
+                Vec::new()
+            };
 
         let mut runtime_filter = if self.config.enable_runtime_filter
             && (self.join_type == JoinType::Inner || self.join_type == JoinType::Semi)
@@ -887,7 +1007,8 @@ impl<'a> ExternalHashJoiner<'a> {
         };
 
         for (r_idx, r_row) in right_rows.iter().enumerate() {
-            let key = JoinKey::from_row(r_row, self.right_schema, &self.right_keys)?;
+            let key =
+                JoinKey::from_row_compiled(r_row, self.right_schema, &self.compiled_right_keys)?;
             // SQL NULL semantics: NULL keys cannot match in equi-join
             if key.has_null() {
                 continue;
@@ -907,10 +1028,12 @@ impl<'a> ExternalHashJoiner<'a> {
                 peak_mem = build_mem;
             }
 
-            build_map
-                .entry(key)
-                .or_default()
-                .push((r_idx, r_row.clone()));
+            match build_map.get_mut(&key) {
+                Some(ml) => ml.push(r_idx),
+                None => {
+                    build_map.insert(key, MatchList::One(r_idx));
+                }
+            }
         }
 
         if let Some(rf) = &runtime_filter {
@@ -919,10 +1042,25 @@ impl<'a> ExternalHashJoiner<'a> {
 
         let left_nulls = vec![Value::Null; self.left_schema.columns.len()];
         let right_nulls = vec![Value::Null; self.right_schema.columns.len()];
-        let mut out_rows = Vec::new();
+        let row_width = self.left_schema.columns.len() + self.right_schema.columns.len();
+        let mut out_rows = Vec::with_capacity(left_rows.len());
+
+        let eval_schema = if self.residual_predicate.is_some() {
+            if self.join_type == JoinType::Semi || self.join_type == JoinType::Anti {
+                let mut combined_columns = Vec::with_capacity(row_width);
+                combined_columns.extend_from_slice(&self.left_schema.columns);
+                combined_columns.extend_from_slice(&self.right_schema.columns);
+                Some(Schema::new_projected(combined_columns))
+            } else {
+                Some(joined_schema.clone())
+            }
+        } else {
+            None
+        };
 
         for l_row in left_rows {
-            let key = JoinKey::from_row(l_row, self.left_schema, &self.left_keys)?;
+            let key =
+                JoinKey::from_row_compiled(l_row, self.left_schema, &self.compiled_left_keys)?;
             if key.has_null() {
                 if runtime_filter.is_some() {
                     metrics.runtime_filter_null_probe_rows += 1;
@@ -933,7 +1071,7 @@ impl<'a> ExternalHashJoiner<'a> {
                 } else if self.join_type == JoinType::Semi {
                     metrics.unmatched_outer_rows += 1;
                 } else if self.join_type == JoinType::Left || self.join_type == JoinType::Full {
-                    let mut combined = Vec::with_capacity(l_row.values.len() + right_nulls.len());
+                    let mut combined = Vec::with_capacity(row_width);
                     combined.extend_from_slice(&l_row.values);
                     combined.extend_from_slice(&right_nulls);
                     out_rows.push(Row::new(combined));
@@ -954,27 +1092,18 @@ impl<'a> ExternalHashJoiner<'a> {
             metrics.hash_probe_rows += 1;
             let mut left_matched = false;
             if let Some(r_matches) = build_map.get(&key) {
-                metrics.candidate_pairs += r_matches.len();
-                for (r_idx, r_row) in r_matches {
-                    let mut combined = Vec::with_capacity(l_row.values.len() + r_row.values.len());
+                let match_slice = r_matches.as_slice();
+                metrics.candidate_pairs += match_slice.len();
+                for &r_idx in match_slice {
+                    let r_row = &right_rows[r_idx];
+                    let mut combined = Vec::with_capacity(row_width);
                     combined.extend_from_slice(&l_row.values);
                     combined.extend_from_slice(&r_row.values);
                     let candidate = Row::new(combined);
 
                     let passed = if let Some(res_expr) = &self.residual_predicate {
-                        let eval_schema = if self.join_type == JoinType::Semi
-                            || self.join_type == JoinType::Anti
-                        {
-                            let mut combined_columns = Vec::with_capacity(
-                                self.left_schema.columns.len() + self.right_schema.columns.len(),
-                            );
-                            combined_columns.extend_from_slice(&self.left_schema.columns);
-                            combined_columns.extend_from_slice(&self.right_schema.columns);
-                            Schema::new_projected(combined_columns)
-                        } else {
-                            joined_schema.clone()
-                        };
-                        let res_val = res_expr.evaluate(&candidate, &eval_schema)?;
+                        let res_val =
+                            res_expr.evaluate(&candidate, eval_schema.as_ref().unwrap())?;
                         res_val == Value::Boolean(true)
                     } else {
                         true
@@ -982,7 +1111,9 @@ impl<'a> ExternalHashJoiner<'a> {
 
                     if passed {
                         left_matched = true;
-                        right_matched[*r_idx] = true;
+                        if !right_matched.is_empty() {
+                            right_matched[r_idx] = true;
+                        }
                         metrics.matched_rows += 1;
                         if self.join_type != JoinType::Semi && self.join_type != JoinType::Anti {
                             out_rows.push(candidate);
@@ -1014,7 +1145,7 @@ impl<'a> ExternalHashJoiner<'a> {
             } else if !left_matched
                 && (self.join_type == JoinType::Left || self.join_type == JoinType::Full)
             {
-                let mut combined = Vec::with_capacity(l_row.values.len() + right_nulls.len());
+                let mut combined = Vec::with_capacity(row_width);
                 combined.extend_from_slice(&l_row.values);
                 combined.extend_from_slice(&right_nulls);
                 out_rows.push(Row::new(combined));
@@ -1037,7 +1168,7 @@ impl<'a> ExternalHashJoiner<'a> {
         if self.join_type == JoinType::Right || self.join_type == JoinType::Full {
             for (r_idx, r_row) in right_rows.iter().enumerate() {
                 if !right_matched[r_idx] {
-                    let mut combined = Vec::with_capacity(left_nulls.len() + r_row.values.len());
+                    let mut combined = Vec::with_capacity(row_width);
                     combined.extend_from_slice(&left_nulls);
                     combined.extend_from_slice(&r_row.values);
                     out_rows.push(Row::new(combined));
@@ -1051,8 +1182,8 @@ impl<'a> ExternalHashJoiner<'a> {
     /// Partitions left and right relations into temporary files and joins matching partition pairs.
     fn partition_and_join(
         &self,
-        left_rows: Vec<Row>,
-        right_rows: Vec<Row>,
+        left_rows: &[Row],
+        right_rows: &[Row],
         joined_schema: &Schema,
         pass: usize,
         metrics: &mut JoinExecutionMetrics,
@@ -1074,7 +1205,8 @@ impl<'a> ExternalHashJoiner<'a> {
 
         // 1. Partition Left rows
         for l_row in left_rows {
-            let key = JoinKey::from_row(&l_row, self.left_schema, &self.left_keys)?;
+            let key =
+                JoinKey::from_row_compiled(l_row, self.left_schema, &self.compiled_left_keys)?;
             let part_idx = if key.has_null() {
                 // If key has NULL, place in partition 0 for LEFT/FULL JOIN preservation;
                 // for INNER/RIGHT JOIN it won't match any right partition row.
@@ -1089,7 +1221,7 @@ impl<'a> ExternalHashJoiner<'a> {
                 left_writers[part_idx] = Some(pw);
             }
             let pw = left_writers[part_idx].as_mut().unwrap();
-            let written = pw.write_row(&l_row)?;
+            let written = pw.write_row(l_row)?;
             metrics.bytes_spilled += written;
 
             if metrics.bytes_spilled > self.config.max_temp_bytes {
@@ -1102,7 +1234,8 @@ impl<'a> ExternalHashJoiner<'a> {
 
         // 2. Partition Right rows
         for r_row in right_rows {
-            let key = JoinKey::from_row(&r_row, self.right_schema, &self.right_keys)?;
+            let key =
+                JoinKey::from_row_compiled(r_row, self.right_schema, &self.compiled_right_keys)?;
             let part_idx = if key.has_null() {
                 // For RIGHT/FULL JOIN, place in partition 0 for unmatched right preservation;
                 // for INNER/LEFT JOIN it won't match any left row.
@@ -1117,7 +1250,7 @@ impl<'a> ExternalHashJoiner<'a> {
                 right_writers[part_idx] = Some(pw);
             }
             let pw = right_writers[part_idx].as_mut().unwrap();
-            let written = pw.write_row(&r_row)?;
+            let written = pw.write_row(r_row)?;
             metrics.bytes_spilled += written;
 
             if metrics.bytes_spilled > self.config.max_temp_bytes {
@@ -1236,10 +1369,13 @@ impl<'a> ExternalHashJoiner<'a> {
                 out_rows.extend(part_out);
             } else {
                 // Check if all keys in this right partition are identical (skew/duplicate keys)
-                let first_key =
-                    JoinKey::from_row(&right_part[0], self.right_schema, &self.right_keys)?;
+                let first_key = JoinKey::from_row_compiled(
+                    &right_part[0],
+                    self.right_schema,
+                    &self.compiled_right_keys,
+                )?;
                 let all_same = right_part.iter().all(|r| {
-                    JoinKey::from_row(r, self.right_schema, &self.right_keys)
+                    JoinKey::from_row_compiled(r, self.right_schema, &self.compiled_right_keys)
                         .map(|k| k == first_key)
                         .unwrap_or(false)
                 });
@@ -1264,8 +1400,8 @@ impl<'a> ExternalHashJoiner<'a> {
                         metrics.partition_passes = pass + 2;
                     }
                     let (sub_out, sub_peak) = self.partition_and_join(
-                        left_part,
-                        right_part,
+                        &left_part,
+                        &right_part,
                         joined_schema,
                         pass + 1,
                         metrics,

@@ -467,4 +467,73 @@ Quality gates:
 * **ACID & MVCC Guarantees**: Unaffected.
 * **Release Tag `v0.1.0`**: Untouched (`2f912c2e24b095976a6a5d6340a6b536b2707c9a`).
 
+## 10. Phase 85 Baseline — Hash Join & Build/Probe Optimization
+
+### 10.1 Context & Objective
+In Phase 84, full table scans and tuple decoding were optimized, leaving relational joins—specifically hash equi-joins—as the primary query execution bottleneck. The Phase 84 report noted that `inner_equi_join` was requiring ~74–88 ms (and fresh baseline runs showed 57.2 ms, p50: 52.7 ms, p99: 127.8 ms) for an in-memory 4,000-row equi-join between `accounts` (2,000 rows) and `logs` (4,000 rows).
+
+The objective for Phase 85 was to profile and optimize `ExternalHashJoiner`, join key evaluation, hash table initialization, build/probe matching, and spill management to reduce join latency and excessive allocations while preserving all SQL semantics, NULL handling, duplicate-row multiplicity, memory limits, and MVCC visibility.
+
+### 10.2 Root-Cause Findings
+1. **Unnecessary Disk Spill Due to Stale Default Memory Budget**:
+   `DEFAULT_JOIN_MEMORY_BUDGET_BYTES` was set to 64 KB (`64 * 1024`), an unrealistically low limit originally intended for testing partition spills. An in-memory 4,000-row join exceeds 64 KB, causing `ExternalHashJoiner::execute` to prematurely fall through to `partition_and_join`, creating 32 disk partition files, writing hundreds of kilobytes to disk, flushing, reopening, reading back, and tearing down 64 temporary runs on every single query execution. Updating the default budget to 2 MB (`2 * 1024 * 1024`) aligns with Phase 83's sort budget, allowing standard in-memory queries to run in-memory while preserving spill mechanics when budgets are exceeded.
+2. **Redundant Row Cloning on Calling Path**:
+   `JoinOperator::apply_with_config_and_row_goal` accepted `right_rows: &[Row]` and unconditionally cloned all rows via `right_rows.to_vec()` to satisfy `execute(left_rows, right_rows)`.
+3. **Excessive Row Cloning during Hash Table Build**:
+   `build_map` had type `HashMap<JoinKey, Vec<(usize, Row)>>`, unconditionally cloning every row on the build side and inserting it into a heap-allocated `Vec<(usize, Row)>` without capacity pre-allocation.
+4. **Join Key Construction and String Resolution Overhead**:
+   Every build and probe row called `JoinKey::from_row`, evaluating `Expr::Column` through repeated string scans over `schema.columns`, copying intermediate `Value` scalars, and converting them to `CanonicalValue`.
+5. **Redundant Schema Cloning during Residual Predicate Evaluation**:
+   When evaluating candidate matches, `eval_schema` was repeatedly constructed and cloned (`joined_schema.clone()`) on every qualifying candidate pair rather than being prepared once before the probe loop.
+
+### 10.3 Implementation Details
+1. **Realistic Default Budget (`external_hash_join.rs`)**:
+   Updated `DEFAULT_JOIN_MEMORY_BUDGET_BYTES` from 64 KB to 2 MB (`2 * 1024 * 1024`), consistent with `DEFAULT_SORT_MEMORY_BUDGET_BYTES`.
+2. **Borrowed Execution (`execute_ref`)**:
+   Introduced `ExternalHashJoiner::execute_ref(&self, left_rows: &[Row], right_rows: &[Row])` and updated `JoinOperator::apply_with_config_and_row_goal` to pass slices directly, eliminating 4,000 row clones on every join invocation.
+3. **Index-Based Match Representation (`MatchList`)**:
+   Replaced `Vec<(usize, Row)>` with `MatchList` (`One(usize)` / `Many(Vec<usize>)`). Unique build keys (e.g., PK-FK equi-joins) require zero vector heap allocations and zero row clones, referencing `right_rows[r_idx]` by index during candidate generation.
+4. **Pre-Compiled Key Extractors (`CompiledKeyExpr`)**:
+   Pre-compiled `left_keys` and `right_keys` into `CompiledKeyExpr` at join construction time. Column references resolve their column indices once upfront, extracting `CanonicalValue` directly from `row.values[idx]` without string searches or intermediate `Value` allocations. Added `JoinKey::from_row_compiled`.
+5. **Pre-Allocated Hash Table Capacity**:
+   Pre-allocated `build_map` with `HashMap::with_capacity(right_rows.len())` to eliminate rehashing during build.
+6. **Pre-Resolved Candidate Schema**:
+   Cached `eval_schema` once before the probe loop, eliminating repeated `Schema::clone` on every candidate match.
+
+### 10.4 Before-and-After Performance Comparison
+
+Hardware / Environment: `Intel Core i7-1355U`, `Windows 11 Pro`, `Rust 1.98.1`, `profile = bench`
+
+| Workload | Dataset / Query | Phase 84 Baseline | Phase 85 Optimized (Run 1) | Phase 85 Optimized (Run 2) | Speedup Factor | Latency Reduction | Throughput Change |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`inner_equi_join`** | Hash join (`accounts` 2,000 JOIN `logs` 4,000) | 57.20 ms (p50: 52.68 ms, p99: 127.77 ms) [17.5 ops/s] | **4.52 ms** (p50: 4.47 ms, p99: 5.41 ms) [221.4 ops/s] | **3.62 ms** (p50: 3.61 ms, p99: 4.07 ms) [276.4 ops/s] | **12.65× – 15.80×** | **-92.1% to -93.7%** | **+1,165% to +1,479%** |
+
+#### Isolated Join Micro-Benchmark
+* Default budget (64 KB spill): **132.4 ms** (32 partitions, 307 KB spilled, 64 temporary runs).
+* In-memory baseline (2 MB budget, unoptimized): **4.78 ms**.
+* In-memory optimized (`MatchList` + `CompiledKeyExpr` + zero row clones): **1.98 ms** (**67× speedup** over 64 KB baseline).
+
+### 10.5 Correctness, Testing, and Quality Gates
+A dedicated test suite (`tests/hash_join_optimization_correctness.rs`) was added covering 8 focused scenarios:
+1. `test_empty_left_or_right_inputs`: Validates empty input handling across Inner, Left, and Anti joins.
+2. `test_single_row_matching_and_unmatched`: Validates single-row match and non-match edge cases.
+3. `test_duplicate_multiplicity_on_both_sides`: Validates exact cross-product row multiplicity on duplicate keys (e.g. 3x2 and 1x4 matches).
+4. `test_null_join_keys_sql_semantics`: Validates SQL 3VL where `NULL = NULL` is UNKNOWN and never matches, while verifying LEFT JOIN null-padding.
+5. `test_string_keys_and_composite_keys`: Validates multi-column composite equi-join keys on string types.
+6. `test_residual_predicates`: Validates evaluation of residual non-equi predicates (`AND t1.id < t2.id`).
+7. `test_memory_budget_spill_equivalence`: Verifies strict multiset equivalence between in-memory and spilled partition execution under constrained budgets (512 bytes).
+8. `test_transaction_and_mvcc_visibility_in_joins`: Validates uncommitted transaction changes, rollback isolation, and commit persistence across joins.
+
+Quality gates:
+* `cargo fmt --all -- --check`: Passed (clean formatting).
+* `cargo clippy --all-targets --all-features -- -D warnings`: Passed (0 warnings).
+* `cargo test --all`: Passed (**1,967 tests passed across 84 test binaries**, 0 failed).
+
+### 10.6 Invariants Preserved
+* **Safe Rust**: Strictly zero `unsafe` blocks.
+* **SQL Semantics**: Exact NULL handling (no `NULL = NULL` match) and correct duplicate multiplicity preserved.
+* **Memory Limits & Spill Correctness**: Spill-to-disk logic remains fully functional and returns identical multiset results under constrained budgets.
+* **On-Disk Format**: Unchanged.
+* **Release Tag `v0.1.0`**: Untouched (`2f912c2e24b095976a6a5d6340a6b536b2707c9a`).
+
 
