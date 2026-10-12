@@ -4,7 +4,7 @@ use std::collections::BinaryHeap;
 use crate::engine::types::{Row, Schema};
 use crate::error::Result;
 use crate::query::external_sort::{estimate_row_memory, SortConfig};
-use crate::query::operator::{compare_rows_by_sort_keys, SortKey};
+use crate::query::operator::{compare_rows_prepared, PreparedSortKey, SortKey};
 
 /// Execution telemetry and statistics for a Top-N operation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -35,24 +35,24 @@ pub struct TopNExecutionMetrics {
 /// In Top-N, we want to retain the smallest (highest-ranking in SQL order) $K$ candidates.
 /// Thus, a row that is *worse* in SQL order (or arrived later in tie-break) is considered *greater* in `Ord`,
 /// so that the worst candidate sits at the top of the heap and can be evicted.
-struct TopNHeapItem<'a> {
+struct TopNHeapItem<'s, 'k> {
     seq: u64,
     row: Row,
-    schema: &'a Schema,
-    sort_keys: &'a [SortKey],
+    schema: &'s Schema,
+    prepared_keys: &'k [PreparedSortKey],
 }
 
-impl<'a> PartialEq for TopNHeapItem<'a> {
+impl<'s, 'k> PartialEq for TopNHeapItem<'s, 'k> {
     fn eq(&self, other: &Self) -> bool {
         self.seq == other.seq
     }
 }
 
-impl<'a> Eq for TopNHeapItem<'a> {}
+impl<'s, 'k> Eq for TopNHeapItem<'s, 'k> {}
 
-impl<'a> Ord for TopNHeapItem<'a> {
+impl<'s, 'k> Ord for TopNHeapItem<'s, 'k> {
     fn cmp(&self, other: &Self) -> Ordering {
-        match compare_rows_by_sort_keys(&self.row, &other.row, self.schema, self.sort_keys) {
+        match compare_rows_prepared(&self.row, &other.row, self.schema, self.prepared_keys) {
             Ok(Ordering::Equal) => self.seq.cmp(&other.seq),
             Ok(ord) => ord,
             Err(_) => self.seq.cmp(&other.seq),
@@ -60,7 +60,7 @@ impl<'a> Ord for TopNHeapItem<'a> {
     }
 }
 
-impl<'a> PartialOrd for TopNHeapItem<'a> {
+impl<'s, 'k> PartialOrd for TopNHeapItem<'s, 'k> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -147,6 +147,8 @@ impl TopNOperator {
             ));
         }
 
+        let prepared_keys = PreparedSortKey::prepare(schema, sort_keys)?;
+
         let fallback_rows = rows.clone();
         let mut heap: BinaryHeap<TopNHeapItem> =
             BinaryHeap::with_capacity(capacity.min(rows_input));
@@ -171,18 +173,18 @@ impl TopNOperator {
                     seq: seq_idx as u64,
                     row,
                     schema,
-                    sort_keys,
+                    prepared_keys: &prepared_keys,
                 });
             } else {
                 let candidate = TopNHeapItem {
                     seq: seq_idx as u64,
                     row,
                     schema,
-                    sort_keys,
+                    prepared_keys: &prepared_keys,
                 };
 
                 let should_replace = if let Some(worst) = heap.peek() {
-                    match compare_rows_by_sort_keys(&candidate.row, &worst.row, schema, sort_keys)?
+                    match compare_rows_prepared(&candidate.row, &worst.row, schema, &prepared_keys)?
                     {
                         Ordering::Less => true,
                         Ordering::Equal => candidate.seq < worst.seq,
@@ -245,7 +247,7 @@ impl TopNOperator {
             if sort_err.is_err() {
                 return Ordering::Equal;
             }
-            match compare_rows_by_sort_keys(&a.row, &b.row, schema, sort_keys) {
+            match compare_rows_prepared(&a.row, &b.row, schema, &prepared_keys) {
                 Ok(Ordering::Equal) => a.seq.cmp(&b.seq),
                 Ok(ord) => ord,
                 Err(e) => {

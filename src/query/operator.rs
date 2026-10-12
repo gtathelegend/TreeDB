@@ -152,26 +152,25 @@ pub fn compare_rows_by_sort_keys(
     Ok(Ordering::Equal)
 }
 
-/// Compares two scalar values for sorting according to direction and NULL ordering rules.
-pub fn compare_values_for_sort(
+/// Compares two scalar values for sorting according to direction and precomputed NULL ordering rules.
+#[inline]
+pub fn compare_evaluated_values(
     a: &Value,
     b: &Value,
     direction: SortDirection,
-    nulls_first: Option<bool>,
+    nulls_first: bool,
 ) -> Result<Ordering> {
-    let effective_nulls_first = nulls_first.unwrap_or(direction == SortDirection::Ascending);
-
     match (a, b) {
         (Value::Null, Value::Null) => Ok(Ordering::Equal),
         (Value::Null, _) => {
-            if effective_nulls_first {
+            if nulls_first {
                 Ok(Ordering::Less)
             } else {
                 Ok(Ordering::Greater)
             }
         }
         (_, Value::Null) => {
-            if effective_nulls_first {
+            if nulls_first {
                 Ok(Ordering::Greater)
             } else {
                 Ok(Ordering::Less)
@@ -190,7 +189,7 @@ pub fn compare_values_for_sort(
                         "cannot sort disparate types: {:?} vs {:?}",
                         non_null_a.data_type(),
                         non_null_b.data_type()
-                    )))
+                    )));
                 }
             };
 
@@ -200,6 +199,96 @@ pub fn compare_values_for_sort(
             }
         }
     }
+}
+
+/// Compares two scalar values for sorting according to direction and NULL ordering rules.
+pub fn compare_values_for_sort(
+    a: &Value,
+    b: &Value,
+    direction: SortDirection,
+    nulls_first: Option<bool>,
+) -> Result<Ordering> {
+    let effective_nulls_first = nulls_first.unwrap_or(direction == SortDirection::Ascending);
+    compare_evaluated_values(a, b, direction, effective_nulls_first)
+}
+
+/// Prepared sort key descriptor pre-resolving schema column index and NULL ordering defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedSortKey {
+    /// Pre-resolved index in `row.values` if `expression` is a direct `Expr::Column`.
+    pub column_index: Option<usize>,
+    /// The original sort key specification.
+    pub sort_key: SortKey,
+    /// Precomputed effective nulls_first (true if NULL values appear first).
+    pub nulls_first: bool,
+}
+
+impl PreparedSortKey {
+    /// Prepares a slice of `SortKey`s by pre-resolving schema column indices and NULL ordering defaults.
+    pub fn prepare(schema: &Schema, sort_keys: &[SortKey]) -> Result<Vec<Self>> {
+        let mut prepared = Vec::with_capacity(sort_keys.len());
+        for key in sort_keys {
+            key.expression.infer_type(schema)?;
+            let column_index = match &key.expression {
+                crate::query::expr::Expr::Column(name) => {
+                    crate::query::expr::resolve_column_in_schema(schema, name).map(|(idx, _)| idx)
+                }
+                _ => None,
+            };
+            let nulls_first = key
+                .nulls_first
+                .unwrap_or(key.direction == SortDirection::Ascending);
+            prepared.push(Self {
+                column_index,
+                sort_key: key.clone(),
+                nulls_first,
+            });
+        }
+        Ok(prepared)
+    }
+
+    /// Evaluates the sort key value for a row, borrowing without allocation when referencing a direct column.
+    #[inline]
+    pub fn evaluate<'a>(
+        &self,
+        row: &'a Row,
+        schema: &Schema,
+    ) -> Result<std::borrow::Cow<'a, Value>> {
+        if let Some(idx) = self.column_index {
+            if let Some(val) = row.values.get(idx) {
+                Ok(std::borrow::Cow::Borrowed(val))
+            } else {
+                Err(Error::ColumnCountMismatch {
+                    expected: schema.columns.len(),
+                    found: row.values.len(),
+                })
+            }
+        } else {
+            self.sort_key
+                .expression
+                .evaluate(row, schema)
+                .map(std::borrow::Cow::Owned)
+        }
+    }
+}
+
+/// Compares two rows using pre-resolved `PreparedSortKey` descriptors.
+pub fn compare_rows_prepared(
+    a: &Row,
+    b: &Row,
+    schema: &Schema,
+    keys: &[PreparedSortKey],
+) -> Result<Ordering> {
+    for key in keys {
+        let val_a = key.evaluate(a, schema)?;
+        let val_b = key.evaluate(b, schema)?;
+        let ord =
+            compare_evaluated_values(&val_a, &val_b, key.sort_key.direction, key.nulls_first)?;
+        if ord != Ordering::Equal {
+            return Ok(ord);
+        }
+    }
+    Ok(Ordering::Equal)
 }
 
 /// Logical filter operator that evaluates a boolean predicate against input rows.

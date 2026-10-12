@@ -7,10 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::engine::types::{Row, Schema, Value};
 use crate::error::{Error, Result};
-use crate::query::operator::{compare_rows_by_sort_keys, SortKey};
+use crate::query::operator::{
+    compare_evaluated_values, compare_rows_prepared, PreparedSortKey, SortDirection, SortKey,
+};
 
-/// Default in-memory sort memory budget: 64 KB.
-pub const DEFAULT_SORT_MEMORY_BUDGET_BYTES: usize = 64 * 1024;
+/// Default in-memory sort memory budget: 2 MB.
+pub const DEFAULT_SORT_MEMORY_BUDGET_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default maximum number of temporary run files open concurrently during merge passes.
 pub const DEFAULT_MAX_TEMP_FILES: usize = 32;
@@ -421,26 +423,26 @@ impl RunReader {
 }
 
 /// Helper struct representing an active item in the k-way merge priority queue.
-struct MergeItem<'a> {
+struct MergeItem<'s, 'k> {
     seq: u64,
     row: Row,
     reader_idx: usize,
-    schema: &'a Schema,
-    sort_keys: &'a [SortKey],
+    schema: &'s Schema,
+    prepared_keys: &'k [PreparedSortKey],
 }
 
-impl<'a> PartialEq for MergeItem<'a> {
+impl<'s, 'k> PartialEq for MergeItem<'s, 'k> {
     fn eq(&self, other: &Self) -> bool {
         self.seq == other.seq
     }
 }
 
-impl<'a> Eq for MergeItem<'a> {}
+impl<'s, 'k> Eq for MergeItem<'s, 'k> {}
 
-impl<'a> Ord for MergeItem<'a> {
+impl<'s, 'k> Ord for MergeItem<'s, 'k> {
     fn cmp(&self, other: &Self) -> Ordering {
         // BinaryHeap is a max-heap; we invert comparisons to yield a min-heap.
-        match compare_rows_by_sort_keys(&self.row, &other.row, self.schema, self.sort_keys) {
+        match compare_rows_prepared(&self.row, &other.row, self.schema, self.prepared_keys) {
             Ok(Ordering::Equal) => other.seq.cmp(&self.seq),
             Ok(ord) => ord.reverse(),
             Err(_) => other.seq.cmp(&self.seq),
@@ -448,7 +450,7 @@ impl<'a> Ord for MergeItem<'a> {
     }
 }
 
-impl<'a> PartialOrd for MergeItem<'a> {
+impl<'s, 'k> PartialOrd for MergeItem<'s, 'k> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -489,10 +491,8 @@ impl<'a> ExternalSorter<'a> {
             ));
         }
 
-        // Validate sort expressions against schema upfront
-        for key in self.sort_keys {
-            key.expression.infer_type(self.schema)?;
-        }
+        // Validate and pre-resolve sort expressions against schema upfront
+        let prepared_keys = PreparedSortKey::prepare(self.schema, self.sort_keys)?;
 
         let total_input_rows = rows.len();
         let temp_dir = self.config.effective_temp_dir();
@@ -509,7 +509,7 @@ impl<'a> ExternalSorter<'a> {
                 && !current_batch.is_empty()
             {
                 // Sort current in-memory batch
-                self.sort_tagged_batch(&mut current_batch)?;
+                self.sort_tagged_batch(&mut current_batch, &prepared_keys)?;
 
                 // Spill to disk
                 let (run_file, written_bytes) = write_sorted_run(&temp_dir, &current_batch)?;
@@ -534,7 +534,7 @@ impl<'a> ExternalSorter<'a> {
 
         // Case 1: In-Memory Fast Path (all rows fit within memory budget)
         if runs.is_empty() {
-            self.sort_tagged_batch(&mut current_batch)?;
+            self.sort_tagged_batch(&mut current_batch, &prepared_keys)?;
             let out_rows = current_batch.into_iter().map(|(_, r)| r).collect();
             return Ok((
                 out_rows,
@@ -551,7 +551,7 @@ impl<'a> ExternalSorter<'a> {
 
         // Case 2: Spill Path (write final batch if non-empty)
         if !current_batch.is_empty() {
-            self.sort_tagged_batch(&mut current_batch)?;
+            self.sort_tagged_batch(&mut current_batch, &prepared_keys)?;
             let (run_file, written_bytes) = write_sorted_run(&temp_dir, &current_batch)?;
             bytes_spilled += written_bytes;
             if bytes_spilled > self.config.max_temp_bytes {
@@ -588,7 +588,7 @@ impl<'a> ExternalSorter<'a> {
                 }
 
                 let (merged_file, written_bytes) =
-                    self.merge_readers_to_run(&temp_dir, chunk_readers)?;
+                    self.merge_readers_to_run(&temp_dir, chunk_readers, &prepared_keys)?;
                 bytes_spilled += written_bytes;
                 if bytes_spilled > self.config.max_temp_bytes {
                     return Err(Error::ExternalSortQuotaExceeded {
@@ -608,7 +608,8 @@ impl<'a> ExternalSorter<'a> {
             final_readers.push(RunReader::open(run)?);
         }
 
-        let out_rows = self.merge_readers_to_output(final_readers, total_input_rows)?;
+        let out_rows =
+            self.merge_readers_to_output(final_readers, total_input_rows, &prepared_keys)?;
 
         Ok((
             out_rows,
@@ -623,30 +624,168 @@ impl<'a> ExternalSorter<'a> {
         ))
     }
 
-    /// Sorts a vector of tagged rows `(sequence, row)` in-memory using the configured sort keys.
-    fn sort_tagged_batch(&self, batch: &mut [(u64, Row)]) -> Result<()> {
+    /// Sorts a vector of tagged rows `(sequence, row)` in-memory using the pre-resolved sort keys.
+    fn sort_tagged_batch(
+        &self,
+        batch: &mut [(u64, Row)],
+        prepared_keys: &[PreparedSortKey],
+    ) -> Result<()> {
+        if batch.len() <= 1 || prepared_keys.is_empty() {
+            return Ok(());
+        }
+
+        // Fast Path 1: Single direct column key (most common query pattern, e.g. ORDER BY id ASC)
+        if prepared_keys.len() == 1 && prepared_keys[0].column_index.is_some() {
+            let col_idx = prepared_keys[0].column_index.unwrap();
+            let direction = prepared_keys[0].sort_key.direction;
+            let nulls_first = prepared_keys[0].nulls_first;
+
+            let mut sort_err = Ok(());
+            batch.sort_by(|(seq_a, row_a), (seq_b, row_b)| {
+                if sort_err.is_err() {
+                    return Ordering::Equal;
+                }
+                let val_a = match row_a.values.get(col_idx) {
+                    Some(v) => v,
+                    None => {
+                        sort_err = Err(Error::ColumnCountMismatch {
+                            expected: self.schema.columns.len(),
+                            found: row_a.values.len(),
+                        });
+                        return Ordering::Equal;
+                    }
+                };
+                let val_b = match row_b.values.get(col_idx) {
+                    Some(v) => v,
+                    None => {
+                        sort_err = Err(Error::ColumnCountMismatch {
+                            expected: self.schema.columns.len(),
+                            found: row_b.values.len(),
+                        });
+                        return Ordering::Equal;
+                    }
+                };
+                match compare_evaluated_values(val_a, val_b, direction, nulls_first) {
+                    Ok(Ordering::Equal) => seq_a.cmp(seq_b),
+                    Ok(ord) => ord,
+                    Err(e) => {
+                        sort_err = Err(e);
+                        Ordering::Equal
+                    }
+                }
+            });
+            return sort_err;
+        }
+
+        // Fast Path 2: All keys are direct columns (e.g. ORDER BY department ASC, salary DESC)
+        if prepared_keys.iter().all(|k| k.column_index.is_some()) {
+            let col_specs: Vec<(usize, SortDirection, bool)> = prepared_keys
+                .iter()
+                .map(|k| (k.column_index.unwrap(), k.sort_key.direction, k.nulls_first))
+                .collect();
+
+            let mut sort_err = Ok(());
+            batch.sort_by(|(seq_a, row_a), (seq_b, row_b)| {
+                if sort_err.is_err() {
+                    return Ordering::Equal;
+                }
+                for &(col_idx, direction, nulls_first) in &col_specs {
+                    let val_a = match row_a.values.get(col_idx) {
+                        Some(v) => v,
+                        None => {
+                            sort_err = Err(Error::ColumnCountMismatch {
+                                expected: self.schema.columns.len(),
+                                found: row_a.values.len(),
+                            });
+                            return Ordering::Equal;
+                        }
+                    };
+                    let val_b = match row_b.values.get(col_idx) {
+                        Some(v) => v,
+                        None => {
+                            sort_err = Err(Error::ColumnCountMismatch {
+                                expected: self.schema.columns.len(),
+                                found: row_b.values.len(),
+                            });
+                            return Ordering::Equal;
+                        }
+                    };
+                    match compare_evaluated_values(val_a, val_b, direction, nulls_first) {
+                        Ok(Ordering::Equal) => continue,
+                        Ok(ord) => return ord,
+                        Err(e) => {
+                            sort_err = Err(e);
+                            return Ordering::Equal;
+                        }
+                    }
+                }
+                seq_a.cmp(seq_b)
+            });
+            return sort_err;
+        }
+
+        // General Path: One or more sort keys are complex expressions (e.g. ORDER BY col1 + 1)
+        // Pre-evaluate sort keys once per row to avoid O(N log N) expression evaluations.
+        let mut row_keys: Vec<Vec<Value>> = Vec::with_capacity(batch.len());
+        for (_, row) in batch.iter() {
+            let mut keys = Vec::with_capacity(prepared_keys.len());
+            for pk in prepared_keys {
+                let val = pk.evaluate(row, self.schema)?;
+                keys.push(val.into_owned());
+            }
+            row_keys.push(keys);
+        }
+
+        let mut indices: Vec<usize> = (0..batch.len()).collect();
         let mut sort_err = Ok(());
-        batch.sort_by(|(seq_a, row_a), (seq_b, row_b)| {
+
+        indices.sort_by(|&i, &j| {
             if sort_err.is_err() {
                 return Ordering::Equal;
             }
-            match compare_rows_by_sort_keys(row_a, row_b, self.schema, self.sort_keys) {
-                Ok(Ordering::Equal) => seq_a.cmp(seq_b),
-                Ok(ord) => ord,
-                Err(e) => {
-                    sort_err = Err(e);
-                    Ordering::Equal
+            let keys_a = &row_keys[i];
+            let keys_b = &row_keys[j];
+            for (k_idx, pk) in prepared_keys.iter().enumerate() {
+                match compare_evaluated_values(
+                    &keys_a[k_idx],
+                    &keys_b[k_idx],
+                    pk.sort_key.direction,
+                    pk.nulls_first,
+                ) {
+                    Ok(Ordering::Equal) => continue,
+                    Ok(ord) => return ord,
+                    Err(e) => {
+                        sort_err = Err(e);
+                        return Ordering::Equal;
+                    }
                 }
             }
+            batch[i].0.cmp(&batch[j].0)
         });
-        sort_err
+
+        sort_err?;
+
+        // Permute batch in-place using temporary vector without cloning rows
+        let mut sorted_batch = Vec::with_capacity(batch.len());
+        for idx in indices {
+            sorted_batch.push(std::mem::replace(
+                &mut batch[idx],
+                (0, Row::new(Vec::new())),
+            ));
+        }
+        for (i, row) in sorted_batch.into_iter().enumerate() {
+            batch[i] = row;
+        }
+
+        Ok(())
     }
 
     /// Merges multiple run readers into a new temporary run file.
-    fn merge_readers_to_run(
+    fn merge_readers_to_run<'k>(
         &self,
         temp_dir: &Path,
         mut readers: Vec<RunReader>,
+        prepared_keys: &'k [PreparedSortKey],
     ) -> Result<(TempRunFile, usize)> {
         let (run_file, file) = TempRunFile::create_in(temp_dir)?;
         let mut writer = BufWriter::new(file);
@@ -665,7 +804,7 @@ impl<'a> ExternalSorter<'a> {
         writer.write_all(&total_run_rows.to_le_bytes())?;
         total_bytes += 8;
 
-        let mut heap: BinaryHeap<MergeItem<'a>> = BinaryHeap::with_capacity(readers.len());
+        let mut heap: BinaryHeap<MergeItem<'a, 'k>> = BinaryHeap::with_capacity(readers.len());
 
         for (reader_idx, reader) in readers.iter_mut().enumerate() {
             if let Some((seq, row)) = reader.next_row()? {
@@ -674,7 +813,7 @@ impl<'a> ExternalSorter<'a> {
                     row,
                     reader_idx,
                     schema: self.schema,
-                    sort_keys: self.sort_keys,
+                    prepared_keys,
                 });
             }
         }
@@ -688,7 +827,7 @@ impl<'a> ExternalSorter<'a> {
                     row,
                     reader_idx,
                     schema: self.schema,
-                    sort_keys: self.sort_keys,
+                    prepared_keys,
                 });
             }
         }
@@ -698,13 +837,14 @@ impl<'a> ExternalSorter<'a> {
     }
 
     /// Merges multiple run readers directly into a vector of output `Row`s.
-    fn merge_readers_to_output(
+    fn merge_readers_to_output<'k>(
         &self,
         mut readers: Vec<RunReader>,
         capacity: usize,
+        prepared_keys: &'k [PreparedSortKey],
     ) -> Result<Vec<Row>> {
         let mut out_rows = Vec::with_capacity(capacity);
-        let mut heap: BinaryHeap<MergeItem<'a>> = BinaryHeap::with_capacity(readers.len());
+        let mut heap: BinaryHeap<MergeItem<'a, 'k>> = BinaryHeap::with_capacity(readers.len());
 
         for (reader_idx, reader) in readers.iter_mut().enumerate() {
             if let Some((seq, row)) = reader.next_row()? {
@@ -713,7 +853,7 @@ impl<'a> ExternalSorter<'a> {
                     row,
                     reader_idx,
                     schema: self.schema,
-                    sort_keys: self.sort_keys,
+                    prepared_keys,
                 });
             }
         }
@@ -727,7 +867,7 @@ impl<'a> ExternalSorter<'a> {
                     row,
                     reader_idx,
                     schema: self.schema,
-                    sort_keys: self.sort_keys,
+                    prepared_keys,
                 });
             }
         }

@@ -124,9 +124,10 @@ pub use metrics::{
     OperatorKind, OperatorMetrics, QueryExecutionMetrics,
 };
 pub use operator::{
-    compare_rows_by_sort_keys, compare_values_for_sort, AggregateOperator, AggregateState,
-    CanonicalValue, FilterOperator, GroupKey, JoinOperator, OffsetLimitOperator, ProjectOperator,
-    QueryResult, SetOperationOperator, SortDirection, SortKey, SortOperator, WindowOperator,
+    compare_evaluated_values, compare_rows_by_sort_keys, compare_rows_prepared,
+    compare_values_for_sort, AggregateOperator, AggregateState, CanonicalValue, FilterOperator,
+    GroupKey, JoinOperator, OffsetLimitOperator, PreparedSortKey, ProjectOperator, QueryResult,
+    SetOperationOperator, SortDirection, SortKey, SortOperator, WindowOperator,
 };
 pub use optimizer::{
     recombine_disjunction, split_disjunction, AccessPath, JoinStrategy, MultiIndexChildScan,
