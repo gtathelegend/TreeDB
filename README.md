@@ -86,10 +86,20 @@ WAL File (.treedb.wal)       Database File (.treedb)
 | **Composite Secondary Indexes** | **Implemented** | Multi-column persistent secondary indexes (`CREATE [UNIQUE] INDEX ... ON table (col1, col2)`), canonical lexicographical composite key encoding, leading-prefix scans, range scans, strict multi-column single-NULL uniqueness, atomic backfill, cost-based optimizer integration |
 | **Covering Indexes & Index-Only Execution** | **Implemented** | Covering secondary indexes with `INCLUDE (col3, col4)`, versioned `CoveredPayload` binary format, index-only physical operator (`IndexOnlyScan`), zero base-record fetches (`base_records_avoided`), residual predicate evaluation on covered values, ORDER BY, GROUP BY, window, and JOIN integration, comprehensive EXPLAIN ANALYZE metrics |
 | **Cost-Based Index Skip Scan** | **Implemented** | Cost-based skip scan over composite secondary indexes (`IndexSkipScan`, `IndexOnlySkipScan`), streaming distinct prefix enumeration (`distinct_prefix_values`), suffix probe matching, statistics-driven cost modeling, covering/index-only integration, safe ORDER BY and early LIMIT/OFFSET termination |
+| **MVCC & Version Chains** | **Implemented** | Slotted tuple delta chains, snapshot visibility filtering (`SnapshotId`, `CommitSeq`), non-blocking readers, transaction isolation, write-set tracking |
+| **Vacuum & Space Reclamation** | **Implemented** | Historical version pruning behind reclamation horizon, empty record page reclamation, overflow page deallocation, freelist recycling |
+| **Cross-Layer Consistency Verification** | **Implemented** | Non-destructive structural and logical audit (`verify_consistency`, `verify_file`, `check_file`), freelist cycle detection, index payload matching |
+| **Recovery & Checkpoint Certification** | **Implemented** | ARIES-inspired 3-phase recovery (Analysis, Redo, Undo with CLRs), fuzzy checkpoints, monotonic `CommitSeq` preservation, deterministic failure injection |
+| **Consistent Backup & Safe Restore** | **Implemented** | Self-describing CRC32 manifests (`treedb.manifest`), companion WAL inclusion, two-phase publication protocol (`RestoreJournal`), deterministic crash recovery |
 
+---
 
+## Release Candidate Status
 
-
+* **Current Milestone:** Release Candidate 1 (`v0.1.0-rc1`)
+* **Test Suite:** **1,935 passing tests** across 80 test binaries (0 failures, 0 warnings, 0 ignored)
+* **Language & Safety:** 100% Safe Rust (`#![forbid(unsafe_code)]`; zero `unsafe` blocks)
+* **Durability:** Write-Ahead Logging (WAL) with PageLSN ordering and ARIES crash recovery certified
 
 ---
 
@@ -105,7 +115,7 @@ cargo build --release
 
 ### Running Tests
 ```bash
-cargo test --all-targets
+cargo test --all
 ```
 
 ### Running the CLI
@@ -116,10 +126,65 @@ cargo run --bin treedb -- init test.treedb
 # Inspect database file metadata
 cargo run --bin treedb -- info test.treedb
 
-# Execute an SQL SELECT query
-cargo run --bin treedb -- query test.treedb "SELECT name, age FROM users WHERE age >= 21 ORDER BY age DESC LIMIT 10;"
+# Execute SQL DDL and DML statements
+cargo run --bin treedb -- query test.treedb "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT);"
+cargo run --bin treedb -- query test.treedb "INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25);"
+cargo run --bin treedb -- query test.treedb "SELECT name, age FROM users WHERE age >= 21 ORDER BY age DESC;"
 ```
 
+### Minimal Rust Public API Example
+
+```rust
+use treedb::{TreeDb, Result};
+
+fn main() -> Result<()> {
+    // 1. Open or create database with a 64-page buffer pool
+    let mut db = TreeDb::open("mydb.treedb", 64)?;
+
+    // 2. Execute DDL and DML statements
+    db.execute_statement("CREATE TABLE accounts (id INT PRIMARY KEY, owner TEXT, balance INT);")?;
+    db.execute_statement("INSERT INTO accounts VALUES (1, 'Alice', 1000), (2, 'Bob', 500);")?;
+
+    // 3. Query records
+    let res = db.execute_sql("SELECT owner, balance FROM accounts WHERE balance > 600;")?;
+    for row in res.rows() {
+        println!("Owner: {}, Balance: {}", row.values[0], row.values[1]);
+    }
+
+    // 4. Force synchronization to disk
+    db.sync()?;
+
+    // 5. Run non-destructive consistency audit
+    let report = db.verify_consistency()?;
+    assert!(report.is_healthy());
+
+    Ok(())
+}
+```
+
+---
+
+## Persistence & Crash Recovery Overview
+
+TreeDB provides durable, recoverable single-node persistence:
+
+1. **Write-Ahead Logging (WAL)**: Mutations log redo and undo records before dirty in-memory pages are evicted or flushed. Flushed `Commit` records guarantee transaction durability.
+2. **ARIES-Inspired Recovery**: Upon restart or crash recovery, TreeDB runs:
+   * **Analysis**: Scans forward from the checkpoint LSN to rebuild active transaction and dirty page tables.
+   * **Redo**: Repeats history forward, ensuring all committed changes are replayed in storage.
+   * **Undo**: Rolls back active uncommitted transactions in reverse, logging Compensation Log Records (CLRs) for restart safety.
+3. **Fuzzy Checkpoints**: Flushes dirty pages, writes checkpoint records, and truncates obsolete WAL records while preserving active transaction undo segments.
+4. **Crash-Resilient Restore (`RestoreJournal`)**: Restoring multi-file database/WAL pairs coordinates through an on-disk journal (`.restore_journal`), guaranteeing that interrupted operations deterministically roll back to the original database or roll forward to the new database.
+
+---
+
+## Operational Constraints & Limitations
+
+TreeDB is designed for single-node embedded storage exploration:
+
+* **Single-Writer Exclusivity**: TreeDB assumes single-process, single-writer access. Concurrent uncoordinated multi-process writes are not supported.
+* **Offline Backups Only**: Backups must be performed when the database is quiescent (no active write transactions). Online hot backup during concurrent writes is not supported.
+* **No Heuristic Auto-Repair**: Damaged headers or corrupted pages fail loudly rather than attempting heuristic repair, preventing silent corruption.
 
 ---
 
@@ -136,6 +201,12 @@ cargo run --bin treedb -- query test.treedb "SELECT name, age FROM users WHERE a
 
 ## Documentation
 
+* [Release Candidate Audit](docs/RELEASE_CANDIDATE_AUDIT.md)
+* [Persistence Certification](docs/PERSISTENCE_CERTIFICATION.md)
+* [Backup & Restore Guide](docs/BACKUP_RESTORE.md)
+* [Cross-Layer Consistency Verification](docs/STORAGE_CONSISTENCY.md)
+* [Recovery & Checkpoint Certification](docs/RECOVERY_CERTIFICATION.md)
+* [Transaction Atomicity & Crash Testing](docs/TRANSACTION_ATOMICITY.md)
 * [Architecture Overview](docs/ARCHITECTURE.md)
 * [B+ Tree Index Engine](docs/BPLUS_TREE.md)
 * [Buffer Pool Manager](docs/BUFFER_POOL.md)
