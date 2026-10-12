@@ -13,12 +13,14 @@ TreeDB v0.1.0-rc1 is fully reproducible, clean-checkout verified, and certified 
 * **Audited Release Commit:** `22dfc2ef6647f9b4f778dd5bde91d142e0ecc867`
 * **Release Tag:** `v0.1.0-rc1` (annotated tag pointing to `22dfc2ef6647f9b4f778dd5bde91d142e0ecc867`)
 * **Tag Message:** `TreeDB Release Candidate 1 (Phase 78 Persistence Freeze)`
+* **Post-Tag Validation Commit:** `eb8a463` (incorporates README and CI adjustments; 0 Rust source changes)
 * **Branch:** `main`
 * **Working Tree:** Clean (verified; 0 uncommitted changes prior to documentation updates)
 * **Toolchain Information:**
   * `rustc 1.98.1 (48a229cea 2026-09-01)`
   * `cargo 1.98.1 (797e8a9bc 2026-08-05)`
   * Target: `x86_64-pc-windows-msvc` (Windows, stable Rust)
+* **Reconciliation Note:** Historical logs mentioned 12 tests in earlier backup/restore test iterations; the actual full `tests/backup_restore.rs` suite contains exactly 51 passing tests covering all offline backup, validation, fault-injection, and journal publication cases.
 
 ---
 

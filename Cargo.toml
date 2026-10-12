@@ -7,6 +7,9 @@ description = "A persistent single-node storage engine built from first principl
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/gtathelegend/TreeDB"
+exclude = [
+    ".github",
+]
 
 [dependencies]
 thiserror = "2.0"

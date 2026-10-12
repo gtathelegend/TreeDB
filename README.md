@@ -94,12 +94,14 @@ WAL File (.treedb.wal)       Database File (.treedb)
 
 ---
 
-## Release Candidate Status
+## Release Status
 
-* **Current Milestone:** Release Candidate 1 (`v0.1.0-rc1`)
+* **Current Version:** `v0.1.0` (General Availability Release Packaging)
+* **Release Candidate:** `v0.1.0-rc1` (frozen at commit `22dfc2ef6647f9b4f778dd5bde91d142e0ecc867`)
 * **Test Suite:** **1,935 passing tests** across 80 test binaries (0 failures, 0 warnings, 0 ignored)
 * **Language & Safety:** 100% Safe Rust (`#![forbid(unsafe_code)]`; zero `unsafe` blocks)
 * **Durability:** Write-Ahead Logging (WAL) with PageLSN ordering and ARIES crash recovery certified
+* **Distribution Packaging:** Clean, verified Cargo package (`cargo package`) containing zero extraneous artifacts
 
 ---
 
@@ -201,6 +203,8 @@ TreeDB is designed for single-node embedded storage exploration:
 
 ## Documentation
 
+* [Release Notes v0.1.0](docs/RELEASE_NOTES_v0.1.0.md)
+* [Release Candidate Validation](docs/RELEASE_CANDIDATE_VALIDATION.md)
 * [Release Candidate Audit](docs/RELEASE_CANDIDATE_AUDIT.md)
 * [Persistence Certification](docs/PERSISTENCE_CERTIFICATION.md)
 * [Backup & Restore Guide](docs/BACKUP_RESTORE.md)
@@ -219,5 +223,5 @@ TreeDB is designed for single-node embedded storage exploration:
 ## License
 
 Dual-licensed under either of:
-* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE) or http://www.apache.org/licenses/LICENSE-2.0)
-* MIT license ([LICENSE-MIT](LICENSE) or http://opensource.org/licenses/MIT)
+* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
