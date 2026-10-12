@@ -330,6 +330,82 @@ impl RecordPage {
         }
     }
 
+    /// Extracts the `RecordLocation` for `slot_id` directly from raw page bytes in $O(1)$
+    /// without full page deserialization, allocation, or copying.
+    pub fn get_location_from_raw_page<'a>(
+        page: &'a Page,
+        slot_id: u32,
+    ) -> Result<Option<RecordLocation<'a>>> {
+        if page.page_type() != PageType::Record {
+            return Err(Error::PageCorruption {
+                page_id: page.id(),
+                reason: "expected Record page type tag",
+            });
+        }
+
+        let payload = page.payload();
+        let slot_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+        let free_space_start = u16::from_le_bytes([payload[2], payload[3]]);
+        let free_space_end = u16::from_le_bytes([payload[4], payload[5]]);
+
+        // Freshly allocated uninitialized record page
+        if slot_count == 0 && free_space_start == 0 && free_space_end == 0 {
+            return Ok(None);
+        }
+
+        let max_slots = (PAGE_PAYLOAD_SIZE - RECORD_PAGE_HEADER_SIZE) / SLOT_SIZE;
+        if slot_count > max_slots {
+            return Err(Error::PageCorruption {
+                page_id: page.id(),
+                reason: "slot count exceeds maximum possible page capacity",
+            });
+        }
+
+        if slot_id as usize >= slot_count {
+            return Ok(None);
+        }
+
+        let slot_offset_pos = RECORD_PAGE_HEADER_SIZE + (slot_id as usize) * SLOT_SIZE;
+        let slot_offset =
+            u16::from_le_bytes([payload[slot_offset_pos], payload[slot_offset_pos + 1]]);
+        let slot_length =
+            u16::from_le_bytes([payload[slot_offset_pos + 2], payload[slot_offset_pos + 3]]);
+
+        if slot_offset == 0 {
+            return Ok(None);
+        }
+
+        let is_overflow = (slot_length & OVERFLOW_FLAG) != 0;
+        let raw_len = (slot_length & !OVERFLOW_FLAG) as usize;
+        let start = slot_offset as usize;
+        let end = start + raw_len;
+
+        if start < free_space_end as usize || end > PAGE_PAYLOAD_SIZE {
+            return Err(Error::PageCorruption {
+                page_id: page.id(),
+                reason: "slot references payload out of valid boundaries",
+            });
+        }
+
+        if is_overflow {
+            if raw_len != OVERFLOW_DESCRIPTOR_SIZE {
+                return Err(Error::PageCorruption {
+                    page_id: page.id(),
+                    reason: "overflow descriptor length is not 8 bytes",
+                });
+            }
+            let slice = &payload[start..end];
+            let head_page_id = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+            let total_length = u32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
+            Ok(Some(RecordLocation::Overflow(OverflowDescriptor {
+                head_page_id,
+                total_length,
+            })))
+        } else {
+            Ok(Some(RecordLocation::Inline(&payload[start..end])))
+        }
+    }
+
     /// Retrieves a mutable reference to the inlined record payload bytes at `slot_id`.
     pub fn get_inline_payload_mut(&mut self, slot_id: u32) -> Option<&mut [u8]> {
         let slot = self.slots.get(slot_id as usize)?;

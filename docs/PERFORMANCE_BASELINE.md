@@ -358,3 +358,113 @@ A dedicated test suite (`tests/query_sort_optimization.rs`) covering 9 focused v
 * **Test Suite**: 1,953 tests passing across 82 test binaries (100% pass rate).
 * **Code Quality**: `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings` fully clean.
 
+## 9. Phase 84 — Full Table Scan & Record Deserialization Optimization
+
+### 9.1 Baseline Verification and Profiling Analysis
+
+* **Baseline Commit**: `184458a3e359edb63196f1c9c2f495879a7b1937`
+* **Environment**:
+  * OS: Windows 11 Pro (x86_64-pc-windows-msvc)
+  * CPU: Intel Core i7-1355U (10 cores, 12 threads)
+  * Toolchain: Rust 1.98.1 (stable)
+  * Benchmark profile: Release (`cargo bench --bench benchmark_suite`)
+* **Commands**:
+  * `cargo bench --bench benchmark_suite -- --category sql`
+  * `cargo bench --bench benchmark_suite -- --category record`
+  * `cargo test --all`
+
+#### Profiling and Root-Cause Findings
+
+1. **Slotted Page Deserialization Overhead in `RecordStore::get` and `read_version`**:
+   Whenever a record was fetched by `RecordId`, `RecordStore::get` invoked `RecordPage::deserialize(page)`. For every record access, this:
+   * Allocated a 4,070-byte stack array and copied the entire 4 KB slotted page payload.
+   * Allocated a `Vec<Slot>` on the heap and traversed/validated every slot on the page ($O(\text{slots})$).
+   * For a 2,000-row table scan across ~45 slotted record pages, this copied over 8 MB of page payloads and created 2,000 heap vector allocations merely to look up a 4-byte slot directory entry!
+2. **Double Heap Allocation and Copy per Row in `read_visible_payload`**:
+   * `RecordStore::get` copied the raw version bytes into an owned `Vec<u8>` (copy 1).
+   * `RecordStore::read_version` parsed `VersionMetadata` and called `payload.to_vec()` (copy 2).
+   * `read_visible` allocated a new `HashSet<RecordId>` for cycle detection on every single row lookup, even when 99.9% of rows only had a single version (chain depth = 1).
+   * `Table::scan` received the owned `Vec<u8>`, decoded it via `Schema::decode_tuple(&bytes)`, and immediately dropped the vector.
+3. **Inefficient Column Projection in `ProjectOperator::apply_named`**:
+   * For `SELECT *`, `ProjectOperator::apply_named` iterated every row and column, calling `expr.evaluate(&row, schema)`.
+   * For each column reference (`Expr::Column`), it linearly parsed and searched `schema.columns` by string comparison and deep-cloned every `Value` object (strings, bytes, etc.).
+   * For 2,000 rows with 4 columns, this performed 8,000 string lookups and 8,000 value clones.
+4. **Redundant Row Vector Cloning in Query Filter Operations**:
+   * In `transaction.rs`, residual filter evaluations (`filter_rows_with_outer_internal`) were called as `self.filter_rows_with_outer_internal(initial_rows.clone(), ...)`. The deep clone of all rows was done exclusively so that lines following the filter could read `initial_rows.len()` for metrics reporting.
+
+### 9.2 Implementation Changes
+
+Targeted, safe optimizations were implemented across `record_page.rs`, `record_store.rs`, `table.rs`, `operator.rs`, and `transaction.rs`:
+
+1. **Zero-Copy Slot Location Extraction (`RecordPage::get_location_from_raw_page`, `src/storage/record_page.rs`)**:
+   Implemented `RecordPage::get_location_from_raw_page<'a>(page: &'a Page, slot_id: u32) -> Result<Option<RecordLocation<'a>>>`:
+   * Reads header slot count, slot offset, and length directly from `page.payload()` in $O(1)$ time.
+   * Performs bounds and corruption validation directly on raw page bytes.
+   * Returns a borrowed `RecordLocation::Inline(&'a [u8])` with zero heap allocations and zero page payload copies.
+2. **Zero-Copy MVCC Version and Visible Payload Access (`RecordStore`, `src/storage/record_store.rs`)**:
+   * **`with_version`**: Invokes a closure `f(&VersionMetadata, &[u8])` directly against borrowed frame memory for inline records.
+   * **`with_visible_payload`**: Traverses the version chain starting at `head_rid`. For inline records, decodes `VersionMetadata` directly from the pinned frame, verifies snapshot visibility, and invokes `f(&[u8])` on the borrowed slice with zero byte copies.
+   * **Lazy Cycle Detection**: Allocates `HashSet<RecordId>` only when `depth > 1`, completely eliminating allocation overhead for the common single-version case.
+   * **`with_exact_version_if_visible`** & **`is_version_visible`**: Enables zero-copy point lookups and allocation-free visibility checks.
+3. **Zero-Copy Record Decoding in Table Operations (`Table`, `src/engine/table.rs`)**:
+   * `Table::scan`, `Table::get`, `Table::get_row_by_rid`, and `Table::index_scan` now use `with_visible_payload` and `with_exact_version_if_visible`.
+   * `schema.decode_tuple(payload)` decodes directly from the pinned page buffer slice, eliminating intermediate `Vec<u8>` heap allocations.
+4. **Fast-Path Identity and Direct Column Projections (`ProjectOperator`, `src/query/operator.rs`)**:
+   * **Fast-Path 1 (Identity Projection)**: Detects when `projections` match all input schema columns in order with no renames (e.g., `SELECT * FROM table`). Directly returns `(out_schema, rows)` with zero expression evaluations, zero string searches, and zero value clones.
+   * **Fast-Path 2 (Pre-Resolved Column Indices)**: When all projection expressions are direct column references, pre-resolves column indices once upfront via `resolve_column_in_schema` and indexes `row.values[idx]` directly.
+5. **Elimination of Redundant Filter Clones (`Transaction`, `src/engine/transaction.rs`)**:
+   * Saved `let input_rows_len = initial_rows.len();` prior to filtering and passed owned `initial_rows` directly to `filter_rows_with_outer_internal`, eliminating complete row set cloning.
+
+### 9.3 Before-and-After Performance Comparison
+
+Benchmarks were executed on the same hardware and environment (`Intel Core i7-1355U`, `Windows 11 Pro`, `Rust 1.98.1`, `profile = bench`):
+
+#### SQL & Query Execution Category
+
+| Workload | Dataset / Query | Phase 83 Baseline | Phase 84 Optimized (Run 1) | Phase 84 Optimized (Run 2) | Speedup Factor | Latency Reduction | Throughput Change |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`full_table_scan`** | 2,000 rows (`SELECT *`) | 3.31 ms (301.7 ops/s) | **1.31 ms** (762.2 ops/s) | **1.14 ms** (880.8 ops/s) | **2.53× – 2.90×** | **-60.4% to -65.6%** | **+152.6% to +191.9%** |
+| **`filter_selective`** | 2,000 rows (~2% match) | 4.06 ms (246.2 ops/s) | **2.24 ms** (446.3 ops/s) | **1.78 ms** (562.4 ops/s) | **1.81× – 2.28×** | **-44.8% to -56.2%** | **+81.3% to +128.4%** |
+| **`aggregation_global`**| 2,000 rows (COUNT, SUM) | 3.09 ms (323.8 ops/s) | **1.84 ms** (543.7 ops/s) | **1.78 ms** (561.3 ops/s) | **1.68× – 1.74×** | **-40.5% to -42.4%** | **+67.9% to +73.3%** |
+| **`order_by_sort`** | 2,000 rows (Sort + Scan) | 2.90 ms (345.2 ops/s) | **1.67 ms** (600.4 ops/s) | **1.60 ms** (626.2 ops/s) | **1.74× – 1.81×** | **-42.4% to -44.8%** | **+73.9% to +81.4%** |
+| **`pk_point_lookup`** | 2,000 rows (PK seek) | 1.09 ms (917.4 ops/s) | **752.5 µs** (1.33k ops/s) | **900.5 µs** (1.11k ops/s) | **1.21× – 1.45×** | **-17.4% to -31.0%** | **+21.0% to +44.9%** |
+| **`prepared_statement`**| 2,000 rows (Bound param) | 2.03 ms (492.6 ops/s) | **1.00 ms** (999.5 ops/s) | **832.0 µs** (1.20k ops/s) | **2.03× – 2.44×** | **-50.7% to -59.0%** | **+102.9% to +143.6%** |
+
+#### Record Store Category
+
+| Workload | Operation | Phase 83 Baseline | Phase 84 Optimized (Run 1) | Phase 84 Optimized (Run 2) | Speedup Factor | Latency Reduction | Throughput Change |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`small_inline_64B`** | Sequential read | 367.4 ns (2.72 M ops/s) | **107.1 ns** (9.33 M ops/s) | **141.3 ns** (7.08 M ops/s) | **2.60× – 3.43×** | **-61.5% to -70.8%** | **+160.3% to +243.0%** |
+| **`small_inline_64B`** | Randomized read | 410.2 ns (2.44 M ops/s) | **150.6 ns** (6.64 M ops/s) | **161.3 ns** (6.20 M ops/s) | **2.54× – 2.72×** | **-60.7% to -63.3%** | **+154.1% to +172.1%** |
+| **`medium_inline_512B`**| Sequential read | 443.4 ns (2.26 M ops/s) | **214.4 ns** (4.66 M ops/s) | **235.2 ns** (4.25 M ops/s) | **1.89× – 2.07×** | **-47.0% to -51.6%** | **+88.1% to +106.2%** |
+| **`medium_inline_512B`**| Randomized read | 462.8 ns (2.16 M ops/s) | **226.1 ns** (4.42 M ops/s) | **226.1 ns** (4.42 M ops/s) | **2.05×** | **-51.1%** | **+104.6%** |
+
+#### Micro-Benchmark Profiling (Isolated Operator Timing)
+
+Under isolated execution (`N=2,000` rows):
+* `Table::scan(None, None)`: Reduced from **1,114.5 µs (1.11 ms)** to **260.9 µs (0.26 ms)** (**4.27× speedup, 76.6% latency reduction**).
+* `execute_sql("SELECT * FROM accounts;")`: Reduced from **2,357.2 µs (2.36 ms)** to **806.2 µs (0.81 ms)** (**2.92× speedup, 65.8% latency reduction**).
+
+### 9.4 Correctness, Testing, and Quality Gates
+
+A dedicated test suite (`tests/scan_deserialization_correctness.rs`) was added covering 6 focused scenarios:
+1. `test_scan_empty_and_single_row`: Validates edge cases for empty and single-row tables.
+2. `test_scan_large_multi_page_and_types`: Validates multi-page scan of 2,500 rows with mixed types (`BIGINT`, `BOOLEAN`, `FLOAT`, `VARCHAR`, `NULL`).
+3. `test_scan_inline_and_overflow_records`: Validates transparent co-existence and decoding of inline and large multi-page overflow records (up to 12 KB).
+4. `test_scan_mvcc_visibility_and_aborts`: Validates MVCC snapshot isolation, committed version visibility, and exclusion of aborted transaction records.
+5. `test_scan_persistence_reopen`: Validates persistence and retrieval consistency across full database sync, shutdown, and reopen.
+6. `test_record_page_raw_slot_validation`: Validates $O(1)$ raw page slot extraction, out-of-bounds protection, deleted slot filtering, page type enforcement, and corrupted boundary rejection.
+
+Quality gates:
+* `cargo fmt --all -- --check`: Passed (clean formatting).
+* `cargo clippy --all-targets --all-features -- -D warnings`: Passed (0 warnings).
+* `cargo test --all`: Passed (**1,959 tests passed across 83 test binaries**, 0 failed).
+
+### 9.5 Invariants Preserved
+
+* **Safe Rust**: Zero `unsafe` blocks introduced.
+* **On-Disk Format**: Unchanged.
+* **ACID & MVCC Guarantees**: Unaffected.
+* **Release Tag `v0.1.0`**: Untouched (`2f912c2e24b095976a6a5d6340a6b536b2707c9a`).
+
+

@@ -403,27 +403,15 @@ impl RecordStore {
         }
 
         let page = buffer_pool.fetch_page(record_id.page_id)?;
-        if page.page_type() != PageType::Record {
-            let _ = buffer_pool.unpin_page(record_id.page_id, false);
-            return Err(Error::PageCorruption {
-                page_id: record_id.page_id,
-                reason: "expected Record page type tag",
-            });
-        }
-
-        let record_page = match RecordPage::deserialize(page) {
-            Ok(rp) => rp,
+        let location = match RecordPage::get_location_from_raw_page(page, record_id.slot_id) {
+            Ok(Some(loc)) => loc,
+            Ok(None) => {
+                buffer_pool.unpin_page(record_id.page_id, false)?;
+                return Ok(None);
+            }
             Err(e) => {
                 let _ = buffer_pool.unpin_page(record_id.page_id, false);
                 return Err(e);
-            }
-        };
-
-        let location = match record_page.get_location(record_id.slot_id) {
-            Some(loc) => loc,
-            None => {
-                buffer_pool.unpin_page(record_id.page_id, false)?;
-                return Ok(None);
             }
         };
 
@@ -778,18 +766,65 @@ impl RecordStore {
         self.insert(buffer_pool, &full_buf)
     }
 
+    /// Invokes closure `f` with borrowed `VersionMetadata` and user payload slice for `record_id`.
+    pub fn with_version<T, F>(
+        &self,
+        buffer_pool: &mut BufferPool,
+        record_id: RecordId,
+        f: F,
+    ) -> Result<Option<T>>
+    where
+        F: FnOnce(&VersionMetadata, &[u8]) -> Result<T>,
+    {
+        if record_id.page_id == INVALID_PAGE_ID {
+            return Ok(None);
+        }
+
+        let page = buffer_pool.fetch_page(record_id.page_id)?;
+        let location = match RecordPage::get_location_from_raw_page(page, record_id.slot_id) {
+            Ok(Some(loc)) => loc,
+            Ok(None) => {
+                buffer_pool.unpin_page(record_id.page_id, false)?;
+                return Ok(None);
+            }
+            Err(e) => {
+                let _ = buffer_pool.unpin_page(record_id.page_id, false);
+                return Err(e);
+            }
+        };
+
+        match location {
+            RecordLocation::Inline(slice) => {
+                let (metadata, user_payload) = match VersionMetadata::deserialize(slice) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        buffer_pool.unpin_page(record_id.page_id, false)?;
+                        return Err(e);
+                    }
+                };
+                let res = f(&metadata, user_payload);
+                buffer_pool.unpin_page(record_id.page_id, false)?;
+                res.map(Some)
+            }
+            RecordLocation::Overflow(desc) => {
+                buffer_pool.unpin_page(record_id.page_id, false)?;
+                let raw_bytes =
+                    self.read_overflow_chain(buffer_pool, desc.head_page_id, desc.total_length)?;
+                let (metadata, user_payload) = VersionMetadata::deserialize(&raw_bytes)?;
+                f(&metadata, user_payload).map(Some)
+            }
+        }
+    }
+
     /// Reads an individual physical MVCC version and splits it into `VersionMetadata` and user payload.
     pub fn read_version(
         &self,
         buffer_pool: &mut BufferPool,
         record_id: RecordId,
     ) -> Result<Option<(VersionMetadata, Vec<u8>)>> {
-        let raw_bytes = match self.get(buffer_pool, record_id)? {
-            Some(bytes) => bytes,
-            None => return Ok(None),
-        };
-        let (metadata, payload) = VersionMetadata::deserialize(&raw_bytes)?;
-        Ok(Some((metadata, payload.to_vec())))
+        self.with_version(buffer_pool, record_id, |meta, payload| {
+            Ok((meta.clone(), payload.to_vec()))
+        })
     }
 
     /// Updates the persistent 44-byte MVCC metadata header of an existing record in place.
@@ -808,27 +843,23 @@ impl RecordStore {
 
         let (is_overflow, head_page_id) = {
             let page = buffer_pool.fetch_page(record_id.page_id)?;
-            if page.page_type() != PageType::Record {
-                let _ = buffer_pool.unpin_page(record_id.page_id, false);
-                return Err(Error::PageCorruption {
-                    page_id: record_id.page_id,
-                    reason: "expected Record page type tag",
-                });
-            }
-            let rp = match RecordPage::deserialize(page) {
-                Ok(rp) => rp,
+            let location = match RecordPage::get_location_from_raw_page(page, record_id.slot_id) {
+                Ok(Some(loc)) => loc,
+                Ok(None) => {
+                    let _ = buffer_pool.unpin_page(record_id.page_id, false);
+                    return Err(Error::InvalidRecordId(record_id));
+                }
                 Err(e) => {
                     let _ = buffer_pool.unpin_page(record_id.page_id, false);
                     return Err(e);
                 }
             };
+            let info = match location {
+                RecordLocation::Inline(_) => (false, NO_OVERFLOW_PAGE),
+                RecordLocation::Overflow(desc) => (true, desc.head_page_id),
+            };
             buffer_pool.unpin_page(record_id.page_id, false)?;
-
-            match rp.get_location(record_id.slot_id) {
-                Some(RecordLocation::Inline(_)) => (false, NO_OVERFLOW_PAGE),
-                Some(RecordLocation::Overflow(desc)) => (true, desc.head_page_id),
-                None => return Err(Error::InvalidRecordId(record_id)),
-            }
+            info
         };
 
         if !is_overflow {
@@ -870,6 +901,130 @@ impl RecordStore {
         Ok(())
     }
 
+    /// Invokes closure `f` with the visible user payload slice for `head_rid`, if any.
+    ///
+    /// For inline records, decodes directly from the pinned buffer-pool frame without
+    /// copying record bytes into temporary heap buffers.
+    pub fn with_visible_payload<T, F>(
+        &self,
+        buffer_pool: &mut BufferPool,
+        head_rid: RecordId,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+        f: F,
+    ) -> Result<Option<T>>
+    where
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
+        let mut curr_rid = head_rid;
+        let mut visited: Option<HashSet<RecordId>> = None;
+        let mut depth = 0;
+
+        while curr_rid.page_id != INVALID_PAGE_ID {
+            depth += 1;
+            if depth > 1 {
+                let set = visited.get_or_insert_with(HashSet::new);
+                if !set.insert(curr_rid) {
+                    return Err(Error::VersionChainCycle(format!(
+                        "cycle detected at {curr_rid:?} in version chain originating at head {head_rid:?}"
+                    )));
+                }
+                if depth > MAX_VERSION_CHAIN_DEPTH {
+                    return Err(Error::VersionChainTooDeep {
+                        depth,
+                        max_depth: MAX_VERSION_CHAIN_DEPTH,
+                    });
+                }
+            }
+
+            let page = buffer_pool.fetch_page(curr_rid.page_id)?;
+            let location = match RecordPage::get_location_from_raw_page(page, curr_rid.slot_id) {
+                Ok(Some(loc)) => loc,
+                Ok(None) => {
+                    buffer_pool.unpin_page(curr_rid.page_id, false)?;
+                    return Ok(None);
+                }
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(curr_rid.page_id, false);
+                    return Err(e);
+                }
+            };
+
+            match location {
+                RecordLocation::Inline(slice) => {
+                    let (metadata, user_payload) = match VersionMetadata::deserialize(slice) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            buffer_pool.unpin_page(curr_rid.page_id, false)?;
+                            return Err(e);
+                        }
+                    };
+
+                    if MvccVisibilityPolicy::is_visible(
+                        metadata.xmin,
+                        metadata.xmax,
+                        metadata.created_at,
+                        metadata.deleted_at,
+                        reader_txn,
+                        snapshot,
+                    ) {
+                        let res = f(user_payload);
+                        buffer_pool.unpin_page(curr_rid.page_id, false)?;
+                        return res.map(Some);
+                    }
+
+                    buffer_pool.unpin_page(curr_rid.page_id, false)?;
+
+                    match metadata.prev_version {
+                        Some(prev) => {
+                            if prev == curr_rid {
+                                return Err(Error::VersionChainCycle(format!(
+                                    "self-referencing previous pointer at {curr_rid:?}"
+                                )));
+                            }
+                            curr_rid = prev;
+                        }
+                        None => break,
+                    }
+                }
+                RecordLocation::Overflow(desc) => {
+                    buffer_pool.unpin_page(curr_rid.page_id, false)?;
+                    let raw_bytes = self.read_overflow_chain(
+                        buffer_pool,
+                        desc.head_page_id,
+                        desc.total_length,
+                    )?;
+                    let (metadata, user_payload) = VersionMetadata::deserialize(&raw_bytes)?;
+
+                    if MvccVisibilityPolicy::is_visible(
+                        metadata.xmin,
+                        metadata.xmax,
+                        metadata.created_at,
+                        metadata.deleted_at,
+                        reader_txn,
+                        snapshot,
+                    ) {
+                        return f(user_payload).map(Some);
+                    }
+
+                    match metadata.prev_version {
+                        Some(prev) => {
+                            if prev == curr_rid {
+                                return Err(Error::VersionChainCycle(format!(
+                                    "self-referencing previous pointer at {curr_rid:?}"
+                                )));
+                            }
+                            curr_rid = prev;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Traverses the version chain starting at `head_rid` to find the first version visible to `snapshot`.
     ///
     /// Detects cycles and enforces `MAX_VERSION_CHAIN_DEPTH`.
@@ -881,49 +1036,108 @@ impl RecordStore {
         snapshot: &Snapshot,
     ) -> Result<Option<(RecordId, VersionMetadata, Vec<u8>)>> {
         let mut curr_rid = head_rid;
-        let mut visited = HashSet::new();
+        let mut visited: Option<HashSet<RecordId>> = None;
         let mut depth = 0;
 
         while curr_rid.page_id != INVALID_PAGE_ID {
-            if !visited.insert(curr_rid) {
-                return Err(Error::VersionChainCycle(format!(
-                    "cycle detected at {curr_rid:?} in version chain originating at head {head_rid:?}"
-                )));
-            }
             depth += 1;
-            if depth > MAX_VERSION_CHAIN_DEPTH {
-                return Err(Error::VersionChainTooDeep {
-                    depth,
-                    max_depth: MAX_VERSION_CHAIN_DEPTH,
-                });
+            if depth > 1 {
+                let set = visited.get_or_insert_with(HashSet::new);
+                if !set.insert(curr_rid) {
+                    return Err(Error::VersionChainCycle(format!(
+                        "cycle detected at {curr_rid:?} in version chain originating at head {head_rid:?}"
+                    )));
+                }
+                if depth > MAX_VERSION_CHAIN_DEPTH {
+                    return Err(Error::VersionChainTooDeep {
+                        depth,
+                        max_depth: MAX_VERSION_CHAIN_DEPTH,
+                    });
+                }
             }
 
-            let (metadata, payload) = match self.read_version(buffer_pool, curr_rid)? {
-                Some(v) => v,
-                None => return Ok(None),
+            let page = buffer_pool.fetch_page(curr_rid.page_id)?;
+            let location = match RecordPage::get_location_from_raw_page(page, curr_rid.slot_id) {
+                Ok(Some(loc)) => loc,
+                Ok(None) => {
+                    buffer_pool.unpin_page(curr_rid.page_id, false)?;
+                    return Ok(None);
+                }
+                Err(e) => {
+                    let _ = buffer_pool.unpin_page(curr_rid.page_id, false);
+                    return Err(e);
+                }
             };
 
-            if MvccVisibilityPolicy::is_visible(
-                metadata.xmin,
-                metadata.xmax,
-                metadata.created_at,
-                metadata.deleted_at,
-                reader_txn,
-                snapshot,
-            ) {
-                return Ok(Some((curr_rid, metadata, payload)));
-            }
+            match location {
+                RecordLocation::Inline(slice) => {
+                    let (metadata, user_payload) = match VersionMetadata::deserialize(slice) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            buffer_pool.unpin_page(curr_rid.page_id, false)?;
+                            return Err(e);
+                        }
+                    };
 
-            match metadata.prev_version {
-                Some(prev) => {
-                    if prev == curr_rid {
-                        return Err(Error::VersionChainCycle(format!(
-                            "self-referencing previous pointer at {curr_rid:?}"
-                        )));
+                    if MvccVisibilityPolicy::is_visible(
+                        metadata.xmin,
+                        metadata.xmax,
+                        metadata.created_at,
+                        metadata.deleted_at,
+                        reader_txn,
+                        snapshot,
+                    ) {
+                        let payload_vec = user_payload.to_vec();
+                        buffer_pool.unpin_page(curr_rid.page_id, false)?;
+                        return Ok(Some((curr_rid, metadata, payload_vec)));
                     }
-                    curr_rid = prev;
+
+                    buffer_pool.unpin_page(curr_rid.page_id, false)?;
+
+                    match metadata.prev_version {
+                        Some(prev) => {
+                            if prev == curr_rid {
+                                return Err(Error::VersionChainCycle(format!(
+                                    "self-referencing previous pointer at {curr_rid:?}"
+                                )));
+                            }
+                            curr_rid = prev;
+                        }
+                        None => break,
+                    }
                 }
-                None => break,
+                RecordLocation::Overflow(desc) => {
+                    buffer_pool.unpin_page(curr_rid.page_id, false)?;
+                    let raw_bytes = self.read_overflow_chain(
+                        buffer_pool,
+                        desc.head_page_id,
+                        desc.total_length,
+                    )?;
+                    let (metadata, user_payload) = VersionMetadata::deserialize(&raw_bytes)?;
+
+                    if MvccVisibilityPolicy::is_visible(
+                        metadata.xmin,
+                        metadata.xmax,
+                        metadata.created_at,
+                        metadata.deleted_at,
+                        reader_txn,
+                        snapshot,
+                    ) {
+                        return Ok(Some((curr_rid, metadata, user_payload.to_vec())));
+                    }
+
+                    match metadata.prev_version {
+                        Some(prev) => {
+                            if prev == curr_rid {
+                                return Err(Error::VersionChainCycle(format!(
+                                    "self-referencing previous pointer at {curr_rid:?}"
+                                )));
+                            }
+                            curr_rid = prev;
+                        }
+                        None => break,
+                    }
+                }
             }
         }
 
@@ -938,9 +1152,9 @@ impl RecordStore {
         reader_txn: Option<TxnId>,
         snapshot: &Snapshot,
     ) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .read_visible(buffer_pool, head_rid, reader_txn, snapshot)?
-            .map(|(_, _, p)| p))
+        self.with_visible_payload(buffer_pool, head_rid, reader_txn, snapshot, |payload| {
+            Ok(payload.to_vec())
+        })
     }
 
     /// Returns `true` if any version in the chain originating at `head_rid` is visible to `snapshot`.
@@ -952,7 +1166,7 @@ impl RecordStore {
         snapshot: &Snapshot,
     ) -> Result<bool> {
         Ok(self
-            .read_visible(buffer_pool, head_rid, reader_txn, snapshot)?
+            .with_visible_payload(buffer_pool, head_rid, reader_txn, snapshot, |_| Ok(()))?
             .is_some())
     }
 
@@ -967,18 +1181,50 @@ impl RecordStore {
         reader_txn: Option<TxnId>,
         snapshot: &Snapshot,
     ) -> Result<bool> {
-        let (metadata, _) = match self.read_version(buffer_pool, rid)? {
-            Some(v) => v,
-            None => return Ok(false),
-        };
-        Ok(MvccVisibilityPolicy::is_visible(
-            metadata.xmin,
-            metadata.xmax,
-            metadata.created_at,
-            metadata.deleted_at,
-            reader_txn,
-            snapshot,
-        ))
+        Ok(self
+            .with_version(buffer_pool, rid, |metadata, _| {
+                Ok(MvccVisibilityPolicy::is_visible(
+                    metadata.xmin,
+                    metadata.xmax,
+                    metadata.created_at,
+                    metadata.deleted_at,
+                    reader_txn,
+                    snapshot,
+                ))
+            })?
+            .unwrap_or(false))
+    }
+
+    /// Invokes closure `f` with borrowed `VersionMetadata` and user payload slice for `rid`
+    /// ONLY if that exact version is visible to `snapshot` and `reader_txn`.
+    ///
+    /// Unlike `with_visible_payload`, this does NOT traverse `prev_version` links.
+    pub fn with_exact_version_if_visible<T, F>(
+        &self,
+        buffer_pool: &mut BufferPool,
+        rid: RecordId,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+        f: F,
+    ) -> Result<Option<T>>
+    where
+        F: FnOnce(&VersionMetadata, &[u8]) -> Result<T>,
+    {
+        self.with_version(buffer_pool, rid, |metadata, payload| {
+            if MvccVisibilityPolicy::is_visible(
+                metadata.xmin,
+                metadata.xmax,
+                metadata.created_at,
+                metadata.deleted_at,
+                reader_txn,
+                snapshot,
+            ) {
+                f(metadata, payload).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .map(|opt| opt.flatten())
     }
 
     /// Reads an individual physical MVCC version and returns its metadata and payload
@@ -992,22 +1238,13 @@ impl RecordStore {
         reader_txn: Option<TxnId>,
         snapshot: &Snapshot,
     ) -> Result<Option<(VersionMetadata, Vec<u8>)>> {
-        let (metadata, payload) = match self.read_version(buffer_pool, rid)? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        if MvccVisibilityPolicy::is_visible(
-            metadata.xmin,
-            metadata.xmax,
-            metadata.created_at,
-            metadata.deleted_at,
+        self.with_exact_version_if_visible(
+            buffer_pool,
+            rid,
             reader_txn,
             snapshot,
-        ) {
-            Ok(Some((metadata, payload)))
-        } else {
-            Ok(None)
-        }
+            |metadata, payload| Ok((metadata.clone(), payload.to_vec())),
+        )
     }
 
     /// Validates the entire version chain starting from `head_rid`.

@@ -371,18 +371,13 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
 
         match self.tree.get(self.buffer_pool, key)? {
-            Some(rid) => match self.record_store.read_visible_payload(
+            Some(rid) => self.record_store.with_visible_payload(
                 self.buffer_pool,
                 rid,
                 reader_txn,
                 &snapshot,
-            )? {
-                Some(bytes) => {
-                    let row = self.metadata.schema.decode_tuple(&bytes)?;
-                    Ok(Some(row))
-                }
-                None => Ok(None),
-            },
+                |bytes| self.metadata.schema.decode_tuple(bytes),
+            ),
             None => Ok(None),
         }
     }
@@ -724,13 +719,13 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
 
         for (_k, rid) in rids {
-            if let Some(bytes) = self.record_store.read_visible_payload(
+            if let Some(row) = self.record_store.with_visible_payload(
                 self.buffer_pool,
                 rid,
                 reader_txn,
                 &snapshot,
+                |bytes| self.metadata.schema.decode_tuple(bytes),
             )? {
-                let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
             }
         }
@@ -754,20 +749,22 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
 
         for rid in rids {
-            if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
+            if let Some(row) = self.record_store.with_exact_version_if_visible(
                 self.buffer_pool,
                 rid,
                 reader_txn,
                 &snapshot,
+                |_meta, bytes| self.metadata.schema.decode_tuple(bytes),
             )? {
-                let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
             } else if meta.unique {
-                if let Some((_, _, bytes)) =
-                    self.record_store
-                        .read_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
-                {
-                    let row = self.metadata.schema.decode_tuple(&bytes)?;
+                if let Some(row) = self.record_store.with_visible_payload(
+                    self.buffer_pool,
+                    rid,
+                    reader_txn,
+                    &snapshot,
+                    |bytes| self.metadata.schema.decode_tuple(bytes),
+                )? {
                     if meta.extract_index_key(&row) == idx_key {
                         rows.push(row);
                     }
@@ -817,17 +814,13 @@ impl<'a> Table<'a> {
     pub fn get_row_by_rid(&mut self, rid: RecordId) -> Result<Option<Row>> {
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
-        if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
+        self.record_store.with_exact_version_if_visible(
             self.buffer_pool,
             rid,
             reader_txn,
             &snapshot,
-        )? {
-            let row = self.metadata.schema.decode_tuple(&bytes)?;
-            Ok(Some(row))
-        } else {
-            Ok(None)
-        }
+            |_meta, bytes| self.metadata.schema.decode_tuple(bytes),
+        )
     }
 
     /// Performs an ordered range scan on a secondary index in `[start, end)`.
@@ -853,13 +846,13 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
 
         for (_k, rid) in entries {
-            if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
+            if let Some(row) = self.record_store.with_exact_version_if_visible(
                 self.buffer_pool,
                 rid,
                 reader_txn,
                 &snapshot,
+                |_meta, bytes| self.metadata.schema.decode_tuple(bytes),
             )? {
-                let row = self.metadata.schema.decode_tuple(&bytes)?;
                 rows.push(row);
             }
         }

@@ -632,8 +632,48 @@ impl ProjectOperator {
         }
 
         let out_schema = Schema::new_projected(out_columns);
-        let mut out_rows = Vec::with_capacity(rows.len());
 
+        // Fast path 1: Identity projection passes through rows without evaluation or cloning
+        let mut is_identity = projections.len() == input_schema.columns.len();
+        let mut all_column_indices = Vec::with_capacity(projections.len());
+        for (i, (expr, alias)) in projections.iter().enumerate() {
+            if let Expr::Column(col_name) = expr {
+                if let Some((idx, _)) =
+                    crate::query::expr::resolve_column_in_schema(input_schema, col_name)
+                {
+                    all_column_indices.push(idx);
+                    if idx != i
+                        || alias
+                            .as_deref()
+                            .is_some_and(|a| a != input_schema.columns[i].name)
+                    {
+                        is_identity = false;
+                    }
+                    continue;
+                }
+            }
+            is_identity = false;
+            break;
+        }
+
+        if is_identity && all_column_indices.len() == input_schema.columns.len() {
+            return Ok((out_schema, rows));
+        }
+
+        // Fast path 2: Direct column projections with pre-resolved column indices
+        if all_column_indices.len() == projections.len() {
+            let mut out_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut values = Vec::with_capacity(all_column_indices.len());
+                for &idx in &all_column_indices {
+                    values.push(row.values[idx].clone());
+                }
+                out_rows.push(Row::new(values));
+            }
+            return Ok((out_schema, out_rows));
+        }
+
+        let mut out_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let mut values = Vec::with_capacity(projections.len());
             for (expr, _) in projections {

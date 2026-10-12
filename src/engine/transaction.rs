@@ -4308,8 +4308,9 @@ impl<'db> Transaction<'db> {
 
                 let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
                     Some(filter) => {
+                        let input_rows_len = initial_rows.len();
                         let filtered = self.filter_rows_with_outer_internal(
-                            initial_rows.clone(),
+                            initial_rows,
                             &raw_schema,
                             filter,
                             outer_contexts,
@@ -4320,12 +4321,12 @@ impl<'db> Transaction<'db> {
                             Some(plan.base_table.estimated_rows),
                             Some(plan.base_table.cost),
                         );
-                        filter_metric.input_rows = initial_rows.len();
+                        filter_metric.input_rows = input_rows_len;
                         filter_metric.actual_rows = filtered.len();
-                        filter_metric.counters.rows_evaluated = initial_rows.len();
+                        filter_metric.counters.rows_evaluated = input_rows_len;
                         filter_metric.counters.rows_passed = filtered.len();
                         filter_metric.counters.rows_rejected =
-                            initial_rows.len().saturating_sub(filtered.len());
+                            input_rows_len.saturating_sub(filtered.len());
                         filter_metric.add_child(scan_metric);
                         (filtered, filter_metric)
                     }
@@ -4387,8 +4388,9 @@ impl<'db> Transaction<'db> {
 
                 let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
                     Some(filter) => {
+                        let input_rows_len = initial_rows.len();
                         let filtered = self.filter_rows_with_outer_internal(
-                            initial_rows.clone(),
+                            initial_rows,
                             &raw_schema,
                             filter,
                             outer_contexts,
@@ -4399,12 +4401,12 @@ impl<'db> Transaction<'db> {
                             Some(plan.base_table.estimated_rows),
                             Some(plan.base_table.cost),
                         );
-                        filter_metric.input_rows = initial_rows.len();
+                        filter_metric.input_rows = input_rows_len;
                         filter_metric.actual_rows = filtered.len();
-                        filter_metric.counters.rows_evaluated = initial_rows.len();
+                        filter_metric.counters.rows_evaluated = input_rows_len;
                         filter_metric.counters.rows_passed = filtered.len();
                         filter_metric.counters.rows_rejected =
-                            initial_rows.len().saturating_sub(filtered.len());
+                            input_rows_len.saturating_sub(filtered.len());
                         filter_metric.add_child(scan_metric);
                         (filtered, filter_metric)
                     }
@@ -4885,8 +4887,9 @@ impl<'db> Transaction<'db> {
                     Some(filter)
                         if early_stop_bound.is_none() && !plan.base_table.late_materialization =>
                     {
+                        let input_rows_len = initial_rows.len();
                         let filtered = self.filter_rows_with_outer_internal(
-                            initial_rows.clone(),
+                            initial_rows,
                             &raw_schema,
                             filter,
                             outer_contexts,
@@ -4897,12 +4900,12 @@ impl<'db> Transaction<'db> {
                             Some(plan.base_table.estimated_rows),
                             Some(plan.base_table.cost),
                         );
-                        filter_metric.input_rows = initial_rows.len();
+                        filter_metric.input_rows = input_rows_len;
                         filter_metric.actual_rows = filtered.len();
-                        filter_metric.counters.rows_evaluated = initial_rows.len();
+                        filter_metric.counters.rows_evaluated = input_rows_len;
                         filter_metric.counters.rows_passed = filtered.len();
                         filter_metric.counters.rows_rejected =
-                            initial_rows.len().saturating_sub(filtered.len());
+                            input_rows_len.saturating_sub(filtered.len());
                         filter_metric.add_child(scan_metric);
                         (filtered, filter_metric)
                     }
@@ -4981,8 +4984,9 @@ impl<'db> Transaction<'db> {
 
                     let (filtered_rows, table_op) = match &join.right.residual_filter {
                         Some(filter) => {
+                            let input_rows_len = initial_rows.len();
                             let filtered = self.filter_rows_with_outer_internal(
-                                initial_rows.clone(),
+                                initial_rows,
                                 &raw_schema,
                                 filter,
                                 outer_contexts,
@@ -4993,12 +4997,12 @@ impl<'db> Transaction<'db> {
                                 Some(join.right.estimated_rows),
                                 Some(join.right.cost),
                             );
-                            filter_metric.input_rows = initial_rows.len();
+                            filter_metric.input_rows = input_rows_len;
                             filter_metric.actual_rows = filtered.len();
-                            filter_metric.counters.rows_evaluated = initial_rows.len();
+                            filter_metric.counters.rows_evaluated = input_rows_len;
                             filter_metric.counters.rows_passed = filtered.len();
                             filter_metric.counters.rows_rejected =
-                                initial_rows.len().saturating_sub(filtered.len());
+                                input_rows_len.saturating_sub(filtered.len());
                             filter_metric.add_child(scan_metric);
                             (filtered, filter_metric)
                         }
@@ -5055,8 +5059,9 @@ impl<'db> Transaction<'db> {
 
                     let (filtered_rows, table_op) = match &join.right.residual_filter {
                         Some(filter) => {
+                            let input_rows_len = initial_rows.len();
                             let filtered = self.filter_rows_with_outer_internal(
-                                initial_rows.clone(),
+                                initial_rows,
                                 &raw_schema,
                                 filter,
                                 outer_contexts,
@@ -5067,12 +5072,12 @@ impl<'db> Transaction<'db> {
                                 Some(join.right.estimated_rows),
                                 Some(join.right.cost),
                             );
-                            filter_metric.input_rows = initial_rows.len();
+                            filter_metric.input_rows = input_rows_len;
                             filter_metric.actual_rows = filtered.len();
-                            filter_metric.counters.rows_evaluated = initial_rows.len();
+                            filter_metric.counters.rows_evaluated = input_rows_len;
                             filter_metric.counters.rows_passed = filtered.len();
                             filter_metric.counters.rows_rejected =
-                                initial_rows.len().saturating_sub(filtered.len());
+                                input_rows_len.saturating_sub(filtered.len());
                             filter_metric.add_child(scan_metric);
                             (filtered, filter_metric)
                         }
