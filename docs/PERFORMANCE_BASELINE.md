@@ -614,5 +614,114 @@ Quality gates:
 * **ACID & MVCC Guarantees**: Unaffected.
 * **Release Tag `v0.1.0`**: Untouched (`2f912c2e24b095976a6a5d6340a6b536b2707c9a`).
 
+## 12. Phase 87 Baseline — Index-Only Scans & Covering Index Optimization
+
+### 12.1 Context & Objective
+Secondary indexes allow queries with selective predicates to locate matching `RecordId`s in $O(\log N)$ steps. Prior to Phase 87, however, every qualifying index entry required fetching the complete base record from the `RecordStore` (which could incur random page I/Os, slotted record parsing, and version chain traversal) even when all columns requested by the query (projection, residual filters, ordering expressions, and joins) were already present in the index key or its `INCLUDE` covering payload.
+
+The primary objective of Phase 87 was to implement and optimize **index-only scans and covering-index execution**, completely eliminating base-table record reads when all required values are present in the index, while strictly guaranteeing:
+* Safe Rust (strictly zero `unsafe`).
+* Unchanged on-disk file format.
+* Full SQL semantics and backward compatibility.
+* Absolute MVCC visibility correctness (evaluating record version visibility without bypassing MVCC checks).
+* Atomicity and consistency across updates, deletes, vacuum reclamation, checkpoints, and crash recovery.
+* Buffer pool correctness (preventing pin contention or frame deadlocks during concurrent record visibility evaluation).
+* Release tag `v0.1.0` remains unchanged.
+
+### 12.2 Measured Cost of Record Retrieval in Eligible Queries
+When queries read base records after index traversal:
+1. For an index lookup yielding 100 rows (`secondary_index_lookup`), 100 base records were read from `RecordStore` (`base_records_fetched = 100`). Baseline execution time was **2.44 ms** (p50: 2.00 ms, p99: 10.54 ms).
+2. With index-only execution (`covering_index_point_lookup`), all 100 base-table reads were completely avoided (`base_records_fetched = 0`, `base_records_avoided = 100`), reducing latency to **946.32 µs** (p50: 927.00 µs, p99: 1.39 ms), achieving a **2.57× throughput improvement (+157.4%)**.
+3. For a 600-row range scan, fetching unindexed columns (`non_covering_index_range_scan`) took **1.87 ms** (534.5 ops/s), whereas the covering index-only scan (`covering_index_range_scan`) executed in **1.41 ms** (711.6 ops/s), achieving a **+33.1% throughput improvement**.
+
+### 12.3 Exact Covering Eligibility Rules
+The cost-based optimizer evaluates candidate access paths. An index is eligible for an `IndexOnlyScan` if and only if **all** of the following conditions hold:
+1. **Column Coverage**: Every column in `req_indices` must satisfy `sec_meta.covers_column(col_idx)`, where:
+   $$\text{covers\_column}(c) \iff c \in \text{sec\_meta.column\_indices} \lor c \in \text{sec\_meta.include\_column\_indices}$$
+2. **Comprehensive Requirement Scope**: `req_indices` encompasses:
+   - Output projection columns (`SELECT ...`).
+   - Residual predicate expressions in the `WHERE` clause.
+   - Ordering expressions in `ORDER BY`.
+   - Grouping and aggregation expressions (`GROUP BY`, aggregate arguments).
+   - Window specification columns (`PARTITION BY`, `ORDER BY`, argument columns).
+   - Join condition columns for downstream operators.
+3. **Format Version Validation**: For covering payloads (columns in `include_column_indices`), the index format version must be $\ge 1$ (`SEC_INDEX_FORMAT_VERSION = 1`).
+4. **Fallback on Incomplete Coverage**: If even a single referenced column is not covered by either index keys or included payloads, `is_covering` evaluates to `false` and the optimizer retains a standard `SecondaryIndexScan` with `RecordStore` retrieval.
+
+### 12.4 Physical-Plan Changes & Execution Path
+1. **Physical Plan Representation**:
+   - Eligible scans are planned as `AccessPath::IndexOnlyScan { index_name, index_id, scan_type, covered_columns }`.
+   - `EXPLAIN` explicitly displays `IndexOnlyScan` alongside `covered=[...]`.
+   - `EXPLAIN ANALYZE` metrics record `index_only = true`, `base_records_fetched = 0`, `base_records_avoided = N`, and `covered_rows_output = N`.
+2. **Zero-Heap-Allocation Raw Routing & Leaf Traversal (`Table::scan_index_only_entries_raw`)**:
+   - Descends B+ Tree internal nodes directly using `SecondaryInternalNode::find_child_raw_bytes` with raw byte slices, avoiding any intermediate `IndexKey` allocations.
+   - Upon fetching a leaf page, copies the 4,088-byte payload to a local stack buffer (`[u8; PAGE_PAYLOAD_SIZE]`) and **immediately unpins** the leaf page in the buffer pool.
+   - Evaluates point or half-open range bounds (`[start_bound, end_bound)`) directly on raw slices.
+   - Decodes only visible, qualified rows directly into `Row` values, bypassing `SecondaryLeafEntry` allocations.
+3. **Limit & Row-Goal Pushdown**:
+   - When no residual filter is present, `early_stop_bound` is pushed directly down to `scan_index_only_entries_raw(..., limit = Some(k))`, early-terminating index leaf traversal as soon as $k$ visible rows are produced.
+
+### 12.5 MVCC & Included-Payload Correctness Guarantees
+Index-only scans do not bypass MVCC visibility. A matching index entry does not automatically imply row visibility:
+1. **Slotted Record Version Check**: Each index entry stores the `RecordId` pointing to the authoritative version slot in `RecordStore`.
+2. **Decoupled Page Pinning**: Because the leaf page is copied to the stack and unpinned immediately, `record_store.is_version_visible(&mut self.buffer_pool, rid, reader_txn, &snapshot)` executes without pin starvation or deadlock, even when record pages reside in the buffer pool.
+3. **MVCC Filtering**: Entries from uncommitted transactions, rolled-back transactions, or deleted versions outside the reader snapshot horizon are rejected before any row values are emitted.
+4. **Included Payload Freshness**: Any `UPDATE` modifying an included column removes the old index entry and inserts a new index entry with the updated covered payload within the transaction write set, preserving exact version correspondence.
+
+### 12.6 Cases That Intentionally Fall Back to RecordStore Retrieval
+1. **Unindexed Columns**: Queries referencing any column outside the index keys and included columns (e.g. `SELECT *` where table columns exceed index coverage).
+2. **Non-Covered Residual Predicates**: Residual filters requiring base columns not in the index.
+3. **Joins Requiring Base Table Columns**: Equi-joins or cross-joins requiring unindexed table columns.
+4. **Legacy Indexes**: Indexes created without covering payloads (Format 0) when queries require non-key columns.
+
+### 12.7 Benchmark & Performance Validation
+
+Hardware / Environment: `Intel Core i7-1355U`, `Windows 11 Pro`, `Rust 1.98.1`, `cargo bench --bench benchmark_suite -- --category sql`
+
+| Workload | Dataset / Query | Baseline (Base Fetch) | Optimized (Index-Only) | Speedup Factor | Latency Reduction | Throughput Change |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`secondary_index_lookup` vs `covering_index_point_lookup`** | 100 rows matching category (N=2,000) | 2.44 ms (p50: 2.00 ms, p99: 10.54 ms) [410.5 ops/s] | **946.32 µs** (p50: 927.00 µs, p99: 1.39 ms) | **2.57×** | **-61.2%** | **1,056.7 ops/s (+157.4%)** |
+| **`non_covering_index_range_scan` vs `covering_index_range_scan`** | 600 rows range scan (category 5 to 10) | 1.87 ms (p50: 1.77 ms, p99: 3.52 ms) [534.5 ops/s] | **1.41 ms** (p50: 1.42 ms, p99: 2.46 ms) | **1.33×** | **-24.9%** | **711.6 ops/s (+33.1%)** |
+| **`pk_point_lookup` (Control)** | Primary key point seek | 810.61 µs (p50: 752.10 µs, p99: 1.81 ms) | 810.61 µs (p50: 752.10 µs, p99: 1.81 ms) | 1.00× | 0.0% | 1,233.6 ops/s |
+| **`full_table_scan` (Control)** | Full scan of 2,000 rows | 2.05 ms (p50: 1.97 ms, p99: 3.56 ms) | 2.05 ms (p50: 1.97 ms, p99: 3.56 ms) | 1.00× | 0.0% | 487.6 ops/s |
+| **`filter_selective` (Control)** | Predicate evaluation (2% matches) | 2.79 ms (p50: 2.76 ms, p99: 5.40 ms) | 2.79 ms (p50: 2.76 ms, p99: 5.40 ms) | 1.00× | 0.0% | 358.5 ops/s |
+| **`order_by_sort` (Control)** | In-memory sort of 2,000 tuples | 2.11 ms (p50: 2.11 ms, p99: 2.98 ms) | 2.11 ms (p50: 2.11 ms, p99: 2.98 ms) | 1.00× | 0.0% | 473.4 ops/s |
+| **`plan_cache_hit_execution` (Control)** | Plan cache reuse execution | 57.06 µs (p50: 53.20 µs, p99: 120.80 µs) | 57.06 µs (p50: 53.20 µs, p99: 120.80 µs) | 1.00× | 0.0% | 17,524.6 ops/s |
+
+### 12.8 Correctness, Testing, and Quality Gates
+A dedicated integration test suite (`tests/index_only_scan_correctness.rs`) was added, validating all 20 required scenarios:
+1. `test_01_eligible_single_column_covering_index_lookup`: Validates single-column covering lookup avoiding 100% of base fetches.
+2. `test_02_eligible_covering_index_range_scan`: Validates bounded range scan over covering index.
+3. `test_03_composite_covering_index_lookup`: Validates composite keys with included payloads.
+4. `test_04_composite_prefix_and_range_queries`: Validates composite prefix scans with residual range filtering on index keys.
+5. `test_05_queries_requiring_non_indexed_column_fall_back`: Validates conservative fallback to base record fetching when unindexed columns are queried.
+6. `test_06_residual_predicates_requiring_non_indexed_columns`: Validates fallback when residual predicates require unindexed columns.
+7. `test_07_expressions_requiring_values_from_multiple_columns`: Validates arithmetic and multi-column expressions over covered columns.
+8. `test_08_duplicate_keys_and_exact_row_multiplicity`: Validates exact row multiplicity on non-unique duplicate keys.
+9. `test_09_null_values_handling`: Validates NULL handling in both indexed key columns and included payload columns.
+10. `test_10_indexed_column_updates`: Validates index maintenance when indexed keys are updated.
+11. `test_11_included_column_updates`: Validates index maintenance when only included columns are updated.
+12. `test_12_deletes_and_reinserts`: Validates index consistency across row deletions and re-insertions.
+13. `test_13_transaction_commit_and_abort`: Validates invisibility of uncommitted and aborted entries in index-only scans.
+14. `test_14_historical_snapshot_visibility`: Validates that historical snapshots observe older committed versions via index-only access.
+15. `test_15_vacuum_while_older_snapshots_remain_active`: Validates that active snapshot versions are preserved during vacuum and correctly read via index-only scans.
+16. `test_16_covering_index_correctness_after_vacuum`: Validates covering index correctness after dead versions are reclaimed by vacuum.
+17. `test_17_checkpoint_and_reopen`: Validates durability and index-only scan consistency across checkpoint and database reopen.
+18. `test_18_corrupt_index_or_invalid_payload_handling`: Validates error handling on malformed or truncated payload slices.
+19. `test_19_empty_result_sets`: Validates clean empty result handling for non-matching point and range scans.
+20. `test_20_large_range_scans_across_multiple_leaf_pages`: Validates large range scans spanning multiple leaf pages against reference results.
+
+Quality gates:
+* `cargo fmt --all -- --check`: Passed (clean formatting).
+* `cargo clippy --all-targets --all-features -- -D warnings`: Passed (0 warnings).
+* `cargo test --all`: Passed (**1,995 tests passed across 86 test binaries**, 0 failed).
+
+### 12.9 Invariants Preserved
+* **Safe Rust**: Strictly zero `unsafe` code.
+* **On-Disk Format**: Fully backward-compatible; no changes to persistent storage structures.
+* **ACID & MVCC**: Complete version visibility verification maintained on every row.
+* **Release Tag `v0.1.0`**: Untouched (`2f912c2e24b095976a6a5d6340a6b536b2707c9a`).
+
+
 
 

@@ -5,9 +5,13 @@ use crate::engine::isolation::{CommitSeq, IsolationContext, Snapshot, Transactio
 use crate::engine::types::{Row, Schema, Value};
 use crate::error::{Error, Result};
 use crate::index::bplus_tree::BPlusTree;
-use crate::index::secondary::{IndexKey, SecondaryIndex};
+use crate::index::node::INVALID_PAGE_ID;
+use crate::index::secondary::{
+    IndexKey, SecondaryIndex, SecondaryInternalNode, SEC_INTERNAL_HEADER_SIZE, SEC_LEAF_HEADER_SIZE,
+};
 use crate::query::stats::{ColumnStatistics, IndexStatistics, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
+use crate::storage::page::{PageType, PAGE_PAYLOAD_SIZE};
 use crate::storage::record_store::{RecordStore, VersionMetadata};
 use crate::wal::lsn::{TxnId, NULL_TXN};
 use crate::RecordId;
@@ -1028,19 +1032,22 @@ impl<'a> Table<'a> {
     }
 
     /// Performs an index-only scan on a secondary index, reconstructing rows directly
-    /// from decoded index keys and included payloads without fetching from `RecordStore`.
+    /// from raw leaf page decoded index keys and included payloads without fetching from `RecordStore`.
     pub fn index_only_scan(
         &mut self,
         index_name: &str,
         scan_type: &crate::query::optimizer::SecondaryScanType,
     ) -> Result<Vec<Row>> {
-        let (meta, sec_idx) = self
-            .indexes
-            .iter()
-            .find(|(m, _)| m.name == index_name)
-            .map(|(m, s)| (m.clone(), *s))
-            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+        self.index_only_scan_with_limit(index_name, scan_type, None)
+    }
 
+    /// Performs an index-only scan on a secondary index with an optional row limit.
+    pub fn index_only_scan_with_limit(
+        &mut self,
+        index_name: &str,
+        scan_type: &crate::query::optimizer::SecondaryScanType,
+        limit: Option<usize>,
+    ) -> Result<Vec<Row>> {
         if let crate::query::optimizer::SecondaryScanType::SkipScan {
             skipped_prefix_columns,
             constrained_columns,
@@ -1053,10 +1060,38 @@ impl<'a> Table<'a> {
                 skipped_prefix_columns.len(),
                 &constrained_values,
             )?;
-            return Ok(rows);
+            return Ok(if let Some(l) = limit {
+                rows.into_iter().take(l).collect()
+            } else {
+                rows
+            });
         }
 
-        let entries: Vec<crate::index::secondary::SecondaryLeafEntry> = match scan_type {
+        let (rows, _) = self.scan_index_only_entries_raw(index_name, scan_type, limit)?;
+        Ok(rows)
+    }
+
+    /// Internal raw page scanner for secondary index-only scans.
+    /// Traverses raw leaf pages and evaluates MVCC visibility per entry without allocating intermediate
+    /// `SecondaryLeafEntry` objects, decoding only visible qualifying rows directly.
+    pub(crate) fn scan_index_only_entries_raw(
+        &mut self,
+        index_name: &str,
+        scan_type: &crate::query::optimizer::SecondaryScanType,
+        limit: Option<usize>,
+    ) -> Result<(Vec<Row>, usize)> {
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        if sec_idx.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let (start_bound, end_bound, is_exact_point, target_key) = match scan_type {
             crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
                 let idx_key = if meta.column_indices.len() == 1 {
                     IndexKey::from_value(val)
@@ -1066,18 +1101,21 @@ impl<'a> Table<'a> {
                     ))
                     .to_index_key(meta.column_indices.len())
                 };
-                sec_idx.lookup_entries(self.buffer_pool, &idx_key)?
+                let target = idx_key.into_bytes();
+                (Some(target.clone()), None, true, target)
             }
             crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals) => {
                 let key = crate::index::composite::CompositeIndexKey::from_values(vals)
                     .to_index_key(meta.column_indices.len());
-                sec_idx.lookup_entries(self.buffer_pool, &key)?
+                let target = key.into_bytes();
+                (Some(target.clone()), None, true, target)
             }
             crate::query::optimizer::SecondaryScanType::PrefixScan(prefix_vals) => {
                 if prefix_vals.len() == meta.column_indices.len() {
                     let key = crate::index::composite::CompositeIndexKey::from_values(prefix_vals)
                         .to_index_key(meta.column_indices.len());
-                    sec_idx.lookup_entries(self.buffer_pool, &key)?
+                    let target = key.into_bytes();
+                    (Some(target.clone()), None, true, target)
                 } else {
                     let start_bytes =
                         crate::index::composite::CompositeIndexKey::encode_prefix_values(
@@ -1086,20 +1124,56 @@ impl<'a> Table<'a> {
                         );
                     let end_bytes =
                         crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
-                    let start_key = IndexKey::new(start_bytes);
-                    let end_key = end_bytes.map(IndexKey::new);
-                    sec_idx.scan_entries(self.buffer_pool, Some(&start_key), end_key.as_ref())?
+                    (Some(start_bytes), end_bytes, false, Vec::new())
                 }
             }
             crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => {
-                let start_key = start.as_ref().map(IndexKey::from_value);
-                let end_key = end.as_ref().map(IndexKey::from_value);
-                sec_idx.scan_entries(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?
+                let start_bytes = start.as_ref().map(|v| IndexKey::from_value(v).into_bytes());
+                let end_bytes = end.as_ref().map(|v| IndexKey::from_value(v).into_bytes());
+                (start_bytes, end_bytes, false, Vec::new())
             }
             crate::query::optimizer::SecondaryScanType::SkipScan { .. } => {
-                unreachable!("SkipScan is handled above")
+                unreachable!("SkipScan is handled by index_only_skip_scan")
             }
         };
+
+        // Descend internal nodes to leftmost qualifying leaf page
+        let mut curr_pid = sec_idx.root_page_id();
+        loop {
+            let page = self.buffer_pool.fetch_page(curr_pid)?;
+            let page_type = page.page_type();
+            match page_type {
+                PageType::Leaf => {
+                    self.buffer_pool.unpin_page(curr_pid, false)?;
+                    break;
+                }
+                PageType::Internal => {
+                    let next_pid = match &start_bound {
+                        Some(k_bytes) => {
+                            SecondaryInternalNode::find_child_raw_bytes(page, k_bytes, true)?
+                        }
+                        None => {
+                            let payload = page.payload();
+                            if payload.len() < SEC_INTERNAL_HEADER_SIZE + 4 {
+                                self.buffer_pool.unpin_page(curr_pid, false)?;
+                                return Err(Error::IndexCorruption(format!(
+                                    "secondary internal page {curr_pid} corrupted header"
+                                )));
+                            }
+                            u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]])
+                        }
+                    };
+                    self.buffer_pool.unpin_page(curr_pid, false)?;
+                    curr_pid = next_pid;
+                }
+                other => {
+                    self.buffer_pool.unpin_page(curr_pid, false)?;
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_pid} during secondary index scan"
+                    )));
+                }
+            }
+        }
 
         let schema_len = self.metadata.schema.columns.len();
         let key_col_types: Vec<crate::engine::types::DataType> = meta
@@ -1113,50 +1187,157 @@ impl<'a> Table<'a> {
             .map(|&i| self.metadata.schema.columns[i].data_type)
             .collect();
 
-        let mut rows = Vec::with_capacity(entries.len());
+        let mut rows = Vec::new();
+        let mut entries_examined = 0;
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
 
-        for entry in entries {
-            if !self.record_store.is_version_visible(
-                self.buffer_pool,
-                entry.rid,
-                reader_txn,
-                &snapshot,
-            )? {
-                continue;
-            }
+        let mut leaf_pid = curr_pid;
+        let mut stopped = false;
+        let mut page_copy = [0u8; PAGE_PAYLOAD_SIZE];
 
-            let mut row_values = vec![Value::Null; schema_len];
-
-            // Decode key columns
-            let key_values = if meta.column_indices.len() == 1 {
-                let val = entry.key.to_value(key_col_types[0])?;
-                vec![val]
-            } else {
-                crate::index::composite::CompositeIndexKey::decode_values(
-                    &entry.key.bytes,
-                    &key_col_types,
-                )?
+        while leaf_pid != INVALID_PAGE_ID && !stopped {
+            let next_leaf = {
+                let leaf_page = self.buffer_pool.fetch_page(leaf_pid)?;
+                let payload = leaf_page.payload();
+                if payload.len() < SEC_LEAF_HEADER_SIZE {
+                    self.buffer_pool.unpin_page(leaf_pid, false)?;
+                    return Err(Error::IndexCorruption(format!(
+                        "secondary leaf page {leaf_pid} payload too short"
+                    )));
+                }
+                page_copy.copy_from_slice(payload);
+                let next = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+                self.buffer_pool.unpin_page(leaf_pid, false)?;
+                next
             };
 
-            for (&col_idx, val) in meta.column_indices.iter().zip(key_values) {
-                row_values[col_idx] = val;
-            }
+            let entry_count = u16::from_le_bytes([page_copy[0], page_copy[1]]) as usize;
+            let format_version = u16::from_le_bytes([page_copy[6], page_copy[7]]);
 
-            // Decode included columns
-            if !meta.include_column_indices.is_empty() && !entry.payload.is_empty() {
-                let inc_values =
-                    crate::index::covering::CoveredPayload::decode(&entry.payload, &inc_col_types)?;
-                for (&inc_idx, val) in meta.include_column_indices.iter().zip(inc_values) {
-                    row_values[inc_idx] = val;
+            let mut offset = SEC_LEAF_HEADER_SIZE;
+            for _ in 0..entry_count {
+                if offset + 2 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload on secondary leaf page {leaf_pid}"
+                    )));
+                }
+                let klen = u16::from_le_bytes([page_copy[offset], page_copy[offset + 1]]) as usize;
+                offset += 2;
+                if offset + klen > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading key on secondary leaf page {leaf_pid}"
+                    )));
+                }
+                let key_slice = &page_copy[offset..offset + klen];
+                offset += klen;
+
+                let (payload_slice, rid) = if format_version == 0 {
+                    if offset + 8 > PAGE_PAYLOAD_SIZE {
+                        return Err(Error::IndexCorruption(format!(
+                            "unexpected end of payload reading rid on secondary leaf page {leaf_pid}"
+                        )));
+                    }
+                    let mut rid_bytes = [0u8; 8];
+                    rid_bytes.copy_from_slice(&page_copy[offset..offset + 8]);
+                    offset += 8;
+                    (&[][..], RecordId::from_bytes(rid_bytes))
+                } else {
+                    if offset + 2 > PAGE_PAYLOAD_SIZE {
+                        return Err(Error::IndexCorruption(format!(
+                            "unexpected end of payload reading payload len on secondary leaf page {leaf_pid}"
+                        )));
+                    }
+                    let plen =
+                        u16::from_le_bytes([page_copy[offset], page_copy[offset + 1]]) as usize;
+                    offset += 2;
+                    if offset + plen + 8 > PAGE_PAYLOAD_SIZE {
+                        return Err(Error::IndexCorruption(format!(
+                            "unexpected end of payload reading payload on secondary leaf page {leaf_pid}"
+                        )));
+                    }
+                    let pl = &page_copy[offset..offset + plen];
+                    offset += plen;
+                    let mut rid_bytes = [0u8; 8];
+                    rid_bytes.copy_from_slice(&page_copy[offset..offset + 8]);
+                    offset += 8;
+                    (pl, RecordId::from_bytes(rid_bytes))
+                };
+
+                // Check search condition
+                if is_exact_point {
+                    if key_slice < target_key.as_slice() {
+                        continue;
+                    }
+                    if key_slice > target_key.as_slice() {
+                        stopped = true;
+                        break;
+                    }
+                } else {
+                    if let Some(ref s) = start_bound {
+                        if key_slice < s.as_slice() {
+                            continue;
+                        }
+                    }
+                    if let Some(ref e) = end_bound {
+                        if key_slice >= e.as_slice() {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
+
+                entries_examined += 1;
+
+                // MVCC Visibility Check
+                if !self.record_store.is_version_visible(
+                    self.buffer_pool,
+                    rid,
+                    reader_txn,
+                    &snapshot,
+                )? {
+                    continue;
+                }
+
+                // Decode directly into Row values
+                let mut row_values = vec![Value::Null; schema_len];
+
+                if meta.column_indices.len() == 1 {
+                    let val = IndexKey::decode_bytes(key_slice, key_col_types[0])?;
+                    row_values[meta.column_indices[0]] = val;
+                } else {
+                    let key_values = crate::index::composite::CompositeIndexKey::decode_values(
+                        key_slice,
+                        &key_col_types,
+                    )?;
+                    for (&col_idx, val) in meta.column_indices.iter().zip(key_values) {
+                        row_values[col_idx] = val;
+                    }
+                }
+
+                if !meta.include_column_indices.is_empty() && !payload_slice.is_empty() {
+                    let inc_values = crate::index::covering::CoveredPayload::decode(
+                        payload_slice,
+                        &inc_col_types,
+                    )?;
+                    for (&inc_idx, val) in meta.include_column_indices.iter().zip(inc_values) {
+                        row_values[inc_idx] = val;
+                    }
+                }
+
+                rows.push(Row::new(row_values));
+                if let Some(lim) = limit {
+                    if rows.len() >= lim {
+                        stopped = true;
+                        break;
+                    }
                 }
             }
 
-            rows.push(Row::new(row_values));
+            leaf_pid = next_leaf;
         }
 
-        Ok(rows)
+        Ok((rows, entries_examined))
     }
 
     /// Fetches and decodes a base record by its `RecordId`.
@@ -1376,14 +1557,8 @@ impl<'a> Table<'a> {
             .map(|(m, s)| (m.clone(), *s))
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        let schema_len = self.metadata.schema.columns.len();
         let key_col_types: Vec<crate::engine::types::DataType> = meta
             .column_indices
-            .iter()
-            .map(|&i| self.metadata.schema.columns[i].data_type)
-            .collect();
-        let inc_col_types: Vec<crate::engine::types::DataType> = meta
-            .include_column_indices
             .iter()
             .map(|&i| self.metadata.schema.columns[i].data_type)
             .collect();
@@ -1403,67 +1578,22 @@ impl<'a> Table<'a> {
 
         let mut rows = Vec::new();
         let total_cols = meta.column_indices.len();
-        let reader_txn = self.reader_txn();
-        let snapshot = self.current_snapshot();
 
         for prefix in distinct_prefixes {
             stats.skip_scan_probes += 1;
             let mut probe_values = prefix;
             probe_values.extend_from_slice(constrained_suffix);
 
-            let entries = if probe_values.len() == total_cols {
-                let key = crate::index::composite::CompositeIndexKey::from_values(&probe_values)
-                    .to_index_key(total_cols);
-                sec_idx.lookup_entries(self.buffer_pool, &key)?
+            let scan_type = if probe_values.len() == total_cols {
+                crate::query::optimizer::SecondaryScanType::CompositePointLookup(probe_values)
             } else {
-                let start_bytes = crate::index::composite::CompositeIndexKey::encode_prefix_values(
-                    &probe_values,
-                    total_cols,
-                );
-                let end_bytes =
-                    crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
-                let start_key = IndexKey::new(start_bytes);
-                let end_key = end_bytes.map(IndexKey::new);
-                sec_idx.scan_entries(self.buffer_pool, Some(&start_key), end_key.as_ref())?
+                crate::query::optimizer::SecondaryScanType::PrefixScan(probe_values)
             };
 
-            stats.index_entries_examined += entries.len();
-
-            for entry in entries {
-                if !self.record_store.is_version_visible(
-                    self.buffer_pool,
-                    entry.rid,
-                    reader_txn,
-                    &snapshot,
-                )? {
-                    continue;
-                }
-
-                let mut row_values = vec![Value::Null; schema_len];
-
-                // Decode key columns
-                let key_values = crate::index::composite::CompositeIndexKey::decode_values(
-                    &entry.key.bytes,
-                    &key_col_types,
-                )?;
-
-                for (&col_idx, val) in meta.column_indices.iter().zip(key_values) {
-                    row_values[col_idx] = val;
-                }
-
-                // Decode included columns
-                if !meta.include_column_indices.is_empty() && !entry.payload.is_empty() {
-                    let inc_values = crate::index::covering::CoveredPayload::decode(
-                        &entry.payload,
-                        &inc_col_types,
-                    )?;
-                    for (&inc_idx, val) in meta.include_column_indices.iter().zip(inc_values) {
-                        row_values[inc_idx] = val;
-                    }
-                }
-
-                rows.push(Row::new(row_values));
-            }
+            let (probe_rows, examined) =
+                self.scan_index_only_entries_raw(index_name, &scan_type, None)?;
+            stats.index_entries_examined += examined;
+            rows.extend(probe_rows);
         }
 
         Ok((rows, stats))

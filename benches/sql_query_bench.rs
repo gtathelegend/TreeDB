@@ -309,4 +309,85 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             "Plan cache reuse without re-invoking cost optimizer",
         ));
     }
+
+    // -------------------------------------------------------------------------
+    // Phase 87 Focused Workloads: Covering Index & Index-Only Execution
+    // -------------------------------------------------------------------------
+    db.execute_statement("CREATE INDEX idx_cat_balance ON accounts (category) INCLUDE (balance);")
+        .unwrap();
+    db.execute_statement("ANALYZE accounts;").unwrap();
+
+    // Workload 11: Covering index point lookup (100 rows, 0 base record fetches)
+    {
+        let iters = 200;
+        let mut samples = Vec::with_capacity(iters);
+        for i in 0..iters {
+            let cat = (i % 20) + 1;
+            let sql = format!(
+                "SELECT category, balance FROM accounts WHERE category = {};",
+                cat
+            );
+            let start = Instant::now();
+            let res = db.execute_sql(&sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 100);
+            samples.push(elapsed);
+        }
+
+        runner.record(BenchmarkResult::from_samples(
+            "SQL & Query",
+            "covering_index_point_lookup",
+            account_count,
+            iters,
+            samples,
+            "Covering index-only lookup (100 rows / zero base-record fetches)",
+        ));
+    }
+
+    // Workload 12: Covering index range scan (600 rows, 0 base record fetches)
+    {
+        let iters = 100;
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let sql =
+                "SELECT category, balance FROM accounts WHERE category >= 5 AND category <= 10;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 600);
+            samples.push(elapsed);
+        }
+
+        runner.record(BenchmarkResult::from_samples(
+            "SQL & Query",
+            "covering_index_range_scan",
+            account_count,
+            iters,
+            samples,
+            "Covering index-only range scan (600 rows / zero base-record fetches)",
+        ));
+    }
+
+    // Workload 13: Ineligible secondary index range scan (non-covered column 'owner', 600 base fetches)
+    {
+        let iters = 100;
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let sql = "SELECT category, balance, owner FROM accounts WHERE category >= 5 AND category <= 10;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 600);
+            samples.push(elapsed);
+        }
+
+        runner.record(BenchmarkResult::from_samples(
+            "SQL & Query",
+            "non_covering_index_range_scan",
+            account_count,
+            iters,
+            samples,
+            "Ineligible index range scan (600 rows / base records fetched for unindexed column)",
+        ));
+    }
 }

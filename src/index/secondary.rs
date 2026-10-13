@@ -78,15 +78,20 @@ impl IndexKey {
         Self { bytes }
     }
 
-    /// Decodes this `IndexKey` back into a typed `Value` given the column's `DataType`.
-    pub fn to_value(&self, data_type: DataType) -> Result<Value> {
-        if self.bytes.is_empty() {
+    /// Consumes the key and returns its underlying byte vector.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Decodes an `IndexKey` byte slice back into a typed `Value` given the column's `DataType`.
+    pub fn decode_bytes(bytes: &[u8], data_type: DataType) -> Result<Value> {
+        if bytes.is_empty() {
             return Err(Error::IndexCorruption(
                 "empty index key byte payload".to_string(),
             ));
         }
 
-        let tag = self.bytes[0];
+        let tag = bytes[0];
         if tag == 0 {
             return Ok(Value::Null);
         }
@@ -95,39 +100,39 @@ impl IndexKey {
             (1, DataType::Boolean) => Ok(Value::Boolean(false)),
             (2, DataType::Boolean) => Ok(Value::Boolean(true)),
             (3, DataType::Int64) => {
-                if self.bytes.len() != 9 {
+                if bytes.len() != 9 {
                     return Err(Error::IndexCorruption(format!(
                         "invalid Int64 index key length {}",
-                        self.bytes.len()
+                        bytes.len()
                     )));
                 }
                 let mut buf = [0u8; 8];
-                buf.copy_from_slice(&self.bytes[1..9]);
+                buf.copy_from_slice(&bytes[1..9]);
                 let sortable = u64::from_be_bytes(buf);
                 let original = (sortable ^ (1u64 << 63)) as i64;
                 Ok(Value::Int64(original))
             }
             (4, DataType::UInt64) => {
-                if self.bytes.len() != 9 {
+                if bytes.len() != 9 {
                     return Err(Error::IndexCorruption(format!(
                         "invalid UInt64 index key length {}",
-                        self.bytes.len()
+                        bytes.len()
                     )));
                 }
                 let mut buf = [0u8; 8];
-                buf.copy_from_slice(&self.bytes[1..9]);
+                buf.copy_from_slice(&bytes[1..9]);
                 let u = u64::from_be_bytes(buf);
                 Ok(Value::UInt64(u))
             }
             (5, DataType::Float64) => {
-                if self.bytes.len() != 9 {
+                if bytes.len() != 9 {
                     return Err(Error::IndexCorruption(format!(
                         "invalid Float64 index key length {}",
-                        self.bytes.len()
+                        bytes.len()
                     )));
                 }
                 let mut buf = [0u8; 8];
-                buf.copy_from_slice(&self.bytes[1..9]);
+                buf.copy_from_slice(&bytes[1..9]);
                 let sortable = u64::from_be_bytes(buf);
                 let bits = if (sortable & (1u64 << 63)) != 0 {
                     sortable ^ (1u64 << 63)
@@ -138,16 +143,21 @@ impl IndexKey {
                 Ok(Value::Float64(f))
             }
             (6, DataType::String) => {
-                let s = std::str::from_utf8(&self.bytes[1..]).map_err(|_| {
+                let s = std::str::from_utf8(&bytes[1..]).map_err(|_| {
                     Error::IndexCorruption("invalid UTF-8 in String index key".to_string())
                 })?;
                 Ok(Value::String(s.to_string()))
             }
-            (7, DataType::Bytes) => Ok(Value::Bytes(self.bytes[1..].to_vec())),
+            (7, DataType::Bytes) => Ok(Value::Bytes(bytes[1..].to_vec())),
             _ => Err(Error::IndexCorruption(format!(
                 "index key tag {tag} does not match expected data type {data_type:?}"
             ))),
         }
+    }
+
+    /// Decodes this `IndexKey` back into a typed `Value` given the column's `DataType`.
+    pub fn to_value(&self, data_type: DataType) -> Result<Value> {
+        Self::decode_bytes(&self.bytes, data_type)
     }
 }
 
@@ -562,10 +572,14 @@ impl SecondaryInternalNode {
         }
     }
 
-    /// Zero-heap-allocation child routing directly on the raw page payload.
-    /// If `leftmost` is true, routes to the leftmost child that could contain `key` (for lookups and scans).
+    /// Zero-heap-allocation child routing directly on the raw page payload using key bytes.
+    /// If `leftmost` is true, routes to the leftmost child that could contain `target_bytes` (for lookups and scans).
     /// If `leftmost` is false, routes to the right child (for insertions).
-    pub fn find_child_raw(page: &Page, key: &IndexKey, leftmost: bool) -> Result<PageId> {
+    pub fn find_child_raw_bytes(
+        page: &Page,
+        target_bytes: &[u8],
+        leftmost: bool,
+    ) -> Result<PageId> {
         let payload = page.payload();
         if payload.len() < SEC_INTERNAL_HEADER_SIZE {
             return Err(Error::IndexCorruption(format!(
@@ -608,8 +622,6 @@ impl SecondaryInternalNode {
                 payload[child_off + 3],
             ]))
         };
-
-        let target_bytes = key.as_bytes();
 
         if leftmost {
             for i in 0..key_count {
@@ -660,6 +672,13 @@ impl SecondaryInternalNode {
             }
             get_child(key_count)
         }
+    }
+
+    /// Zero-heap-allocation child routing directly on the raw page payload.
+    /// If `leftmost` is true, routes to the leftmost child that could contain `key` (for lookups and scans).
+    /// If `leftmost` is false, routes to the right child (for insertions).
+    pub fn find_child_raw(page: &Page, key: &IndexKey, leftmost: bool) -> Result<PageId> {
+        Self::find_child_raw_bytes(page, key.as_bytes(), leftmost)
     }
 
     pub fn serialize(&self, page: &mut Page) -> Result<()> {

@@ -4706,35 +4706,50 @@ impl<'db> Transaction<'db> {
                             _ => {
                                 index_lookups = 1;
                                 if let Some(k) = early_stop_bound {
-                                    let all_rows = table.index_only_scan(index_name, scan_type)?;
-                                    let mut rows = Vec::new();
-                                    for row in all_rows {
-                                        early_index_entries += 1;
-                                        let keep = match &plan.base_table.residual_filter {
-                                            Some(f) => {
-                                                let res = self.evaluate_expr_with_outer_internal(
-                                                    f,
-                                                    &row,
-                                                    &raw_schema,
-                                                    outer_contexts,
-                                                    cte_store,
-                                                )?;
-                                                match res {
-                                                    Value::Boolean(b) => b,
-                                                    _ => false,
+                                    if plan.base_table.residual_filter.is_none() {
+                                        let rows = table.index_only_scan_with_limit(
+                                            index_name,
+                                            scan_type,
+                                            Some(k),
+                                        )?;
+                                        early_index_entries = rows.len();
+                                        if rows.len() >= k {
+                                            early_terminated = true;
+                                        }
+                                        rows
+                                    } else {
+                                        let all_rows =
+                                            table.index_only_scan(index_name, scan_type)?;
+                                        let mut rows = Vec::new();
+                                        for row in all_rows {
+                                            early_index_entries += 1;
+                                            let keep = match &plan.base_table.residual_filter {
+                                                Some(f) => {
+                                                    let res = self
+                                                        .evaluate_expr_with_outer_internal(
+                                                            f,
+                                                            &row,
+                                                            &raw_schema,
+                                                            outer_contexts,
+                                                            cte_store,
+                                                        )?;
+                                                    match res {
+                                                        Value::Boolean(b) => b,
+                                                        _ => false,
+                                                    }
+                                                }
+                                                None => true,
+                                            };
+                                            if keep {
+                                                rows.push(row);
+                                                if rows.len() >= k {
+                                                    early_terminated = true;
+                                                    break;
                                                 }
                                             }
-                                            None => true,
-                                        };
-                                        if keep {
-                                            rows.push(row);
-                                            if rows.len() >= k {
-                                                early_terminated = true;
-                                                break;
-                                            }
                                         }
+                                        rows
                                     }
-                                    rows
                                 } else {
                                     table.index_only_scan(index_name, scan_type)?
                                 }
