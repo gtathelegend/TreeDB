@@ -408,6 +408,7 @@ impl VacuumEngine {
             }
         }
 
+        table.clear_visibility_map();
         table.sync_metadata_if_needed()?;
         Ok(result)
     }

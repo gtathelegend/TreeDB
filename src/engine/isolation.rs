@@ -768,6 +768,18 @@ impl TransactionWriteSet {
         self.inserted.len() + self.updated.len() + self.deleted.len()
     }
 
+    /// Returns `true` if this write set recorded any mutations against `table`.
+    pub fn has_modified_table(&self, table: &str) -> bool {
+        self.modified_tables.contains(table)
+    }
+
+    /// Returns `true` if any recorded mutation in this write set modified a record on `page_id`.
+    pub fn touches_page(&self, page_id: crate::storage::page::PageId) -> bool {
+        self.inserted.iter().any(|r| r.page_id == page_id)
+            || self.updated.iter().any(|r| r.page_id == page_id)
+            || self.deleted.iter().any(|r| r.page_id == page_id)
+    }
+
     /// Returns `true` if no mutations have been recorded.
     pub fn is_empty(&self) -> bool {
         self.inserted.is_empty()

@@ -82,6 +82,7 @@ pub struct TreeDb {
     pub(crate) active_txn_inserts: HashMap<TxnId, Vec<RecordId>>,
     pub(crate) active_txn_updates: HashMap<TxnId, Vec<RecordId>>,
     pub(crate) active_txn_deletes: HashMap<TxnId, Vec<RecordId>>,
+    pub(crate) visibility_map: crate::storage::VisibilityMap,
 }
 
 impl TreeDb {
@@ -140,6 +141,7 @@ impl TreeDb {
             active_txn_inserts: HashMap::new(),
             active_txn_updates: HashMap::new(),
             active_txn_deletes: HashMap::new(),
+            visibility_map: crate::storage::VisibilityMap::new(),
         })
     }
 
@@ -202,6 +204,7 @@ impl TreeDb {
             active_txn_inserts: HashMap::new(),
             active_txn_updates: HashMap::new(),
             active_txn_deletes: HashMap::new(),
+            visibility_map: crate::storage::VisibilityMap::new(),
         })
     }
 
@@ -250,6 +253,7 @@ impl TreeDb {
             active_txn_inserts: HashMap::new(),
             active_txn_updates: HashMap::new(),
             active_txn_deletes: HashMap::new(),
+            visibility_map: crate::storage::VisibilityMap::new(),
         })
     }
 
@@ -282,6 +286,7 @@ impl TreeDb {
             active_txn_inserts: HashMap::new(),
             active_txn_updates: HashMap::new(),
             active_txn_deletes: HashMap::new(),
+            visibility_map: crate::storage::VisibilityMap::new(),
         }
     }
 
@@ -976,13 +981,29 @@ impl TreeDb {
             indexes.push((idx_meta, sec_tree));
         }
 
-        Ok(Table::new(
+        Ok(Table::new_with_visibility_map(
             metadata,
             tree,
             record_store,
             indexes,
             &mut self.buffer_pool,
+            Some(&mut self.visibility_map),
         ))
+    }
+
+    /// Returns a copy of the current runtime visibility map statistics.
+    pub fn visibility_map_stats(&self) -> crate::storage::VisibilityMapStats {
+        self.visibility_map.stats()
+    }
+
+    /// Resets the runtime visibility map statistics to zero.
+    pub fn reset_visibility_map_stats(&mut self) {
+        self.visibility_map.reset_stats();
+    }
+
+    /// Sets whether the runtime MVCC visibility map fast path is enabled.
+    pub fn set_visibility_map_enabled(&mut self, enabled: bool) {
+        self.visibility_map.set_enabled(enabled);
     }
 
     /// Constructs a programmatic query against a named table.

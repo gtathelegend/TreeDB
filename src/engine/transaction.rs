@@ -1023,7 +1023,7 @@ impl<'db> Transaction<'db> {
             indexes.push((idx_meta, sec_tree));
         }
 
-        Ok(crate::engine::table::Table::new_with_isolation(
+        let mut table = crate::engine::table::Table::new_with_isolation(
             metadata,
             tree,
             record_store,
@@ -1031,7 +1031,9 @@ impl<'db> Transaction<'db> {
             &mut self.db.buffer_pool,
             Some(self.isolation_context.clone()),
             Some(&mut self.write_set),
-        ))
+        );
+        table.set_visibility_map(Some(&mut self.db.visibility_map));
+        Ok(table)
     }
 
     /// Executes a vacuum pass on a specific table within the context of this transaction.
@@ -4898,6 +4900,14 @@ impl<'db> Transaction<'db> {
                     scan_metric.counters.covered_rows_output = 0;
                 }
 
+                scan_metric.counters.visibility_checks_evaluated =
+                    self.db.visibility_map.stats.visibility_checks_evaluated;
+                scan_metric.counters.visibility_checks_skipped =
+                    self.db.visibility_map.stats.visibility_checks_skipped;
+                scan_metric.counters.visibility_map_hits =
+                    self.db.visibility_map.stats.page_map_hits
+                        + self.db.visibility_map.stats.record_map_hits;
+
                 let (filtered_rows, table_op) = match &plan.base_table.residual_filter {
                     Some(filter)
                         if early_stop_bound.is_none() && !plan.base_table.late_materialization =>
@@ -7962,6 +7972,17 @@ impl<'db> Transaction<'db> {
                     self.db.catalog_generation += 1;
                     self.db.plan_cache.invalidate_all();
                 }
+                for &rid in self.write_set.inserted_records() {
+                    self.db.visibility_map.invalidate_page(rid.page_id);
+                }
+                for &old_rid in self.write_set.updated_records() {
+                    self.db.visibility_map.invalidate_record(old_rid);
+                    self.db.visibility_map.invalidate_page(old_rid.page_id);
+                }
+                for &old_rid in self.write_set.deleted_records() {
+                    self.db.visibility_map.invalidate_record(old_rid);
+                    self.db.visibility_map.invalidate_page(old_rid.page_id);
+                }
                 Ok(())
             }
             Err(Error::InjectedFault(
@@ -8083,6 +8104,17 @@ impl<'db> Transaction<'db> {
             }
 
             self.db.abort_txn(self.txn_id)?;
+            for &rid in self.write_set.inserted_records() {
+                self.db.visibility_map.invalidate_page(rid.page_id);
+            }
+            for &old_rid in self.write_set.updated_records() {
+                self.db.visibility_map.invalidate_record(old_rid);
+                self.db.visibility_map.invalidate_page(old_rid.page_id);
+            }
+            for &old_rid in self.write_set.deleted_records() {
+                self.db.visibility_map.invalidate_record(old_rid);
+                self.db.visibility_map.invalidate_page(old_rid.page_id);
+            }
             if let Some(owned_id) = self.owned_snapshot_id.take() {
                 self.db.snapshot_registry.release(owned_id);
             }

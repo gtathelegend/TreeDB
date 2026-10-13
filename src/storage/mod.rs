@@ -6,6 +6,7 @@ pub mod page;
 pub mod page_manager;
 pub mod record_page;
 pub mod record_store;
+pub mod visibility_map;
 
 pub use buffer_pool::{BufferPool, BufferPoolStats, FrameId};
 pub use freelist::{FreePageLayout, FreePageManager};
@@ -26,3 +27,4 @@ pub use record_store::{
     RecordStore, VersionId, VersionMetadata, MAX_VERSION_CHAIN_DEPTH, MVCC_VERSION_FORMAT,
     VERSION_HEADER_SIZE,
 };
+pub use visibility_map::{VisibilityMap, VisibilityMapStats};

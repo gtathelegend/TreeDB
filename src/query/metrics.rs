@@ -181,6 +181,12 @@ pub struct OperatorCounters {
     pub base_records_avoided: usize,
     /// Number of covered rows output directly from index without base table access.
     pub covered_rows_output: usize,
+    /// Number of MVCC visibility checks evaluated against RecordStore.
+    pub visibility_checks_evaluated: usize,
+    /// Number of MVCC visibility checks safely skipped via VisibilityMap.
+    pub visibility_checks_skipped: usize,
+    /// Number of VisibilityMap cache hits (page-level or record-level).
+    pub visibility_map_hits: usize,
     /// Number of distinct leading-prefix values discovered from the index during skip scan.
     pub distinct_prefix_values: usize,
     /// Number of point lookups / prefix range scans executed across distinct prefix values during skip scan.

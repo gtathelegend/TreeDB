@@ -1195,6 +1195,32 @@ impl RecordStore {
             .unwrap_or(false))
     }
 
+    /// Checks whether a specific physical version is visible to `snapshot` and `reader_txn`,
+    /// returning both the boolean visibility flag and an owned copy of `VersionMetadata` if found.
+    pub fn check_version_visibility(
+        &self,
+        buffer_pool: &mut BufferPool,
+        rid: RecordId,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+    ) -> Result<(bool, Option<VersionMetadata>)> {
+        let res = self.with_version(buffer_pool, rid, |metadata, _| {
+            let vis = MvccVisibilityPolicy::is_visible(
+                metadata.xmin,
+                metadata.xmax,
+                metadata.created_at,
+                metadata.deleted_at,
+                reader_txn,
+                snapshot,
+            );
+            Ok((vis, metadata.clone()))
+        })?;
+        match res {
+            Some((vis, meta)) => Ok((vis, Some(meta))),
+            None => Ok((false, None)),
+        }
+    }
+
     /// Invokes closure `f` with borrowed `VersionMetadata` and user payload slice for `rid`
     /// ONLY if that exact version is visible to `snapshot` and `reader_txn`.
     ///

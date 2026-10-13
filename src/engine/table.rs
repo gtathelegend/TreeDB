@@ -93,6 +93,7 @@ pub struct Table<'a> {
     pub(crate) buffer_pool: &'a mut BufferPool,
     pub(crate) isolation_context: Option<IsolationContext>,
     pub(crate) write_set: Option<&'a mut TransactionWriteSet>,
+    pub(crate) visibility_map: Option<&'a mut crate::storage::VisibilityMap>,
 }
 
 impl<'a> Table<'a> {
@@ -113,6 +114,28 @@ impl<'a> Table<'a> {
             buffer_pool,
             isolation_context: None,
             write_set: None,
+            visibility_map: None,
+        }
+    }
+
+    /// Creates a new `Table` handle with optional visibility map attached.
+    pub fn new_with_visibility_map(
+        metadata: TableMetadata,
+        tree: BPlusTree,
+        record_store: RecordStore,
+        indexes: Vec<(IndexMetadata, SecondaryIndex)>,
+        buffer_pool: &'a mut BufferPool,
+        visibility_map: Option<&'a mut crate::storage::VisibilityMap>,
+    ) -> Self {
+        Self {
+            metadata,
+            tree,
+            record_store,
+            indexes,
+            buffer_pool,
+            isolation_context: None,
+            write_set: None,
+            visibility_map,
         }
     }
 
@@ -134,6 +157,60 @@ impl<'a> Table<'a> {
             buffer_pool,
             isolation_context,
             write_set,
+            visibility_map: None,
+        }
+    }
+
+    /// Attaches or clears the runtime visibility map on this table handle.
+    pub fn set_visibility_map(&mut self, vm: Option<&'a mut crate::storage::VisibilityMap>) {
+        self.visibility_map = vm;
+    }
+
+    /// Clears the attached visibility map if present.
+    pub fn clear_visibility_map(&mut self) {
+        if let Some(ref mut vm) = self.visibility_map {
+            vm.clear();
+        }
+    }
+
+    /// Evaluates visibility for `rid` using the `VisibilityMap` fast path when eligible,
+    /// falling back to reading `RecordStore` version metadata if needed.
+    pub(crate) fn is_rid_visible(
+        &mut self,
+        rid: RecordId,
+        reader_txn: Option<TxnId>,
+        snapshot: &Snapshot,
+    ) -> Result<bool> {
+        if let Some(ref mut vm) = self.visibility_map {
+            let has_mutation = self
+                .write_set
+                .as_ref()
+                .map(|ws| ws.touches_page(rid.page_id))
+                .unwrap_or(false);
+            if vm.check_visibility_fast_path(
+                self.buffer_pool,
+                rid,
+                snapshot.as_of_commit_seq,
+                has_mutation,
+            )? {
+                return Ok(true);
+            }
+
+            let (vis, meta) = self.record_store.check_version_visibility(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                snapshot,
+            )?;
+            if vis {
+                if let Some(m) = meta {
+                    vm.record_version_visibility(rid, m.created_at, m.xmax, m.deleted_at);
+                }
+            }
+            Ok(vis)
+        } else {
+            self.record_store
+                .is_version_visible(self.buffer_pool, rid, reader_txn, snapshot)
         }
     }
 
@@ -343,6 +420,10 @@ impl<'a> Table<'a> {
             let _ = self.buffer_pool.set_max_commit_seq(commit_seq.0);
             rid
         };
+
+        if let Some(ref mut vm) = self.visibility_map {
+            vm.invalidate_page(rid.page_id);
+        }
 
         if prev_rid.is_some() {
             self.tree.update(self.buffer_pool, key, rid)?;
@@ -564,6 +645,12 @@ impl<'a> Table<'a> {
             new_rid
         };
 
+        if let Some(ref mut vm) = self.visibility_map {
+            vm.invalidate_record(old_rid);
+            vm.invalidate_page(old_rid.page_id);
+            vm.invalidate_page(new_rid.page_id);
+        }
+
         self.tree.update(self.buffer_pool, key, new_rid)?;
         self.buffer_pool
             .check_fault(crate::engine::failure::StorageFailurePoint::AfterPrimaryIndexModified)?;
@@ -695,6 +782,11 @@ impl<'a> Table<'a> {
             let _ = self.buffer_pool.set_max_commit_seq(commit_seq.0);
         }
 
+        if let Some(ref mut vm) = self.visibility_map {
+            vm.invalidate_record(old_rid);
+            vm.invalidate_page(old_rid.page_id);
+        }
+
         self.sync_metadata_if_needed()?;
         Ok(Some(row))
     }
@@ -794,10 +886,7 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
         let mut visible = Vec::with_capacity(rids.len());
         for rid in rids {
-            if self
-                .record_store
-                .is_version_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
-            {
+            if self.is_rid_visible(rid, reader_txn, &snapshot)? {
                 visible.push(rid);
             } else if meta.unique {
                 if let Some((vis_rid, _, bytes)) =
@@ -903,10 +992,7 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
         let mut visible = Vec::with_capacity(raw_rids.len());
         for rid in raw_rids {
-            if self
-                .record_store
-                .is_version_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
-            {
+            if self.is_rid_visible(rid, reader_txn, &snapshot)? {
                 visible.push(rid);
             }
         }
@@ -990,10 +1076,7 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
         let mut visible = Vec::with_capacity(rids.len());
         for rid in rids {
-            if self
-                .record_store
-                .is_version_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
-            {
+            if self.is_rid_visible(rid, reader_txn, &snapshot)? {
                 visible.push(rid);
             }
         }
@@ -1020,10 +1103,7 @@ impl<'a> Table<'a> {
         let snapshot = self.current_snapshot();
         let mut visible = Vec::with_capacity(entries.len());
         for (k, rid) in entries {
-            if self
-                .record_store
-                .is_version_visible(self.buffer_pool, rid, reader_txn, &snapshot)?
-            {
+            if self.is_rid_visible(rid, reader_txn, &snapshot)? {
                 let val = k.to_value(col_type)?;
                 visible.push((val, rid));
             }
@@ -1290,12 +1370,7 @@ impl<'a> Table<'a> {
                 entries_examined += 1;
 
                 // MVCC Visibility Check
-                if !self.record_store.is_version_visible(
-                    self.buffer_pool,
-                    rid,
-                    reader_txn,
-                    &snapshot,
-                )? {
+                if !self.is_rid_visible(rid, reader_txn, &snapshot)? {
                     continue;
                 }
 
@@ -1655,12 +1730,7 @@ impl<'a> Table<'a> {
             let reader_txn = self.reader_txn();
             let snapshot = self.current_snapshot();
             for entry in entries {
-                if self.record_store.is_version_visible(
-                    self.buffer_pool,
-                    entry.rid,
-                    reader_txn,
-                    &snapshot,
-                )? {
+                if self.is_rid_visible(entry.rid, reader_txn, &snapshot)? {
                     rids.push(entry.rid);
                 }
             }
@@ -1709,12 +1779,7 @@ impl<'a> Table<'a> {
                 let snapshot = self.current_snapshot();
                 let mut rids = Vec::with_capacity(count);
                 for (_k, rid) in entries {
-                    if self.record_store.is_version_visible(
-                        self.buffer_pool,
-                        rid,
-                        reader_txn,
-                        &snapshot,
-                    )? {
+                    if self.is_rid_visible(rid, reader_txn, &snapshot)? {
                         rids.push(rid);
                     }
                 }
