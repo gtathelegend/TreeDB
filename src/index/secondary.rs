@@ -408,6 +408,96 @@ impl SecondaryLeafNode {
 
         (right_leaf, split_key)
     }
+
+    /// Iterates over raw leaf entries directly from page payload without allocating Entry/Key/payload objects.
+    /// Passes `(key_bytes, payload_bytes, rid)` to callback. If callback returns `false`, terminates iteration.
+    /// Returns `(next_leaf, early_stopped)`.
+    pub fn for_each_entry_raw<F>(page: &Page, mut f: F) -> Result<(PageId, bool)>
+    where
+        F: FnMut(&[u8], &[u8], RecordId) -> bool,
+    {
+        let payload = page.payload();
+        if payload.len() < SEC_LEAF_HEADER_SIZE {
+            return Err(Error::IndexCorruption(format!(
+                "secondary leaf page {} payload too short",
+                page.id()
+            )));
+        }
+        let entry_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+        let next_leaf = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+        let format_version = u16::from_le_bytes([payload[6], payload[7]]);
+
+        let mut offset = SEC_LEAF_HEADER_SIZE;
+        if format_version == 0 {
+            for _ in 0..entry_count {
+                if offset + 2 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let klen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if offset + klen + 8 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading entry on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let key_bytes = &payload[offset..offset + klen];
+                offset += klen;
+                let mut rid_bytes = [0u8; 8];
+                rid_bytes.copy_from_slice(&payload[offset..offset + 8]);
+                offset += 8;
+                let rid = RecordId::from_bytes(rid_bytes);
+
+                if !f(key_bytes, &[], rid) {
+                    return Ok((next_leaf, true));
+                }
+            }
+        } else {
+            for _ in 0..entry_count {
+                if offset + 2 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let klen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if offset + klen + 2 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading key on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let key_bytes = &payload[offset..offset + klen];
+                offset += klen;
+
+                let plen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if offset + plen + 8 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading payload on secondary leaf page {}",
+                        page.id()
+                    )));
+                }
+                let entry_payload = &payload[offset..offset + plen];
+                offset += plen;
+
+                let mut rid_bytes = [0u8; 8];
+                rid_bytes.copy_from_slice(&payload[offset..offset + 8]);
+                offset += 8;
+                let rid = RecordId::from_bytes(rid_bytes);
+
+                if !f(key_bytes, entry_payload, rid) {
+                    return Ok((next_leaf, true));
+                }
+            }
+        }
+
+        Ok((next_leaf, false))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -449,8 +539,126 @@ impl SecondaryInternalNode {
 
     pub fn find_child(&self, key: &IndexKey) -> PageId {
         match self.keys.binary_search(key) {
-            Ok(idx) => self.children[idx + 1],
+            Ok(idx) => {
+                let last_idx = idx + self.keys[idx..].iter().take_while(|k| *k == key).count() - 1;
+                self.children[last_idx + 1]
+            }
             Err(idx) => self.children[idx],
+        }
+    }
+
+    /// Finds the leftmost child page ID that could contain `key` (for point lookups and range scans).
+    pub fn find_leftmost_child(&self, key: &IndexKey) -> PageId {
+        match self.keys.binary_search(key) {
+            Ok(idx) => {
+                let first_idx = self.keys[..=idx]
+                    .iter()
+                    .rposition(|k| k != key)
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                self.children[first_idx]
+            }
+            Err(idx) => self.children[idx],
+        }
+    }
+
+    /// Zero-heap-allocation child routing directly on the raw page payload.
+    /// If `leftmost` is true, routes to the leftmost child that could contain `key` (for lookups and scans).
+    /// If `leftmost` is false, routes to the right child (for insertions).
+    pub fn find_child_raw(page: &Page, key: &IndexKey, leftmost: bool) -> Result<PageId> {
+        let payload = page.payload();
+        if payload.len() < SEC_INTERNAL_HEADER_SIZE {
+            return Err(Error::IndexCorruption(format!(
+                "secondary internal page {} payload too short",
+                page.id()
+            )));
+        }
+        let key_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+        let child_count = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+        if child_count == 0 {
+            return Err(Error::IndexCorruption(format!(
+                "secondary internal page {} has zero children",
+                page.id()
+            )));
+        }
+
+        let mut offset = SEC_INTERNAL_HEADER_SIZE;
+        let children_start = offset;
+        let children_bytes = child_count * 4;
+        if offset + children_bytes > PAGE_PAYLOAD_SIZE {
+            return Err(Error::IndexCorruption(format!(
+                "unexpected end of payload reading children on secondary internal page {}",
+                page.id()
+            )));
+        }
+        offset += children_bytes;
+
+        let get_child = |idx: usize| -> Result<PageId> {
+            if idx >= child_count {
+                return Err(Error::IndexCorruption(format!(
+                    "child index {idx} out of range {child_count} on secondary internal page {}",
+                    page.id()
+                )));
+            }
+            let child_off = children_start + idx * 4;
+            Ok(u32::from_le_bytes([
+                payload[child_off],
+                payload[child_off + 1],
+                payload[child_off + 2],
+                payload[child_off + 3],
+            ]))
+        };
+
+        let target_bytes = key.as_bytes();
+
+        if leftmost {
+            for i in 0..key_count {
+                if offset + 2 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading key on secondary internal page {}",
+                        page.id()
+                    )));
+                }
+                let klen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if offset + klen > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading key bytes on secondary internal page {}",
+                        page.id()
+                    )));
+                }
+                let kbytes = &payload[offset..offset + klen];
+                offset += klen;
+
+                if target_bytes <= kbytes {
+                    return get_child(i);
+                }
+            }
+            get_child(key_count)
+        } else {
+            for i in 0..key_count {
+                if offset + 2 > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading key on secondary internal page {}",
+                        page.id()
+                    )));
+                }
+                let klen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if offset + klen > PAGE_PAYLOAD_SIZE {
+                    return Err(Error::IndexCorruption(format!(
+                        "unexpected end of payload reading key bytes on secondary internal page {}",
+                        page.id()
+                    )));
+                }
+                let kbytes = &payload[offset..offset + klen];
+                offset += klen;
+
+                if target_bytes < kbytes {
+                    return get_child(i);
+                }
+            }
+            get_child(key_count)
         }
     }
 
@@ -624,54 +832,36 @@ impl SecondaryIndex {
 
             match page_type {
                 PageType::Leaf => {
-                    let leaf = match SecondaryLeafNode::deserialize(page) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let _ = buffer_pool.unpin_page(curr_pid, false);
-                            return Err(e);
-                        }
-                    };
                     buffer_pool.unpin_page(curr_pid, false)?;
-
                     let mut results = Vec::new();
-                    let mut leaf_node = leaf;
+                    let target_bytes = key.as_bytes();
+                    let mut leaf_pid = curr_pid;
 
-                    'scan: loop {
-                        for entry in &leaf_node.entries {
-                            if &entry.key == key {
-                                results.push(entry.clone());
-                            } else if &entry.key > key {
-                                break 'scan;
-                            }
-                        }
+                    loop {
+                        let leaf_page = buffer_pool.fetch_page(leaf_pid)?;
+                        let (next_leaf, stopped) =
+                            SecondaryLeafNode::for_each_entry_raw(leaf_page, |kbytes, pl, rid| {
+                                if kbytes == target_bytes {
+                                    results.push(SecondaryLeafEntry::with_payload(
+                                        key.clone(),
+                                        pl.to_vec(),
+                                        rid,
+                                    ));
+                                }
+                                kbytes <= target_bytes
+                            })?;
+                        buffer_pool.unpin_page(leaf_pid, false)?;
 
-                        if leaf_node.next_leaf == INVALID_PAGE_ID {
+                        if stopped || next_leaf == INVALID_PAGE_ID {
                             break;
                         }
-
-                        let leaf_pid = leaf_node.next_leaf;
-                        let next_page = buffer_pool.fetch_page(leaf_pid)?;
-                        leaf_node = match SecondaryLeafNode::deserialize(next_page) {
-                            Ok(l) => l,
-                            Err(e) => {
-                                let _ = buffer_pool.unpin_page(leaf_pid, false);
-                                return Err(e);
-                            }
-                        };
-                        buffer_pool.unpin_page(leaf_pid, false)?;
+                        leaf_pid = next_leaf;
                     }
 
                     return Ok(results);
                 }
                 PageType::Internal => {
-                    let internal = match SecondaryInternalNode::deserialize(page) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = buffer_pool.unpin_page(curr_pid, false);
-                            return Err(e);
-                        }
-                    };
-                    let next_pid = internal.find_child(key);
+                    let next_pid = SecondaryInternalNode::find_child_raw(page, key, true)?;
                     buffer_pool.unpin_page(curr_pid, false)?;
                     curr_pid = next_pid;
                 }
@@ -685,10 +875,139 @@ impl SecondaryIndex {
         }
     }
 
-    /// Performs a point lookup for all `RecordId`s associated with `key`.
+    /// Performs a point lookup for all `RecordId`s associated with `key` with zero entry deserialization.
     pub fn lookup(&self, buffer_pool: &mut BufferPool, key: &IndexKey) -> Result<Vec<RecordId>> {
-        let entries = self.lookup_entries(buffer_pool, key)?;
-        Ok(entries.into_iter().map(|e| e.rid).collect())
+        if self.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut curr_pid = self.root_page_id;
+        loop {
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            let page_type = page.page_type();
+
+            match page_type {
+                PageType::Leaf => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    let mut results = Vec::new();
+                    let target_bytes = key.as_bytes();
+                    let mut leaf_pid = curr_pid;
+
+                    loop {
+                        let leaf_page = buffer_pool.fetch_page(leaf_pid)?;
+                        let (next_leaf, stopped) = SecondaryLeafNode::for_each_entry_raw(
+                            leaf_page,
+                            |kbytes, _pl, rid| {
+                                if kbytes == target_bytes {
+                                    results.push(rid);
+                                }
+                                kbytes <= target_bytes
+                            },
+                        )?;
+                        buffer_pool.unpin_page(leaf_pid, false)?;
+
+                        if stopped || next_leaf == INVALID_PAGE_ID {
+                            break;
+                        }
+                        leaf_pid = next_leaf;
+                    }
+
+                    return Ok(results);
+                }
+                PageType::Internal => {
+                    let next_pid = SecondaryInternalNode::find_child_raw(page, key, true)?;
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    curr_pid = next_pid;
+                }
+                other => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_pid} during secondary index lookup"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Performs an ordered range scan returning `RecordId`s within `[start, end)` directly with zero key allocation.
+    pub fn scan_rids(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<&IndexKey>,
+        end: Option<&IndexKey>,
+    ) -> Result<Vec<RecordId>> {
+        if self.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Descend to leftmost leaf or leaf containing start key
+        let mut curr_pid = self.root_page_id;
+        loop {
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            let page_type = page.page_type();
+
+            match page_type {
+                PageType::Leaf => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    break;
+                }
+                PageType::Internal => {
+                    let next_pid = match start {
+                        Some(k) => SecondaryInternalNode::find_child_raw(page, k, true)?,
+                        None => {
+                            let payload = page.payload();
+                            if payload.len() < SEC_INTERNAL_HEADER_SIZE + 4 {
+                                buffer_pool.unpin_page(curr_pid, false)?;
+                                return Err(Error::IndexCorruption(format!(
+                                    "secondary internal page {curr_pid} corrupted header"
+                                )));
+                            }
+                            u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]])
+                        }
+                    };
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    curr_pid = next_pid;
+                }
+                other => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_pid} during secondary index range scan"
+                    )));
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        let mut leaf_pid = curr_pid;
+        let start_bytes = start.map(|k| k.as_bytes());
+        let end_bytes = end.map(|k| k.as_bytes());
+
+        while leaf_pid != INVALID_PAGE_ID {
+            let page = buffer_pool.fetch_page(leaf_pid)?;
+            let (next_leaf, stopped) =
+                SecondaryLeafNode::for_each_entry_raw(page, |kbytes, _pl, rid| {
+                    if let Some(s) = start_bytes {
+                        if kbytes < s {
+                            return true;
+                        }
+                    }
+                    if let Some(e) = end_bytes {
+                        if kbytes >= e {
+                            return false;
+                        }
+                    }
+                    results.push(rid);
+                    true
+                })?;
+            buffer_pool.unpin_page(leaf_pid, false)?;
+
+            if stopped {
+                break;
+            }
+            leaf_pid = next_leaf;
+        }
+
+        Ok(results)
     }
 
     /// Performs an ordered range scan returning `SecondaryLeafEntry`s within `[start, end)`.
@@ -714,16 +1033,18 @@ impl SecondaryIndex {
                     break;
                 }
                 PageType::Internal => {
-                    let internal = match SecondaryInternalNode::deserialize(page) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = buffer_pool.unpin_page(curr_pid, false);
-                            return Err(e);
-                        }
-                    };
                     let next_pid = match start {
-                        Some(k) => internal.find_child(k),
-                        None => internal.children[0],
+                        Some(k) => SecondaryInternalNode::find_child_raw(page, k, true)?,
+                        None => {
+                            let payload = page.payload();
+                            if payload.len() < SEC_INTERNAL_HEADER_SIZE + 4 {
+                                buffer_pool.unpin_page(curr_pid, false)?;
+                                return Err(Error::IndexCorruption(format!(
+                                    "secondary internal page {curr_pid} corrupted header"
+                                )));
+                            }
+                            u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]])
+                        }
                     };
                     buffer_pool.unpin_page(curr_pid, false)?;
                     curr_pid = next_pid;
@@ -739,36 +1060,36 @@ impl SecondaryIndex {
 
         let mut results = Vec::new();
         let mut leaf_pid = curr_pid;
+        let start_bytes = start.map(|k| k.as_bytes());
+        let end_bytes = end.map(|k| k.as_bytes());
 
-        'leaf_loop: loop {
+        while leaf_pid != INVALID_PAGE_ID {
             let page = buffer_pool.fetch_page(leaf_pid)?;
-            let leaf = match SecondaryLeafNode::deserialize(page) {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = buffer_pool.unpin_page(leaf_pid, false);
-                    return Err(e);
-                }
-            };
+            let (next_leaf, stopped) =
+                SecondaryLeafNode::for_each_entry_raw(page, |kbytes, pl, rid| {
+                    if let Some(s) = start_bytes {
+                        if kbytes < s {
+                            return true;
+                        }
+                    }
+                    if let Some(e) = end_bytes {
+                        if kbytes >= e {
+                            return false;
+                        }
+                    }
+                    results.push(SecondaryLeafEntry::with_payload(
+                        IndexKey::new(kbytes.to_vec()),
+                        pl.to_vec(),
+                        rid,
+                    ));
+                    true
+                })?;
             buffer_pool.unpin_page(leaf_pid, false)?;
 
-            for entry in leaf.entries {
-                if let Some(s) = start {
-                    if &entry.key < s {
-                        continue;
-                    }
-                }
-                if let Some(e) = end {
-                    if &entry.key >= e {
-                        break 'leaf_loop;
-                    }
-                }
-                results.push(entry);
-            }
-
-            if leaf.next_leaf == INVALID_PAGE_ID {
+            if stopped {
                 break;
             }
-            leaf_pid = leaf.next_leaf;
+            leaf_pid = next_leaf;
         }
 
         Ok(results)
@@ -781,8 +1102,78 @@ impl SecondaryIndex {
         start: Option<&IndexKey>,
         end: Option<&IndexKey>,
     ) -> Result<Vec<(IndexKey, RecordId)>> {
-        let entries = self.scan_entries(buffer_pool, start, end)?;
-        Ok(entries.into_iter().map(|e| (e.key, e.rid)).collect())
+        if self.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Descend to leftmost leaf or leaf containing start key
+        let mut curr_pid = self.root_page_id;
+        loop {
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            let page_type = page.page_type();
+
+            match page_type {
+                PageType::Leaf => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    break;
+                }
+                PageType::Internal => {
+                    let next_pid = match start {
+                        Some(k) => SecondaryInternalNode::find_child_raw(page, k, true)?,
+                        None => {
+                            let payload = page.payload();
+                            if payload.len() < SEC_INTERNAL_HEADER_SIZE + 4 {
+                                buffer_pool.unpin_page(curr_pid, false)?;
+                                return Err(Error::IndexCorruption(format!(
+                                    "secondary internal page {curr_pid} corrupted header"
+                                )));
+                            }
+                            u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]])
+                        }
+                    };
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    curr_pid = next_pid;
+                }
+                other => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_pid} during secondary index range scan"
+                    )));
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        let mut leaf_pid = curr_pid;
+        let start_bytes = start.map(|k| k.as_bytes());
+        let end_bytes = end.map(|k| k.as_bytes());
+
+        while leaf_pid != INVALID_PAGE_ID {
+            let page = buffer_pool.fetch_page(leaf_pid)?;
+            let (next_leaf, stopped) =
+                SecondaryLeafNode::for_each_entry_raw(page, |kbytes, _pl, rid| {
+                    if let Some(s) = start_bytes {
+                        if kbytes < s {
+                            return true;
+                        }
+                    }
+                    if let Some(e) = end_bytes {
+                        if kbytes >= e {
+                            return false;
+                        }
+                    }
+                    results.push((IndexKey::new(kbytes.to_vec()), rid));
+                    true
+                })?;
+            buffer_pool.unpin_page(leaf_pid, false)?;
+
+            if stopped {
+                break;
+            }
+            leaf_pid = next_leaf;
+        }
+
+        Ok(results)
     }
 
     /// Enumerates distinct leading-prefix values of length `skipped_prefix_len` in deterministic key order.
@@ -809,14 +1200,15 @@ impl SecondaryIndex {
                     break;
                 }
                 PageType::Internal => {
-                    let internal = match SecondaryInternalNode::deserialize(page) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = buffer_pool.unpin_page(curr_pid, false);
-                            return Err(e);
-                        }
-                    };
-                    let next_pid = internal.children[0];
+                    let payload = page.payload();
+                    if payload.len() < SEC_INTERNAL_HEADER_SIZE + 4 {
+                        buffer_pool.unpin_page(curr_pid, false)?;
+                        return Err(Error::IndexCorruption(format!(
+                            "secondary internal page {curr_pid} corrupted header"
+                        )));
+                    }
+                    let next_pid =
+                        u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
                     buffer_pool.unpin_page(curr_pid, false)?;
                     curr_pid = next_pid;
                 }
@@ -899,15 +1291,8 @@ impl SecondaryIndex {
                     break;
                 }
                 PageType::Internal => {
-                    let internal = match SecondaryInternalNode::deserialize(page) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = buffer_pool.unpin_page(curr_pid, false);
-                            return Err(e);
-                        }
-                    };
+                    let next_pid = SecondaryInternalNode::find_child_raw(page, key, false)?;
                     path.push(curr_pid);
-                    let next_pid = internal.find_child(key);
                     buffer_pool.unpin_page(curr_pid, false)?;
                     curr_pid = next_pid;
                 }
@@ -1056,14 +1441,7 @@ impl SecondaryIndex {
                     break;
                 }
                 PageType::Internal => {
-                    let internal = match SecondaryInternalNode::deserialize(page) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = buffer_pool.unpin_page(curr_pid, false);
-                            return Err(e);
-                        }
-                    };
-                    let next_pid = internal.find_child(key);
+                    let next_pid = SecondaryInternalNode::find_child_raw(page, key, true)?;
                     buffer_pool.unpin_page(curr_pid, false)?;
                     curr_pid = next_pid;
                 }
@@ -1076,22 +1454,33 @@ impl SecondaryIndex {
             }
         }
 
-        let leaf_pid = curr_pid;
-        let mut leaf = {
-            let page = buffer_pool.fetch_page(leaf_pid)?;
-            let l = SecondaryLeafNode::deserialize(page)?;
-            buffer_pool.unpin_page(leaf_pid, false)?;
-            l
-        };
+        let mut curr_leaf_pid = curr_pid;
+        loop {
+            let mut leaf = {
+                let page = buffer_pool.fetch_page(curr_leaf_pid)?;
+                let l = SecondaryLeafNode::deserialize(page)?;
+                buffer_pool.unpin_page(curr_leaf_pid, false)?;
+                l
+            };
 
-        let removed = leaf.remove(key, record_id);
-        if removed {
-            let page_mut = buffer_pool.fetch_page_mut(leaf_pid)?;
-            leaf.serialize(page_mut)?;
-            buffer_pool.unpin_page(leaf_pid, true)?;
+            let removed = leaf.remove(key, record_id);
+            if removed {
+                let page_mut = buffer_pool.fetch_page_mut(curr_leaf_pid)?;
+                leaf.serialize(page_mut)?;
+                buffer_pool.unpin_page(curr_leaf_pid, true)?;
+                return Ok(true);
+            }
+
+            if leaf.next_leaf == INVALID_PAGE_ID {
+                return Ok(false);
+            }
+            if let Some(first) = leaf.entries.first() {
+                if &first.key > key {
+                    return Ok(false);
+                }
+            }
+            curr_leaf_pid = leaf.next_leaf;
         }
-
-        Ok(removed)
     }
 
     /// Collects all physical `PageId`s currently allocated to this secondary index.

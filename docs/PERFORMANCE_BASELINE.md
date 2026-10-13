@@ -536,4 +536,83 @@ Quality gates:
 * **On-Disk Format**: Unchanged.
 * **Release Tag `v0.1.0`**: Untouched (`2f912c2e24b095976a6a5d6340a6b536b2707c9a`).
 
+## 11. Phase 86 Baseline — Secondary Index & Range Scan Optimization
+
+### 11.1 Context & Objective
+Following the hash join optimization in Phase 85, access-path execution—specifically secondary-index point lookups, secondary-index range scans, and primary-key range scans—was the primary remaining performance candidate.
+
+The objective for Phase 86 was to profile secondary-index point lookups, secondary-index range scans, and primary-key range scans, determine the exact root causes of latency, and implement targeted optimizations while preserving:
+- Safe Rust (zero `unsafe`).
+- On-disk storage format.
+- ACID atomicity and MVCC snapshot visibility.
+- Secondary index consistency across updates, deletes, and vacuum.
+- Buffer pool correctness (no bypassing).
+- Release tag `v0.1.0` unchanged.
+
+### 11.2 Root-Cause Findings & Profiling
+Tracing end-to-end SQL query execution and operator paths revealed several critical bottlenecks:
+1. **Unbounded Upper Range Scan Scans to EOF (`optimizer.rs`)**:
+   `extract_col_range_bounds` in `src/query/optimizer.rs` extracted range bounds for B+ Tree scans. For discrete types (`Int64`, `UInt64`), an upper bound predicate like `col <= val` or `val >= col` omitted setting `end` because B+ Tree scan bounds are half-open `[start, end)`. As a result, queries like `WHERE id >= 100 AND id <= 200` scanned all remaining table rows to EOF (e.g. 1,900 rows instead of 101 rows) and relied on residual filters to discard rows after reading them. Resolving `end = Some(val + 1)` and `start = Some(val + 1)` for strict inequalities immediately terminates leaf traversal at the upper bound.
+2. **Duplicate-Key Truncation Bug Across Leaf Splits (`secondary.rs`)**:
+   In `SecondaryInternalNode`, `find_child` used binary search and returned `children[last_idx + 1]`. When duplicate keys spanned leaf boundaries, point lookups, range scans, and deletions routed to the right child, omitting earlier duplicate entries on the left leaf. Introducing `find_leftmost_child` ensures traversal descends to the leftmost qualifying leaf page.
+3. **Pervasive Heap Allocations During Secondary Leaf Deserialization**:
+   `SecondaryLeafNode::deserialize` constructed a `Vec<SecondaryLeafEntry>`, which allocated individual `Vec<u8>` buffers for every key and covered payload across every entry on every leaf page traversed. Even for a point lookup matching a single row, all ~200 entries on a leaf page were deserialized and allocated.
+4. **Intermediate Key Cloning in Index Scans & Table Record Retrieval**:
+   `SecondaryIndex::lookup` and `scan` returned `Vec<SecondaryLeafEntry>` or `Vec<(IndexKey, RecordId)>`, cloning `IndexKey` byte vectors only for callers (`Table::index_lookup`, `Table::index_scan`, etc.) to discard the keys and keep only the `RecordId`s.
+5. **Redundant Leaf Fetch and Node Construction in Primary B+ Tree Scans**:
+   `BPlusTree::get` and `BPlusTree::scan` deserialized full `InternalNode` and `LeafNode` structs (allocating `Vec<Key>` and `Vec<RecordId>`) on every hop down the tree.
+
+### 11.3 Implementation Details
+1. **Discrete Upper and Lower Bound Tightening (`optimizer.rs`)**:
+   In `extract_col_range_bounds`, tightened discrete column inequalities (`<=`, `>=`, `<`, `>`) for `Int64` and `UInt64` types with overflow protection (`val + 1`), providing an exact exclusive upper bound for half-open `[start, end)` B+ Tree scans.
+2. **Zero-Heap-Allocation Raw Routing (`InternalNode::find_child_raw`, `SecondaryInternalNode::find_child_raw`)**:
+   Implemented zero-allocation routing directly on raw page payloads. Binary search on 12-byte fixed-size entries in primary internal nodes, and linear slice inspection in secondary internal nodes, traverses down the tree without deserializing internal node structs.
+3. **Zero-Heap-Allocation Raw Leaf Search (`LeafNode::find_key_raw`, `SecondaryLeafNode::for_each_entry_raw`)**:
+   Implemented raw binary search in primary leaf pages (16-byte fixed entries) and zero-allocation slice iteration in secondary leaf pages (`for_each_entry_raw`). Slice comparisons against search keys avoid constructing `SecondaryLeafEntry` or allocating `IndexKey` / payload buffers.
+4. **Direct RecordId Retrieval (`SecondaryIndex::scan_rids`, `SecondaryIndex::lookup`)**:
+   Implemented `SecondaryIndex::scan_rids` and optimized `SecondaryIndex::lookup` to return `Vec<RecordId>` directly from raw leaf page bytes. Updated `Table::index_scan`, `Table::composite_index_scan`, and `Table::composite_index_lookup_rids` to consume `scan_rids`, completely bypassing intermediate key allocations.
+5. **Multi-Leaf Duplicate Traversal & Deletion**:
+   Added `find_leftmost_child` and sibling leaf inspection across leaf splits in `SecondaryIndex::lookup`, `scan_entries`, `scan_rids`, and `delete`.
+
+### 11.4 Before-and-After Performance Comparison
+
+Hardware / Environment: `Intel Core i7-1355U`, `Windows 11 Pro`, `Rust 1.98.1`, `cargo bench --bench benchmark_suite`
+
+| Workload | Dataset / Query | Phase 85 Baseline | Phase 86 Optimized | Speedup Factor | Latency Reduction | Throughput Change |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`pk_point_lookup`** | B+ Tree primary index point seek (N=2000) | 2.67 ms (p50: 2.59 ms, p99: 4.88 ms) [375.1 ops/s] | **1.58 ms** (p50: 1.62 ms, p99: 3.71 ms) | **1.69×** | **-40.8%** | **634.5 ops/s (+69.2%)** |
+| **`secondary_index_lookup`** | Secondary index scan (100 rows / 5% selectivity) | 6.20 ms (p50: 5.93 ms, p99: 10.31 ms) [161.4 ops/s] | **4.38 ms** (p50: 4.53 ms, p99: 6.06 ms) | **1.42×** | **-29.4%** | **228.5 ops/s (+41.6%)** |
+| **`pk_range_scan`** | Primary key range scan (100 rows) | 6.25 ms (p50: 5.86 ms, p99: 12.06 ms) [160.0 ops/s] | **5.22 ms** (p50: 5.24 ms, p99: 7.80 ms) | **1.20×** | **-16.5%** | **191.7 ops/s (+19.8%)** |
+| **`full_table_scan`** | Full table scan of all 2,000 rows | 3.87 ms (p50: 3.87 ms, p99: 6.13 ms) [258.4 ops/s] | **2.54 ms** (p50: 2.46 ms, p99: 3.95 ms) | **1.52×** | **-34.4%** | **394.4 ops/s (+52.6%)** |
+| **`inner_equi_join`** | Hash join (accounts 2,000 JOIN logs 4,000) | 20.34 ms (p50: 19.34 ms, p99: 25.13 ms) [49.2 ops/s] | **16.63 ms** (p50: 16.16 ms, p99: 22.50 ms) | **1.22×** | **-18.2%** | **60.1 ops/s (+22.2%)** |
+
+#### Micro-Benchmark Measurements
+- `point_lookup_hit` (N=10,000): **247.3 ns** (p50: 200.0 ns) — **4.04M ops/sec**
+- `point_lookup_miss` (N=10,000): **146.0 ns** (p50: 100.0 ns) — **6.85M ops/sec**
+- Operator `table.index_lookup` (100 rows): **580 µs**
+- Operator `table.scan` (101 rows PK range): **521 µs**
+
+### 11.5 Correctness, Testing, and Quality Gates
+A dedicated test suite (`tests/secondary_index_and_range_scan_optimizations.rs`) was added covering 8 focused scenarios:
+1. `test_secondary_index_point_lookups_and_missing_keys`: Validates point lookup hits, misses, and NULL index keys.
+2. `test_secondary_index_duplicate_keys_spanning_leaf_splits`: Validates hundreds of duplicate keys spanning leaf splits with multi-leaf traversal.
+3. `test_range_scans_inclusive_exclusive_bounds_and_empty`: Validates inclusive (`<=`), exclusive (`<`), and empty ranges on primary key and secondary index against a full table scan oracle.
+4. `test_composite_index_point_and_prefix_and_range_scans`: Validates composite point lookups, prefix scans, and bounded range scans.
+5. `test_secondary_index_mutations_updates_deletes_vacuum`: Validates index consistency across updates, deletes, and vacuum cleanup.
+6. `test_secondary_index_mvcc_snapshot_isolation`: Validates uncommitted mutation isolation, transaction abort rollback, and committed visibility.
+7. `test_secondary_index_persistence_reopen`: Validates secondary index persistence and query correctness across clean reopen.
+8. `test_corrupt_index_or_page_detection`: Validates that corrupted page headers or invalid offsets return `Error::IndexCorruption` safely without panicking.
+
+Quality gates:
+* `cargo fmt --all -- --check`: Passed (clean formatting).
+* `cargo clippy --all-targets --all-features -- -D warnings`: Passed (0 warnings).
+* `cargo test --all`: Passed (**1,975 tests passed across 85 test binaries**, 0 failed).
+
+### 11.6 Invariants Preserved
+* **Safe Rust**: Strictly zero `unsafe` blocks.
+* **On-Disk Format**: Unchanged.
+* **ACID & MVCC Guarantees**: Unaffected.
+* **Release Tag `v0.1.0`**: Untouched (`2f912c2e24b095976a6a5d6340a6b536b2707c9a`).
+
+
 

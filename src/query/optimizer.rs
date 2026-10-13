@@ -6600,10 +6600,21 @@ fn extract_col_range_bounds(
                 }
                 (Expr::Literal(val), Expr::Column(name))
                 | (Expr::Parameter { value: val, .. }, Expr::Column(name))
-                    if name == target_col && val.data_type() == target_type && !val.is_null() =>
+                    if name == target_col
+                        && val.data_type() == target_type
+                        && !val.is_null()
+                        && end.is_none() =>
                 {
                     // val >= col -> col <= val
-                    // Handled as residual
+                    let succ = match val {
+                        Value::Int64(i) if *i < i64::MAX => Some(Value::Int64(*i + 1)),
+                        Value::UInt64(u) if *u < u64::MAX => Some(Value::UInt64(*u + 1)),
+                        _ => None,
+                    };
+                    if let Some(s) = succ {
+                        end = Some(s);
+                        used.insert(idx);
+                    }
                 }
                 _ => {}
             },
@@ -6619,8 +6630,29 @@ fn extract_col_range_bounds(
                         && !val.is_null()
                         && start.is_none() =>
                 {
-                    start = Some(val.clone());
-                    // Keep in residual filter to check strict inequality
+                    let succ = match val {
+                        Value::Int64(i) if *i < i64::MAX => Some(Value::Int64(*i + 1)),
+                        Value::UInt64(u) if *u < u64::MAX => Some(Value::UInt64(*u + 1)),
+                        _ => None,
+                    };
+                    if let Some(s) = succ {
+                        start = Some(s);
+                        used.insert(idx);
+                    } else {
+                        start = Some(val.clone());
+                        // Keep in residual filter to check strict inequality
+                    }
+                }
+                (Expr::Literal(val), Expr::Column(name))
+                | (Expr::Parameter { value: val, .. }, Expr::Column(name))
+                    if name == target_col
+                        && val.data_type() == target_type
+                        && !val.is_null()
+                        && end.is_none() =>
+                {
+                    // val > col -> col < val
+                    end = Some(val.clone());
+                    used.insert(idx);
                 }
                 _ => {}
             },
@@ -6647,8 +6679,18 @@ fn extract_col_range_bounds(
                         && start.is_none() =>
                 {
                     // val < col -> col > val
-                    start = Some(val.clone());
-                    // Keep in residual filter to check strict inequality
+                    let succ = match val {
+                        Value::Int64(i) if *i < i64::MAX => Some(Value::Int64(*i + 1)),
+                        Value::UInt64(u) if *u < u64::MAX => Some(Value::UInt64(*u + 1)),
+                        _ => None,
+                    };
+                    if let Some(s) = succ {
+                        start = Some(s);
+                        used.insert(idx);
+                    } else {
+                        start = Some(val.clone());
+                        // Keep in residual filter to check strict inequality
+                    }
                 }
                 _ => {}
             },
@@ -6668,11 +6710,22 @@ fn extract_col_range_bounds(
                     start = Some(val.clone());
                     used.insert(idx);
                 }
-                (Expr::Column(name), Expr::Literal(_))
-                | (Expr::Column(name), Expr::Parameter { .. })
-                    if name == target_col =>
+                (Expr::Column(name), Expr::Literal(val))
+                | (Expr::Column(name), Expr::Parameter { value: val, .. })
+                    if name == target_col
+                        && val.data_type() == target_type
+                        && !val.is_null()
+                        && end.is_none() =>
                 {
-                    // col <= val: B+ Tree scan is exclusive on end, so keep in residual filter
+                    let succ = match val {
+                        Value::Int64(i) if *i < i64::MAX => Some(Value::Int64(*i + 1)),
+                        Value::UInt64(u) if *u < u64::MAX => Some(Value::UInt64(*u + 1)),
+                        _ => None,
+                    };
+                    if let Some(s) = succ {
+                        end = Some(s);
+                        used.insert(idx);
+                    }
                 }
                 _ => {}
             },

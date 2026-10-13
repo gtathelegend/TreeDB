@@ -840,12 +840,12 @@ impl<'a> Table<'a> {
         let start_key = start.map(IndexKey::from_value);
         let end_key = end.map(IndexKey::from_value);
 
-        let entries = sec_idx.scan(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?;
-        let mut rows = Vec::with_capacity(entries.len());
+        let rids = sec_idx.scan_rids(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?;
+        let mut rows = Vec::with_capacity(rids.len());
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
 
-        for (_k, rid) in entries {
+        for rid in rids {
             if let Some(row) = self.record_store.with_exact_version_if_visible(
                 self.buffer_pool,
                 rid,
@@ -892,8 +892,7 @@ impl<'a> Table<'a> {
                 crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
             let start_key = IndexKey::new(start_bytes);
             let end_key = end_bytes.map(IndexKey::new);
-            let entries = sec_idx.scan(self.buffer_pool, Some(&start_key), end_key.as_ref())?;
-            entries.into_iter().map(|(_k, rid)| rid).collect()
+            sec_idx.scan_rids(self.buffer_pool, Some(&start_key), end_key.as_ref())?
         };
 
         let reader_txn = self.reader_txn();
@@ -948,12 +947,12 @@ impl<'a> Table<'a> {
             .map(|(_, s)| *s)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        let entries = sec_idx.scan(self.buffer_pool, start_key, end_key)?;
-        let mut rows = Vec::with_capacity(entries.len());
+        let rids = sec_idx.scan_rids(self.buffer_pool, start_key, end_key)?;
+        let mut rows = Vec::with_capacity(rids.len());
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
 
-        for (_k, rid) in entries {
+        for rid in rids {
             if let Some((_, bytes)) = self.record_store.read_exact_version_if_visible(
                 self.buffer_pool,
                 rid,
@@ -982,11 +981,11 @@ impl<'a> Table<'a> {
             .map(|(_, s)| *s)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        let entries = sec_idx.scan(self.buffer_pool, start_key, end_key)?;
+        let rids = sec_idx.scan_rids(self.buffer_pool, start_key, end_key)?;
         let reader_txn = self.reader_txn();
         let snapshot = self.current_snapshot();
-        let mut visible = Vec::with_capacity(entries.len());
-        for (_k, rid) in entries {
+        let mut visible = Vec::with_capacity(rids.len());
+        for rid in rids {
             if self
                 .record_store
                 .is_version_visible(self.buffer_pool, rid, reader_txn, &snapshot)?

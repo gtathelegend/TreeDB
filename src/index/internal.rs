@@ -272,6 +272,66 @@ impl InternalNode {
 
         Ok(node)
     }
+
+    /// Finds target child PageId directly from raw page bytes with zero heap allocations.
+    pub fn find_child_raw(page: &Page, key: Key) -> Result<PageId> {
+        if page.page_type() != PageType::Internal {
+            return Err(Error::PageCorruption {
+                page_id: page.id(),
+                reason: "expected Internal page type tag",
+            });
+        }
+        let payload = page.payload();
+        let key_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+        if key_count > INTERNAL_MAX_KEYS {
+            return Err(Error::PageCorruption {
+                page_id: page.id(),
+                reason: "internal key count exceeds maximum capacity",
+            });
+        }
+        if key_count == 0 {
+            return Ok(u32::from_le_bytes([
+                payload[2], payload[3], payload[4], payload[5],
+            ]));
+        }
+
+        // Binary search 12-byte entries [SeparatorKey (8B) | ChildPageId (4B)]
+        let mut low = 0;
+        let mut high = key_count;
+        while low < high {
+            let mid = (low + high) / 2;
+            let offset = INTERNAL_HEADER_SIZE + mid * INTERNAL_ENTRY_SIZE;
+            let sep_key = u64::from_le_bytes([
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
+                payload[offset + 4],
+                payload[offset + 5],
+                payload[offset + 6],
+                payload[offset + 7],
+            ]);
+            if key < sep_key {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        if low == 0 {
+            Ok(u32::from_le_bytes([
+                payload[2], payload[3], payload[4], payload[5],
+            ]))
+        } else {
+            let offset = INTERNAL_HEADER_SIZE + (low - 1) * INTERNAL_ENTRY_SIZE + 8;
+            Ok(u32::from_le_bytes([
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
+            ]))
+        }
+    }
 }
 
 #[cfg(test)]
