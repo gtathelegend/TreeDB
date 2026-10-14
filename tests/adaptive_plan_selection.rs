@@ -90,6 +90,7 @@ fn dummy_plan(access_path: AccessPath, cost: f64, rows: f64) -> PhysicalPlan {
         table_name: "users".to_string(),
         table_alias: None,
         access_path,
+        scan_direction: SortDirection::Ascending,
         residual_filter: None,
         estimated_rows: rows,
         cost,

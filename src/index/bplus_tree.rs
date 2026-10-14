@@ -3,7 +3,10 @@ use std::collections::HashSet;
 use crate::error::{Error, Result};
 use crate::index::internal::InternalNode;
 use crate::index::leaf::LeafNode;
-use crate::index::node::{RecordId, INVALID_PAGE_ID, LEAF_ENTRY_SIZE, LEAF_HEADER_SIZE};
+use crate::index::node::{
+    RecordId, INTERNAL_ENTRY_SIZE, INTERNAL_HEADER_SIZE, INVALID_PAGE_ID, LEAF_ENTRY_SIZE,
+    LEAF_HEADER_SIZE,
+};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::{Key, PageId, PageType};
 
@@ -953,7 +956,18 @@ impl BPlusTree {
         start: Option<Key>,
         end: Option<Key>,
     ) -> Result<Vec<(Key, RecordId)>> {
-        if self.is_empty() {
+        self.scan_with_limit(buffer_pool, start, end, None)
+    }
+
+    /// Performs an ordered range scan returning up to `limit` entries within `[start, end)`.
+    pub fn scan_with_limit(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<Key>,
+        end: Option<Key>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Key, RecordId)>> {
+        if self.is_empty() || limit == Some(0) {
             return Ok(Vec::new());
         }
 
@@ -1070,6 +1084,12 @@ impl BPlusTree {
                 let mut rid_bytes = [0u8; 8];
                 rid_bytes.copy_from_slice(&payload[offset + 8..offset + 16]);
                 results.push((k, RecordId::from_bytes(rid_bytes)));
+                if let Some(lim) = limit {
+                    if results.len() >= lim {
+                        stop = true;
+                        break;
+                    }
+                }
             }
 
             buffer_pool.unpin_page(curr_leaf_id, false)?;
@@ -1077,6 +1097,227 @@ impl BPlusTree {
                 break;
             }
             curr_leaf_id = next_leaf;
+        }
+
+        Ok(results)
+    }
+
+    /// Performs an ordered reverse range scan returning entries in descending order within `[start, end)`.
+    pub fn scan_reverse(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<Key>,
+        end: Option<Key>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Key, RecordId)>> {
+        if self.is_empty() || limit == Some(0) {
+            return Ok(Vec::new());
+        }
+
+        if let (Some(s), Some(e)) = (start, end) {
+            if s >= e {
+                return Ok(Vec::new());
+            }
+        }
+
+        // Descend to rightmost candidate leaf page
+        let mut curr_id = self.root_page_id;
+        let mut stack: Vec<(PageId, usize)> = Vec::new();
+
+        loop {
+            let page = buffer_pool.fetch_page(curr_id)?;
+            match page.page_type() {
+                PageType::Internal => {
+                    let payload = page.payload();
+                    let key_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                    let child_idx = match end {
+                        Some(end_key) => {
+                            let mut count = 0;
+                            for i in 0..key_count {
+                                let offset = INTERNAL_HEADER_SIZE + i * INTERNAL_ENTRY_SIZE;
+                                let k = u64::from_le_bytes([
+                                    payload[offset],
+                                    payload[offset + 1],
+                                    payload[offset + 2],
+                                    payload[offset + 3],
+                                    payload[offset + 4],
+                                    payload[offset + 5],
+                                    payload[offset + 6],
+                                    payload[offset + 7],
+                                ]);
+                                if k < end_key {
+                                    count = i + 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            count
+                        }
+                        None => key_count,
+                    };
+
+                    let next_id = if child_idx == 0 {
+                        u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]])
+                    } else {
+                        let offset = INTERNAL_HEADER_SIZE + (child_idx - 1) * INTERNAL_ENTRY_SIZE;
+                        u32::from_le_bytes([
+                            payload[offset + 8],
+                            payload[offset + 9],
+                            payload[offset + 10],
+                            payload[offset + 11],
+                        ])
+                    };
+
+                    buffer_pool.unpin_page(curr_id, false)?;
+                    stack.push((curr_id, child_idx));
+                    curr_id = next_id;
+                }
+                PageType::Leaf => {
+                    buffer_pool.unpin_page(curr_id, false)?;
+                    break;
+                }
+                other => {
+                    let _ = buffer_pool.unpin_page(curr_id, false);
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_id} during reverse scan traversal"
+                    )));
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        let mut stop = false;
+
+        loop {
+            let page = buffer_pool.fetch_page(curr_id)?;
+            let page_type = page.page_type();
+            if page_type != PageType::Leaf {
+                let _ = buffer_pool.unpin_page(curr_id, false);
+                return Err(Error::TreeCorruption(format!(
+                    "expected leaf page in reverse scan, found {:?}",
+                    page_type
+                )));
+            }
+
+            let payload = page.payload();
+            let key_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+
+            for i in (0..key_count).rev() {
+                let offset = LEAF_HEADER_SIZE + i * LEAF_ENTRY_SIZE;
+                let k = u64::from_le_bytes([
+                    payload[offset],
+                    payload[offset + 1],
+                    payload[offset + 2],
+                    payload[offset + 3],
+                    payload[offset + 4],
+                    payload[offset + 5],
+                    payload[offset + 6],
+                    payload[offset + 7],
+                ]);
+
+                if let Some(end_key) = end {
+                    if k >= end_key {
+                        continue;
+                    }
+                }
+
+                if let Some(start_key) = start {
+                    if k < start_key {
+                        stop = true;
+                        break;
+                    }
+                }
+
+                let mut rid_bytes = [0u8; 8];
+                rid_bytes.copy_from_slice(&payload[offset + 8..offset + 16]);
+                results.push((k, RecordId::from_bytes(rid_bytes)));
+
+                if let Some(lim) = limit {
+                    if results.len() >= lim {
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+
+            buffer_pool.unpin_page(curr_id, false)?;
+            if stop {
+                break;
+            }
+
+            // Step to previous leaf using parent stack
+            let mut next_leaf_id = INVALID_PAGE_ID;
+            while let Some((parent_id, child_idx)) = stack.pop() {
+                if child_idx > 0 {
+                    let new_child_idx = child_idx - 1;
+                    let parent_page = buffer_pool.fetch_page(parent_id)?;
+                    let p_payload = parent_page.payload();
+                    let target_child_id = if new_child_idx == 0 {
+                        u32::from_le_bytes([p_payload[2], p_payload[3], p_payload[4], p_payload[5]])
+                    } else {
+                        let off = INTERNAL_HEADER_SIZE + (new_child_idx - 1) * INTERNAL_ENTRY_SIZE;
+                        u32::from_le_bytes([
+                            p_payload[off + 8],
+                            p_payload[off + 9],
+                            p_payload[off + 10],
+                            p_payload[off + 11],
+                        ])
+                    };
+                    buffer_pool.unpin_page(parent_id, false)?;
+                    stack.push((parent_id, new_child_idx));
+
+                    // Descend along rightmost path from target_child_id to leaf
+                    let mut desc_id = target_child_id;
+                    loop {
+                        let desc_page = buffer_pool.fetch_page(desc_id)?;
+                        match desc_page.page_type() {
+                            PageType::Internal => {
+                                let d_payload = desc_page.payload();
+                                let d_keys =
+                                    u16::from_le_bytes([d_payload[0], d_payload[1]]) as usize;
+                                let last_child_idx = d_keys;
+                                let last_child_id = if last_child_idx == 0 {
+                                    u32::from_le_bytes([
+                                        d_payload[2],
+                                        d_payload[3],
+                                        d_payload[4],
+                                        d_payload[5],
+                                    ])
+                                } else {
+                                    let off = INTERNAL_HEADER_SIZE
+                                        + (last_child_idx - 1) * INTERNAL_ENTRY_SIZE;
+                                    u32::from_le_bytes([
+                                        d_payload[off + 8],
+                                        d_payload[off + 9],
+                                        d_payload[off + 10],
+                                        d_payload[off + 11],
+                                    ])
+                                };
+                                buffer_pool.unpin_page(desc_id, false)?;
+                                stack.push((desc_id, last_child_idx));
+                                desc_id = last_child_id;
+                            }
+                            PageType::Leaf => {
+                                buffer_pool.unpin_page(desc_id, false)?;
+                                next_leaf_id = desc_id;
+                                break;
+                            }
+                            _ => {
+                                buffer_pool.unpin_page(desc_id, false)?;
+                                return Err(Error::TreeCorruption(
+                                    "unexpected page type during reverse traversal".into(),
+                                ));
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if next_leaf_id == INVALID_PAGE_ID {
+                break;
+            }
+            curr_id = next_leaf_id;
         }
 
         Ok(results)

@@ -390,4 +390,99 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             "Ineligible index range scan (600 rows / base records fetched for unindexed column)",
         ));
     }
+
+    // -------------------------------------------------------------------------
+    // Phase 89 Focused Workloads: Index Aggregation & Early Termination
+    // -------------------------------------------------------------------------
+    // Workload 14: Index-level COUNT(*) (2,000 accounts, 0 row materializations)
+    {
+        let iters = 500;
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let sql = "SELECT COUNT(*) FROM accounts;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 1);
+            samples.push(elapsed);
+        }
+
+        runner.record(BenchmarkResult::from_samples(
+            "SQL & Query",
+            "index_aggregate_count_all",
+            account_count,
+            iters,
+            samples,
+            "Index-level COUNT(*) (2,000 rows / zero row materializations)",
+        ));
+    }
+
+    // Workload 15: Index-level MIN and MAX (zero table scan)
+    {
+        let iters = 500;
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let sql = "SELECT MIN(id), MAX(id) FROM accounts;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 1);
+            samples.push(elapsed);
+        }
+
+        runner.record(BenchmarkResult::from_samples(
+            "SQL & Query",
+            "index_aggregate_min_max",
+            account_count,
+            iters,
+            samples,
+            "Index-level MIN/MAX via B+ Tree extrema (zero row materializations)",
+        ));
+    }
+
+    // Workload 16: Early termination forward scan (ORDER BY id ASC LIMIT 10)
+    {
+        let iters = 500;
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let sql = "SELECT * FROM accounts ORDER BY id ASC LIMIT 10;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 10);
+            samples.push(elapsed);
+        }
+
+        runner.record(BenchmarkResult::from_samples(
+            "SQL & Query",
+            "early_termination_order_by_limit_asc",
+            account_count,
+            iters,
+            samples,
+            "Early-termination index scan ORDER BY id ASC LIMIT 10 (10 entries examined)",
+        ));
+    }
+
+    // Workload 17: Early termination reverse scan (ORDER BY id DESC LIMIT 10)
+    {
+        let iters = 500;
+        let mut samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let sql = "SELECT * FROM accounts ORDER BY id DESC LIMIT 10;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 10);
+            samples.push(elapsed);
+        }
+
+        runner.record(BenchmarkResult::from_samples(
+            "SQL & Query",
+            "early_termination_order_by_limit_desc",
+            account_count,
+            iters,
+            samples,
+            "Early-termination reverse index scan ORDER BY id DESC LIMIT 10 (10 entries examined)",
+        ));
+    }
 }

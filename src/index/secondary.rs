@@ -955,7 +955,18 @@ impl SecondaryIndex {
         start: Option<&IndexKey>,
         end: Option<&IndexKey>,
     ) -> Result<Vec<RecordId>> {
-        if self.is_empty() {
+        self.scan_rids_with_limit(buffer_pool, start, end, None)
+    }
+
+    /// Performs an ordered range scan returning up to `limit` `RecordId`s within `[start, end)`.
+    pub fn scan_rids_with_limit(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<&IndexKey>,
+        end: Option<&IndexKey>,
+        limit: Option<usize>,
+    ) -> Result<Vec<RecordId>> {
+        if self.is_empty() || limit == Some(0) {
             return Ok(Vec::new());
         }
 
@@ -1016,17 +1027,34 @@ impl SecondaryIndex {
                         }
                     }
                     results.push(rid);
+                    if let Some(lim) = limit {
+                        if results.len() >= lim {
+                            return false;
+                        }
+                    }
                     true
                 })?;
             buffer_pool.unpin_page(leaf_pid, false)?;
 
-            if stopped {
+            if stopped || limit.is_some_and(|lim| results.len() >= lim) {
                 break;
             }
             leaf_pid = next_leaf;
         }
 
         Ok(results)
+    }
+
+    /// Performs an ordered reverse range scan returning `RecordId`s in descending order within `[start, end)`.
+    pub fn scan_rids_reverse(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<&IndexKey>,
+        end: Option<&IndexKey>,
+        limit: Option<usize>,
+    ) -> Result<Vec<RecordId>> {
+        let entries = self.scan_entries_reverse(buffer_pool, start, end, limit)?;
+        Ok(entries.into_iter().map(|e| e.rid).collect())
     }
 
     /// Performs an ordered range scan returning `SecondaryLeafEntry`s within `[start, end)`.
@@ -1036,7 +1064,18 @@ impl SecondaryIndex {
         start: Option<&IndexKey>,
         end: Option<&IndexKey>,
     ) -> Result<Vec<SecondaryLeafEntry>> {
-        if self.is_empty() {
+        self.scan_entries_with_limit(buffer_pool, start, end, None)
+    }
+
+    /// Performs an ordered range scan returning up to `limit` `SecondaryLeafEntry`s within `[start, end)`.
+    pub fn scan_entries_with_limit(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<&IndexKey>,
+        end: Option<&IndexKey>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SecondaryLeafEntry>> {
+        if self.is_empty() || limit == Some(0) {
             return Ok(Vec::new());
         }
 
@@ -1101,14 +1140,165 @@ impl SecondaryIndex {
                         pl.to_vec(),
                         rid,
                     ));
+                    if let Some(lim) = limit {
+                        if results.len() >= lim {
+                            return false;
+                        }
+                    }
                     true
                 })?;
             buffer_pool.unpin_page(leaf_pid, false)?;
 
-            if stopped {
+            if stopped || limit.is_some_and(|lim| results.len() >= lim) {
                 break;
             }
             leaf_pid = next_leaf;
+        }
+
+        Ok(results)
+    }
+
+    /// Performs an ordered reverse range scan returning `SecondaryLeafEntry`s in descending order within `[start, end)`.
+    pub fn scan_entries_reverse(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<&IndexKey>,
+        end: Option<&IndexKey>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SecondaryLeafEntry>> {
+        if self.is_empty() || limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        if let (Some(s), Some(e)) = (start, end) {
+            if s >= e {
+                return Ok(Vec::new());
+            }
+        }
+
+        let mut curr_pid = self.root_page_id;
+        let mut stack: Vec<(PageId, usize)> = Vec::new();
+
+        loop {
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            let page_type = page.page_type();
+            match page_type {
+                PageType::Leaf => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    break;
+                }
+                PageType::Internal => {
+                    let internal_node = SecondaryInternalNode::deserialize(page)?;
+                    let child_idx = match end {
+                        Some(end_key) => {
+                            let mut count = 0;
+                            for (i, k) in internal_node.keys.iter().enumerate() {
+                                if k < end_key {
+                                    count = i + 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            count
+                        }
+                        None => internal_node.children.len().saturating_sub(1),
+                    };
+                    let next_pid = internal_node.children[child_idx];
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    stack.push((curr_pid, child_idx));
+                    curr_pid = next_pid;
+                }
+                other => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_pid} during secondary reverse scan"
+                    )));
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        let mut stop = false;
+
+        loop {
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            if page.page_type() != PageType::Leaf {
+                buffer_pool.unpin_page(curr_pid, false)?;
+                return Err(Error::TreeCorruption("expected secondary leaf page".into()));
+            }
+            let leaf = SecondaryLeafNode::deserialize(page)?;
+            buffer_pool.unpin_page(curr_pid, false)?;
+
+            for entry in leaf.entries.into_iter().rev() {
+                if let Some(e) = end {
+                    if &entry.key >= e {
+                        continue;
+                    }
+                }
+                if let Some(s) = start {
+                    if &entry.key < s {
+                        stop = true;
+                        break;
+                    }
+                }
+                results.push(entry);
+                if let Some(lim) = limit {
+                    if results.len() >= lim {
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+
+            if stop {
+                break;
+            }
+
+            // Step to previous leaf
+            let mut next_leaf_id = INVALID_PAGE_ID;
+            while let Some((parent_id, child_idx)) = stack.pop() {
+                if child_idx > 0 {
+                    let new_child_idx = child_idx - 1;
+                    let parent_page = buffer_pool.fetch_page(parent_id)?;
+                    let parent_node = SecondaryInternalNode::deserialize(parent_page)?;
+                    let target_child_id = parent_node.children[new_child_idx];
+                    buffer_pool.unpin_page(parent_id, false)?;
+                    stack.push((parent_id, new_child_idx));
+
+                    // Descend rightmost
+                    let mut desc_id = target_child_id;
+                    loop {
+                        let desc_page = buffer_pool.fetch_page(desc_id)?;
+                        match desc_page.page_type() {
+                            PageType::Internal => {
+                                let desc_node = SecondaryInternalNode::deserialize(desc_page)?;
+                                let last_idx = desc_node.children.len().saturating_sub(1);
+                                let last_child = desc_node.children[last_idx];
+                                buffer_pool.unpin_page(desc_id, false)?;
+                                stack.push((desc_id, last_idx));
+                                desc_id = last_child;
+                            }
+                            PageType::Leaf => {
+                                buffer_pool.unpin_page(desc_id, false)?;
+                                next_leaf_id = desc_id;
+                                break;
+                            }
+                            _ => {
+                                buffer_pool.unpin_page(desc_id, false)?;
+                                return Err(Error::TreeCorruption(
+                                    "unexpected page type during secondary reverse traversal"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if next_leaf_id == INVALID_PAGE_ID {
+                break;
+            }
+            curr_pid = next_leaf_id;
         }
 
         Ok(results)

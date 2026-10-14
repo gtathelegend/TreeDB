@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use treedb::engine::types::{Column, DataType, Row, Schema, Value};
+use treedb::query::operator::SortDirection;
 use treedb::query::optimizer::{AccessPath, SecondaryScanType};
 use treedb::TreeDb;
 
@@ -952,6 +953,7 @@ fn baseline_execute(
         table_name: bound.table_name.clone(),
         table_alias: bound.table_alias.clone(),
         access_path: AccessPath::FullTableScan,
+        scan_direction: SortDirection::Ascending,
         residual_filter: None,
         estimated_rows: 0.0,
         cost: 0.0,
@@ -975,6 +977,7 @@ fn baseline_execute(
                 table_name: j.table_name.clone(),
                 table_alias: j.table_alias.clone(),
                 access_path: AccessPath::FullTableScan,
+                scan_direction: SortDirection::Ascending,
                 residual_filter: None,
                 estimated_rows: 0.0,
                 cost: 0.0,

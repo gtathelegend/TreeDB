@@ -6,7 +6,7 @@ use crate::engine::types::{DataType, Schema, Value};
 use crate::error::Result;
 use crate::query::cardinality::CardinalityEstimator;
 use crate::query::cost::{CostModel, SEC_INDEX_FETCH_COST, SEC_INDEX_LOOKUP_COST};
-use crate::query::expr::{AggregateExpr, BinaryOp, Expr};
+use crate::query::expr::{AggregateExpr, AggregateFunction, BinaryOp, Expr};
 use crate::query::external_aggregate::DEFAULT_AGGREGATE_MEMORY_BUDGET_BYTES;
 use crate::query::external_hash_join::DEFAULT_JOIN_MEMORY_BUDGET_BYTES;
 use crate::query::external_multi_index::{
@@ -370,6 +370,8 @@ pub struct PhysicalTableScan {
     pub index_covered_filter: Option<Expr>,
     /// Base-record filtering predicate evaluated after base record fetching.
     pub base_record_filter: Option<Expr>,
+    /// Direction of scan traversal (Ascending or Descending). Default is Ascending.
+    pub scan_direction: crate::query::operator::SortDirection,
 }
 
 impl PhysicalTableScan {
@@ -406,6 +408,7 @@ impl PhysicalTableScan {
             late_materialization: false,
             index_covered_filter: None,
             base_record_filter: None,
+            scan_direction: crate::query::operator::SortDirection::Ascending,
         }
     }
 }
@@ -491,6 +494,8 @@ pub enum AggregateStrategy {
     Streaming { sort_required: bool },
     /// Spilled external hash aggregation.
     External,
+    /// Index-level aggregation.
+    Index,
 }
 
 impl fmt::Display for AggregateStrategy {
@@ -503,6 +508,7 @@ impl fmt::Display for AggregateStrategy {
                 if *sort_required { "Yes" } else { "No" }
             ),
             Self::External => write!(f, "ExternalAggregate"),
+            Self::Index => write!(f, "IndexAggregate"),
         }
     }
 }
@@ -589,6 +595,7 @@ impl PhysicalPlan {
                 late_materialization: false,
                 index_covered_filter: None,
                 base_record_filter: None,
+                scan_direction: crate::query::operator::SortDirection::Ascending,
             },
             joins: Vec::new(),
             post_join_filter: None,
@@ -637,6 +644,7 @@ impl PhysicalPlan {
                 late_materialization: false,
                 index_covered_filter: None,
                 base_record_filter: None,
+                scan_direction: crate::query::operator::SortDirection::Ascending,
             },
             joins: Vec::new(),
             post_join_filter: None,
@@ -941,6 +949,14 @@ impl fmt::Display for PhysicalPlan {
                         aggs.join(", ")
                     )?;
                 }
+                Some(AggregateStrategy::Index) => {
+                    writeln!(
+                        f,
+                        "IndexAggregate (group_by: [{}], aggs: [{}])",
+                        groups.join(", "),
+                        aggs.join(", ")
+                    )?;
+                }
                 _ => {
                     writeln!(
                         f,
@@ -1035,6 +1051,10 @@ impl fmt::Display for PhysicalPlan {
             if self.base_table.early_termination_possible {
                 write_indent(f, indent + 1)?;
                 writeln!(f, "Early Termination: possible")?;
+            }
+            if self.base_table.scan_direction == crate::query::operator::SortDirection::Descending {
+                write_indent(f, indent + 1)?;
+                writeln!(f, "Scan Direction: Descending")?;
             }
             if let Some(rf) = &self.base_table.residual_filter {
                 format_subqueries_in_expr(rf, f, indent + 1)?;
@@ -3514,6 +3534,48 @@ fn plan_semi_anti_strategy(
     )
 }
 
+/// Returns true if single-table scalar aggregation can be evaluated via index without full table scan or row materialization.
+pub fn is_index_aggregate_eligible(bound: &BoundSelect, tables: &[TableOptInfo]) -> bool {
+    bound.group_by.is_empty()
+        && !bound.aggregates.is_empty()
+        && bound.window_exprs.is_empty()
+        && bound.having.is_none()
+        && tables.len() == 1
+        && !tables[0].is_cte
+        && !bound
+            .filter
+            .as_ref()
+            .map(|f| f.contains_subquery())
+            .unwrap_or(false)
+        && bound.aggregates.iter().all(|agg| match agg {
+            AggregateExpr::CountAll => true,
+            AggregateExpr::Function {
+                func: AggregateFunction::Count,
+                expr: Expr::Column(c),
+            } => {
+                let pure = c.split('.').next_back().unwrap_or(c.as_str());
+                tables[0].schema.primary_key_column().name == pure
+                    || tables[0].indexes.iter().any(|idx| {
+                        idx.column_indices
+                            .iter()
+                            .any(|&i| tables[0].schema.columns[i].name == pure)
+                    })
+            }
+            AggregateExpr::Function {
+                func: AggregateFunction::Min | AggregateFunction::Max,
+                expr: Expr::Column(c),
+            } => {
+                let pure = c.split('.').next_back().unwrap_or(c.as_str());
+                tables[0].schema.primary_key_column().name == pure
+                    || tables[0].indexes.iter().any(|idx| {
+                        !idx.column_indices.is_empty()
+                            && tables[0].schema.columns[idx.column_indices[0]].name == pure
+                    })
+            }
+            _ => false,
+        })
+}
+
 /// Selected physical aggregation strategy, updated cumulative cost, and output ordering property.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_aggregation_strategy(
@@ -3758,7 +3820,33 @@ impl Optimizer {
                 None
             };
 
-            for base_table_scan in &candidate_scans {
+            let mut all_scans = candidate_scans;
+            if bound
+                .order_by
+                .iter()
+                .any(|k| k.direction == crate::query::operator::SortDirection::Descending)
+            {
+                let mut desc_scans = Vec::new();
+                for scan in &all_scans {
+                    if matches!(
+                        scan.access_path,
+                        AccessPath::FullTableScan
+                            | AccessPath::PrimaryRangeScan { .. }
+                            | AccessPath::SecondaryIndexScan { .. }
+                            | AccessPath::IndexOnlyScan { .. }
+                    ) {
+                        let mut desc_scan = scan.clone();
+                        desc_scan.scan_direction =
+                            crate::query::operator::SortDirection::Descending;
+                        desc_scans.push(desc_scan);
+                    }
+                }
+                all_scans.extend(desc_scans);
+            }
+
+            let is_index_agg_eligible = is_index_aggregate_eligible(bound, tables);
+
+            for base_table_scan in &all_scans {
                 let mut cur_cost = base_table_scan.cost;
                 let mut cur_rows = base_table_scan.estimated_rows;
 
@@ -3767,22 +3855,45 @@ impl Optimizer {
                         &tables[0],
                         base_table_scan,
                     );
-                let (agg_strategy, post_agg_cost, post_agg_ordering) = plan_aggregation_strategy(
-                    cur_cost,
-                    cur_rows,
-                    Some(&scan_ordering),
-                    &bound.group_by,
-                    &bound.aggregates,
-                    Some(tables[0].qualifier()),
-                    feedback,
-                    param_sig,
-                    resource_sig,
-                    stats_gen,
-                );
+                let (agg_strategy, post_agg_cost, post_agg_ordering) = if is_index_agg_eligible {
+                    let cost = if bound.aggregates.iter().all(|a| {
+                        matches!(
+                            a,
+                            AggregateExpr::Function {
+                                func: AggregateFunction::Min | AggregateFunction::Max,
+                                ..
+                            }
+                        )
+                    }) {
+                        CostModel::primary_point_lookup_cost()
+                    } else {
+                        CostModel::primary_point_lookup_cost() + (cur_rows * 0.05).max(1.0)
+                    };
+                    (
+                        Some(AggregateStrategy::Index),
+                        cost,
+                        crate::query::merge_join::OrderingProperty::default(),
+                    )
+                } else {
+                    plan_aggregation_strategy(
+                        cur_cost,
+                        cur_rows,
+                        Some(&scan_ordering),
+                        &bound.group_by,
+                        &bound.aggregates,
+                        Some(tables[0].qualifier()),
+                        feedback,
+                        param_sig,
+                        resource_sig,
+                        stats_gen,
+                    )
+                };
                 cur_cost = post_agg_cost;
                 let current_ordering = post_agg_ordering;
 
-                if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
+                if is_index_agg_eligible {
+                    cur_rows = 1.0;
+                } else if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
                     cur_rows = CardinalityEstimator::estimate_group_by_cardinality(
                         cur_rows,
                         &bound.group_by,
@@ -3823,6 +3934,16 @@ impl Optimizer {
                     }
                 };
 
+                let mut early_term = false;
+                if let Some(rg) = root_row_goal.as_ref() {
+                    if !sort_required && !top_n {
+                        early_term = true;
+                        cur_cost = (cur_cost * (rg.k() as f64 / cur_rows.max(1.0)))
+                            .max(CostModel::primary_point_lookup_cost());
+                        cur_rows = cur_rows.min(rg.k() as f64);
+                    }
+                }
+
                 let plan = PhysicalPlan {
                     ctes: bound.ctes.clone(),
                     base_table: base_table_scan.clone(),
@@ -3846,7 +3967,8 @@ impl Optimizer {
                     row_goal: base_table_scan.row_goal.or(root_row_goal),
                     estimated_rows_examined: base_table_scan.estimated_rows_examined,
                     estimated_qualifying_rows: base_table_scan.estimated_qualifying_rows,
-                    row_goal_early_termination: base_table_scan.early_termination_possible,
+                    row_goal_early_termination: early_term
+                        || base_table_scan.early_termination_possible,
                     total_cost: cur_cost,
                     estimated_rows: cur_rows,
                 };
@@ -3935,7 +4057,7 @@ impl Optimizer {
                 ConstraintSet::extract_from_conjuncts(&where_conjuncts, &mut metrics);
             let req_cols = compute_query_required_columns(bound);
             let ref_cols = collect_table_referenced_columns(&tables[0], bound, &where_conjuncts);
-            let candidate_scans = plan_table_scan_candidates(
+            let mut candidate_scans = plan_table_scan_candidates(
                 &tables[0],
                 where_conjuncts.clone(),
                 Some(&ref_cols),
@@ -3946,6 +4068,20 @@ impl Optimizer {
                 stats_gen,
                 Some(&req_cols),
             );
+
+            if bound
+                .order_by
+                .iter()
+                .any(|o| o.direction == crate::query::operator::SortDirection::Descending)
+            {
+                let mut desc_scans = Vec::new();
+                for scan in &candidate_scans {
+                    let mut desc_scan = scan.clone();
+                    desc_scan.scan_direction = crate::query::operator::SortDirection::Descending;
+                    desc_scans.push(desc_scan);
+                }
+                candidate_scans.extend(desc_scans);
+            }
 
             let safe_row_goal = bound.group_by.is_empty()
                 && bound.aggregates.is_empty()
@@ -3959,6 +4095,7 @@ impl Optimizer {
                 None
             };
             let table_rows = CardinalityEstimator::estimate_table_rows(tables[0].stats.as_ref());
+            let is_index_agg_eligible = is_index_aggregate_eligible(bound, tables);
 
             let mut best_plan_info: Option<(
                 PhysicalTableScan,
@@ -3979,19 +4116,26 @@ impl Optimizer {
                         &tables[0],
                         &base_table_scan,
                     );
-                let (agg_strategy, post_agg_cost, post_agg_ordering) = plan_aggregation_strategy(
-                    cur_cost,
-                    cur_rows,
-                    Some(&scan_ordering),
-                    &bound.group_by,
-                    &bound.aggregates,
-                    Some(tables[0].qualifier()),
-                    feedback,
-                    param_sig,
-                    resource_sig,
-                    stats_gen,
-                );
-                cur_cost = post_agg_cost;
+                let (mut agg_strategy, post_agg_cost, post_agg_ordering) =
+                    plan_aggregation_strategy(
+                        cur_cost,
+                        cur_rows,
+                        Some(&scan_ordering),
+                        &bound.group_by,
+                        &bound.aggregates,
+                        Some(tables[0].qualifier()),
+                        feedback,
+                        param_sig,
+                        resource_sig,
+                        stats_gen,
+                    );
+
+                if is_index_agg_eligible {
+                    agg_strategy = Some(AggregateStrategy::Index);
+                    cur_cost = CostModel::primary_point_lookup_cost();
+                } else {
+                    cur_cost = post_agg_cost;
+                }
                 let mut current_ordering = post_agg_ordering;
 
                 if !bound.group_by.is_empty() || !bound.aggregates.is_empty() {
@@ -4712,6 +4856,7 @@ pub fn plan_table_scan_candidates(
             late_materialization: false,
             index_covered_filter: None,
             base_record_filter: None,
+            scan_direction: crate::query::operator::SortDirection::Ascending,
         }];
     }
 
@@ -6288,6 +6433,7 @@ pub fn plan_table_scan_candidates(
                 late_materialization: cand.late_materialization,
                 index_covered_filter: cand.index_covered_filter,
                 base_record_filter: cand.base_record_filter,
+                scan_direction: crate::query::operator::SortDirection::Ascending,
             }
         })
         .collect()

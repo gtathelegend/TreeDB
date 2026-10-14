@@ -9,6 +9,8 @@ use crate::index::node::INVALID_PAGE_ID;
 use crate::index::secondary::{
     IndexKey, SecondaryIndex, SecondaryInternalNode, SEC_INTERNAL_HEADER_SIZE, SEC_LEAF_HEADER_SIZE,
 };
+use crate::query::expr::Expr;
+use crate::query::operator::SortDirection;
 use crate::query::stats::{ColumnStatistics, IndexStatistics, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::{PageType, PAGE_PAYLOAD_SIZE};
@@ -829,6 +831,75 @@ impl<'a> Table<'a> {
         Ok(rows)
     }
 
+    /// Performs an ordered range scan over primary keys returning visible rows that pass `filter`,
+    /// terminating early as soon as `limit` qualifying rows are collected.
+    pub fn scan_with_filter_and_limit<F>(
+        &mut self,
+        start: Option<&Value>,
+        end: Option<&Value>,
+        limit: Option<usize>,
+        direction: SortDirection,
+        mut filter: F,
+    ) -> Result<(Vec<Row>, usize)>
+    where
+        F: FnMut(&Row) -> Result<bool>,
+    {
+        if limit == Some(0) {
+            return Ok((Vec::new(), 0));
+        }
+
+        let start_key = match start {
+            Some(v) => {
+                self.validate_pk_type(v)?;
+                Some(v.encode_to_canonical_key()?)
+            }
+            None => None,
+        };
+
+        let end_key = match end {
+            Some(v) => {
+                self.validate_pk_type(v)?;
+                Some(v.encode_to_canonical_key()?)
+            }
+            None => None,
+        };
+
+        let rids = match direction {
+            SortDirection::Ascending => self.tree.scan(self.buffer_pool, start_key, end_key)?,
+            SortDirection::Descending => {
+                self.tree
+                    .scan_reverse(self.buffer_pool, start_key, end_key, None)?
+            }
+        };
+
+        let mut rows = Vec::with_capacity(limit.unwrap_or(16).min(1024));
+        let mut entries_examined = 0;
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+
+        for (_k, rid) in rids {
+            entries_examined += 1;
+            if let Some(row) = self.record_store.with_visible_payload(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                &snapshot,
+                |bytes| self.metadata.schema.decode_tuple(bytes),
+            )? {
+                if filter(&row)? {
+                    rows.push(row);
+                    if let Some(lim) = limit {
+                        if rows.len() >= lim {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((rows, entries_examined))
+    }
+
     /// Performs a point lookup on a secondary index, returning all matching rows.
     pub fn index_lookup(&mut self, index_name: &str, value: &Value) -> Result<Vec<Row>> {
         let (meta, sec_idx) = self
@@ -951,6 +1022,74 @@ impl<'a> Table<'a> {
         }
 
         Ok(rows)
+    }
+
+    /// Performs an ordered range scan over a secondary index, returning visible rows that pass `filter`,
+    /// terminating early as soon as `limit` qualifying rows are collected.
+    pub fn index_scan_with_filter_and_limit<F>(
+        &mut self,
+        index_name: &str,
+        start: Option<&Value>,
+        end: Option<&Value>,
+        limit: Option<usize>,
+        direction: SortDirection,
+        mut filter: F,
+    ) -> Result<(Vec<Row>, usize)>
+    where
+        F: FnMut(&Row) -> Result<bool>,
+    {
+        if limit == Some(0) {
+            return Ok((Vec::new(), 0));
+        }
+
+        let sec_idx = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let start_key = start.map(IndexKey::from_value);
+        let end_key = end.map(IndexKey::from_value);
+
+        let rids = match direction {
+            SortDirection::Ascending => {
+                sec_idx.scan_rids(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?
+            }
+            SortDirection::Descending => sec_idx.scan_rids_reverse(
+                self.buffer_pool,
+                start_key.as_ref(),
+                end_key.as_ref(),
+                None,
+            )?,
+        };
+
+        let mut rows = Vec::with_capacity(limit.unwrap_or(16).min(1024));
+        let mut entries_examined = 0;
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+
+        for rid in rids {
+            entries_examined += 1;
+            if let Some(row) = self.record_store.with_exact_version_if_visible(
+                self.buffer_pool,
+                rid,
+                reader_txn,
+                &snapshot,
+                |_meta, bytes| self.metadata.schema.decode_tuple(bytes),
+            )? {
+                if filter(&row)? {
+                    rows.push(row);
+                    if let Some(lim) = limit {
+                        if rows.len() >= lim {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((rows, entries_examined))
     }
 
     /// Performs a composite point or prefix lookup on a secondary index, returning matching record IDs.
@@ -1147,19 +1286,205 @@ impl<'a> Table<'a> {
             });
         }
 
-        let (rows, _) = self.scan_index_only_entries_raw(index_name, scan_type, limit)?;
+        let (rows, _) =
+            self.scan_index_only_entries_raw(index_name, scan_type, limit, |_| Ok(true))?;
         Ok(rows)
+    }
+
+    /// Performs an index-only scan on a secondary index with limit, sort direction, and residual filter.
+    pub fn index_only_scan_with_options<F>(
+        &mut self,
+        index_name: &str,
+        scan_type: &crate::query::optimizer::SecondaryScanType,
+        limit: Option<usize>,
+        direction: SortDirection,
+        mut filter: F,
+    ) -> Result<(Vec<Row>, usize)>
+    where
+        F: FnMut(&Row) -> Result<bool>,
+    {
+        if limit == Some(0) {
+            return Ok((Vec::new(), 0));
+        }
+
+        let (meta, sec_idx) = self
+            .indexes
+            .iter()
+            .find(|(m, _)| m.name == index_name)
+            .map(|(m, s)| (m.clone(), *s))
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        if sec_idx.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        if let crate::query::optimizer::SecondaryScanType::SkipScan {
+            skipped_prefix_columns,
+            constrained_columns,
+        } = scan_type
+        {
+            let constrained_values: Vec<Value> =
+                constrained_columns.iter().map(|(_, v)| v.clone()).collect();
+            let (rows, stats) = self.index_only_skip_scan(
+                index_name,
+                skipped_prefix_columns.len(),
+                &constrained_values,
+            )?;
+            let mut filtered = Vec::new();
+            for r in rows {
+                if filter(&r)? {
+                    filtered.push(r);
+                    if let Some(l) = limit {
+                        if filtered.len() >= l {
+                            break;
+                        }
+                    }
+                }
+            }
+            return Ok((filtered, stats.index_entries_examined));
+        }
+
+        if direction == SortDirection::Ascending {
+            return self.scan_index_only_entries_raw(index_name, scan_type, limit, filter);
+        }
+
+        let (start_bound, end_bound) = match scan_type {
+            crate::query::optimizer::SecondaryScanType::RangeScan { start, end } => (
+                start.as_ref().map(IndexKey::from_value),
+                end.as_ref().map(IndexKey::from_value),
+            ),
+            crate::query::optimizer::SecondaryScanType::PointLookup(val) => {
+                let key = if meta.column_indices.len() == 1 {
+                    IndexKey::from_value(val)
+                } else {
+                    crate::index::composite::CompositeIndexKey::from_values(std::slice::from_ref(
+                        val,
+                    ))
+                    .to_index_key(meta.column_indices.len())
+                };
+                let end =
+                    crate::index::composite::CompositeIndexKey::prefix_successor(key.as_bytes())
+                        .map(IndexKey::new);
+                (Some(key), end)
+            }
+            crate::query::optimizer::SecondaryScanType::CompositePointLookup(vals) => {
+                let key = crate::index::composite::CompositeIndexKey::from_values(vals)
+                    .to_index_key(meta.column_indices.len());
+                let end =
+                    crate::index::composite::CompositeIndexKey::prefix_successor(key.as_bytes())
+                        .map(IndexKey::new);
+                (Some(key), end)
+            }
+            crate::query::optimizer::SecondaryScanType::PrefixScan(prefix_vals) => {
+                if prefix_vals.len() == meta.column_indices.len() {
+                    let key = crate::index::composite::CompositeIndexKey::from_values(prefix_vals)
+                        .to_index_key(meta.column_indices.len());
+                    let end = crate::index::composite::CompositeIndexKey::prefix_successor(
+                        key.as_bytes(),
+                    )
+                    .map(IndexKey::new);
+                    (Some(key), end)
+                } else {
+                    let start_bytes =
+                        crate::index::composite::CompositeIndexKey::encode_prefix_values(
+                            prefix_vals,
+                            meta.column_indices.len(),
+                        );
+                    let end_bytes =
+                        crate::index::composite::CompositeIndexKey::prefix_successor(&start_bytes);
+                    (
+                        Some(IndexKey::new(start_bytes)),
+                        end_bytes.map(IndexKey::new),
+                    )
+                }
+            }
+            crate::query::optimizer::SecondaryScanType::SkipScan { .. } => unreachable!(),
+        };
+
+        let schema_len = self.metadata.schema.columns.len();
+        let key_col_types: Vec<crate::engine::types::DataType> = meta
+            .column_indices
+            .iter()
+            .map(|&i| self.metadata.schema.columns[i].data_type)
+            .collect();
+        let inc_col_types: Vec<crate::engine::types::DataType> = meta
+            .include_column_indices
+            .iter()
+            .map(|&i| self.metadata.schema.columns[i].data_type)
+            .collect();
+
+        let entries = match direction {
+            SortDirection::Ascending => {
+                sec_idx.scan_entries(self.buffer_pool, start_bound.as_ref(), end_bound.as_ref())?
+            }
+            SortDirection::Descending => sec_idx.scan_entries_reverse(
+                self.buffer_pool,
+                start_bound.as_ref(),
+                end_bound.as_ref(),
+                None,
+            )?,
+        };
+
+        let mut rows = Vec::with_capacity(limit.unwrap_or(16).min(1024));
+        let mut entries_examined = 0;
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+
+        for entry in entries {
+            entries_examined += 1;
+            if !self.is_rid_visible(entry.rid, reader_txn, &snapshot)? {
+                continue;
+            }
+
+            let mut row_values = vec![Value::Null; schema_len];
+            if meta.column_indices.len() == 1 {
+                let val = IndexKey::decode_bytes(entry.key.as_bytes(), key_col_types[0])?;
+                row_values[meta.column_indices[0]] = val;
+            } else {
+                let key_values = crate::index::composite::CompositeIndexKey::decode_values(
+                    entry.key.as_bytes(),
+                    &key_col_types,
+                )?;
+                for (&col_idx, val) in meta.column_indices.iter().zip(key_values) {
+                    row_values[col_idx] = val;
+                }
+            }
+
+            if !meta.include_column_indices.is_empty() && !entry.payload.is_empty() {
+                let inc_values =
+                    crate::index::covering::CoveredPayload::decode(&entry.payload, &inc_col_types)?;
+                for (&inc_idx, val) in meta.include_column_indices.iter().zip(inc_values) {
+                    row_values[inc_idx] = val;
+                }
+            }
+
+            let row = Row::new(row_values);
+            if filter(&row)? {
+                rows.push(row);
+                if let Some(lim) = limit {
+                    if rows.len() >= lim {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok((rows, entries_examined))
     }
 
     /// Internal raw page scanner for secondary index-only scans.
     /// Traverses raw leaf pages and evaluates MVCC visibility per entry without allocating intermediate
     /// `SecondaryLeafEntry` objects, decoding only visible qualifying rows directly.
-    pub(crate) fn scan_index_only_entries_raw(
+    pub(crate) fn scan_index_only_entries_raw<F>(
         &mut self,
         index_name: &str,
         scan_type: &crate::query::optimizer::SecondaryScanType,
         limit: Option<usize>,
-    ) -> Result<(Vec<Row>, usize)> {
+        mut filter: F,
+    ) -> Result<(Vec<Row>, usize)>
+    where
+        F: FnMut(&Row) -> Result<bool>,
+    {
         let (meta, sec_idx) = self
             .indexes
             .iter()
@@ -1400,11 +1725,14 @@ impl<'a> Table<'a> {
                     }
                 }
 
-                rows.push(Row::new(row_values));
-                if let Some(lim) = limit {
-                    if rows.len() >= lim {
-                        stopped = true;
-                        break;
+                let row = Row::new(row_values);
+                if filter(&row)? {
+                    rows.push(row);
+                    if let Some(lim) = limit {
+                        if rows.len() >= lim {
+                            stopped = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1429,6 +1757,325 @@ impl<'a> Table<'a> {
             Ok(Some(row))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Performs streaming index count without materializing full output rows.
+    pub fn count_index_entries(
+        &mut self,
+        index_name: Option<&str>,
+        scan_type: Option<&crate::query::optimizer::SecondaryScanType>,
+        start_bound: Option<&Value>,
+        end_bound: Option<&Value>,
+        filter: Option<&Expr>,
+        count_column: Option<&str>,
+    ) -> Result<u64> {
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+        let mut count: u64 = 0;
+
+        match index_name {
+            None => {
+                let start_key = match start_bound {
+                    Some(v) => {
+                        self.validate_pk_type(v)?;
+                        Some(v.encode_to_canonical_key()?)
+                    }
+                    None => None,
+                };
+                let end_key = match end_bound {
+                    Some(v) => {
+                        self.validate_pk_type(v)?;
+                        Some(v.encode_to_canonical_key()?)
+                    }
+                    None => None,
+                };
+                let rids = self.tree.scan(self.buffer_pool, start_key, end_key)?;
+                for (_k, rid) in rids {
+                    if !self.is_rid_visible(rid, reader_txn, &snapshot)? {
+                        continue;
+                    }
+                    if count_column.is_some() || filter.is_some() {
+                        if let Some(row) = self.get_by_rid(rid)? {
+                            if let Some(col) = count_column {
+                                let col_idx = self
+                                    .metadata
+                                    .schema
+                                    .column_index(col)
+                                    .ok_or_else(|| Error::ColumnNotFound(col.to_string()))?;
+                                let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
+                                if val.is_null() {
+                                    continue;
+                                }
+                            }
+                            if let Some(f) = filter {
+                                if f.evaluate(&row, &self.metadata.schema)? != Value::Boolean(true)
+                                {
+                                    continue;
+                                }
+                            }
+                            count += 1;
+                        }
+                    } else {
+                        count += 1;
+                    }
+                }
+            }
+            Some(idx_name) => {
+                let (meta, sec_idx) = self
+                    .indexes
+                    .iter()
+                    .find(|(m, _)| m.name == idx_name)
+                    .map(|(m, s)| (m.clone(), *s))
+                    .ok_or_else(|| Error::IndexNotFound(idx_name.to_string()))?;
+
+                if sec_idx.is_empty() {
+                    return Ok(0);
+                }
+
+                let (start_key, end_key) = match scan_type {
+                    Some(crate::query::optimizer::SecondaryScanType::RangeScan { start, end }) => (
+                        start.as_ref().map(IndexKey::from_value),
+                        end.as_ref().map(IndexKey::from_value),
+                    ),
+                    Some(crate::query::optimizer::SecondaryScanType::PointLookup(val)) => {
+                        let key = if meta.column_indices.len() == 1 {
+                            IndexKey::from_value(val)
+                        } else {
+                            crate::index::composite::CompositeIndexKey::from_values(
+                                std::slice::from_ref(val),
+                            )
+                            .to_index_key(meta.column_indices.len())
+                        };
+                        (Some(key.clone()), Some(key))
+                    }
+                    Some(crate::query::optimizer::SecondaryScanType::CompositePointLookup(
+                        vals,
+                    )) => {
+                        let key = crate::index::composite::CompositeIndexKey::from_values(vals)
+                            .to_index_key(meta.column_indices.len());
+                        (Some(key.clone()), Some(key))
+                    }
+                    Some(crate::query::optimizer::SecondaryScanType::PrefixScan(prefix_vals)) => {
+                        let start_bytes =
+                            crate::index::composite::CompositeIndexKey::encode_prefix_values(
+                                prefix_vals,
+                                meta.column_indices.len(),
+                            );
+                        let end_bytes =
+                            crate::index::composite::CompositeIndexKey::prefix_successor(
+                                &start_bytes,
+                            );
+                        (
+                            Some(IndexKey::new(start_bytes)),
+                            end_bytes.map(IndexKey::new),
+                        )
+                    }
+                    None => (
+                        start_bound.map(IndexKey::from_value),
+                        end_bound.map(IndexKey::from_value),
+                    ),
+                    _ => (None, None),
+                };
+
+                let col_type = if !meta.column_indices.is_empty() {
+                    self.metadata.schema.columns[meta.column_indices[0]].data_type
+                } else {
+                    crate::engine::types::DataType::Int64
+                };
+
+                let entries =
+                    sec_idx.scan_entries(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?;
+                for entry in entries {
+                    if !self.is_rid_visible(entry.rid, reader_txn, &snapshot)? {
+                        continue;
+                    }
+                    if let Some(col) = count_column {
+                        if meta.column_indices.len() == 1
+                            && self.metadata.schema.columns[meta.column_indices[0]].name == col
+                        {
+                            let val = entry.key.to_value(col_type)?;
+                            if val.is_null() {
+                                continue;
+                            }
+                        } else if let Some(row) = self.get_by_rid(entry.rid)? {
+                            let col_idx = self
+                                .metadata
+                                .schema
+                                .column_index(col)
+                                .ok_or_else(|| Error::ColumnNotFound(col.to_string()))?;
+                            let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
+                            if val.is_null() {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    if let Some(f) = filter {
+                        if let Some(row) = self.get_by_rid(entry.rid)? {
+                            if f.evaluate(&row, &self.metadata.schema)? != Value::Boolean(true) {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    count += 1;
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Evaluates MIN or MAX over an indexed column using boundary seek and early termination.
+    pub fn index_min_max(
+        &mut self,
+        index_name: Option<&str>,
+        col_name: &str,
+        is_min: bool,
+        start_bound: Option<&Value>,
+        end_bound: Option<&Value>,
+        filter: Option<&Expr>,
+    ) -> Result<Option<Value>> {
+        let reader_txn = self.reader_txn();
+        let snapshot = self.current_snapshot();
+
+        match index_name {
+            None => {
+                let start_key = match start_bound {
+                    Some(v) => {
+                        self.validate_pk_type(v)?;
+                        Some(v.encode_to_canonical_key()?)
+                    }
+                    None => None,
+                };
+                let end_key = match end_bound {
+                    Some(v) => {
+                        self.validate_pk_type(v)?;
+                        Some(v.encode_to_canonical_key()?)
+                    }
+                    None => None,
+                };
+
+                let rids = if is_min {
+                    self.tree.scan(self.buffer_pool, start_key, end_key)?
+                } else {
+                    self.tree
+                        .scan_reverse(self.buffer_pool, start_key, end_key, None)?
+                };
+
+                let pk_type = self.metadata.schema.primary_key_column().data_type;
+                for (k, rid) in rids {
+                    if !self.is_rid_visible(rid, reader_txn, &snapshot)? {
+                        continue;
+                    }
+                    if let Some(f) = filter {
+                        if let Some(row) = self.get_by_rid(rid)? {
+                            if f.evaluate(&row, &self.metadata.schema)? != Value::Boolean(true) {
+                                continue;
+                            }
+                            let col_idx = self
+                                .metadata
+                                .schema
+                                .column_index(col_name)
+                                .ok_or_else(|| Error::ColumnNotFound(col_name.to_string()))?;
+                            let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
+                            if !val.is_null() {
+                                return Ok(Some(val));
+                            }
+                        }
+                    } else {
+                        let val = Value::decode_from_canonical_key(k, pk_type)?;
+                        if !val.is_null() {
+                            return Ok(Some(val));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Some(idx_name) => {
+                let (meta, sec_idx) = self
+                    .indexes
+                    .iter()
+                    .find(|(m, _)| m.name == idx_name)
+                    .map(|(m, s)| (m.clone(), *s))
+                    .ok_or_else(|| Error::IndexNotFound(idx_name.to_string()))?;
+
+                if sec_idx.is_empty() {
+                    return Ok(None);
+                }
+
+                let start_key = start_bound.map(IndexKey::from_value);
+                let end_key = end_bound.map(IndexKey::from_value);
+
+                let entries = if is_min {
+                    sec_idx.scan_entries(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?
+                } else {
+                    sec_idx.scan_entries_reverse(
+                        self.buffer_pool,
+                        start_key.as_ref(),
+                        end_key.as_ref(),
+                        None,
+                    )?
+                };
+
+                let key_col_types: Vec<crate::engine::types::DataType> = meta
+                    .column_indices
+                    .iter()
+                    .map(|&i| self.metadata.schema.columns[i].data_type)
+                    .collect();
+
+                let target_col_idx_in_key = meta
+                    .column_indices
+                    .iter()
+                    .position(|&i| self.metadata.schema.columns[i].name == col_name);
+
+                for entry in entries {
+                    if !self.is_rid_visible(entry.rid, reader_txn, &snapshot)? {
+                        continue;
+                    }
+
+                    let val = if let Some(pos) = target_col_idx_in_key {
+                        if meta.column_indices.len() == 1 {
+                            entry.key.to_value(key_col_types[0])?
+                        } else {
+                            let values = crate::index::composite::CompositeIndexKey::decode_values(
+                                entry.key.as_bytes(),
+                                &key_col_types,
+                            )?;
+                            values.get(pos).cloned().unwrap_or(Value::Null)
+                        }
+                    } else if let Some(row) = self.get_by_rid(entry.rid)? {
+                        let col_idx = self
+                            .metadata
+                            .schema
+                            .column_index(col_name)
+                            .ok_or_else(|| Error::ColumnNotFound(col_name.to_string()))?;
+                        row.get(col_idx).cloned().unwrap_or(Value::Null)
+                    } else {
+                        continue;
+                    };
+
+                    if val.is_null() {
+                        continue;
+                    }
+
+                    if let Some(f) = filter {
+                        if let Some(row) = self.get_by_rid(entry.rid)? {
+                            if f.evaluate(&row, &self.metadata.schema)? != Value::Boolean(true) {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    return Ok(Some(val));
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -1666,7 +2313,7 @@ impl<'a> Table<'a> {
             };
 
             let (probe_rows, examined) =
-                self.scan_index_only_entries_raw(index_name, &scan_type, None)?;
+                self.scan_index_only_entries_raw(index_name, &scan_type, None, |_| Ok(true))?;
             stats.index_entries_examined += examined;
             rows.extend(probe_rows);
         }

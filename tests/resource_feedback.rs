@@ -372,6 +372,7 @@ fn test_r194_memory_budget_differences_isolate_feedback() -> Result<()> {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_r195_plan_cache_does_not_reuse_incompatible_resource_plans() -> Result<()> {
+    use treedb::query::operator::SortDirection;
     use treedb::query::optimizer::{AccessPath, PhysicalPlan, PhysicalTableScan};
     use treedb::query::plan_cache::{PlanCache, PlanValidity};
 
@@ -390,6 +391,7 @@ fn test_r195_plan_cache_does_not_reuse_incompatible_resource_plans() -> Result<(
             table_name: "t".to_string(),
             table_alias: None,
             access_path: AccessPath::FullTableScan,
+            scan_direction: SortDirection::Ascending,
             residual_filter: None,
             estimated_rows: 100.0,
             cost: 10.0,

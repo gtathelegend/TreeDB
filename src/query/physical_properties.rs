@@ -916,13 +916,17 @@ pub fn ordering_property_for_table_scan(
     if table.is_cte {
         return OrderingProperty::default();
     }
+    let (direction, nulls_first) = match scan.scan_direction {
+        SortDirection::Ascending => (SortDirection::Ascending, true),
+        SortDirection::Descending => (SortDirection::Descending, false),
+    };
     match &scan.access_path {
         AccessPath::PrimaryRangeScan { .. } | AccessPath::FullTableScan => {
             let pk_col = table.schema.primary_key_column();
             OrderingProperty::new(vec![OrderingColumn {
                 column: pk_col.name.clone(),
-                direction: SortDirection::Ascending,
-                nulls_first: true,
+                direction,
+                nulls_first,
             }])
         }
         AccessPath::SecondaryIndexScan {
@@ -948,8 +952,8 @@ pub fn ordering_property_for_table_scan(
                             .into_iter()
                             .map(|name| OrderingColumn {
                                 column: name,
-                                direction: SortDirection::Ascending,
-                                nulls_first: true,
+                                direction,
+                                nulls_first,
                             })
                             .collect();
                         OrderingProperty::new(cols)
@@ -961,8 +965,8 @@ pub fn ordering_property_for_table_scan(
                             .skip(skip)
                             .map(|name| OrderingColumn {
                                 column: name,
-                                direction: SortDirection::Ascending,
-                                nulls_first: true,
+                                direction,
+                                nulls_first,
                             })
                             .collect();
                         OrderingProperty::new(cols)

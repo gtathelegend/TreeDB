@@ -220,6 +220,7 @@ pub fn canonicalize_plan(
                 let _ = write!(out, "Streaming(sort={})", sort_required);
             }
             Some(AggregateStrategy::External) => out.push_str("External"),
+            Some(AggregateStrategy::Index) => out.push_str("Index"),
             None => out.push_str("None"),
         }
         out.push_str(",grp=[");
@@ -387,6 +388,9 @@ pub fn canonicalize_table_scan(scan: &PhysicalTableScan, out: &mut String) {
     }
     if scan.early_termination_possible {
         out.push_str(",early_term=true");
+    }
+    if scan.scan_direction == crate::query::operator::SortDirection::Descending {
+        out.push_str(",direction=desc");
     }
 
     out.push(')');

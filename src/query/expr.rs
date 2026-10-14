@@ -475,6 +475,23 @@ pub fn resolve_column_in_schema<'a>(schema: &'a Schema, name: &str) -> Option<(u
 }
 
 impl Expr {
+    /// Returns true if this expression contains any subquery AST node.
+    pub fn contains_subquery(&self) -> bool {
+        match self {
+            Expr::Subquery(_) => true,
+            Expr::Binary { left, right, .. } => {
+                left.contains_subquery() || right.contains_subquery()
+            }
+            Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+                expr.contains_subquery()
+            }
+            Expr::InList { expr, list, .. } => {
+                expr.contains_subquery() || list.iter().any(|e| e.contains_subquery())
+            }
+            _ => false,
+        }
+    }
+
     /// Creates a literal expression from a `Value`.
     pub fn literal(value: impl Into<Value>) -> Self {
         Expr::Literal(value.into())

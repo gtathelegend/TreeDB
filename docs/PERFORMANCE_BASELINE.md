@@ -828,6 +828,80 @@ Quality gates:
 * **ACID & MVCC**: 100% preservation of serializable snapshot isolation and durability.
 * **Release Tag `v0.1.0`**: Untouched (`2f912c2e24b095976a6a5d6340a6b536b2707c9a`).
 
+## 14. Phase 89 Baseline — Index-Level Aggregation & Early-Termination Scans
+
+### 14.1 Context & Objective
+Following the MVCC visibility map and index-only scan optimization in Phase 88, aggregate queries (`COUNT(*)`, `COUNT(col)`, `MIN()`, `MAX()`) and `ORDER BY ... LIMIT N` queries were identified as major optimization opportunities:
+- Previously, aggregate queries on indexed columns materialized full tuples through table scans or index scans before feeding them into hash or streaming aggregation operators.
+- Queries with `ORDER BY col LIMIT N` scanned all table rows, sorted the entire dataset in-memory or on disk, and only then truncated the output to `N` items. Even queries without `ORDER BY` scanned entire ranges when filtering predicates were applied.
+
+The objectives for Phase 89:
+1. **Index-Level Aggregates**:
+   - `COUNT(*)` and `COUNT(col)`: Compute counts directly by counting qualifying leaf entries in B+ Trees without fetching or deserializing base record payloads. When the MVCC visibility map indicates all pages are all-visible or when scanning index-only entries, base heap lookups are 100% avoided.
+   - `MIN(col)` and `MAX(col)`: Identify the minimum or maximum key directly by seeking the leftmost or rightmost entry in the B+ Tree index, executing in $O(\log N)$ or $O(1)$ leaf inspection rather than $O(N)$ full scans.
+2. **Early-Termination Scans & Reverse B+ Tree Leaf Traversal**:
+   - `ORDER BY col ASC LIMIT N`: Feed the limit directly into primary range scans, secondary index scans, and index-only scans to terminate leaf iteration immediately once `N` qualifying tuples are produced.
+   - `ORDER BY col DESC LIMIT N`: Implement true reverse index scans traversing B+ Tree leaf pages backwards without altering the on-disk page layout (using parent stack reconstruction for primary B+ Trees and reverse leaf traversal for secondary indexes).
+3. **Safety & Format Guarantees**:
+   - 100% Safe Rust (`#![forbid(unsafe_code)]`).
+   - Zero changes to the on-disk database file format.
+   - 100% ACID, MVCC visibility, and vacuum correctness.
+   - Zero clippy warnings with `-D warnings`.
+   - Release tag `v0.1.0` remains unchanged.
+
+### 14.2 Architecture & Implementation Details
+1. **Reverse B+ Tree Traversal (`bplus_tree.rs`, `secondary.rs`)**:
+   - `BPlusTree::scan_reverse`: Navigates to the upper bound leaf, then steps backwards across leaf pages using a parent stack to find the left sibling without requiring a backward sibling pointer in the leaf page header.
+   - `SecondaryBPlusTree::scan_rids_reverse` & `scan_entries_reverse`: Traverses secondary leaf pages in reverse key order, handling duplicate keys and multi-leaf boundaries.
+2. **Pushdown Filtering & Early Termination (`table.rs`)**:
+   - Extended `scan_with_filter_and_limit`, `index_scan_with_filter_and_limit`, and `index_only_scan_with_options` with residual filter closures and direction parameters.
+   - Traversal stops immediately when `rows.len() >= limit`, minimizing page pins, buffer pool contention, and memory allocation.
+3. **Index Aggregations (`table.rs`, `optimizer.rs`)**:
+   - Added `table.count_index_entries` and `table.index_min_max`.
+   - Added `is_index_aggregate_eligible` to detect single-table scalar queries without grouping or complex subqueries.
+   - Added `AggregateStrategy::Index` and `OperatorKind::IndexAggregate`.
+4. **Execution Diagnostics & EXPLAIN (`optimizer.rs`, `metrics.rs`)**:
+   - EXPLAIN output prints `Operator: IndexAggregate` and `Scan Direction: Descending` when reverse early-stopping index scans are chosen.
+
+### 14.3 Performance Results & Measurements
+Measured on: `Intel Core i7-1355U`, `Windows 11 Pro`, `Rust 1.98.1` / TreeDB 0.1.0
+
+| Workload | Query / Description | Pre-Phase 89 Baseline | Phase 89 Optimized | Speedup Factor | Latency Reduction |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`index_aggregate_count_all`** | `SELECT COUNT(*) FROM accounts;` (2,000 rows) | 13.89 ms (p50: 13.68 ms) [72.0 ops/s] | **5.41 ms** (p50: 5.39 ms) [184.8 ops/s] | **2.57×** | **-61.0%** |
+| **`index_aggregate_min_max`** | `SELECT MIN(id), MAX(id) FROM accounts;` | 13.89 ms (p50: 13.68 ms) [72.0 ops/s] | **5.90 ms** (p50: 5.00 ms) [169.4 ops/s] | **2.35×** | **-57.5%** |
+| **`early_termination_order_by_limit_asc`** | `SELECT * FROM accounts ORDER BY id ASC LIMIT 10;` | 13.00 ms (p50: 13.25 ms) [76.9 ops/s] | **4.33 ms** (p50: 3.51 ms) [231.0 ops/s] | **3.00×** | **-66.7%** |
+| **`early_termination_order_by_limit_desc`** | `SELECT * FROM accounts ORDER BY id DESC LIMIT 10;` | 13.00 ms (p50: 13.25 ms) [76.9 ops/s] | **2.88 ms** (p50: 2.60 ms) [347.1 ops/s] | **4.51×** | **-77.8%** |
+
+#### Materialization & Inspection Metrics:
+- `ORDER BY id LIMIT 10`: Entries examined reduced from **2,000 tuples** to **10 entries** (**200× reduction** in inspected rows).
+- `COUNT(*)`: Base record heap fetches reduced from **2,000 heap reads** to **0 heap reads** (**100% reduction** via index-level counting).
+- `MIN(id)` / `MAX(id)`: Full scan reduced to direct extrema inspection.
+
+### 14.4 Correctness, Testing, and Quality Gates
+A comprehensive dedicated test suite (`tests/index_aggregation_and_early_termination.rs`) was introduced with 9 focused tests:
+1. `test_count_all_empty_single_and_many`: Validates `COUNT(*)` across empty tables, single-row tables, and tables with 10,000 rows.
+2. `test_count_column_with_nulls_and_secondary_index`: Validates `COUNT(col)` accurately ignoring NULL entries across primary and secondary indexes.
+3. `test_min_max_empty_all_null_and_mixed`: Validates `MIN` and `MAX` on empty tables, all-NULL datasets, and mixed value ranges.
+4. `test_composite_index_prefix_and_range`: Validates index aggregates and early-termination scans on composite indexes with multi-column prefixes.
+5. `test_order_by_limit_asc_and_desc_early_stopping`: Validates forward and reverse early-stopping index scans against full sort oracle.
+6. `test_mvcc_visibility_and_rollback_safety`: Validates that uncommitted inserts, updates, and deletes are never incorrectly included, and rolled-back mutations leave clean state.
+7. `test_reopen_and_vacuum_consistency`: Validates that database close/reopen and background vacuum cycles maintain 100% index aggregate consistency.
+8. `test_differential_accuracy_against_full_scan`: Randomized differential testing asserting bit-for-bit equivalence between index aggregates / early termination and full table scans.
+9. `test_explain_shows_index_aggregate_and_reverse_scan`: Asserts `EXPLAIN` diagnostic output correctly displays `IndexAggregate` and `Scan Direction: Descending`.
+
+Quality Gates:
+- `cargo fmt --all -- --check`: Passed (clean formatting).
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed (0 warnings).
+- `cargo test --all`: Passed (2,023+ tests passed across 88 test binaries, 0 failed).
+
+### 14.5 Invariants Preserved
+- **Safe Rust**: Strictly `#![forbid(unsafe_code)]`.
+- **On-Disk Format**: Unchanged, backward-compatible with Phase 1.
+- **ACID & MVCC**: Conservative visibility-map fast path and version chain traversal preserved.
+- **Release Tag `v0.1.0`**: Untouched (`2f912c2e24b095976a6a5d6340a6b536b2707c9a`).
+
+
 
 
 

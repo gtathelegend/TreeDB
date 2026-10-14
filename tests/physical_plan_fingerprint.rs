@@ -76,6 +76,7 @@ fn create_dummy_base_scan(table_name: &str, access_path: AccessPath) -> Physical
         table_name: table_name.to_string(),
         table_alias: None,
         access_path,
+        scan_direction: SortDirection::Ascending,
         residual_filter: None,
         estimated_rows: 100.0,
         cost: 10.0,

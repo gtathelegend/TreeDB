@@ -39,6 +39,8 @@ pub enum OperatorKind {
     Aggregate,
     /// Cost-based ordered streaming aggregation.
     StreamingAggregate,
+    /// Index-level aggregation.
+    IndexAggregate,
     /// Window function evaluation.
     Window,
     /// Subquery execution.
@@ -91,6 +93,7 @@ impl fmt::Display for OperatorKind {
             Self::NestedLoopAntiJoin => write!(f, "NestedLoopAntiJoin"),
             Self::Aggregate => write!(f, "Aggregate"),
             Self::StreamingAggregate => write!(f, "StreamingAggregate"),
+            Self::IndexAggregate => write!(f, "IndexAggregate"),
             Self::Window => write!(f, "Window"),
             Self::Subquery { kind } => write!(f, "Subquery ({kind})"),
             Self::Cte { name } => write!(f, "CTE {name}"),
@@ -757,6 +760,12 @@ pub fn format_plan_with_metrics(
                     proper_aggs = aggs.join(", ")
                 ));
             }
+            Some(crate::query::optimizer::AggregateStrategy::Index) => {
+                out.push_str(&format!(
+                    "IndexAggregate (aggs: [{proper_aggs}])\n",
+                    proper_aggs = aggs.join(", ")
+                ));
+            }
             Some(crate::query::optimizer::AggregateStrategy::External) => {
                 out.push_str(&format!(
                     "ExternalAggregate (group_by: [{}], aggs: [{proper_aggs}])\n",
@@ -776,11 +785,23 @@ pub fn format_plan_with_metrics(
             if let Some(agg_op) = find_operator_metrics(root, &|k| {
                 matches!(
                     k,
-                    OperatorKind::Aggregate | OperatorKind::StreamingAggregate
+                    OperatorKind::Aggregate
+                        | OperatorKind::StreamingAggregate
+                        | OperatorKind::IndexAggregate
                 )
             }) {
                 write_indent(&mut out, indent + 1);
-                if matches!(agg_op.kind, OperatorKind::StreamingAggregate) {
+                if matches!(agg_op.kind, OperatorKind::IndexAggregate) {
+                    out.push_str(&format!(
+                        "actual_rows: {}, early_terminated: {}\n",
+                        agg_op.actual_rows,
+                        if agg_op.counters.early_terminated {
+                            "Yes"
+                        } else {
+                            "No"
+                        },
+                    ));
+                } else if matches!(agg_op.kind, OperatorKind::StreamingAggregate) {
                     out.push_str(&format!(
                         "actual_rows: {}, group_count: {}, input_rows: {}, group_transitions: {}, max_group_size: {}, aggregate_updates: {}, sort_required: {}, sort_spilled: {}, memory_bytes: {}\n",
                         agg_op.actual_rows,

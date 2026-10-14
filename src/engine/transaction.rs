@@ -4443,8 +4443,13 @@ impl<'db> Transaction<'db> {
                 let mut skip_scan_stats: Option<crate::engine::table::SkipScanStats> = None;
                 let mut multi_index_stats: Option<crate::engine::table::MultiIndexScanStats> = None;
 
-                let can_early_stop = !plan.order_by.is_empty()
-                    && !plan.order_by_sort_required
+                let is_index_agg = matches!(
+                    plan.aggregate_strategy,
+                    Some(crate::query::optimizer::AggregateStrategy::Index)
+                );
+                let order_preserves_limit =
+                    plan.order_by.is_empty() || !plan.order_by_sort_required;
+                let can_early_stop = order_preserves_limit
                     && plan.group_by.is_empty()
                     && plan.aggregates.is_empty()
                     && plan.window_exprs.is_empty()
@@ -4467,6 +4472,7 @@ impl<'db> Transaction<'db> {
                 } else {
                     None
                 };
+                let scan_dir = plan.base_table.scan_direction;
                 let mut early_terminated = false;
                 let mut early_index_entries = 0;
 
@@ -4483,35 +4489,76 @@ impl<'db> Transaction<'db> {
                     }
                     crate::query::optimizer::AccessPath::PrimaryRangeScan { start, end } => {
                         index_lookups = 1;
-                        if let Some(k) = early_stop_bound {
-                            let mut rows = Vec::new();
-                            let all_rows = table.scan(start.as_ref(), end.as_ref())?;
-                            for row in all_rows {
-                                early_index_entries += 1;
-                                let keep = match &plan.base_table.residual_filter {
-                                    Some(f) => {
-                                        let res = self.evaluate_expr_with_outer_internal(
-                                            f,
-                                            &row,
-                                            &raw_schema,
-                                            outer_contexts,
-                                            cte_store,
-                                        )?;
-                                        match res {
-                                            Value::Boolean(b) => b,
-                                            _ => false,
+                        if is_index_agg {
+                            Vec::new()
+                        } else if let Some(k) = early_stop_bound {
+                            let has_subquery = plan
+                                .base_table
+                                .residual_filter
+                                .as_ref()
+                                .map(|f| f.contains_subquery())
+                                .unwrap_or(false);
+                            if outer_contexts.is_empty() && !has_subquery {
+                                let (rows, examined) = table.scan_with_filter_and_limit(
+                                    start.as_ref(),
+                                    end.as_ref(),
+                                    Some(k),
+                                    scan_dir,
+                                    |row| match &plan.base_table.residual_filter {
+                                        Some(f) => match f.evaluate(row, &raw_schema)? {
+                                            Value::Boolean(b) => Ok(b),
+                                            _ => Ok(false),
+                                        },
+                                        None => Ok(true),
+                                    },
+                                )?;
+                                early_index_entries = examined;
+                                if rows.len() >= k {
+                                    early_terminated = true;
+                                }
+                                rows
+                            } else {
+                                let mut rows = Vec::new();
+                                let all_rows = table.scan(start.as_ref(), end.as_ref())?;
+                                for row in all_rows {
+                                    early_index_entries += 1;
+                                    let keep = match &plan.base_table.residual_filter {
+                                        Some(f) => {
+                                            let res = self.evaluate_expr_with_outer_internal(
+                                                f,
+                                                &row,
+                                                &raw_schema,
+                                                outer_contexts,
+                                                cte_store,
+                                            )?;
+                                            match res {
+                                                Value::Boolean(b) => b,
+                                                _ => false,
+                                            }
+                                        }
+                                        None => true,
+                                    };
+                                    if keep {
+                                        rows.push(row);
+                                        if rows.len() >= k {
+                                            early_terminated = true;
+                                            break;
                                         }
                                     }
-                                    None => true,
-                                };
-                                if keep {
-                                    rows.push(row);
-                                    if rows.len() >= k {
-                                        early_terminated = true;
-                                        break;
-                                    }
                                 }
+                                rows
                             }
+                        } else if scan_dir == crate::query::operator::SortDirection::Descending
+                            && outer_contexts.is_empty()
+                        {
+                            let (rows, examined) = table.scan_with_filter_and_limit(
+                                start.as_ref(),
+                                end.as_ref(),
+                                None,
+                                scan_dir,
+                                |_| Ok(true),
+                            )?;
+                            early_index_entries = examined;
                             rows
                         } else {
                             table.scan(start.as_ref(), end.as_ref())?
@@ -4624,40 +4671,88 @@ impl<'db> Transaction<'db> {
                                     end,
                                 } => {
                                     index_lookups = 1;
-                                    if let Some(k) = early_stop_bound {
-                                        let all_rows = table.index_scan(
-                                            index_name,
-                                            start.as_ref(),
-                                            end.as_ref(),
-                                        )?;
-                                        let mut rows = Vec::new();
-                                        for row in all_rows {
-                                            early_index_entries += 1;
-                                            let keep = match &plan.base_table.residual_filter {
-                                                Some(f) => {
-                                                    let res =
-                                                        self.evaluate_expr_with_outer_internal(
-                                                            f,
-                                                            &row,
-                                                            &raw_schema,
-                                                            outer_contexts,
-                                                            cte_store,
-                                                        )?;
-                                                    match res {
-                                                        Value::Boolean(b) => b,
-                                                        _ => false,
+                                    if is_index_agg {
+                                        Vec::new()
+                                    } else if let Some(k) = early_stop_bound {
+                                        let has_subquery = plan
+                                            .base_table
+                                            .residual_filter
+                                            .as_ref()
+                                            .map(|f| f.contains_subquery())
+                                            .unwrap_or(false);
+                                        if outer_contexts.is_empty() && !has_subquery {
+                                            let (rows, examined) = table
+                                                .index_scan_with_filter_and_limit(
+                                                    index_name,
+                                                    start.as_ref(),
+                                                    end.as_ref(),
+                                                    Some(k),
+                                                    scan_dir,
+                                                    |row| match &plan.base_table.residual_filter {
+                                                        Some(f) => {
+                                                            match f.evaluate(row, &raw_schema)? {
+                                                                Value::Boolean(b) => Ok(b),
+                                                                _ => Ok(false),
+                                                            }
+                                                        }
+                                                        None => Ok(true),
+                                                    },
+                                                )?;
+                                            early_index_entries = examined;
+                                            if rows.len() >= k {
+                                                early_terminated = true;
+                                            }
+                                            rows
+                                        } else {
+                                            let all_rows = table.index_scan(
+                                                index_name,
+                                                start.as_ref(),
+                                                end.as_ref(),
+                                            )?;
+                                            let mut rows = Vec::new();
+                                            for row in all_rows {
+                                                early_index_entries += 1;
+                                                let keep = match &plan.base_table.residual_filter {
+                                                    Some(f) => {
+                                                        let res =
+                                                            self.evaluate_expr_with_outer_internal(
+                                                                f,
+                                                                &row,
+                                                                &raw_schema,
+                                                                outer_contexts,
+                                                                cte_store,
+                                                            )?;
+                                                        match res {
+                                                            Value::Boolean(b) => b,
+                                                            _ => false,
+                                                        }
+                                                    }
+                                                    None => true,
+                                                };
+                                                if keep {
+                                                    rows.push(row);
+                                                    if rows.len() >= k {
+                                                        early_terminated = true;
+                                                        break;
                                                     }
                                                 }
-                                                None => true,
-                                            };
-                                            if keep {
-                                                rows.push(row);
-                                                if rows.len() >= k {
-                                                    early_terminated = true;
-                                                    break;
-                                                }
                                             }
+                                            rows
                                         }
+                                    } else if scan_dir
+                                        == crate::query::operator::SortDirection::Descending
+                                        && outer_contexts.is_empty()
+                                    {
+                                        let (rows, examined) = table
+                                            .index_scan_with_filter_and_limit(
+                                                index_name,
+                                                start.as_ref(),
+                                                end.as_ref(),
+                                                None,
+                                                scan_dir,
+                                                |_| Ok(true),
+                                            )?;
+                                        early_index_entries = examined;
                                         rows
                                     } else {
                                         table.index_scan(index_name, start.as_ref(), end.as_ref())?
@@ -4707,14 +4802,30 @@ impl<'db> Transaction<'db> {
                             }
                             _ => {
                                 index_lookups = 1;
-                                if let Some(k) = early_stop_bound {
-                                    if plan.base_table.residual_filter.is_none() {
-                                        let rows = table.index_only_scan_with_limit(
+                                if is_index_agg {
+                                    Vec::new()
+                                } else if let Some(k) = early_stop_bound {
+                                    let has_subquery = plan
+                                        .base_table
+                                        .residual_filter
+                                        .as_ref()
+                                        .map(|f| f.contains_subquery())
+                                        .unwrap_or(false);
+                                    if outer_contexts.is_empty() && !has_subquery {
+                                        let (rows, examined) = table.index_only_scan_with_options(
                                             index_name,
                                             scan_type,
                                             Some(k),
+                                            scan_dir,
+                                            |row| match &plan.base_table.residual_filter {
+                                                Some(f) => match f.evaluate(row, &raw_schema)? {
+                                                    Value::Boolean(b) => Ok(b),
+                                                    _ => Ok(false),
+                                                },
+                                                None => Ok(true),
+                                            },
                                         )?;
-                                        early_index_entries = rows.len();
+                                        early_index_entries = examined;
                                         if rows.len() >= k {
                                             early_terminated = true;
                                         }
@@ -4752,6 +4863,19 @@ impl<'db> Transaction<'db> {
                                         }
                                         rows
                                     }
+                                } else if scan_dir
+                                    == crate::query::operator::SortDirection::Descending
+                                    && outer_contexts.is_empty()
+                                {
+                                    let (rows, examined) = table.index_only_scan_with_options(
+                                        index_name,
+                                        scan_type,
+                                        None,
+                                        scan_dir,
+                                        |_| Ok(true),
+                                    )?;
+                                    early_index_entries = examined;
+                                    rows
                                 } else {
                                     table.index_only_scan(index_name, scan_type)?
                                 }
@@ -4774,35 +4898,76 @@ impl<'db> Transaction<'db> {
                         rows
                     }
                     crate::query::optimizer::AccessPath::FullTableScan => {
-                        if let Some(k) = early_stop_bound {
-                            let all_rows = table.scan(None, None)?;
-                            let mut rows = Vec::new();
-                            for row in all_rows {
-                                early_index_entries += 1;
-                                let keep = match &plan.base_table.residual_filter {
-                                    Some(f) => {
-                                        let res = self.evaluate_expr_with_outer_internal(
-                                            f,
-                                            &row,
-                                            &raw_schema,
-                                            outer_contexts,
-                                            cte_store,
-                                        )?;
-                                        match res {
-                                            Value::Boolean(b) => b,
-                                            _ => false,
+                        if is_index_agg {
+                            Vec::new()
+                        } else if let Some(k) = early_stop_bound {
+                            let has_subquery = plan
+                                .base_table
+                                .residual_filter
+                                .as_ref()
+                                .map(|f| f.contains_subquery())
+                                .unwrap_or(false);
+                            if outer_contexts.is_empty() && !has_subquery {
+                                let (rows, examined) = table.scan_with_filter_and_limit(
+                                    None,
+                                    None,
+                                    Some(k),
+                                    scan_dir,
+                                    |row| match &plan.base_table.residual_filter {
+                                        Some(f) => match f.evaluate(row, &raw_schema)? {
+                                            Value::Boolean(b) => Ok(b),
+                                            _ => Ok(false),
+                                        },
+                                        None => Ok(true),
+                                    },
+                                )?;
+                                early_index_entries = examined;
+                                if rows.len() >= k {
+                                    early_terminated = true;
+                                }
+                                rows
+                            } else {
+                                let all_rows = table.scan(None, None)?;
+                                let mut rows = Vec::new();
+                                for row in all_rows {
+                                    early_index_entries += 1;
+                                    let keep = match &plan.base_table.residual_filter {
+                                        Some(f) => {
+                                            let res = self.evaluate_expr_with_outer_internal(
+                                                f,
+                                                &row,
+                                                &raw_schema,
+                                                outer_contexts,
+                                                cte_store,
+                                            )?;
+                                            match res {
+                                                Value::Boolean(b) => b,
+                                                _ => false,
+                                            }
+                                        }
+                                        None => true,
+                                    };
+                                    if keep {
+                                        rows.push(row);
+                                        if rows.len() >= k {
+                                            early_terminated = true;
+                                            break;
                                         }
                                     }
-                                    None => true,
-                                };
-                                if keep {
-                                    rows.push(row);
-                                    if rows.len() >= k {
-                                        early_terminated = true;
-                                        break;
-                                    }
                                 }
+                                rows
                             }
+                        } else if scan_dir == crate::query::operator::SortDirection::Descending
+                            && outer_contexts.is_empty()
+                        {
+                            let (rows, examined) = table.scan_with_filter_and_limit(
+                                None,
+                                None,
+                                None,
+                                scan_dir,
+                                |_| Ok(true),
+                            )?;
+                            early_index_entries = examined;
                             rows
                         } else {
                             table.scan(None, None)?
@@ -5591,6 +5756,256 @@ impl<'db> Transaction<'db> {
                     metric.add_child(current_op);
 
                     (schema, rows, metric)
+                }
+                Some(crate::query::optimizer::AggregateStrategy::Index) => {
+                    let mut out_cols = Vec::with_capacity(plan.aggregates.len());
+                    for agg_expr in &plan.aggregates {
+                        let dt = agg_expr.infer_type(&current_schema)?;
+                        let name = agg_expr.display_name();
+                        out_cols.push(crate::engine::types::Column::new(name, dt, true));
+                    }
+                    let grouped_schema = crate::engine::types::Schema::new_projected(out_cols);
+
+                    let mut table = self.open_table(&plan.base_table.table_name)?;
+                    let raw_schema = table.schema().clone();
+
+                    let mut agg_values = Vec::with_capacity(plan.aggregates.len());
+                    for agg in &plan.aggregates {
+                        match agg {
+                            crate::query::expr::AggregateExpr::CountAll => {
+                                let (idx_name, scan_type, start, end) = match &plan
+                                    .base_table
+                                    .access_path
+                                {
+                                    crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                                        index_name,
+                                        scan_type,
+                                        ..
+                                    }
+                                    | crate::query::optimizer::AccessPath::IndexOnlyScan {
+                                        index_name,
+                                        scan_type,
+                                        ..
+                                    } => (Some(index_name.as_str()), Some(scan_type), None, None),
+                                    crate::query::optimizer::AccessPath::PrimaryRangeScan {
+                                        start,
+                                        end,
+                                    } => (None, None, start.as_ref(), end.as_ref()),
+                                    _ => (None, None, None, None),
+                                };
+                                let count = table.count_index_entries(
+                                    idx_name,
+                                    scan_type,
+                                    start,
+                                    end,
+                                    plan.base_table.residual_filter.as_ref(),
+                                    None,
+                                )?;
+                                agg_values.push(Value::UInt64(count));
+                            }
+                            crate::query::expr::AggregateExpr::Function {
+                                func: crate::query::expr::AggregateFunction::Count,
+                                expr,
+                            } => {
+                                let count_col = match expr {
+                                    crate::query::expr::Expr::Column(col) => {
+                                        let pure =
+                                            col.split('.').next_back().unwrap_or(col.as_str());
+                                        Some(pure)
+                                    }
+                                    _ => None,
+                                };
+                                let (idx_name, scan_type, start, end) = match &plan
+                                    .base_table
+                                    .access_path
+                                {
+                                    crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                                        index_name,
+                                        scan_type,
+                                        ..
+                                    }
+                                    | crate::query::optimizer::AccessPath::IndexOnlyScan {
+                                        index_name,
+                                        scan_type,
+                                        ..
+                                    } => (Some(index_name.as_str()), Some(scan_type), None, None),
+                                    crate::query::optimizer::AccessPath::PrimaryRangeScan {
+                                        start,
+                                        end,
+                                    } => (None, None, start.as_ref(), end.as_ref()),
+                                    _ => (None, None, None, None),
+                                };
+                                let count = table.count_index_entries(
+                                    idx_name,
+                                    scan_type,
+                                    start,
+                                    end,
+                                    plan.base_table.residual_filter.as_ref(),
+                                    count_col,
+                                )?;
+                                agg_values.push(Value::UInt64(count));
+                            }
+                            crate::query::expr::AggregateExpr::Function {
+                                func: crate::query::expr::AggregateFunction::Min,
+                                expr,
+                            } => {
+                                let target_col = match expr {
+                                    crate::query::expr::Expr::Column(col) => {
+                                        col.split('.').next_back().unwrap_or(col.as_str())
+                                    }
+                                    _ => "",
+                                };
+                                let (idx_name, start, end): (
+                                    Option<String>,
+                                    Option<&Value>,
+                                    Option<&Value>,
+                                ) = match &plan.base_table.access_path {
+                                    crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                                        index_name,
+                                        scan_type,
+                                        ..
+                                    }
+                                    | crate::query::optimizer::AccessPath::IndexOnlyScan {
+                                        index_name,
+                                        scan_type,
+                                        ..
+                                    } => match scan_type {
+                                        crate::query::optimizer::SecondaryScanType::RangeScan {
+                                            start,
+                                            end,
+                                        } => {
+                                            (Some(index_name.clone()), start.as_ref(), end.as_ref())
+                                        }
+                                        _ => (Some(index_name.clone()), None, None),
+                                    },
+                                    crate::query::optimizer::AccessPath::PrimaryRangeScan {
+                                        start,
+                                        end,
+                                    } => (None, start.as_ref(), end.as_ref()),
+                                    _ => {
+                                        let is_pk =
+                                            raw_schema.columns.first().map(|c| c.name.as_str())
+                                                == Some(target_col);
+                                        if is_pk {
+                                            (None, None, None)
+                                        } else {
+                                            let sec_name = table
+                                                .indexes
+                                                .iter()
+                                                .find(|(m, _)| {
+                                                    m.column_indices.first().map(|&idx| {
+                                                        raw_schema.columns[idx].name.as_str()
+                                                    }) == Some(target_col)
+                                                })
+                                                .map(|(m, _)| m.name.clone());
+                                            (sec_name, None, None)
+                                        }
+                                    }
+                                };
+                                let min_val = table.index_min_max(
+                                    idx_name.as_deref(),
+                                    target_col,
+                                    true,
+                                    start,
+                                    end,
+                                    plan.base_table.residual_filter.as_ref(),
+                                )?;
+                                agg_values.push(min_val.unwrap_or(Value::Null));
+                            }
+                            crate::query::expr::AggregateExpr::Function {
+                                func: crate::query::expr::AggregateFunction::Max,
+                                expr,
+                            } => {
+                                let target_col = match expr {
+                                    crate::query::expr::Expr::Column(col) => {
+                                        col.split('.').next_back().unwrap_or(col.as_str())
+                                    }
+                                    _ => "",
+                                };
+                                let (idx_name, start, end): (
+                                    Option<String>,
+                                    Option<&Value>,
+                                    Option<&Value>,
+                                ) = match &plan.base_table.access_path {
+                                    crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                                        index_name,
+                                        scan_type,
+                                        ..
+                                    }
+                                    | crate::query::optimizer::AccessPath::IndexOnlyScan {
+                                        index_name,
+                                        scan_type,
+                                        ..
+                                    } => match scan_type {
+                                        crate::query::optimizer::SecondaryScanType::RangeScan {
+                                            start,
+                                            end,
+                                        } => {
+                                            (Some(index_name.clone()), start.as_ref(), end.as_ref())
+                                        }
+                                        _ => (Some(index_name.clone()), None, None),
+                                    },
+                                    crate::query::optimizer::AccessPath::PrimaryRangeScan {
+                                        start,
+                                        end,
+                                    } => (None, start.as_ref(), end.as_ref()),
+                                    _ => {
+                                        let is_pk =
+                                            raw_schema.columns.first().map(|c| c.name.as_str())
+                                                == Some(target_col);
+                                        if is_pk {
+                                            (None, None, None)
+                                        } else {
+                                            let sec_name = table
+                                                .indexes
+                                                .iter()
+                                                .find(|(m, _)| {
+                                                    m.column_indices.first().map(|&idx| {
+                                                        raw_schema.columns[idx].name.as_str()
+                                                    }) == Some(target_col)
+                                                })
+                                                .map(|(m, _)| m.name.clone());
+                                            (sec_name, None, None)
+                                        }
+                                    }
+                                };
+                                let max_val = table.index_min_max(
+                                    idx_name.as_deref(),
+                                    target_col,
+                                    false,
+                                    start,
+                                    end,
+                                    plan.base_table.residual_filter.as_ref(),
+                                )?;
+                                agg_values.push(max_val.unwrap_or(Value::Null));
+                            }
+                            _ => {
+                                return Err(Error::QueryExecutionError(
+                                    "unsupported index aggregate function".into(),
+                                ));
+                            }
+                        }
+                    }
+
+                    let grouped_rows = vec![Row::new(agg_values)];
+                    let mut agg_metric = crate::query::OperatorMetrics::new(
+                        crate::query::OperatorKind::IndexAggregate,
+                        Some(plan.estimated_rows),
+                        Some(plan.total_cost),
+                    );
+                    agg_metric.input_rows = 1;
+                    agg_metric.actual_rows = 1;
+                    agg_metric.counters.early_terminated = true;
+                    agg_metric.counters.visibility_checks_evaluated =
+                        self.db.visibility_map.stats.visibility_checks_evaluated;
+                    agg_metric.counters.visibility_checks_skipped =
+                        self.db.visibility_map.stats.visibility_checks_skipped;
+                    agg_metric.counters.visibility_map_hits =
+                        self.db.visibility_map.stats.page_map_hits
+                            + self.db.visibility_map.stats.record_map_hits;
+                    agg_metric.add_child(current_op);
+
+                    (grouped_schema, grouped_rows, agg_metric)
                 }
                 _ => {
                     let (grouped_schema, grouped_rows, agg_metrics) =
