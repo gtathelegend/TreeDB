@@ -3,6 +3,7 @@ mod buffer_pool_bench;
 mod framework;
 mod mvcc_vacuum_bench;
 mod record_store_bench;
+mod scale_bench;
 mod sql_query_bench;
 mod wal_transaction_bench;
 
@@ -16,12 +17,14 @@ use buffer_pool_bench::run_buffer_pool_benchmarks;
 use framework::BenchmarkRunner;
 use mvcc_vacuum_bench::run_mvcc_vacuum_benchmarks;
 use record_store_bench::run_record_store_benchmarks;
+use scale_bench::run_scale_benchmarks;
 use sql_query_bench::run_sql_query_benchmarks;
 use wal_transaction_bench::run_wal_transaction_benchmarks;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut selected_category: Option<String> = None;
+    let mut selected_scale: Option<String> = None;
     let mut csv_path = PathBuf::from("target/benchmark_results.csv");
 
     let mut i = 1;
@@ -30,6 +33,12 @@ fn main() {
             "--category" => {
                 if i + 1 < args.len() {
                     selected_category = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--scale" => {
+                if i + 1 < args.len() {
+                    selected_scale = Some(args[i + 1].clone());
                     i += 1;
                 }
             }
@@ -45,7 +54,8 @@ fn main() {
                 println!("Usage: cargo bench --bench benchmark_suite [-- [OPTIONS]]");
                 println!();
                 println!("Options:");
-                println!("  --category <NAME>   Run only benchmarks for category (e.g. 'bplus_tree', 'sql', 'wal', 'record', 'buffer', 'mvcc')");
+                println!("  --category <NAME>   Run only benchmarks for category (e.g. 'scale', 'bplus_tree', 'sql', 'wal', 'record', 'buffer', 'mvcc')");
+                println!("  --scale <N>         Target dataset scale for scale benchmarks ('2000', '20000', '100000', or 'all')");
                 println!("  --csv <PATH>        Export results to CSV (default: target/benchmark_results.csv)");
                 println!("  --help, -h          Show this help message");
                 return;
@@ -90,6 +100,17 @@ fn main() {
 
     if cat == "all" || cat.contains("mvcc") || cat.contains("vacuum") {
         run_mvcc_vacuum_benchmarks(&mut runner);
+    }
+
+    let selected_scales = match selected_scale.as_deref() {
+        Some("2000") | Some("2k") => vec![2_000],
+        Some("20000") | Some("20k") => vec![20_000],
+        Some("100000") | Some("100k") => vec![100_000],
+        _ => vec![2_000, 20_000, 100_000],
+    };
+
+    if cat == "all" || cat.contains("scale") {
+        run_scale_benchmarks(&mut runner, &selected_scales);
     }
 
     let suite_duration = suite_start.elapsed();
