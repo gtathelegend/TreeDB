@@ -435,7 +435,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "count_star_baseline",
             bench_count,
             bench_iters,
@@ -456,7 +456,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "count_star_optimized",
             bench_count,
             bench_iters,
@@ -477,7 +477,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "count_col_nulls_baseline",
             bench_count,
             bench_iters,
@@ -498,7 +498,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "count_col_nulls_optimized",
             bench_count,
             bench_iters,
@@ -507,7 +507,49 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
         ));
     }
 
-    // 5. MIN and MAX - Baseline
+    // 5. COUNT(col) with Selective Filter - Baseline
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT COUNT(rating + 0) FROM bench_items WHERE rating >= 80;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 1);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 91",
+            "count_col_filtered_baseline",
+            bench_count,
+            bench_iters,
+            samples,
+            "Baseline: COUNT(col) with range filter via full scan (2,000 rows evaluated)",
+        ));
+    }
+
+    // 6. COUNT(col) with Selective Filter - Optimized
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT COUNT(rating) FROM bench_items WHERE rating >= 80;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 1);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 91",
+            "count_col_filtered_optimized",
+            bench_count,
+            bench_iters,
+            samples,
+            "Optimized: Index range scan COUNT(col) (qualifying slice / zero heap fetches)",
+        ));
+    }
+
+    // 7. MIN and MAX - Baseline
     {
         let mut samples = Vec::with_capacity(bench_iters);
         for _ in 0..bench_iters {
@@ -519,7 +561,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "min_max_baseline",
             bench_count,
             bench_iters,
@@ -540,7 +582,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "min_max_optimized",
             bench_count,
             bench_iters,
@@ -561,7 +603,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "order_by_limit_asc_baseline",
             bench_count,
             bench_iters,
@@ -582,7 +624,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "order_by_limit_asc_optimized",
             bench_count,
             bench_iters,
@@ -603,7 +645,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "order_by_limit_desc_baseline",
             bench_count,
             bench_iters,
@@ -624,7 +666,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "order_by_limit_desc_optimized",
             bench_count,
             bench_iters,
@@ -645,7 +687,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "residual_filter_limit_baseline",
             bench_count,
             bench_iters,
@@ -666,7 +708,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "residual_filter_limit_optimized",
             bench_count,
             bench_iters,
@@ -687,7 +729,7 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
             samples.push(elapsed);
         }
         runner.record(BenchmarkResult::from_samples(
-            "Phase 89/90",
+            "Phase 91",
             "fallback_unsupported_aggregate",
             bench_count,
             bench_iters,

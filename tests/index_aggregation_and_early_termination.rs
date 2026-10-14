@@ -895,3 +895,203 @@ fn test_metrics_fast_path_assertion() {
     assert_eq!(metrics.total_tuples_fetched, 0);
     txn.commit().unwrap();
 }
+
+#[test]
+fn test_count_column_edge_cases_all_null_empty_all_non_null() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("count_edge_cases.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_v ON t (v);")
+        .unwrap();
+
+    // 1. Empty table
+    let res = db.execute_sql("SELECT COUNT(v) FROM t;").unwrap();
+    assert_eq!(res.rows[0].values[0], Value::UInt64(0));
+
+    // 2. All NULL rows
+    for i in 1..=20 {
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, NULL);"))
+            .unwrap();
+    }
+    let res = db.execute_sql("SELECT COUNT(v) FROM t;").unwrap();
+    assert_eq!(res.rows[0].values[0], Value::UInt64(0));
+    let res_star = db.execute_sql("SELECT COUNT(*) FROM t;").unwrap();
+    assert_eq!(res_star.rows[0].values[0], Value::UInt64(20));
+
+    // 3. All non-NULL rows added
+    for i in 21..=40 {
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, {});", i * 10))
+            .unwrap();
+    }
+    let res = db.execute_sql("SELECT COUNT(v) FROM t;").unwrap();
+    assert_eq!(res.rows[0].values[0], Value::UInt64(20));
+    let res_star = db.execute_sql("SELECT COUNT(*) FROM t;").unwrap();
+    assert_eq!(res_star.rows[0].values[0], Value::UInt64(40));
+
+    // 4. Differential check against reference engine
+    let oracle = db.execute_sql_reference("SELECT COUNT(v) FROM t;").unwrap();
+    assert_eq!(res.rows[0].values[0], oracle.rows[0].values[0]);
+}
+
+#[test]
+fn test_secondary_count_filtered_and_composite_prefix() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("sec_count_filtered.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, tenant_id BIGINT, status VARCHAR, amount BIGINT);",
+    )
+    .unwrap();
+    db.execute_statement("CREATE INDEX idx_tenant_status ON orders (tenant_id, status);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_amount ON orders (amount);")
+        .unwrap();
+
+    let mut id = 1;
+    for tenant in [100, 200] {
+        for i in 1..=100 {
+            let status = match i % 4 {
+                0 => "NULL",
+                1 => "'PENDING'",
+                2 => "'SHIPPED'",
+                _ => "'DELIVERED'",
+            };
+            let amt = if i % 5 == 0 { "NULL" } else { "50" };
+            db.execute_statement(&format!(
+                "INSERT INTO orders VALUES ({id}, {tenant}, {status}, {amt});"
+            ))
+            .unwrap();
+            id += 1;
+        }
+    }
+
+    // 1. Prefix scan COUNT(*) on tenant 100
+    let res = db
+        .execute_sql("SELECT COUNT(*) FROM orders WHERE tenant_id = 100;")
+        .unwrap();
+    let ref_res = db
+        .execute_sql_reference("SELECT COUNT(*) FROM orders WHERE tenant_id = 100;")
+        .unwrap();
+    assert_eq!(res.rows[0].values[0], Value::UInt64(100));
+    assert_eq!(res.rows[0].values[0], ref_res.rows[0].values[0]);
+
+    // 2. Secondary index range count on amount
+    let res_amt = db
+        .execute_sql("SELECT COUNT(amount) FROM orders WHERE amount >= 40 AND amount <= 60;")
+        .unwrap();
+    let ref_amt = db
+        .execute_sql_reference(
+            "SELECT COUNT(amount) FROM orders WHERE amount >= 40 AND amount <= 60;",
+        )
+        .unwrap();
+    assert_eq!(res_amt.rows[0].values[0], ref_amt.rows[0].values[0]);
+    // 200 total rows, 20% are NULL -> 160 non-NULL rows
+    assert_eq!(res_amt.rows[0].values[0], Value::UInt64(160));
+}
+
+#[test]
+fn test_secondary_count_differential_oracle_with_transactions_and_vacuum() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("diff_sec_count.treedb");
+    let mut db = TreeDb::create(&db_path, 128).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT, cat VARCHAR);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_v ON t (v);")
+        .unwrap();
+
+    // Populate initial rows
+    for i in 1..=120 {
+        let v = if i % 3 == 0 {
+            "NULL".to_string()
+        } else {
+            (i * 7).to_string()
+        };
+        db.execute_statement(&format!(
+            "INSERT INTO t VALUES ({i}, {v}, 'cat_{}');",
+            i % 4
+        ))
+        .unwrap();
+    }
+
+    // Transaction with uncommitted inserts that aborts
+    let mut tx = db.begin_transaction().unwrap();
+    for i in 121..=140 {
+        tx.execute_statement(&format!("INSERT INTO t VALUES ({i}, {i}, 'cat_0');"))
+            .unwrap();
+    }
+    tx.abort().unwrap();
+
+    // Verify equivalence after abort
+    let opt = db.execute_sql("SELECT COUNT(v) FROM t;").unwrap();
+    let oracle = db.execute_sql_reference("SELECT COUNT(v) FROM t;").unwrap();
+    assert_eq!(opt.rows[0].values[0], oracle.rows[0].values[0]);
+
+    // Transaction with committed deletes
+    let mut tx2 = db.begin_transaction().unwrap();
+    tx2.execute_statement("DELETE FROM t WHERE id <= 20;")
+        .unwrap();
+    tx2.commit().unwrap();
+
+    // Run vacuum
+    let vac_cfg = treedb::VacuumConfig::default();
+    db.vacuum(&vac_cfg).unwrap();
+
+    // Verify equivalence after vacuum
+    let opt2 = db.execute_sql("SELECT COUNT(v) FROM t;").unwrap();
+    let oracle2 = db.execute_sql_reference("SELECT COUNT(v) FROM t;").unwrap();
+    assert_eq!(opt2.rows[0].values[0], oracle2.rows[0].values[0]);
+    // 100 rows remaining (21..=120). Divisible by 3 in 21..=120: 34 rows. Non-null: 100 - 34 = 66.
+    assert_eq!(opt2.rows[0].values[0], Value::UInt64(66));
+}
+
+#[test]
+fn test_aggregate_path_selection_fallback_when_ineligible() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("path_selection_fallback.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    // Table with unindexed 'unindexed_col'
+    db.execute_statement(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, indexed_col BIGINT, unindexed_col BIGINT);",
+    )
+    .unwrap();
+    db.execute_statement("CREATE INDEX idx_col ON t (indexed_col);")
+        .unwrap();
+
+    for i in 1..=30 {
+        let u_val = if i % 2 == 0 { "NULL" } else { "100" };
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, {i}, {u_val});"))
+            .unwrap();
+    }
+
+    // 1. COUNT(unindexed_col) must fall back to normal aggregation
+    let mut txn = db.begin_transaction().unwrap();
+    let prep = txn
+        .prepare_sql("SELECT COUNT(unindexed_col) FROM t;")
+        .unwrap();
+    let (res, metrics) = txn.execute_prepared_with_metrics(&prep, &[]).unwrap();
+    assert_eq!(res.rows[0].values[0], Value::UInt64(15));
+    // Since unindexed_col has no index, rows were fetched from table scan
+    assert!(
+        metrics.total_tuples_fetched > 0,
+        "Ineligible query must fetch table rows: {}",
+        metrics.total_tuples_fetched
+    );
+    txn.commit().unwrap();
+
+    // 2. COUNT(*) is eligible and fetches 0 base records
+    let mut txn2 = db.begin_transaction().unwrap();
+    let prep2 = txn2.prepare_sql("SELECT COUNT(*) FROM t;").unwrap();
+    let (res2, metrics2) = txn2.execute_prepared_with_metrics(&prep2, &[]).unwrap();
+    assert_eq!(res2.rows[0].values[0], Value::UInt64(30));
+    assert_eq!(
+        metrics2.total_tuples_fetched, 0,
+        "Eligible COUNT(*) must avoid base heap fetches"
+    );
+    txn2.commit().unwrap();
+}

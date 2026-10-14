@@ -1158,6 +1158,111 @@ impl SecondaryIndex {
         Ok(results)
     }
 
+    /// Performs an in-place ordered scan over `[start, end)` invoking a callback for each entry
+    /// without heap-allocating `SecondaryLeafEntry` or copying key/payload bytes.
+    pub fn scan_raw_entries<F>(
+        &self,
+        buffer_pool: &mut BufferPool,
+        start: Option<&IndexKey>,
+        end: Option<&IndexKey>,
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8], RecordId) -> Result<bool>,
+    {
+        if self.is_empty() {
+            return Ok(());
+        }
+        if let (Some(s), Some(e)) = (start, end) {
+            if s >= e {
+                return Ok(());
+            }
+        }
+
+        // Descend to leftmost leaf or leaf containing start key
+        let mut curr_pid = self.root_page_id;
+        loop {
+            let page = buffer_pool.fetch_page(curr_pid)?;
+            let page_type = page.page_type();
+
+            match page_type {
+                PageType::Leaf => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    break;
+                }
+                PageType::Internal => {
+                    let next_pid = match start {
+                        Some(k) => SecondaryInternalNode::find_child_raw(page, k, true)?,
+                        None => {
+                            let payload = page.payload();
+                            if payload.len() < SEC_INTERNAL_HEADER_SIZE + 4 {
+                                buffer_pool.unpin_page(curr_pid, false)?;
+                                return Err(Error::IndexCorruption(format!(
+                                    "secondary internal page {curr_pid} corrupted header"
+                                )));
+                            }
+                            u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]])
+                        }
+                    };
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    curr_pid = next_pid;
+                }
+                other => {
+                    buffer_pool.unpin_page(curr_pid, false)?;
+                    return Err(Error::TreeCorruption(format!(
+                        "unexpected page type {other:?} at page {curr_pid} during secondary index raw scan"
+                    )));
+                }
+            }
+        }
+
+        let mut leaf_pid = curr_pid;
+        let start_bytes = start.map(|k| k.as_bytes());
+        let end_bytes = end.map(|k| k.as_bytes());
+        let mut keep_going = true;
+        let mut err: Option<Error> = None;
+
+        while leaf_pid != INVALID_PAGE_ID {
+            let page = buffer_pool.fetch_page(leaf_pid)?;
+            let (next_leaf, stopped) =
+                SecondaryLeafNode::for_each_entry_raw(page, |kbytes, pl, rid| {
+                    if let Some(s) = start_bytes {
+                        if kbytes < s {
+                            return true;
+                        }
+                    }
+                    if let Some(e) = end_bytes {
+                        if kbytes >= e {
+                            return false;
+                        }
+                    }
+                    match visitor(kbytes, pl, rid) {
+                        Ok(true) => true,
+                        Ok(false) => {
+                            keep_going = false;
+                            false
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            keep_going = false;
+                            false
+                        }
+                    }
+                })?;
+            buffer_pool.unpin_page(leaf_pid, false)?;
+
+            if let Some(e) = err {
+                return Err(e);
+            }
+            if stopped || !keep_going {
+                break;
+            }
+            leaf_pid = next_leaf;
+        }
+
+        Ok(())
+    }
+
     /// Performs an ordered reverse range scan returning `SecondaryLeafEntry`s in descending order within `[start, end)`.
     pub fn scan_entries_reverse(
         &self,

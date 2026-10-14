@@ -13,7 +13,7 @@ use crate::query::expr::Expr;
 use crate::query::operator::SortDirection;
 use crate::query::stats::{ColumnStatistics, IndexStatistics, TableStatistics};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::page::{PageType, PAGE_PAYLOAD_SIZE};
+use crate::storage::page::{PageId, PageType, PAGE_PAYLOAD_SIZE};
 use crate::storage::record_store::{RecordStore, VersionMetadata};
 use crate::wal::lsn::{TxnId, NULL_TXN};
 use crate::RecordId;
@@ -1833,59 +1833,207 @@ impl<'a> Table<'a> {
                     return Ok(0);
                 }
 
-                let col_type = if !meta.column_indices.is_empty() {
-                    self.metadata.schema.columns[meta.column_indices[0]].data_type
-                } else {
-                    crate::engine::types::DataType::Int64
+                let is_leading_count_col = count_column.is_some_and(|col| {
+                    meta.column_indices
+                        .first()
+                        .map(|&idx| self.metadata.schema.columns[idx].name.as_str())
+                        == Some(col)
+                });
+
+                // Point lookups on secondary index
+                if let Some(crate::query::optimizer::SecondaryScanType::PointLookup(val)) =
+                    scan_type
+                {
+                    if is_leading_count_col && val.is_null() {
+                        return Ok(0);
+                    }
+                    let idx_key = if meta.column_indices.len() == 1 {
+                        IndexKey::from_value(val)
+                    } else {
+                        crate::index::composite::CompositeIndexKey::from_values(
+                            std::slice::from_ref(val),
+                        )
+                        .to_index_key(meta.column_indices.len())
+                    };
+                    let rids = sec_idx.lookup(self.buffer_pool, &idx_key)?;
+                    let mut last_page: Option<(PageId, bool)> = None;
+                    for rid in rids {
+                        let is_visible = if let Some((pid, true)) = last_page {
+                            if pid == rid.page_id {
+                                true
+                            } else {
+                                let vis = self.is_rid_visible(rid, reader_txn, &snapshot)?;
+                                let page_all_visible =
+                                    self.visibility_map.as_ref().is_some_and(|vm| {
+                                        vm.is_page_all_visible(
+                                            rid.page_id,
+                                            snapshot.as_of_commit_seq,
+                                        )
+                                    });
+                                last_page = Some((rid.page_id, page_all_visible));
+                                vis
+                            }
+                        } else {
+                            let vis = self.is_rid_visible(rid, reader_txn, &snapshot)?;
+                            let page_all_visible = self.visibility_map.as_ref().is_some_and(|vm| {
+                                vm.is_page_all_visible(rid.page_id, snapshot.as_of_commit_seq)
+                            });
+                            last_page = Some((rid.page_id, page_all_visible));
+                            vis
+                        };
+
+                        if !is_visible {
+                            continue;
+                        }
+
+                        if let Some(f) = filter {
+                            if let Some(row) = self.get_by_rid(rid)? {
+                                if f.evaluate(&row, &self.metadata.schema)? != Value::Boolean(true)
+                                {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                        count += 1;
+                    }
+                    return Ok(count);
+                }
+
+                // Range or full scan bounds
+                let (mut start_key, end_key) = match scan_type {
+                    Some(crate::query::optimizer::SecondaryScanType::RangeScan { start, end }) => (
+                        start.as_ref().map(IndexKey::from_value),
+                        end.as_ref().map(IndexKey::from_value),
+                    ),
+                    Some(crate::query::optimizer::SecondaryScanType::CompositePointLookup(
+                        vals,
+                    )) => {
+                        let k = crate::index::composite::CompositeIndexKey::from_values(vals)
+                            .to_index_key(meta.column_indices.len());
+                        let end_k =
+                            crate::index::composite::CompositeIndexKey::prefix_successor(&k.bytes)
+                                .map(IndexKey::new);
+                        (Some(k), end_k)
+                    }
+                    Some(crate::query::optimizer::SecondaryScanType::PrefixScan(prefix_vals)) => {
+                        if prefix_vals.len() == meta.column_indices.len() {
+                            let k = crate::index::composite::CompositeIndexKey::from_values(
+                                prefix_vals,
+                            )
+                            .to_index_key(meta.column_indices.len());
+                            let end_k =
+                                crate::index::composite::CompositeIndexKey::prefix_successor(
+                                    &k.bytes,
+                                )
+                                .map(IndexKey::new);
+                            (Some(k), end_k)
+                        } else {
+                            let start_bytes =
+                                crate::index::composite::CompositeIndexKey::encode_prefix_values(
+                                    prefix_vals,
+                                    meta.column_indices.len(),
+                                );
+                            let end_bytes =
+                                crate::index::composite::CompositeIndexKey::prefix_successor(
+                                    &start_bytes,
+                                );
+                            (
+                                Some(IndexKey::new(start_bytes)),
+                                end_bytes.map(IndexKey::new),
+                            )
+                        }
+                    }
+                    _ => (
+                        start_bound.map(IndexKey::from_value),
+                        end_bound.map(IndexKey::from_value),
+                    ),
                 };
 
-                let entries = match scan_type {
-                    Some(st) => self.secondary_index_leaf_entries(idx_name, st)?.1,
-                    None => {
-                        let start_key = start_bound.map(IndexKey::from_value);
-                        let end_key = end_bound.map(IndexKey::from_value);
-                        sec_idx.scan_entries(
-                            self.buffer_pool,
-                            start_key.as_ref(),
-                            end_key.as_ref(),
-                        )?
+                // Skip NULL keys at B+ Tree descent level when counting non-null column
+                if is_leading_count_col {
+                    match start_key {
+                        None => {
+                            start_key = Some(IndexKey::new(vec![1]));
+                        }
+                        Some(ref k) if k.bytes.first() == Some(&0) => {
+                            start_key = Some(IndexKey::new(vec![1]));
+                        }
+                        _ => {}
                     }
-                };
-                for entry in entries {
-                    if !self.is_rid_visible(entry.rid, reader_txn, &snapshot)? {
-                        continue;
-                    }
-                    if let Some(col) = count_column {
-                        if meta.column_indices.len() == 1
-                            && self.metadata.schema.columns[meta.column_indices[0]].name == col
-                        {
-                            let val = entry.key.to_value(col_type)?;
-                            if val.is_null() {
-                                continue;
-                            }
-                        } else if let Some(row) = self.get_by_rid(entry.rid)? {
-                            let col_idx = self
-                                .metadata
+                }
+
+                // If non-leading count column, verify column index
+                let non_leading_col_idx = if let Some(col) = count_column {
+                    if !is_leading_count_col {
+                        Some(
+                            self.metadata
                                 .schema
                                 .column_index(col)
-                                .ok_or_else(|| Error::ColumnNotFound(col.to_string()))?;
-                            let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
-                            if val.is_null() {
-                                continue;
+                                .ok_or_else(|| Error::ColumnNotFound(col.to_string()))?,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let rids = sec_idx.scan_rids_with_limit(
+                    self.buffer_pool,
+                    start_key.as_ref(),
+                    end_key.as_ref(),
+                    None,
+                )?;
+
+                let mut last_page: Option<(PageId, bool)> = None;
+
+                for rid in rids {
+                    // Check visibility using page-level cache
+                    let is_visible = if let Some((pid, true)) = last_page {
+                        if pid == rid.page_id {
+                            true
+                        } else {
+                            let vis = self.is_rid_visible(rid, reader_txn, &snapshot)?;
+                            let page_all_visible = self.visibility_map.as_ref().is_some_and(|vm| {
+                                vm.is_page_all_visible(rid.page_id, snapshot.as_of_commit_seq)
+                            });
+                            last_page = Some((rid.page_id, page_all_visible));
+                            vis
+                        }
+                    } else {
+                        let vis = self.is_rid_visible(rid, reader_txn, &snapshot)?;
+                        let page_all_visible = self.visibility_map.as_ref().is_some_and(|vm| {
+                            vm.is_page_all_visible(rid.page_id, snapshot.as_of_commit_seq)
+                        });
+                        last_page = Some((rid.page_id, page_all_visible));
+                        vis
+                    };
+
+                    if !is_visible {
+                        continue;
+                    }
+
+                    if non_leading_col_idx.is_some() || filter.is_some() {
+                        if let Some(row) = self.get_by_rid(rid)? {
+                            if let Some(col_idx) = non_leading_col_idx {
+                                let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
+                                if val.is_null() {
+                                    continue;
+                                }
+                            }
+                            if let Some(f) = filter {
+                                if f.evaluate(&row, &self.metadata.schema)? != Value::Boolean(true)
+                                {
+                                    continue;
+                                }
                             }
                         } else {
                             continue;
                         }
                     }
-                    if let Some(f) = filter {
-                        if let Some(row) = self.get_by_rid(entry.rid)? {
-                            if f.evaluate(&row, &self.metadata.schema)? != Value::Boolean(true) {
-                                continue;
-                            }
-                        } else {
-                            continue;
-                        }
-                    }
+
                     count += 1;
                 }
             }
