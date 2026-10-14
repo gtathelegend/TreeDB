@@ -1833,59 +1833,24 @@ impl<'a> Table<'a> {
                     return Ok(0);
                 }
 
-                let (start_key, end_key) = match scan_type {
-                    Some(crate::query::optimizer::SecondaryScanType::RangeScan { start, end }) => (
-                        start.as_ref().map(IndexKey::from_value),
-                        end.as_ref().map(IndexKey::from_value),
-                    ),
-                    Some(crate::query::optimizer::SecondaryScanType::PointLookup(val)) => {
-                        let key = if meta.column_indices.len() == 1 {
-                            IndexKey::from_value(val)
-                        } else {
-                            crate::index::composite::CompositeIndexKey::from_values(
-                                std::slice::from_ref(val),
-                            )
-                            .to_index_key(meta.column_indices.len())
-                        };
-                        (Some(key.clone()), Some(key))
-                    }
-                    Some(crate::query::optimizer::SecondaryScanType::CompositePointLookup(
-                        vals,
-                    )) => {
-                        let key = crate::index::composite::CompositeIndexKey::from_values(vals)
-                            .to_index_key(meta.column_indices.len());
-                        (Some(key.clone()), Some(key))
-                    }
-                    Some(crate::query::optimizer::SecondaryScanType::PrefixScan(prefix_vals)) => {
-                        let start_bytes =
-                            crate::index::composite::CompositeIndexKey::encode_prefix_values(
-                                prefix_vals,
-                                meta.column_indices.len(),
-                            );
-                        let end_bytes =
-                            crate::index::composite::CompositeIndexKey::prefix_successor(
-                                &start_bytes,
-                            );
-                        (
-                            Some(IndexKey::new(start_bytes)),
-                            end_bytes.map(IndexKey::new),
-                        )
-                    }
-                    None => (
-                        start_bound.map(IndexKey::from_value),
-                        end_bound.map(IndexKey::from_value),
-                    ),
-                    _ => (None, None),
-                };
-
                 let col_type = if !meta.column_indices.is_empty() {
                     self.metadata.schema.columns[meta.column_indices[0]].data_type
                 } else {
                     crate::engine::types::DataType::Int64
                 };
 
-                let entries =
-                    sec_idx.scan_entries(self.buffer_pool, start_key.as_ref(), end_key.as_ref())?;
+                let entries = match scan_type {
+                    Some(st) => self.secondary_index_leaf_entries(idx_name, st)?.1,
+                    None => {
+                        let start_key = start_bound.map(IndexKey::from_value);
+                        let end_key = end_bound.map(IndexKey::from_value);
+                        sec_idx.scan_entries(
+                            self.buffer_pool,
+                            start_key.as_ref(),
+                            end_key.as_ref(),
+                        )?
+                    }
+                };
                 for entry in entries {
                     if !self.is_rid_visible(entry.rid, reader_txn, &snapshot)? {
                         continue;

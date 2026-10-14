@@ -5855,51 +5855,50 @@ impl<'db> Transaction<'db> {
                                     }
                                     _ => "",
                                 };
+                                let is_pk = raw_schema.columns.first().map(|c| c.name.as_str())
+                                    == Some(target_col);
                                 let (idx_name, start, end): (
                                     Option<String>,
                                     Option<&Value>,
                                     Option<&Value>,
-                                ) = match &plan.base_table.access_path {
-                                    crate::query::optimizer::AccessPath::SecondaryIndexScan {
-                                        index_name,
-                                        scan_type,
-                                        ..
-                                    }
-                                    | crate::query::optimizer::AccessPath::IndexOnlyScan {
-                                        index_name,
-                                        scan_type,
-                                        ..
-                                    } => match scan_type {
-                                        crate::query::optimizer::SecondaryScanType::RangeScan {
+                                ) = if is_pk {
+                                    match &plan.base_table.access_path {
+                                        crate::query::optimizer::AccessPath::PrimaryRangeScan {
                                             start,
                                             end,
-                                        } => {
-                                            (Some(index_name.clone()), start.as_ref(), end.as_ref())
+                                        } => (None, start.as_ref(), end.as_ref()),
+                                        _ => (None, None, None),
+                                    }
+                                } else {
+                                    let sec_name = table
+                                        .indexes
+                                        .iter()
+                                        .find(|(m, _)| {
+                                            m.column_indices
+                                                .first()
+                                                .map(|&idx| raw_schema.columns[idx].name.as_str())
+                                                == Some(target_col)
+                                        })
+                                        .map(|(m, _)| m.name.clone());
+
+                                    match &plan.base_table.access_path {
+                                        crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                                            index_name,
+                                            scan_type,
+                                            ..
                                         }
-                                        _ => (Some(index_name.clone()), None, None),
-                                    },
-                                    crate::query::optimizer::AccessPath::PrimaryRangeScan {
-                                        start,
-                                        end,
-                                    } => (None, start.as_ref(), end.as_ref()),
-                                    _ => {
-                                        let is_pk =
-                                            raw_schema.columns.first().map(|c| c.name.as_str())
-                                                == Some(target_col);
-                                        if is_pk {
-                                            (None, None, None)
-                                        } else {
-                                            let sec_name = table
-                                                .indexes
-                                                .iter()
-                                                .find(|(m, _)| {
-                                                    m.column_indices.first().map(|&idx| {
-                                                        raw_schema.columns[idx].name.as_str()
-                                                    }) == Some(target_col)
-                                                })
-                                                .map(|(m, _)| m.name.clone());
-                                            (sec_name, None, None)
-                                        }
+                                        | crate::query::optimizer::AccessPath::IndexOnlyScan {
+                                            index_name,
+                                            scan_type,
+                                            ..
+                                        } if Some(index_name) == sec_name.as_ref() => match scan_type {
+                                            crate::query::optimizer::SecondaryScanType::RangeScan {
+                                                start,
+                                                end,
+                                            } => (sec_name, start.as_ref(), end.as_ref()),
+                                            _ => (sec_name, None, None),
+                                        },
+                                        _ => (sec_name, None, None),
                                     }
                                 };
                                 let min_val = table.index_min_max(
@@ -5922,51 +5921,50 @@ impl<'db> Transaction<'db> {
                                     }
                                     _ => "",
                                 };
+                                let is_pk = raw_schema.columns.first().map(|c| c.name.as_str())
+                                    == Some(target_col);
                                 let (idx_name, start, end): (
                                     Option<String>,
                                     Option<&Value>,
                                     Option<&Value>,
-                                ) = match &plan.base_table.access_path {
-                                    crate::query::optimizer::AccessPath::SecondaryIndexScan {
-                                        index_name,
-                                        scan_type,
-                                        ..
-                                    }
-                                    | crate::query::optimizer::AccessPath::IndexOnlyScan {
-                                        index_name,
-                                        scan_type,
-                                        ..
-                                    } => match scan_type {
-                                        crate::query::optimizer::SecondaryScanType::RangeScan {
+                                ) = if is_pk {
+                                    match &plan.base_table.access_path {
+                                        crate::query::optimizer::AccessPath::PrimaryRangeScan {
                                             start,
                                             end,
-                                        } => {
-                                            (Some(index_name.clone()), start.as_ref(), end.as_ref())
+                                        } => (None, start.as_ref(), end.as_ref()),
+                                        _ => (None, None, None),
+                                    }
+                                } else {
+                                    let sec_name = table
+                                        .indexes
+                                        .iter()
+                                        .find(|(m, _)| {
+                                            m.column_indices
+                                                .first()
+                                                .map(|&idx| raw_schema.columns[idx].name.as_str())
+                                                == Some(target_col)
+                                        })
+                                        .map(|(m, _)| m.name.clone());
+
+                                    match &plan.base_table.access_path {
+                                        crate::query::optimizer::AccessPath::SecondaryIndexScan {
+                                            index_name,
+                                            scan_type,
+                                            ..
                                         }
-                                        _ => (Some(index_name.clone()), None, None),
-                                    },
-                                    crate::query::optimizer::AccessPath::PrimaryRangeScan {
-                                        start,
-                                        end,
-                                    } => (None, start.as_ref(), end.as_ref()),
-                                    _ => {
-                                        let is_pk =
-                                            raw_schema.columns.first().map(|c| c.name.as_str())
-                                                == Some(target_col);
-                                        if is_pk {
-                                            (None, None, None)
-                                        } else {
-                                            let sec_name = table
-                                                .indexes
-                                                .iter()
-                                                .find(|(m, _)| {
-                                                    m.column_indices.first().map(|&idx| {
-                                                        raw_schema.columns[idx].name.as_str()
-                                                    }) == Some(target_col)
-                                                })
-                                                .map(|(m, _)| m.name.clone());
-                                            (sec_name, None, None)
-                                        }
+                                        | crate::query::optimizer::AccessPath::IndexOnlyScan {
+                                            index_name,
+                                            scan_type,
+                                            ..
+                                        } if Some(index_name) == sec_name.as_ref() => match scan_type {
+                                            crate::query::optimizer::SecondaryScanType::RangeScan {
+                                                start,
+                                                end,
+                                            } => (sec_name, start.as_ref(), end.as_ref()),
+                                            _ => (sec_name, None, None),
+                                        },
+                                        _ => (sec_name, None, None),
                                     }
                                 };
                                 let max_val = table.index_min_max(

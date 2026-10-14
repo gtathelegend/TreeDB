@@ -543,3 +543,355 @@ fn test_explain_shows_index_aggregate_and_reverse_scan() {
         "Explain output should show descending scan direction: {plan_str}"
     );
 }
+
+#[test]
+fn test_secondary_index_point_lookup_count() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("point_count.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT, cat VARCHAR);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_score ON t (score);")
+        .unwrap();
+
+    for i in 1..=50 {
+        let score = if i <= 10 { 100 } else { i * 10 };
+        db.execute_statement(&format!(
+            "INSERT INTO t VALUES ({i}, {score}, 'cat_{}');",
+            i % 5
+        ))
+        .unwrap();
+    }
+
+    // Point lookup count on secondary index
+    let res = db
+        .execute_sql("SELECT COUNT(*) FROM t WHERE score = 100;")
+        .unwrap();
+    assert_eq!(res.rows[0].values[0], Value::UInt64(10));
+
+    let res_col = db
+        .execute_sql("SELECT COUNT(score) FROM t WHERE score = 100;")
+        .unwrap();
+    assert_eq!(res_col.rows[0].values[0], Value::UInt64(10));
+
+    // Zero-match point lookup
+    let res_none = db
+        .execute_sql("SELECT COUNT(*) FROM t WHERE score = 9999;")
+        .unwrap();
+    assert_eq!(res_none.rows[0].values[0], Value::UInt64(0));
+}
+
+#[test]
+fn test_min_max_with_unrelated_filter_fallback() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("min_max_unrelated.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, cat VARCHAR, score BIGINT);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_cat ON t (cat);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_score ON t (score);")
+        .unwrap();
+
+    // Insert rows: cat_A has scores 50, 80, 20. cat_B has scores 10, 90.
+    db.execute_statement("INSERT INTO t VALUES (1, 'cat_A', 50);")
+        .unwrap();
+    db.execute_statement("INSERT INTO t VALUES (2, 'cat_A', 80);")
+        .unwrap();
+    db.execute_statement("INSERT INTO t VALUES (3, 'cat_A', 20);")
+        .unwrap();
+    db.execute_statement("INSERT INTO t VALUES (4, 'cat_B', 10);")
+        .unwrap();
+    db.execute_statement("INSERT INTO t VALUES (5, 'cat_B', 90);")
+        .unwrap();
+
+    // Query filters on cat, aggregates on score. Must NOT blindly take first of idx_cat!
+    let res = db
+        .execute_sql("SELECT MIN(score), MAX(score) FROM t WHERE cat = 'cat_A';")
+        .unwrap();
+    assert_eq!(res.rows[0].values[0], Value::Int64(20));
+    assert_eq!(res.rows[0].values[1], Value::Int64(80));
+
+    let res_b = db
+        .execute_sql("SELECT MIN(score), MAX(score) FROM t WHERE cat = 'cat_B';")
+        .unwrap();
+    assert_eq!(res_b.rows[0].values[0], Value::Int64(10));
+    assert_eq!(res_b.rows[0].values[1], Value::Int64(90));
+}
+
+#[test]
+fn test_min_max_filtered_on_same_column() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("min_max_same_col.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_score ON t (score);")
+        .unwrap();
+
+    for i in 1..=50 {
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, {});", i * 10))
+            .unwrap();
+    }
+
+    // Bounded range on score
+    let res = db
+        .execute_sql("SELECT MIN(score), MAX(score) FROM t WHERE score >= 150 AND score <= 350;")
+        .unwrap();
+    assert_eq!(res.rows[0].values[0], Value::Int64(150));
+    assert_eq!(res.rows[0].values[1], Value::Int64(350));
+
+    // Primary key bounds
+    let res_pk = db
+        .execute_sql("SELECT MIN(id), MAX(id) FROM t WHERE id >= 10 AND id <= 25;")
+        .unwrap();
+    assert_eq!(res_pk.rows[0].values[0], Value::Int64(10));
+    assert_eq!(res_pk.rows[0].values[1], Value::Int64(25));
+}
+
+#[test]
+fn test_early_stop_with_heavy_residual_filter() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("residual_early_stop.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, flag BIGINT);")
+        .unwrap();
+
+    // 200 rows, only 20 have flag = 1
+    for i in 1..=200 {
+        let flag = if i % 10 == 0 { 1 } else { 0 };
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, {flag});"))
+            .unwrap();
+    }
+
+    // Ascending with residual filter
+    let res_asc = db
+        .execute_sql("SELECT id FROM t WHERE flag = 1 ORDER BY id ASC LIMIT 5;")
+        .unwrap();
+    assert_eq!(res_asc.rows.len(), 5);
+    assert_eq!(res_asc.rows[0].values[0], Value::Int64(10));
+    assert_eq!(res_asc.rows[1].values[0], Value::Int64(20));
+    assert_eq!(res_asc.rows[2].values[0], Value::Int64(30));
+    assert_eq!(res_asc.rows[3].values[0], Value::Int64(40));
+    assert_eq!(res_asc.rows[4].values[0], Value::Int64(50));
+
+    // Descending with residual filter
+    let res_desc = db
+        .execute_sql("SELECT id FROM t WHERE flag = 1 ORDER BY id DESC LIMIT 5;")
+        .unwrap();
+    assert_eq!(res_desc.rows.len(), 5);
+    assert_eq!(res_desc.rows[0].values[0], Value::Int64(200));
+    assert_eq!(res_desc.rows[1].values[0], Value::Int64(190));
+    assert_eq!(res_desc.rows[2].values[0], Value::Int64(180));
+    assert_eq!(res_desc.rows[3].values[0], Value::Int64(170));
+    assert_eq!(res_desc.rows[4].values[0], Value::Int64(160));
+}
+
+#[test]
+fn test_early_stop_ties_and_nulls() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("ties_and_nulls.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_score ON t (score);")
+        .unwrap();
+
+    // 5 NULLs, 5 with 10, 5 with 20
+    for i in 1..=5 {
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, NULL);"))
+            .unwrap();
+    }
+    for i in 6..=10 {
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, 10);"))
+            .unwrap();
+    }
+    for i in 11..=15 {
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, 20);"))
+            .unwrap();
+    }
+
+    // Ascending: NULLs first
+    let res_asc = db
+        .execute_sql("SELECT score FROM t ORDER BY score ASC LIMIT 8;")
+        .unwrap();
+    assert_eq!(res_asc.rows.len(), 8);
+    for i in 0..5 {
+        assert_eq!(res_asc.rows[i].values[0], Value::Null);
+    }
+    for i in 5..8 {
+        assert_eq!(res_asc.rows[i].values[0], Value::Int64(10));
+    }
+
+    // Descending: NULLs last
+    let res_desc = db
+        .execute_sql("SELECT score FROM t ORDER BY score DESC LIMIT 8;")
+        .unwrap();
+    assert_eq!(res_desc.rows.len(), 8);
+    for i in 0..5 {
+        assert_eq!(res_desc.rows[i].values[0], Value::Int64(20));
+    }
+    for i in 5..8 {
+        assert_eq!(res_desc.rows[i].values[0], Value::Int64(10));
+    }
+}
+
+#[test]
+fn test_early_stop_limit_edge_cases() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("limit_edges.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT);")
+        .unwrap();
+
+    // 1. LIMIT on empty table
+    let res = db
+        .execute_sql("SELECT * FROM t ORDER BY id ASC LIMIT 5;")
+        .unwrap();
+    assert_eq!(res.rows.len(), 0);
+
+    for i in 1..=10 {
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, {i});"))
+            .unwrap();
+    }
+
+    // 2. LIMIT 0
+    let res_0 = db
+        .execute_sql("SELECT * FROM t ORDER BY id ASC LIMIT 0;")
+        .unwrap();
+    assert_eq!(res_0.rows.len(), 0);
+
+    // 3. LIMIT 1
+    let res_1 = db
+        .execute_sql("SELECT id FROM t ORDER BY id ASC LIMIT 1;")
+        .unwrap();
+    assert_eq!(res_1.rows.len(), 1);
+    assert_eq!(res_1.rows[0].values[0], Value::Int64(1));
+
+    // 4. LIMIT greater than row count
+    let res_big = db
+        .execute_sql("SELECT id FROM t ORDER BY id ASC LIMIT 100;")
+        .unwrap();
+    assert_eq!(res_big.rows.len(), 10);
+}
+
+#[test]
+fn test_unsupported_ordering_fallback_sort() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("unsupported_sort.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT, name VARCHAR);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_score ON t (score);")
+        .unwrap();
+
+    // Insert rows where score has ties but name differs
+    db.execute_statement("INSERT INTO t VALUES (1, 10, 'Zack');")
+        .unwrap();
+    db.execute_statement("INSERT INTO t VALUES (2, 10, 'Alice');")
+        .unwrap();
+    db.execute_statement("INSERT INTO t VALUES (3, 20, 'Bob');")
+        .unwrap();
+    db.execute_statement("INSERT INTO t VALUES (4, 10, 'Charlie');")
+        .unwrap();
+
+    // ORDER BY score ASC, name ASC (index only satisfies score, NOT name)
+    let res = db
+        .execute_sql("SELECT name FROM t ORDER BY score ASC, name ASC LIMIT 3;")
+        .unwrap();
+    assert_eq!(res.rows.len(), 3);
+    assert_eq!(res.rows[0].values[0], Value::String("Alice".to_string()));
+    assert_eq!(res.rows[1].values[0], Value::String("Charlie".to_string()));
+    assert_eq!(res.rows[2].values[0], Value::String("Zack".to_string()));
+}
+
+#[test]
+fn test_differential_mvcc_concurrent_snapshots() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mvcc_snapshots.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT);")
+        .unwrap();
+    for i in 1..=20 {
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, {i});"))
+            .unwrap();
+    }
+
+    // 1. Transaction 1: uncommitted insert and update
+    let mut tx1 = db.begin_transaction().unwrap();
+    for i in 21..=30 {
+        tx1.execute_statement(&format!("INSERT INTO t VALUES ({i}, {i});"))
+            .unwrap();
+    }
+    tx1.execute_statement("UPDATE t SET val = val + 100 WHERE id = 1;")
+        .unwrap();
+    // In tx1: sees 30 rows and MAX = 101
+    let res1_count = tx1.execute_sql("SELECT COUNT(*) FROM t;").unwrap();
+    assert_eq!(res1_count.rows[0].values[0], Value::UInt64(30));
+    let res1_max = tx1.execute_sql("SELECT MAX(val) FROM t;").unwrap();
+    assert_eq!(res1_max.rows[0].values[0], Value::Int64(101));
+    tx1.abort().unwrap();
+
+    // 2. Transaction 2: after abort, sees pre-mutation state
+    let mut tx2 = db.begin_transaction().unwrap();
+    let res2_count = tx2.execute_sql("SELECT COUNT(*) FROM t;").unwrap();
+    assert_eq!(res2_count.rows[0].values[0], Value::UInt64(20));
+    let res2_max = tx2.execute_sql("SELECT MAX(val) FROM t;").unwrap();
+    assert_eq!(res2_max.rows[0].values[0], Value::Int64(20));
+
+    // Commit a mutation in tx2
+    for i in 21..=25 {
+        tx2.execute_statement(&format!("INSERT INTO t VALUES ({i}, {i});"))
+            .unwrap();
+    }
+    tx2.commit().unwrap();
+
+    // 3. Transaction 3: sees committed changes
+    let mut tx3 = db.begin_transaction().unwrap();
+    let res3_count = tx3.execute_sql("SELECT COUNT(*) FROM t;").unwrap();
+    assert_eq!(res3_count.rows[0].values[0], Value::UInt64(25));
+    let res3_max = tx3.execute_sql("SELECT MAX(val) FROM t;").unwrap();
+    assert_eq!(res3_max.rows[0].values[0], Value::Int64(25));
+    tx3.commit().unwrap();
+}
+
+#[test]
+fn test_metrics_fast_path_assertion() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("metrics_assertion.treedb");
+    let mut db = TreeDb::create(&db_path, 64).unwrap();
+
+    db.execute_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT);")
+        .unwrap();
+    for i in 1..=50 {
+        db.execute_statement(&format!("INSERT INTO t VALUES ({i}, {i});"))
+            .unwrap();
+    }
+
+    let mut txn = db.begin_transaction().unwrap();
+    let prep = txn.prepare_sql("SELECT COUNT(*) FROM t;").unwrap();
+    let (res, metrics) = txn.execute_prepared_with_metrics(&prep, &[]).unwrap();
+    assert_eq!(res.rows[0].values[0], Value::UInt64(50));
+
+    // Fast-path index aggregate operator was selected in the plan tree
+    let root = metrics.root_operator.expect("root operator exists");
+    let has_index_agg = root.kind == treedb::query::OperatorKind::IndexAggregate
+        || root
+            .children
+            .iter()
+            .any(|c| c.kind == treedb::query::OperatorKind::IndexAggregate);
+    assert!(
+        has_index_agg,
+        "Operator tree must contain IndexAggregate: {root:?}"
+    );
+    assert_eq!(metrics.total_tuples_fetched, 0);
+    txn.commit().unwrap();
+}

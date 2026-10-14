@@ -3536,7 +3536,7 @@ fn plan_semi_anti_strategy(
 
 /// Returns true if single-table scalar aggregation can be evaluated via index without full table scan or row materialization.
 pub fn is_index_aggregate_eligible(bound: &BoundSelect, tables: &[TableOptInfo]) -> bool {
-    bound.group_by.is_empty()
+    if bound.group_by.is_empty()
         && !bound.aggregates.is_empty()
         && bound.window_exprs.is_empty()
         && bound.having.is_none()
@@ -3547,33 +3547,66 @@ pub fn is_index_aggregate_eligible(bound: &BoundSelect, tables: &[TableOptInfo])
             .as_ref()
             .map(|f| f.contains_subquery())
             .unwrap_or(false)
-        && bound.aggregates.iter().all(|agg| match agg {
-            AggregateExpr::CountAll => true,
+    {
+        let filter_cols: Vec<String> = if let Some(f) = &bound.filter {
+            f.referenced_columns()
+                .into_iter()
+                .map(|c| c.split('.').next_back().unwrap_or(c.as_str()).to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        bound.aggregates.iter().all(|agg| match agg {
+            AggregateExpr::CountAll => {
+                if filter_cols.is_empty() {
+                    true
+                } else {
+                    filter_cols.iter().all(|fc| {
+                        tables[0].schema.primary_key_column().name == *fc
+                            || tables[0].indexes.iter().any(|idx| {
+                                !idx.column_indices.is_empty()
+                                    && tables[0].schema.columns[idx.column_indices[0]].name == *fc
+                            })
+                    })
+                }
+            }
             AggregateExpr::Function {
                 func: AggregateFunction::Count,
                 expr: Expr::Column(c),
             } => {
                 let pure = c.split('.').next_back().unwrap_or(c.as_str());
-                tables[0].schema.primary_key_column().name == pure
+                let has_idx = tables[0].schema.primary_key_column().name == pure
                     || tables[0].indexes.iter().any(|idx| {
                         idx.column_indices
                             .iter()
                             .any(|&i| tables[0].schema.columns[i].name == pure)
-                    })
+                    });
+                if !has_idx {
+                    return false;
+                }
+                filter_cols.is_empty() || (filter_cols.len() == 1 && filter_cols[0] == pure)
             }
             AggregateExpr::Function {
                 func: AggregateFunction::Min | AggregateFunction::Max,
                 expr: Expr::Column(c),
             } => {
                 let pure = c.split('.').next_back().unwrap_or(c.as_str());
-                tables[0].schema.primary_key_column().name == pure
+                let has_idx = tables[0].schema.primary_key_column().name == pure
                     || tables[0].indexes.iter().any(|idx| {
                         !idx.column_indices.is_empty()
                             && tables[0].schema.columns[idx.column_indices[0]].name == pure
-                    })
+                    });
+                if !has_idx {
+                    return false;
+                }
+                filter_cols.is_empty() || (filter_cols.len() == 1 && filter_cols[0] == pure)
             }
             _ => false,
         })
+    } else {
+        false
+    }
 }
 
 /// Selected physical aggregation strategy, updated cumulative cost, and output ordering property.

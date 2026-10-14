@@ -392,97 +392,307 @@ pub fn run_sql_query_benchmarks(runner: &mut BenchmarkRunner) {
     }
 
     // -------------------------------------------------------------------------
-    // Phase 89 Focused Workloads: Index Aggregation & Early Termination
+    // Phase 89 & 90 Focused Workloads: Index Aggregation & Early Termination
     // -------------------------------------------------------------------------
-    // Workload 14: Index-level COUNT(*) (2,000 accounts, 0 row materializations)
+    db.execute_statement(
+        "CREATE TABLE bench_items (id INT PRIMARY KEY, category VARCHAR, rating INT, price INT);",
+    )
+    .unwrap();
+    db.execute_statement("CREATE INDEX idx_rating ON bench_items (rating);")
+        .unwrap();
+    db.execute_statement("CREATE INDEX idx_category ON bench_items (category);")
+        .unwrap();
+
+    let bench_count = 2_000;
+    for i in 1..=bench_count {
+        let rating_str = if i % 5 == 0 {
+            "NULL".to_string()
+        } else {
+            ((i * 13) % 100 + 1).to_string()
+        };
+        let price = (i * 37) % 10_000 + 1;
+        let cat = format!("'cat_{}'", (i % 20) + 1);
+        db.execute_statement(&format!(
+            "INSERT INTO bench_items VALUES ({}, {}, {}, {});",
+            i, cat, rating_str, price
+        ))
+        .unwrap();
+    }
+    db.sync().unwrap();
+    db.execute_statement("ANALYZE bench_items;").unwrap();
+
+    let bench_iters = 200;
+
+    // 1. COUNT(*) - Baseline (Standard aggregation via non-index expression)
     {
-        let iters = 500;
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let sql = "SELECT COUNT(*) FROM accounts;";
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT COUNT(price + 0) FROM bench_items;";
             let start = Instant::now();
             let res = db.execute_sql(sql).unwrap();
             let elapsed = start.elapsed().as_nanos() as u64;
             assert_eq!(res.rows().len(), 1);
             samples.push(elapsed);
         }
-
         runner.record(BenchmarkResult::from_samples(
-            "SQL & Query",
-            "index_aggregate_count_all",
-            account_count,
-            iters,
+            "Phase 89/90",
+            "count_star_baseline",
+            bench_count,
+            bench_iters,
             samples,
-            "Index-level COUNT(*) (2,000 rows / zero row materializations)",
+            "Baseline: COUNT(*) via full table scan & streaming aggregate (2,000 rows fetched)",
         ));
     }
 
-    // Workload 15: Index-level MIN and MAX (zero table scan)
+    // 2. COUNT(*) - Optimized (Index-level aggregation)
     {
-        let iters = 500;
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let sql = "SELECT MIN(id), MAX(id) FROM accounts;";
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT COUNT(*) FROM bench_items;";
             let start = Instant::now();
             let res = db.execute_sql(sql).unwrap();
             let elapsed = start.elapsed().as_nanos() as u64;
             assert_eq!(res.rows().len(), 1);
             samples.push(elapsed);
         }
-
         runner.record(BenchmarkResult::from_samples(
-            "SQL & Query",
-            "index_aggregate_min_max",
-            account_count,
-            iters,
+            "Phase 89/90",
+            "count_star_optimized",
+            bench_count,
+            bench_iters,
             samples,
-            "Index-level MIN/MAX via B+ Tree extrema (zero row materializations)",
+            "Optimized: Index-level COUNT(*) (2,000 rows / zero heap record fetches)",
         ));
     }
 
-    // Workload 16: Early termination forward scan (ORDER BY id ASC LIMIT 10)
+    // 3. COUNT(col) with NULLs - Baseline
     {
-        let iters = 500;
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let sql = "SELECT * FROM accounts ORDER BY id ASC LIMIT 10;";
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT COUNT(rating + 0) FROM bench_items;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 1);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 89/90",
+            "count_col_nulls_baseline",
+            bench_count,
+            bench_iters,
+            samples,
+            "Baseline: COUNT(col) with 20% NULLs via full table scan (2,000 rows fetched)",
+        ));
+    }
+
+    // 4. COUNT(col) with NULLs - Optimized (Secondary index scan skipping NULL tag)
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT COUNT(rating) FROM bench_items;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 1);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 89/90",
+            "count_col_nulls_optimized",
+            bench_count,
+            bench_iters,
+            samples,
+            "Optimized: Index-level COUNT(col) with 20% NULLs (1,600 counted / zero heap fetches)",
+        ));
+    }
+
+    // 5. MIN and MAX - Baseline
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT MIN(rating + 0), MAX(rating + 0) FROM bench_items;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 1);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 89/90",
+            "min_max_baseline",
+            bench_count,
+            bench_iters,
+            samples,
+            "Baseline: MIN/MAX via full table scan & row-by-row comparisons (2,000 rows fetched)",
+        ));
+    }
+
+    // 6. MIN and MAX - Optimized (Index extrema seek)
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT MIN(rating), MAX(rating) FROM bench_items;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 1);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 89/90",
+            "min_max_optimized",
+            bench_count,
+            bench_iters,
+            samples,
+            "Optimized: Index MIN/MAX via leftmost and rightmost index leaf seek",
+        ));
+    }
+
+    // 7. ORDER BY ASC LIMIT 10 - Baseline (Full table scan + full sort)
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT id, category, price FROM bench_items ORDER BY id + 0 ASC LIMIT 10;";
             let start = Instant::now();
             let res = db.execute_sql(sql).unwrap();
             let elapsed = start.elapsed().as_nanos() as u64;
             assert_eq!(res.rows().len(), 10);
             samples.push(elapsed);
         }
-
         runner.record(BenchmarkResult::from_samples(
-            "SQL & Query",
-            "early_termination_order_by_limit_asc",
-            account_count,
-            iters,
+            "Phase 89/90",
+            "order_by_limit_asc_baseline",
+            bench_count,
+            bench_iters,
             samples,
-            "Early-termination index scan ORDER BY id ASC LIMIT 10 (10 entries examined)",
+            "Baseline: ORDER BY ASC LIMIT 10 via full 2,000-row table scan & sort",
         ));
     }
 
-    // Workload 17: Early termination reverse scan (ORDER BY id DESC LIMIT 10)
+    // 8. ORDER BY ASC LIMIT 10 - Optimized (Early-termination index scan)
     {
-        let iters = 500;
-        let mut samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let sql = "SELECT * FROM accounts ORDER BY id DESC LIMIT 10;";
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT id, category, price FROM bench_items ORDER BY id ASC LIMIT 10;";
             let start = Instant::now();
             let res = db.execute_sql(sql).unwrap();
             let elapsed = start.elapsed().as_nanos() as u64;
             assert_eq!(res.rows().len(), 10);
             samples.push(elapsed);
         }
-
         runner.record(BenchmarkResult::from_samples(
-            "SQL & Query",
-            "early_termination_order_by_limit_desc",
-            account_count,
-            iters,
+            "Phase 89/90",
+            "order_by_limit_asc_optimized",
+            bench_count,
+            bench_iters,
             samples,
-            "Early-termination reverse index scan ORDER BY id DESC LIMIT 10 (10 entries examined)",
+            "Optimized: Early-termination primary index scan ORDER BY ASC LIMIT 10 (10 entries examined)",
+        ));
+    }
+
+    // 9. ORDER BY DESC LIMIT 10 - Baseline (Full table scan + full sort)
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT id, category, price FROM bench_items ORDER BY id + 0 DESC LIMIT 10;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 10);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 89/90",
+            "order_by_limit_desc_baseline",
+            bench_count,
+            bench_iters,
+            samples,
+            "Baseline: ORDER BY DESC LIMIT 10 via full 2,000-row table scan & sort",
+        ));
+    }
+
+    // 10. ORDER BY DESC LIMIT 10 - Optimized (Reverse early-termination index scan)
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT id, category, price FROM bench_items ORDER BY id DESC LIMIT 10;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 10);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 89/90",
+            "order_by_limit_desc_optimized",
+            bench_count,
+            bench_iters,
+            samples,
+            "Optimized: Early-termination reverse index scan ORDER BY DESC LIMIT 10 (10 entries examined)",
+        ));
+    }
+
+    // 11. Selective residual filter LIMIT 10 - Baseline
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT id, category, price FROM bench_items WHERE price > 9000 ORDER BY id + 0 ASC LIMIT 10;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 10);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 89/90",
+            "residual_filter_limit_baseline",
+            bench_count,
+            bench_iters,
+            samples,
+            "Baseline: Residual filter (>90% rejected) with full sort before LIMIT 10",
+        ));
+    }
+
+    // 12. Selective residual filter LIMIT 10 - Optimized
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT id, category, price FROM bench_items WHERE price > 9000 ORDER BY id ASC LIMIT 10;";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 10);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 89/90",
+            "residual_filter_limit_optimized",
+            bench_count,
+            bench_iters,
+            samples,
+            "Optimized: Early-termination index scan stops after 10 visible matching rows found",
+        ));
+    }
+
+    // 13. Fallback query - Ineligible aggregate correctly falls back to normal path
+    {
+        let mut samples = Vec::with_capacity(bench_iters);
+        for _ in 0..bench_iters {
+            let sql = "SELECT MIN(price) FROM bench_items WHERE category = 'cat_1';";
+            let start = Instant::now();
+            let res = db.execute_sql(sql).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert_eq!(res.rows().len(), 1);
+            samples.push(elapsed);
+        }
+        runner.record(BenchmarkResult::from_samples(
+            "Phase 89/90",
+            "fallback_unsupported_aggregate",
+            bench_count,
+            bench_iters,
+            samples,
+            "Audited Fallback: MIN on unindexed column with filter falls back to normal aggregation",
         ));
     }
 }
