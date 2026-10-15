@@ -119,20 +119,24 @@ impl<R: Read + Seek> WalReader<R> {
         ]) as usize;
 
         if payload_len < MIN_WAL_RECORD_PAYLOAD_LEN {
-            if self.is_durable_corruption() {
+            if self.is_durable_corruption()
+                || self.has_bytes_after(4 + MIN_WAL_RECORD_PAYLOAD_LEN)?
+            {
                 return Err(Error::WalCorruption(format!(
-                    "Durable WAL corrupted before flushed_lsn {}: invalid payload length {payload_len} at offset {}",
-                    self.flushed_lsn, self.stream_offset
+                    "WAL corrupted at offset {}: invalid payload length {payload_len}",
+                    self.stream_offset
                 )));
             }
             return Ok(None);
         }
 
         if payload_len > MAX_WAL_RECORD_PAYLOAD_LEN {
-            if self.is_durable_corruption() {
+            if self.is_durable_corruption()
+                || self.has_bytes_after(4 + MIN_WAL_RECORD_PAYLOAD_LEN)?
+            {
                 return Err(Error::WalCorruption(format!(
-                    "Durable WAL corrupted before flushed_lsn {}: payload length {payload_len} exceeds maximum allowed {MAX_WAL_RECORD_PAYLOAD_LEN} at offset {}",
-                    self.flushed_lsn, self.stream_offset
+                    "WAL corrupted at offset {}: payload length {payload_len} exceeds maximum allowed {MAX_WAL_RECORD_PAYLOAD_LEN}",
+                    self.stream_offset
                 )));
             }
             return Ok(None);
@@ -243,7 +247,8 @@ impl<R: Read + Seek> WalReader<R> {
         let curr_pos = self.inner.stream_position()?;
         let end_pos = self.inner.seek(SeekFrom::End(0))?;
         self.inner.seek(SeekFrom::Start(curr_pos))?;
-        Ok(end_pos > curr_pos)
+        let bytes_in_file = end_pos.saturating_sub(curr_pos);
+        Ok(bytes_in_file + unparsed as u64 > consumed_bytes as u64)
     }
 
     /// Shrinks the buffer back to `initial_buffer_size` if it was temporarily grown for a large record.

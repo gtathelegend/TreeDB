@@ -211,22 +211,19 @@ pub fn run_wal_transaction_benchmarks(runner: &mut BenchmarkRunner) {
 
     // 7. Checkpointed vs Uncheckpointed WAL Recovery Benchmark
     {
-        // 7a. Uncheckpointed WAL Recovery (5,000 records)
+        // 7a. Uncheckpointed WAL Recovery (5,000 TreeDb::put operations)
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal_rec_uncheckpointed.treedb");
         let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
         let records_count = 5_000;
         {
-            let _pm = PageManager::create(&path).unwrap();
-            let mut lm = LogManager::create(&wal_path).unwrap();
-            let txn_id = lm.begin_txn().unwrap();
+            let mut db = TreeDb::create(&path, 64).unwrap();
             for i in 0..records_count {
-                let page_id = 2 + (i as u32 % 20);
-                lm.append_page_delta(txn_id, page_id, 0, vec![0; 16], vec![1; 16])
-                    .unwrap();
+                let key = (i as u64 % 100) + 1;
+                let val = (i as u64).to_le_bytes();
+                db.put(key, &val).unwrap();
             }
-            let commit_lsn = lm.commit_txn(txn_id).unwrap();
-            lm.flush(commit_lsn).unwrap();
+            db.sync().unwrap();
         }
         let start = Instant::now();
         let mut pm = PageManager::open(&path).unwrap();
@@ -241,7 +238,7 @@ pub fn run_wal_transaction_benchmarks(runner: &mut BenchmarkRunner) {
             1,
             vec![elapsed_ns],
             format!(
-                "Streaming ARIES recovery of {} records without checkpoint (redo: {}, undo: {})",
+                "Streaming ARIES recovery of {} operations without checkpoint (redo: {}, undo: {})",
                 records_count, stats.redo_count, stats.undo_count
             ),
         ));

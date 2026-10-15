@@ -472,11 +472,42 @@ impl LogManager {
         Ok(rec)
     }
 
-    /// Reads a log record for an active transaction by looking up its recorded offset.
+    /// Reads a log record for an active transaction by looking up its recorded offset,
+    /// validating LSN and transaction identity, and safely falling back to a streaming scan if stale.
     pub fn read_record_for_txn(&mut self, txn_id: TxnId, lsn: Lsn) -> Result<Option<LogRecord>> {
         if let Some(offset) = self.get_record_offset(txn_id, lsn) {
-            return Ok(Some(self.read_record_at_offset(offset)?));
+            match self.read_record_at_offset(offset) {
+                Ok(rec) => {
+                    if rec.txn_id == txn_id && rec.lsn == lsn {
+                        return Ok(Some(rec));
+                    }
+                    // Stale offset detected (e.g. file rewritten or truncated):
+                    // Invalidate cached offset and fallback to streaming scan.
+                    if let Some(map) = self.txn_record_offsets.get_mut(&txn_id) {
+                        map.remove(&lsn);
+                    }
+                }
+                Err(_) => {
+                    if let Some(map) = self.txn_record_offsets.get_mut(&txn_id) {
+                        map.remove(&lsn);
+                    }
+                }
+            }
         }
+
+        // Fallback: streaming scan to locate the record and self-heal the offset cache
+        let mut reader = self.reader()?;
+        while let Some((rec, offset, _)) = reader.next_record_with_offset()? {
+            if rec.txn_id == txn_id && rec.lsn == lsn {
+                self.txn_record_offsets
+                    .entry(txn_id)
+                    .or_default()
+                    .insert(lsn, offset);
+                self.file.seek(SeekFrom::End(0))?;
+                return Ok(Some(rec));
+            }
+        }
+        self.file.seek(SeekFrom::End(0))?;
         Ok(None)
     }
 

@@ -192,6 +192,9 @@ impl RecoveryEngine {
         while let Some((rec, rec_offset, _)) = reader.next_record_with_offset()? {
             match rec.record_type {
                 LogRecordType::Begin => {
+                    if !txn_table.contains_key(&rec.txn_id) {
+                        stats.active_txns += 1;
+                    }
                     txn_table.insert(
                         rec.txn_id,
                         TxnTableEntry {
@@ -204,10 +207,8 @@ impl RecoveryEngine {
                     loser_record_offsets.insert(rec.lsn, rec_offset);
                 }
                 LogRecordType::Commit => {
-                    if let Some(entry) = txn_table.get_mut(&rec.txn_id) {
-                        entry.status = TxnStatus::Committed;
-                        entry.last_lsn = rec.lsn;
-                    }
+                    stats.committed_txns += 1;
+                    txn_table.remove(&rec.txn_id);
                     if let LogRecordBody::Commit { commit_seq } = rec.body {
                         stats.max_commit_seq = std::cmp::max(stats.max_commit_seq, commit_seq);
                     }
@@ -218,10 +219,7 @@ impl RecoveryEngine {
                     }
                 }
                 LogRecordType::Abort => {
-                    if let Some(entry) = txn_table.get_mut(&rec.txn_id) {
-                        entry.status = TxnStatus::Aborted;
-                        entry.last_lsn = rec.lsn;
-                    }
+                    txn_table.remove(&rec.txn_id);
                     if let Some(lsns) = active_txn_lsns.remove(&rec.txn_id) {
                         for l in lsns {
                             loser_record_offsets.remove(&l);
@@ -229,6 +227,9 @@ impl RecoveryEngine {
                     }
                 }
                 LogRecordType::PageDelta => {
+                    if !txn_table.contains_key(&rec.txn_id) {
+                        stats.active_txns += 1;
+                    }
                     let entry = txn_table.entry(rec.txn_id).or_insert(TxnTableEntry {
                         status: TxnStatus::Active,
                         last_lsn: rec.lsn,
@@ -252,6 +253,9 @@ impl RecoveryEngine {
                         ..
                     } = &rec.body
                     {
+                        if !txn_table.contains_key(&rec.txn_id) {
+                            stats.active_txns += 1;
+                        }
                         let entry = txn_table.entry(rec.txn_id).or_insert(TxnTableEntry {
                             status: TxnStatus::Active,
                             last_lsn: rec.lsn,
@@ -270,6 +274,9 @@ impl RecoveryEngine {
                 LogRecordType::Checkpoint => {
                     if let LogRecordBody::Checkpoint { active_txns } = &rec.body {
                         for &(txn_id, last_lsn) in active_txns {
+                            if !txn_table.contains_key(&txn_id) {
+                                stats.active_txns += 1;
+                            }
                             txn_table.entry(txn_id).or_insert(TxnTableEntry {
                                 status: TxnStatus::Active,
                                 last_lsn,
@@ -281,14 +288,7 @@ impl RecoveryEngine {
             }
         }
 
-        for entry in txn_table.values() {
-            match entry.status {
-                TxnStatus::Active => stats.loser_txns += 1,
-                TxnStatus::Committed => stats.committed_txns += 1,
-                TxnStatus::Aborted => {}
-            }
-        }
-        stats.active_txns = txn_table.len();
+        stats.loser_txns = txn_table.len();
 
         if fault == Some(RecoveryFault::BeforeRedo) {
             return Err(Error::RecoveryInterrupted(
@@ -406,88 +406,95 @@ impl RecoveryEngine {
             let (curr_lsn, txn_id) = active_undo_lsns.pop().unwrap();
 
             let rec = if let Some(&offset) = loser_record_offsets.get(&curr_lsn) {
-                Some(log_manager.read_record_at_offset(offset)?)
+                match log_manager.read_record_at_offset(offset) {
+                    Ok(r) if r.lsn == curr_lsn && r.txn_id == txn_id => Some(r),
+                    _ => log_manager.read_record_for_txn(txn_id, curr_lsn)?,
+                }
             } else {
                 log_manager.read_record_for_txn(txn_id, curr_lsn)?
             };
 
-            if let Some(rec) = rec {
-                match &rec.body {
-                    LogRecordBody::PageDelta {
-                        page_id,
-                        offset,
-                        before_image,
-                        ..
-                    } => {
-                        let mut page = if *page_id < page_manager.page_count() {
-                            page_manager.read_page(*page_id)?
-                        } else {
-                            Page::new(*page_id, crate::storage::page::PageType::Free)
-                        };
+            let rec = rec.ok_or_else(|| {
+                Error::WalCorruption(format!(
+                    "Recovery undo failed: record for txn {txn_id} at LSN {curr_lsn} not found"
+                ))
+            })?;
 
-                        // Apply before_image (undo change)
-                        let start = *offset as usize;
-                        let end = start + before_image.len();
-                        if end <= page.as_bytes().len() {
-                            page.as_bytes_mut()[start..end].copy_from_slice(before_image);
-                        }
+            match &rec.body {
+                LogRecordBody::PageDelta {
+                    page_id,
+                    offset,
+                    before_image,
+                    ..
+                } => {
+                    let mut page = if *page_id < page_manager.page_count() {
+                        page_manager.read_page(*page_id)?
+                    } else {
+                        Page::new(*page_id, crate::storage::page::PageType::Free)
+                    };
 
-                        // Append Compensation Log Record (CLR)
-                        let clr_lsn = log_manager.append_clr(
-                            txn_id,
-                            *page_id,
-                            *offset,
-                            before_image.clone(),
-                            rec.prev_lsn,
-                        )?;
-
-                        if fault == Some(RecoveryFault::AfterClrAppendBeforeFlush) {
-                            return Err(Error::RecoveryInterrupted(
-                                "simulated crash after CLR append before flush".into(),
-                            ));
-                        }
-
-                        // Enforce Write-Ahead ordering for CLRs before updating page on disk
-                        log_manager.flush(clr_lsn)?;
-
-                        if fault == Some(RecoveryFault::AfterClrFlushBeforePageWrite) {
-                            return Err(Error::RecoveryInterrupted(
-                                "simulated crash after CLR flush before page write".into(),
-                            ));
-                        }
-
-                        page.set_lsn(clr_lsn);
-                        page_manager.write_page(&page)?;
-
-                        stats.undo_count += 1;
-                        stats.clrs_generated += 1;
-
-                        if fault == Some(RecoveryFault::AfterRecoveredPageWrite(stats.undo_count)) {
-                            return Err(Error::RecoveryInterrupted(
-                                "simulated crash after recovered page write".into(),
-                            ));
-                        }
-
-                        if rec.prev_lsn.is_valid() {
-                            active_undo_lsns.push((rec.prev_lsn, txn_id));
-                        } else {
-                            // Transaction undo complete, append Abort record
-                            log_manager.abort_txn(txn_id)?;
-                        }
+                    // Apply before_image (undo change)
+                    let start = *offset as usize;
+                    let end = start + before_image.len();
+                    if end <= page.as_bytes().len() {
+                        page.as_bytes_mut()[start..end].copy_from_slice(before_image);
                     }
-                    LogRecordBody::Clr { undo_next_lsn, .. } => {
-                        if undo_next_lsn.is_valid() {
-                            active_undo_lsns.push((*undo_next_lsn, txn_id));
-                        } else {
-                            log_manager.abort_txn(txn_id)?;
-                        }
+
+                    // Append Compensation Log Record (CLR)
+                    let clr_lsn = log_manager.append_clr(
+                        txn_id,
+                        *page_id,
+                        *offset,
+                        before_image.clone(),
+                        rec.prev_lsn,
+                    )?;
+
+                    if fault == Some(RecoveryFault::AfterClrAppendBeforeFlush) {
+                        return Err(Error::RecoveryInterrupted(
+                            "simulated crash after CLR append before flush".into(),
+                        ));
                     }
-                    LogRecordBody::Begin => {
-                        // Reached beginning of transaction log chain
+
+                    // Enforce Write-Ahead ordering for CLRs before updating page on disk
+                    log_manager.flush(clr_lsn)?;
+
+                    if fault == Some(RecoveryFault::AfterClrFlushBeforePageWrite) {
+                        return Err(Error::RecoveryInterrupted(
+                            "simulated crash after CLR flush before page write".into(),
+                        ));
+                    }
+
+                    page.set_lsn(clr_lsn);
+                    page_manager.write_page(&page)?;
+
+                    stats.undo_count += 1;
+                    stats.clrs_generated += 1;
+
+                    if fault == Some(RecoveryFault::AfterRecoveredPageWrite(stats.undo_count)) {
+                        return Err(Error::RecoveryInterrupted(
+                            "simulated crash after recovered page write".into(),
+                        ));
+                    }
+
+                    if rec.prev_lsn.is_valid() {
+                        active_undo_lsns.push((rec.prev_lsn, txn_id));
+                    } else {
+                        // Transaction undo complete, append Abort record
                         log_manager.abort_txn(txn_id)?;
                     }
-                    _ => {}
                 }
+                LogRecordBody::Clr { undo_next_lsn, .. } => {
+                    if undo_next_lsn.is_valid() {
+                        active_undo_lsns.push((*undo_next_lsn, txn_id));
+                    } else {
+                        log_manager.abort_txn(txn_id)?;
+                    }
+                }
+                LogRecordBody::Begin => {
+                    // Reached beginning of transaction log chain
+                    log_manager.abort_txn(txn_id)?;
+                }
+                _ => {}
             }
         }
 
