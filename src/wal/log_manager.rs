@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::storage::page::PageId;
 use crate::wal::log_record::{LogRecord, LogRecordBody, LogRecordType};
 use crate::wal::lsn::{Lsn, TxnId, NULL_LSN};
+use crate::wal::reader::WalReader;
 
 /// Recognizable magic bytes for TreeDB WAL files.
 pub const WAL_MAGIC_BYTES: &[u8; 8] = b"TREEWAL1";
@@ -95,6 +96,7 @@ pub struct LogManager {
     next_txn_id: TxnId,
     txn_first_lsn: HashMap<TxnId, Lsn>,
     txn_prev_lsn: HashMap<TxnId, Lsn>,
+    txn_record_offsets: HashMap<TxnId, HashMap<Lsn, u64>>,
 }
 
 impl LogManager {
@@ -122,6 +124,7 @@ impl LogManager {
             next_txn_id: TxnId::new(1),
             txn_first_lsn: HashMap::new(),
             txn_prev_lsn: HashMap::new(),
+            txn_record_offsets: HashMap::new(),
         })
     }
 
@@ -172,14 +175,16 @@ impl LogManager {
             next_txn_id: TxnId::new(1),
             txn_first_lsn: HashMap::new(),
             txn_prev_lsn: HashMap::new(),
+            txn_record_offsets: HashMap::new(),
         };
 
-        // Scan existing records to locate highest LSN, highest TxnId, and active transactions
-        let records = manager.read_all_records()?;
+        // Incrementally stream existing records to locate highest LSN, highest TxnId, and active transactions
+        let mut reader = WalReader::new(&mut manager.file, header.flushed_lsn)?;
         let mut active_first_lsn = HashMap::new();
         let mut active_prev_lsn = HashMap::new();
+        let mut txn_record_offsets: HashMap<TxnId, HashMap<Lsn, u64>> = HashMap::new();
 
-        for rec in &records {
+        while let Some((rec, rec_offset, _)) = reader.next_record_with_offset()? {
             if rec.lsn >= manager.next_lsn {
                 manager.next_lsn = rec.lsn.next();
             }
@@ -190,14 +195,23 @@ impl LogManager {
                 LogRecordType::Begin => {
                     active_first_lsn.insert(rec.txn_id, rec.lsn);
                     active_prev_lsn.insert(rec.txn_id, rec.lsn);
+                    txn_record_offsets
+                        .entry(rec.txn_id)
+                        .or_default()
+                        .insert(rec.lsn, rec_offset);
                 }
                 LogRecordType::Commit | LogRecordType::Abort => {
                     active_first_lsn.remove(&rec.txn_id);
                     active_prev_lsn.remove(&rec.txn_id);
+                    txn_record_offsets.remove(&rec.txn_id);
                 }
                 LogRecordType::PageDelta | LogRecordType::Clr => {
                     active_first_lsn.entry(rec.txn_id).or_insert(rec.lsn);
                     active_prev_lsn.insert(rec.txn_id, rec.lsn);
+                    txn_record_offsets
+                        .entry(rec.txn_id)
+                        .or_default()
+                        .insert(rec.lsn, rec_offset);
                 }
                 LogRecordType::Checkpoint => {
                     if let LogRecordBody::Checkpoint { active_txns } = &rec.body {
@@ -211,6 +225,7 @@ impl LogManager {
         }
         manager.txn_first_lsn = active_first_lsn;
         manager.txn_prev_lsn = active_prev_lsn;
+        manager.txn_record_offsets = txn_record_offsets;
 
         // Position file pointer at end of log
         manager.file.seek(SeekFrom::End(0))?;
@@ -225,10 +240,14 @@ impl LogManager {
 
         let lsn = self.allocate_lsn();
         let record = LogRecord::new_begin(lsn, txn_id);
-        self.append_record(&record)?;
+        let offset = self.append_record(&record)?;
 
         self.txn_first_lsn.insert(txn_id, lsn);
         self.txn_prev_lsn.insert(txn_id, lsn);
+        self.txn_record_offsets
+            .entry(txn_id)
+            .or_default()
+            .insert(lsn, offset);
         Ok(txn_id)
     }
 
@@ -275,6 +294,7 @@ impl LogManager {
 
         self.txn_first_lsn.remove(&txn_id);
         self.txn_prev_lsn.remove(&txn_id);
+        self.txn_record_offsets.remove(&txn_id);
 
         self.flush(lsn)?;
 
@@ -297,6 +317,7 @@ impl LogManager {
 
         self.txn_first_lsn.remove(&txn_id);
         self.txn_prev_lsn.remove(&txn_id);
+        self.txn_record_offsets.remove(&txn_id);
         self.flush(lsn)?;
         Ok(lsn)
     }
@@ -321,9 +342,13 @@ impl LogManager {
             before_image,
             after_image,
         );
-        self.append_record(&record)?;
+        let pos = self.append_record(&record)?;
         self.txn_first_lsn.entry(txn_id).or_insert(lsn);
         self.txn_prev_lsn.insert(txn_id, lsn);
+        self.txn_record_offsets
+            .entry(txn_id)
+            .or_default()
+            .insert(lsn, pos);
         Ok(lsn)
     }
 
@@ -347,9 +372,13 @@ impl LogManager {
             redo_image,
             undo_next_lsn,
         );
-        self.append_record(&record)?;
+        let pos = self.append_record(&record)?;
         self.txn_first_lsn.entry(txn_id).or_insert(lsn);
         self.txn_prev_lsn.insert(txn_id, lsn);
+        self.txn_record_offsets
+            .entry(txn_id)
+            .or_default()
+            .insert(lsn, pos);
         Ok(lsn)
     }
 
@@ -407,43 +436,48 @@ impl LogManager {
     /// Distinguishes between un-flushed crash-truncated tails (which are gracefully ignored)
     /// and mid-log corruption within the durable prefix (which returns `Error::WalCorruption`).
     pub fn read_all_records(&mut self) -> Result<Vec<LogRecord>> {
-        self.file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
-        let mut buffer = Vec::new();
-        self.file.read_to_end(&mut buffer)?;
-
+        let mut reader = self.reader()?;
         let mut records = Vec::new();
-        let mut offset = 0;
-        let mut last_lsn = NULL_LSN;
-
-        while offset < buffer.len() {
-            let slice = &buffer[offset..];
-            match LogRecord::deserialize(slice) {
-                Ok((record, consumed)) => {
-                    if record.lsn <= last_lsn {
-                        return Err(Error::WalCorruption(format!(
-                            "LSN monotonicity violation: record LSN {} <= previous LSN {}",
-                            record.lsn, last_lsn
-                        )));
-                    }
-                    last_lsn = record.lsn;
-                    records.push(record);
-                    offset += consumed;
-                }
-                Err(err) => {
-                    // Check if corruption occurred within the durable prefix
-                    if self.header.flushed_lsn.is_valid() && last_lsn < self.header.flushed_lsn {
-                        return Err(Error::WalCorruption(format!(
-                            "Durable WAL corrupted before flushed_lsn {}: {err}",
-                            self.header.flushed_lsn
-                        )));
-                    }
-                    // Otherwise, stop gracefully on un-flushed trailing fragment
-                    break;
-                }
-            }
+        while let Some(rec) = reader.next_record()? {
+            records.push(rec);
         }
-
+        self.file.seek(SeekFrom::End(0))?;
         Ok(records)
+    }
+
+    /// Returns a streaming WAL reader over this log manager's underlying file with default buffer capacity.
+    pub fn reader(&mut self) -> Result<WalReader<&mut File>> {
+        self.file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
+        WalReader::new(&mut self.file, self.header.flushed_lsn)
+    }
+
+    /// Returns a streaming WAL reader with an explicit buffer capacity.
+    pub fn reader_with_buffer_size(&mut self, buffer_size: usize) -> Result<WalReader<&mut File>> {
+        self.file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
+        WalReader::with_buffer_size(&mut self.file, self.header.flushed_lsn, buffer_size)
+    }
+
+    /// Looks up the recorded file offset for `(txn_id, lsn)` among active transactions.
+    pub fn get_record_offset(&self, txn_id: TxnId, lsn: Lsn) -> Option<u64> {
+        self.txn_record_offsets
+            .get(&txn_id)
+            .and_then(|m| m.get(&lsn).copied())
+    }
+
+    /// Reads a single log record starting precisely at `offset`.
+    pub fn read_record_at_offset(&mut self, offset: u64) -> Result<LogRecord> {
+        let mut reader = self.reader()?;
+        let rec = reader.read_record_at(offset)?;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(rec)
+    }
+
+    /// Reads a log record for an active transaction by looking up its recorded offset.
+    pub fn read_record_for_txn(&mut self, txn_id: TxnId, lsn: Lsn) -> Result<Option<LogRecord>> {
+        if let Some(offset) = self.get_record_offset(txn_id, lsn) {
+            return Ok(Some(self.read_record_at_offset(offset)?));
+        }
+        Ok(None)
     }
 
     /// Returns a list of all currently active transactions and their last logged LSNs.
@@ -480,30 +514,20 @@ impl LogManager {
 
     /// Truncates the WAL prefix by safely removing records with `LSN < min_lsn`.
     ///
-    /// Retained records (`LSN >= min_lsn`) are written to a temporary file, synced,
-    /// and replaced crash-safely.
+    /// Retained records (`LSN >= min_lsn`) are written to a temporary file incrementally, synced,
+    /// and replaced crash-safely without loading all records into memory.
     /// Returns the number of obsolete log records removed.
     pub fn truncate_prefix(&mut self, min_lsn: Lsn) -> Result<usize> {
         if !min_lsn.is_valid() || min_lsn <= Lsn(1) {
             return Ok(0);
         }
 
-        let all_records = self.read_all_records()?;
-        let total_count = all_records.len();
-        let retained: Vec<LogRecord> = all_records
-            .into_iter()
-            .filter(|r| r.lsn >= min_lsn)
-            .collect();
-        let removed_count = total_count - retained.len();
-
-        if removed_count == 0 {
-            return Ok(0);
-        }
-
         let tmp_path = PathBuf::from(format!("{}.tmp", self.path.display()));
         let bak_path = PathBuf::from(format!("{}.bak", self.path.display()));
 
-        // 1. Write retained records to temp file
+        let mut removed_count = 0;
+
+        // 1. Write retained records to temp file streaming incrementally
         {
             let mut tmp_file = OpenOptions::new()
                 .read(true)
@@ -514,11 +538,21 @@ impl LogManager {
 
             let header_bytes = self.header.serialize();
             tmp_file.write_all(&header_bytes)?;
-            for rec in &retained {
-                let rec_bytes = rec.serialize();
-                tmp_file.write_all(&rec_bytes)?;
+
+            let mut reader = self.reader()?;
+            while let Some(rec) = reader.next_record()? {
+                if rec.lsn < min_lsn {
+                    removed_count += 1;
+                } else {
+                    tmp_file.write_all(&rec.serialize())?;
+                }
             }
             tmp_file.sync_all()?;
+        }
+
+        if removed_count == 0 {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Ok(0);
         }
 
         // 2. Safely replace WAL file releasing file handles to avoid OS sharing violations
@@ -547,7 +581,34 @@ impl LogManager {
         self.file.seek(SeekFrom::End(0))?;
         let _ = std::fs::remove_file(&scratch_path);
 
+        // 4. Rebuild active transaction record offsets since file positions shifted
+        self.rebuild_active_txn_offsets()?;
+
         Ok(removed_count)
+    }
+
+    fn rebuild_active_txn_offsets(&mut self) -> Result<()> {
+        self.txn_record_offsets.clear();
+        self.file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
+        let mut reader = WalReader::new(&mut self.file, self.header.flushed_lsn)?;
+        while let Some((rec, offset, _)) = reader.next_record_with_offset()? {
+            match rec.record_type {
+                LogRecordType::Begin | LogRecordType::PageDelta | LogRecordType::Clr => {
+                    if self.txn_prev_lsn.contains_key(&rec.txn_id) {
+                        self.txn_record_offsets
+                            .entry(rec.txn_id)
+                            .or_default()
+                            .insert(rec.lsn, offset);
+                    }
+                }
+                LogRecordType::Commit | LogRecordType::Abort => {
+                    self.txn_record_offsets.remove(&rec.txn_id);
+                }
+                _ => {}
+            }
+        }
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(())
     }
 
     /// Returns the currently flushed LSN.
@@ -583,11 +644,12 @@ impl LogManager {
         lsn
     }
 
-    fn append_record(&mut self, record: &LogRecord) -> Result<()> {
+    fn append_record(&mut self, record: &LogRecord) -> Result<u64> {
         let bytes = record.serialize();
         self.file.seek(SeekFrom::End(0))?;
+        let offset = self.file.stream_position()?;
         self.file.write_all(&bytes)?;
-        Ok(())
+        Ok(offset)
     }
 }
 

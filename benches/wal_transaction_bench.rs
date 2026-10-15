@@ -208,4 +208,76 @@ pub fn run_wal_transaction_benchmarks(runner: &mut BenchmarkRunner) {
             ),
         ));
     }
+
+    // 7. Checkpointed vs Uncheckpointed WAL Recovery Benchmark
+    {
+        // 7a. Uncheckpointed WAL Recovery (5,000 records)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal_rec_uncheckpointed.treedb");
+        let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
+        let records_count = 5_000;
+        {
+            let _pm = PageManager::create(&path).unwrap();
+            let mut lm = LogManager::create(&wal_path).unwrap();
+            let txn_id = lm.begin_txn().unwrap();
+            for i in 0..records_count {
+                let page_id = 2 + (i as u32 % 20);
+                lm.append_page_delta(txn_id, page_id, 0, vec![0; 16], vec![1; 16])
+                    .unwrap();
+            }
+            let commit_lsn = lm.commit_txn(txn_id).unwrap();
+            lm.flush(commit_lsn).unwrap();
+        }
+        let start = Instant::now();
+        let mut pm = PageManager::open(&path).unwrap();
+        let mut lm = LogManager::open(&wal_path).unwrap();
+        let stats = RecoveryEngine::recover(&mut pm, &mut lm).unwrap();
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+
+        runner.record(BenchmarkResult::from_samples(
+            "WAL & Txn",
+            "aries_crash_recovery_uncheckpointed_5k",
+            records_count,
+            1,
+            vec![elapsed_ns],
+            format!(
+                "Streaming ARIES recovery of {} records without checkpoint (redo: {}, undo: {})",
+                records_count, stats.redo_count, stats.undo_count
+            ),
+        ));
+
+        // 7b. Checkpointed WAL Recovery (5,000 records with checkpoint)
+        let dir_cp = tempfile::tempdir().unwrap();
+        let path_cp = dir_cp.path().join("wal_rec_checkpointed.treedb");
+        let wal_path_cp = std::path::PathBuf::from(format!("{}.wal", path_cp.display()));
+        {
+            let mut db = TreeDb::create(&path_cp, 64).unwrap();
+            for i in 0..records_count {
+                let key = (i as u64 % 100) + 1;
+                let val = (i as u64).to_le_bytes();
+                db.put(key, &val).unwrap();
+                if (i + 1) % 1_000 == 0 {
+                    db.checkpoint_and_truncate_wal().unwrap();
+                }
+            }
+            db.sync().unwrap();
+        }
+        let start_cp = Instant::now();
+        let mut pm_cp = PageManager::open(&path_cp).unwrap();
+        let mut lm_cp = LogManager::open(&wal_path_cp).unwrap();
+        let stats_cp = RecoveryEngine::recover(&mut pm_cp, &mut lm_cp).unwrap();
+        let elapsed_cp_ns = start_cp.elapsed().as_nanos() as u64;
+
+        runner.record(BenchmarkResult::from_samples(
+            "WAL & Txn",
+            "aries_crash_recovery_checkpointed_5k",
+            records_count,
+            1,
+            vec![elapsed_cp_ns],
+            format!(
+                "Streaming ARIES recovery of {} operations with periodic checkpoints (redo: {}, undo: {})",
+                records_count, stats_cp.redo_count, stats_cp.undo_count
+            ),
+        ));
+    }
 }

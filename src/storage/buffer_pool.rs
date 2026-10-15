@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::storage::page::{Page, PageId, PageType, PAGE_SIZE};
 use crate::storage::page_manager::PageManager;
 use crate::wal::log_manager::LogManager;
-use crate::wal::log_record::{LogRecord, LogRecordBody};
+use crate::wal::log_record::LogRecordBody;
 use crate::wal::lsn::{Lsn, TxnId, NULL_LSN};
 
 /// Frame identifier within the buffer pool.
@@ -645,72 +645,76 @@ impl BufferPool {
             None => return Ok(NULL_LSN),
         };
 
-        let records = wal.read_all_records()?;
-        let mut log_map: HashMap<Lsn, LogRecord> = HashMap::with_capacity(records.len());
-        for rec in &records {
-            log_map.insert(rec.lsn, rec.clone());
-        }
-
         let mut curr_lsn = wal.txn_prev_lsn().get(&txn_id).copied().unwrap_or(NULL_LSN);
 
         while curr_lsn.is_valid() {
-            if let Some(rec) = log_map.get(&curr_lsn) {
-                if rec.txn_id == txn_id {
-                    if let LogRecordBody::PageDelta {
-                        page_id,
-                        offset,
-                        before_image,
-                        ..
-                    } = &rec.body
-                    {
-                        let pid = *page_id;
-                        let off = *offset as usize;
-                        let len = before_image.len();
+            let rec = match wal.read_record_for_txn(txn_id, curr_lsn)? {
+                Some(r) => r,
+                None => {
+                    // Fallback to streaming scan if offset was not cached
+                    let mut reader = wal.reader()?;
+                    let mut found = None;
+                    while let Some(r) = reader.next_record()? {
+                        if r.lsn == curr_lsn && r.txn_id == txn_id {
+                            found = Some(r);
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(r) => r,
+                        None => break,
+                    }
+                }
+            };
 
-                        // 1. Apply before_image to page in buffer pool or on disk
-                        if let Some(&frame_id) = self.page_table.get(&pid) {
-                            let frame = &mut self.frames[frame_id];
-                            if let Some(ref mut page) = frame.page {
-                                if off + len <= page.as_bytes().len() {
-                                    page.as_bytes_mut()[off..off + len]
-                                        .copy_from_slice(before_image);
-                                }
-                            }
-                            frame.dirty = true;
-                            if let Some(ref mut before) = frame.before_image {
-                                if off + len <= before.len() {
-                                    before[off..off + len].copy_from_slice(before_image);
-                                }
-                            }
-                        } else if pid < self.page_manager.page_count() {
-                            let mut page = self.page_manager.read_page(pid)?;
+            if rec.txn_id == txn_id {
+                if let LogRecordBody::PageDelta {
+                    page_id,
+                    offset,
+                    before_image,
+                    ..
+                } = &rec.body
+                {
+                    let pid = *page_id;
+                    let off = *offset as usize;
+                    let len = before_image.len();
+
+                    // 1. Apply before_image to page in buffer pool or on disk
+                    if let Some(&frame_id) = self.page_table.get(&pid) {
+                        let frame = &mut self.frames[frame_id];
+                        if let Some(ref mut page) = frame.page {
                             if off + len <= page.as_bytes().len() {
                                 page.as_bytes_mut()[off..off + len].copy_from_slice(before_image);
-                                self.page_manager.write_page(&page)?;
                             }
                         }
-
-                        // 2. Append CLR and flush WAL for write-ahead durability
-                        let wal = self.wal.as_mut().unwrap();
-                        let clr_lsn = wal.append_clr(
-                            txn_id,
-                            pid,
-                            *offset,
-                            before_image.clone(),
-                            rec.prev_lsn,
-                        )?;
-                        wal.flush(clr_lsn)?;
-
-                        // 3. Update page LSN
-                        if let Some(&frame_id) = self.page_table.get(&pid) {
-                            if let Some(ref mut page) = self.frames[frame_id].page {
-                                page.set_lsn(clr_lsn);
+                        frame.dirty = true;
+                        if let Some(ref mut before) = frame.before_image {
+                            if off + len <= before.len() {
+                                before[off..off + len].copy_from_slice(before_image);
                             }
-                        } else if pid < self.page_manager.page_count() {
-                            if let Ok(mut page) = self.page_manager.read_page(pid) {
-                                page.set_lsn(clr_lsn);
-                                let _ = self.page_manager.write_page(&page);
-                            }
+                        }
+                    } else if pid < self.page_manager.page_count() {
+                        let mut page = self.page_manager.read_page(pid)?;
+                        if off + len <= page.as_bytes().len() {
+                            page.as_bytes_mut()[off..off + len].copy_from_slice(before_image);
+                            self.page_manager.write_page(&page)?;
+                        }
+                    }
+
+                    // 2. Append CLR and flush WAL for write-ahead durability
+                    let clr_lsn =
+                        wal.append_clr(txn_id, pid, *offset, before_image.clone(), rec.prev_lsn)?;
+                    wal.flush(clr_lsn)?;
+
+                    // 3. Update page LSN
+                    if let Some(&frame_id) = self.page_table.get(&pid) {
+                        if let Some(ref mut page) = self.frames[frame_id].page {
+                            page.set_lsn(clr_lsn);
+                        }
+                    } else if pid < self.page_manager.page_count() {
+                        if let Ok(mut page) = self.page_manager.read_page(pid) {
+                            page.set_lsn(clr_lsn);
+                            let _ = self.page_manager.write_page(&page);
                         }
                     }
                 }
@@ -720,7 +724,6 @@ impl BufferPool {
             }
         }
 
-        let wal = self.wal.as_mut().unwrap();
         let lsn = wal.abort_txn(txn_id)?;
         if self.active_txn == Some(txn_id) {
             self.active_txn = None;

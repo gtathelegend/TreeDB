@@ -89,6 +89,7 @@ pub use storage::{
 
 pub use wal::{
     crc32, LogManager, LogRecord, LogRecordBody, LogRecordType, Lsn, RecoveryEngine, RecoveryFault,
-    RecoveryStats, TxnId, TxnStatus, TxnTableEntry, WalHeader, CURRENT_WAL_VERSION, INVALID_LSN,
+    RecoveryStats, TxnId, TxnStatus, TxnTableEntry, WalHeader, WalReader, CURRENT_WAL_VERSION,
+    DEFAULT_WAL_BUFFER_SIZE, INVALID_LSN, MAX_WAL_RECORD_PAYLOAD_LEN, MIN_WAL_RECORD_PAYLOAD_LEN,
     NULL_LSN, NULL_TXN, WAL_HEADER_SIZE, WAL_MAGIC_BYTES,
 };

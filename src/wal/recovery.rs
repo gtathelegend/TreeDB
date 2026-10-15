@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use crate::error::{Error, Result};
 use crate::storage::page::{Page, PageId};
 use crate::storage::page_manager::PageManager;
-use crate::wal::log_manager::LogManager;
-use crate::wal::log_record::{LogRecord, LogRecordBody, LogRecordType};
+use crate::wal::log_manager::{LogManager, WAL_HEADER_SIZE};
+use crate::wal::log_record::{LogRecordBody, LogRecordType};
 use crate::wal::lsn::{Lsn, TxnId};
 
 /// Status of a transaction during crash recovery analysis.
@@ -82,89 +82,114 @@ impl RecoveryEngine {
 
         let mut stats = RecoveryStats::default();
 
-        // Load all log records from the WAL
-        let records = log_manager.read_all_records()?;
-        stats.records_scanned = records.len();
-        if records.is_empty() {
-            return Ok(stats);
-        }
-
-        // Map LSN to LogRecord for random access during Undo pass
-        let mut log_map: HashMap<Lsn, LogRecord> = HashMap::with_capacity(records.len());
-        for rec in &records {
-            log_map.insert(rec.lsn, rec.clone());
-        }
-
-        // -------------------------------------------------------------------
-        // CHECKPOINT VALIDATION & INITIALIZATION
-        // -------------------------------------------------------------------
         let last_checkpoint_lsn = page_manager.header().last_checkpoint_lsn;
         let mut txn_table: HashMap<TxnId, TxnTableEntry> = HashMap::new();
         let mut dpt: HashMap<PageId, Lsn> = HashMap::new();
+        let mut dpt_first_offset: HashMap<PageId, u64> = HashMap::new();
+        let mut loser_record_offsets: HashMap<Lsn, u64> = HashMap::new();
+        let mut active_txn_lsns: HashMap<TxnId, Vec<Lsn>> = HashMap::new();
 
-        let scan_start_idx = if last_checkpoint_lsn.is_valid() {
-            // Validate that last_checkpoint_lsn does not exceed durable WAL boundary
-            if log_manager.flushed_lsn().is_valid()
-                && last_checkpoint_lsn > log_manager.flushed_lsn()
-            {
-                return Err(Error::WalCorruption(format!(
-                    "checkpoint LSN {} exceeds durable flushed LSN {}",
-                    last_checkpoint_lsn,
-                    log_manager.flushed_lsn()
-                )));
+        // Validate checkpoint LSN bounds against durable flushed LSN
+        if last_checkpoint_lsn.is_valid()
+            && log_manager.flushed_lsn().is_valid()
+            && last_checkpoint_lsn > log_manager.flushed_lsn()
+        {
+            return Err(Error::WalCorruption(format!(
+                "checkpoint LSN {} exceeds durable flushed LSN {}",
+                last_checkpoint_lsn,
+                log_manager.flushed_lsn()
+            )));
+        }
+
+        // -------------------------------------------------------------------
+        // 0. INITIAL PROBE: Record count & Checkpoint location
+        // -------------------------------------------------------------------
+        let mut total_records_in_wal = 0;
+        let mut checkpoint_record = None;
+        let mut cp_active_txns = Vec::new();
+        let mut start_offset = WAL_HEADER_SIZE as u64;
+
+        {
+            let mut reader = log_manager.reader()?;
+            while let Some((rec, offset, _)) = reader.next_record_with_offset()? {
+                total_records_in_wal += 1;
+                if last_checkpoint_lsn.is_valid() && rec.lsn == last_checkpoint_lsn {
+                    if rec.record_type != LogRecordType::Checkpoint {
+                        return Err(Error::WalCorruption(format!(
+                            "record at checkpoint LSN {} is not a Checkpoint record (type={:?})",
+                            last_checkpoint_lsn, rec.record_type
+                        )));
+                    }
+                    if let LogRecordBody::Checkpoint { active_txns } = &rec.body {
+                        for &(txn_id, last_lsn) in active_txns {
+                            if !txn_id.is_valid()
+                                || !last_lsn.is_valid()
+                                || last_lsn >= last_checkpoint_lsn
+                            {
+                                return Err(Error::WalCorruption(format!(
+                                    "corrupted active transaction entry (txn_id={txn_id}, last_lsn={last_lsn}) in checkpoint record {last_checkpoint_lsn}"
+                                )));
+                            }
+                        }
+                        cp_active_txns = active_txns.clone();
+                    }
+                    checkpoint_record = Some(offset);
+                }
             }
+        }
 
-            let cp_rec = log_map.get(&last_checkpoint_lsn).ok_or_else(|| {
+        stats.records_scanned = total_records_in_wal;
+        if total_records_in_wal == 0 {
+            return Ok(stats);
+        }
+
+        if last_checkpoint_lsn.is_valid() {
+            let cp_offset = checkpoint_record.ok_or_else(|| {
                 Error::WalCorruption(format!(
                     "checkpoint LSN {} referenced in header not found in WAL",
                     last_checkpoint_lsn
                 ))
             })?;
 
-            if cp_rec.record_type != LogRecordType::Checkpoint {
-                return Err(Error::WalCorruption(format!(
-                    "record at checkpoint LSN {} is not a Checkpoint record (type={:?})",
-                    last_checkpoint_lsn, cp_rec.record_type
-                )));
-            }
-
             stats.checkpoint_lsn = last_checkpoint_lsn;
 
-            if let LogRecordBody::Checkpoint { active_txns } = &cp_rec.body {
-                for &(txn_id, last_lsn) in active_txns {
-                    if !txn_id.is_valid() || !last_lsn.is_valid() || last_lsn >= last_checkpoint_lsn
-                    {
-                        return Err(Error::WalCorruption(format!(
-                            "corrupted active transaction entry (txn_id={txn_id}, last_lsn={last_lsn}) in checkpoint record {last_checkpoint_lsn}"
-                        )));
-                    }
-                    txn_table.insert(
-                        txn_id,
-                        TxnTableEntry {
-                            status: TxnStatus::Active,
-                            last_lsn,
-                            undo_next_lsn: last_lsn,
-                        },
-                    );
-                }
+            for &(txn_id, last_lsn) in &cp_active_txns {
+                txn_table.insert(
+                    txn_id,
+                    TxnTableEntry {
+                        status: TxnStatus::Active,
+                        last_lsn,
+                        undo_next_lsn: last_lsn,
+                    },
+                );
             }
 
-            // Find index of checkpoint record or start scan from earliest active LSN
             let min_active_lsn = txn_table.values().map(|e| e.last_lsn).min();
             let start_lsn = match min_active_lsn {
                 Some(min_l) => std::cmp::min(min_l, last_checkpoint_lsn),
                 None => last_checkpoint_lsn,
             };
 
-            records.iter().position(|r| r.lsn >= start_lsn).unwrap_or(0)
-        } else {
-            0
-        };
+            if start_lsn == last_checkpoint_lsn {
+                start_offset = cp_offset;
+            } else {
+                let mut reader = log_manager.reader()?;
+                while let Some((rec, offset, _)) = reader.next_record_with_offset()? {
+                    if rec.lsn >= start_lsn {
+                        start_offset = offset;
+                        break;
+                    }
+                }
+            }
+        }
 
         // -------------------------------------------------------------------
-        // 1. ANALYSIS PASS
+        // 1. ANALYSIS PASS (Incremental Streaming)
         // -------------------------------------------------------------------
-        for rec in &records[scan_start_idx..] {
+        let mut reader = log_manager.reader()?;
+        reader.seek_to_offset(start_offset)?;
+
+        while let Some((rec, rec_offset, _)) = reader.next_record_with_offset()? {
             match rec.record_type {
                 LogRecordType::Begin => {
                     txn_table.insert(
@@ -175,6 +200,8 @@ impl RecoveryEngine {
                             undo_next_lsn: rec.lsn,
                         },
                     );
+                    active_txn_lsns.entry(rec.txn_id).or_default().push(rec.lsn);
+                    loser_record_offsets.insert(rec.lsn, rec_offset);
                 }
                 LogRecordType::Commit => {
                     if let Some(entry) = txn_table.get_mut(&rec.txn_id) {
@@ -184,11 +211,21 @@ impl RecoveryEngine {
                     if let LogRecordBody::Commit { commit_seq } = rec.body {
                         stats.max_commit_seq = std::cmp::max(stats.max_commit_seq, commit_seq);
                     }
+                    if let Some(lsns) = active_txn_lsns.remove(&rec.txn_id) {
+                        for l in lsns {
+                            loser_record_offsets.remove(&l);
+                        }
+                    }
                 }
                 LogRecordType::Abort => {
                     if let Some(entry) = txn_table.get_mut(&rec.txn_id) {
                         entry.status = TxnStatus::Aborted;
                         entry.last_lsn = rec.lsn;
+                    }
+                    if let Some(lsns) = active_txn_lsns.remove(&rec.txn_id) {
+                        for l in lsns {
+                            loser_record_offsets.remove(&l);
+                        }
                     }
                 }
                 LogRecordType::PageDelta => {
@@ -200,8 +237,12 @@ impl RecoveryEngine {
                     entry.last_lsn = rec.lsn;
                     entry.undo_next_lsn = rec.lsn;
 
+                    active_txn_lsns.entry(rec.txn_id).or_default().push(rec.lsn);
+                    loser_record_offsets.insert(rec.lsn, rec_offset);
+
                     if let LogRecordBody::PageDelta { page_id, .. } = rec.body {
                         dpt.entry(page_id).or_insert(rec.lsn);
+                        dpt_first_offset.entry(page_id).or_insert(rec_offset);
                     }
                 }
                 LogRecordType::Clr => {
@@ -219,7 +260,11 @@ impl RecoveryEngine {
                         entry.last_lsn = rec.lsn;
                         entry.undo_next_lsn = *undo_next_lsn;
 
+                        active_txn_lsns.entry(rec.txn_id).or_default().push(rec.lsn);
+                        loser_record_offsets.insert(rec.lsn, rec_offset);
+
                         dpt.entry(*page_id).or_insert(rec.lsn);
+                        dpt_first_offset.entry(*page_id).or_insert(rec_offset);
                     }
                 }
                 LogRecordType::Checkpoint => {
@@ -252,76 +297,86 @@ impl RecoveryEngine {
         }
 
         // -------------------------------------------------------------------
-        // 2. REDO PASS
+        // 2. REDO PASS (Incremental Streaming)
         // -------------------------------------------------------------------
-        // Replay history forward for all PageDelta and Clr records
         let min_rec_lsn = dpt.values().copied().min();
-        let redo_start_idx = if let Some(min_rec) = min_rec_lsn {
-            records.iter().position(|r| r.lsn >= min_rec).unwrap_or(0)
-        } else {
-            records.len()
-        };
+        if let Some(min_rec) = min_rec_lsn {
+            let redo_start_offset = dpt
+                .iter()
+                .filter(|(_, &lsn)| lsn == min_rec)
+                .find_map(|(pid, _)| dpt_first_offset.get(pid).copied())
+                .unwrap_or(WAL_HEADER_SIZE as u64);
 
-        for rec in &records[redo_start_idx..] {
-            match &rec.body {
-                LogRecordBody::PageDelta {
-                    page_id,
-                    offset,
-                    after_image,
-                    ..
-                } if *page_id < page_manager.page_count() => {
-                    // DPT check: if rec.lsn < DPT[page_id], redo is unnecessary
-                    if let Some(&rec_lsn) = dpt.get(page_id) {
-                        if rec.lsn >= rec_lsn {
-                            let mut page = page_manager.read_page(*page_id)?;
-                            if page.lsn() < rec.lsn {
-                                let start = *offset as usize;
-                                let end = start + after_image.len();
-                                if end <= page.as_bytes().len() {
-                                    page.as_bytes_mut()[start..end].copy_from_slice(after_image);
-                                    page.set_lsn(rec.lsn);
-                                    page_manager.write_page(&page)?;
-                                    stats.redo_count += 1;
+            reader.seek_to_offset(redo_start_offset)?;
 
-                                    if fault == Some(RecoveryFault::DuringRedo(stats.redo_count)) {
-                                        return Err(Error::RecoveryInterrupted(
-                                            "simulated crash during redo".into(),
-                                        ));
+            while let Some((rec, _, _)) = reader.next_record_with_offset()? {
+                if rec.lsn < min_rec {
+                    continue;
+                }
+                match &rec.body {
+                    LogRecordBody::PageDelta {
+                        page_id,
+                        offset,
+                        after_image,
+                        ..
+                    } if *page_id < page_manager.page_count() => {
+                        if let Some(&rec_lsn) = dpt.get(page_id) {
+                            if rec.lsn >= rec_lsn {
+                                let mut page = page_manager.read_page(*page_id)?;
+                                if page.lsn() < rec.lsn {
+                                    let start = *offset as usize;
+                                    let end = start + after_image.len();
+                                    if end <= page.as_bytes().len() {
+                                        page.as_bytes_mut()[start..end]
+                                            .copy_from_slice(after_image);
+                                        page.set_lsn(rec.lsn);
+                                        page_manager.write_page(&page)?;
+                                        stats.redo_count += 1;
+
+                                        if fault
+                                            == Some(RecoveryFault::DuringRedo(stats.redo_count))
+                                        {
+                                            return Err(Error::RecoveryInterrupted(
+                                                "simulated crash during redo".into(),
+                                            ));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                LogRecordBody::Clr {
-                    page_id,
-                    offset,
-                    redo_image,
-                    ..
-                } if *page_id < page_manager.page_count() => {
-                    if let Some(&rec_lsn) = dpt.get(page_id) {
-                        if rec.lsn >= rec_lsn {
-                            let mut page = page_manager.read_page(*page_id)?;
-                            if page.lsn() < rec.lsn {
-                                let start = *offset as usize;
-                                let end = start + redo_image.len();
-                                if end <= page.as_bytes().len() {
-                                    page.as_bytes_mut()[start..end].copy_from_slice(redo_image);
-                                    page.set_lsn(rec.lsn);
-                                    page_manager.write_page(&page)?;
-                                    stats.redo_count += 1;
+                    LogRecordBody::Clr {
+                        page_id,
+                        offset,
+                        redo_image,
+                        ..
+                    } if *page_id < page_manager.page_count() => {
+                        if let Some(&rec_lsn) = dpt.get(page_id) {
+                            if rec.lsn >= rec_lsn {
+                                let mut page = page_manager.read_page(*page_id)?;
+                                if page.lsn() < rec.lsn {
+                                    let start = *offset as usize;
+                                    let end = start + redo_image.len();
+                                    if end <= page.as_bytes().len() {
+                                        page.as_bytes_mut()[start..end].copy_from_slice(redo_image);
+                                        page.set_lsn(rec.lsn);
+                                        page_manager.write_page(&page)?;
+                                        stats.redo_count += 1;
 
-                                    if fault == Some(RecoveryFault::DuringRedo(stats.redo_count)) {
-                                        return Err(Error::RecoveryInterrupted(
-                                            "simulated crash during redo".into(),
-                                        ));
+                                        if fault
+                                            == Some(RecoveryFault::DuringRedo(stats.redo_count))
+                                        {
+                                            return Err(Error::RecoveryInterrupted(
+                                                "simulated crash during redo".into(),
+                                            ));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -332,9 +387,8 @@ impl RecoveryEngine {
         }
 
         // -------------------------------------------------------------------
-        // 3. UNDO PASS
+        // 3. UNDO PASS (Targeted Record Reads)
         // -------------------------------------------------------------------
-        // Roll back uncommitted (loser) transactions backward
         let mut active_undo_lsns: Vec<(Lsn, TxnId)> = txn_table
             .iter()
             .filter(|(_, entry)| {
@@ -343,12 +397,21 @@ impl RecoveryEngine {
             .map(|(&txn_id, entry)| (entry.undo_next_lsn, txn_id))
             .collect();
 
+        // Drop the reader borrow on log_manager so log_manager can append and flush CLRs
+        drop(reader);
+
         while !active_undo_lsns.is_empty() {
             // Find maximum LSN among active losers to undo in reverse chronological order
             active_undo_lsns.sort_by_key(|&(lsn, _)| lsn);
             let (curr_lsn, txn_id) = active_undo_lsns.pop().unwrap();
 
-            if let Some(rec) = log_map.get(&curr_lsn) {
+            let rec = if let Some(&offset) = loser_record_offsets.get(&curr_lsn) {
+                Some(log_manager.read_record_at_offset(offset)?)
+            } else {
+                log_manager.read_record_for_txn(txn_id, curr_lsn)?
+            };
+
+            if let Some(rec) = rec {
                 match &rec.body {
                     LogRecordBody::PageDelta {
                         page_id,
