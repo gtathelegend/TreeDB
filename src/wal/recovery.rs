@@ -481,6 +481,9 @@ impl RecoveryEngine {
                     } else {
                         // Transaction undo complete, append Abort record
                         log_manager.abort_txn(txn_id)?;
+                        if let Some(entry) = txn_table.get_mut(&txn_id) {
+                            entry.status = TxnStatus::Aborted;
+                        }
                     }
                 }
                 LogRecordBody::Clr { undo_next_lsn, .. } => {
@@ -488,13 +491,28 @@ impl RecoveryEngine {
                         active_undo_lsns.push((*undo_next_lsn, txn_id));
                     } else {
                         log_manager.abort_txn(txn_id)?;
+                        if let Some(entry) = txn_table.get_mut(&txn_id) {
+                            entry.status = TxnStatus::Aborted;
+                        }
                     }
                 }
                 LogRecordBody::Begin => {
                     // Reached beginning of transaction log chain
                     log_manager.abort_txn(txn_id)?;
+                    if let Some(entry) = txn_table.get_mut(&txn_id) {
+                        entry.status = TxnStatus::Aborted;
+                    }
                 }
                 _ => {}
+            }
+        }
+
+        // Finalize any active loser transactions that were already completely undone
+        // prior to this recovery pass (e.g. crash occurred after final CLR flush but before abort record)
+        for (&txn_id, entry) in &mut txn_table {
+            if entry.status == TxnStatus::Active && !entry.undo_next_lsn.is_valid() {
+                log_manager.abort_txn(txn_id)?;
+                entry.status = TxnStatus::Aborted;
             }
         }
 

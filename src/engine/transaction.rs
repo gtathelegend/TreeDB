@@ -591,6 +591,7 @@ pub struct Transaction<'db> {
     initial_free_page_count: u32,
     #[allow(dead_code)]
     initial_page_count: u32,
+    initial_record_store_last_page: PageId,
     pub(crate) has_catalog_mutations: bool,
 }
 
@@ -632,6 +633,7 @@ impl<'db> Transaction<'db> {
         initial_page_count: u32,
     ) -> Self {
         let snap_id = isolation_context.snapshot.snapshot_id;
+        let initial_record_store_last_page = db.record_store.last_page_id();
         Self {
             db,
             txn_id,
@@ -643,6 +645,7 @@ impl<'db> Transaction<'db> {
             initial_freelist_head,
             initial_free_page_count,
             initial_page_count,
+            initial_record_store_last_page,
             has_catalog_mutations: false,
         }
     }
@@ -8381,6 +8384,11 @@ impl<'db> Transaction<'db> {
                     self.db.snapshot_registry.release(owned_id);
                 }
                 self.state = TxnState::Committed;
+                self.db
+                    .buffer_pool
+                    .page_manager_mut()
+                    .header_mut()
+                    .root_page_id = self.db.tree.root_page_id();
                 if self.has_catalog_mutations {
                     self.db.catalog_generation += 1;
                     self.db.plan_cache.invalidate_all();
@@ -8554,6 +8562,9 @@ impl<'db> Transaction<'db> {
                 .write_header_to_disk();
             self.db.tree =
                 crate::index::bplus_tree::BPlusTree::from_root(self.initial_root_page_id);
+            self.db.record_store = crate::storage::record_store::RecordStore::with_last_page(
+                self.initial_record_store_last_page,
+            );
             if self.has_catalog_mutations {
                 self.db.catalog_generation += 1;
                 self.db.index_generation += 1;

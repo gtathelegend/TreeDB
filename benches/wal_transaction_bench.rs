@@ -210,71 +210,143 @@ pub fn run_wal_transaction_benchmarks(runner: &mut BenchmarkRunner) {
     }
 
     // 7. Checkpointed vs Uncheckpointed WAL Recovery Benchmark
+    // Workloads are logically identical: same keys, values, and operation counts.
+    // Database setup and WAL generation are strictly separated from timed recovery across 10 repetitions.
     {
-        // 7a. Uncheckpointed WAL Recovery (5,000 TreeDb::put operations)
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wal_rec_uncheckpointed.treedb");
-        let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
-        let records_count = 5_000;
-        {
-            let mut db = TreeDb::create(&path, 64).unwrap();
-            for i in 0..records_count {
-                let key = (i as u64 % 100) + 1;
-                let val = (i as u64).to_le_bytes();
-                db.put(key, &val).unwrap();
-            }
-            db.sync().unwrap();
-        }
-        let start = Instant::now();
-        let mut pm = PageManager::open(&path).unwrap();
-        let mut lm = LogManager::open(&wal_path).unwrap();
-        let stats = RecoveryEngine::recover(&mut pm, &mut lm).unwrap();
-        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let repetitions = 10;
 
-        runner.record(BenchmarkResult::from_samples(
-            "WAL & Txn",
-            "aries_crash_recovery_uncheckpointed_5k",
-            records_count,
-            1,
-            vec![elapsed_ns],
-            format!(
-                "Streaming ARIES recovery of {} operations without checkpoint (redo: {}, undo: {})",
-                records_count, stats.redo_count, stats.undo_count
-            ),
-        ));
+        // 7a. Small WAL Workload (500 operations)
+        let small_records = 500;
+        run_recovery_benchmark_pair(
+            runner,
+            "small_500",
+            small_records,
+            repetitions,
+            250, // Checkpoint every 250 operations
+        );
 
-        // 7b. Checkpointed WAL Recovery (5,000 records with checkpoint)
-        let dir_cp = tempfile::tempdir().unwrap();
-        let path_cp = dir_cp.path().join("wal_rec_checkpointed.treedb");
-        let wal_path_cp = std::path::PathBuf::from(format!("{}.wal", path_cp.display()));
-        {
-            let mut db = TreeDb::create(&path_cp, 64).unwrap();
-            for i in 0..records_count {
-                let key = (i as u64 % 100) + 1;
-                let val = (i as u64).to_le_bytes();
-                db.put(key, &val).unwrap();
-                if (i + 1) % 1_000 == 0 {
-                    db.checkpoint_and_truncate_wal().unwrap();
-                }
-            }
-            db.sync().unwrap();
-        }
-        let start_cp = Instant::now();
-        let mut pm_cp = PageManager::open(&path_cp).unwrap();
-        let mut lm_cp = LogManager::open(&wal_path_cp).unwrap();
-        let stats_cp = RecoveryEngine::recover(&mut pm_cp, &mut lm_cp).unwrap();
-        let elapsed_cp_ns = start_cp.elapsed().as_nanos() as u64;
-
-        runner.record(BenchmarkResult::from_samples(
-            "WAL & Txn",
-            "aries_crash_recovery_checkpointed_5k",
-            records_count,
-            1,
-            vec![elapsed_cp_ns],
-            format!(
-                "Streaming ARIES recovery of {} operations with periodic checkpoints (redo: {}, undo: {})",
-                records_count, stats_cp.redo_count, stats_cp.undo_count
-            ),
-        ));
+        // 7b. Large WAL Workload (5,000 operations)
+        let large_records = 5_000;
+        run_recovery_benchmark_pair(
+            runner,
+            "large_5k",
+            large_records,
+            repetitions,
+            1_000, // Checkpoint every 1,000 operations
+        );
     }
+}
+
+fn run_recovery_benchmark_pair(
+    runner: &mut BenchmarkRunner,
+    label: &str,
+    records_count: usize,
+    repetitions: usize,
+    checkpoint_interval: usize,
+) {
+    // 1. Prepare Uncheckpointed Baseline
+    let dir_un = tempfile::tempdir().unwrap();
+    let path_un = dir_un.path().join("source.treedb");
+    let wal_path_un = std::path::PathBuf::from(format!("{}.wal", path_un.display()));
+    {
+        let mut db = TreeDb::create(&path_un, 64).unwrap();
+        for i in 0..records_count {
+            let key = (i as u64 % 100) + 1;
+            let val = (i as u64).to_le_bytes();
+            db.put(key, &val).unwrap();
+        }
+        db.sync().unwrap();
+    }
+    let unchk_wal_bytes = std::fs::metadata(&wal_path_un).unwrap().len();
+
+    // Timed repetitions for Uncheckpointed
+    let mut un_samples = Vec::with_capacity(repetitions);
+    let mut un_stats = None;
+    for _ in 0..repetitions {
+        let run_dir = tempfile::tempdir().unwrap();
+        let run_db = run_dir.path().join("run.treedb");
+        let run_wal = std::path::PathBuf::from(format!("{}.wal", run_db.display()));
+        std::fs::copy(&path_un, &run_db).unwrap();
+        std::fs::copy(&wal_path_un, &run_wal).unwrap();
+
+        let mut pm = PageManager::open(&run_db).unwrap();
+        let mut lm = LogManager::open(&run_wal).unwrap();
+        let start = Instant::now();
+        let stats = RecoveryEngine::recover(&mut pm, &mut lm).unwrap();
+        let elapsed = start.elapsed().as_nanos() as u64;
+        un_samples.push(elapsed);
+        un_stats = Some(stats);
+    }
+    let un_final_stats = un_stats.unwrap();
+
+    runner.record(BenchmarkResult::from_samples(
+        "WAL & Txn",
+        Box::leak(format!("aries_recovery_uncheckpointed_{label}").into_boxed_str()),
+        records_count,
+        repetitions,
+        un_samples,
+        format!(
+            "Uncheckpointed recovery of {} ops (WAL: {} KB, redo: {}, undo: {}, {} reps)",
+            records_count,
+            unchk_wal_bytes / 1024,
+            un_final_stats.redo_count,
+            un_final_stats.undo_count,
+            repetitions
+        ),
+    ));
+
+    // 2. Prepare Checkpointed Baseline (logically identical operations)
+    let dir_cp = tempfile::tempdir().unwrap();
+    let path_cp = dir_cp.path().join("source_cp.treedb");
+    let wal_path_cp = std::path::PathBuf::from(format!("{}.wal", path_cp.display()));
+    {
+        let mut db = TreeDb::create(&path_cp, 64).unwrap();
+        for i in 0..records_count {
+            let key = (i as u64 % 100) + 1;
+            let val = (i as u64).to_le_bytes();
+            db.put(key, &val).unwrap();
+            if (i + 1) % checkpoint_interval == 0 {
+                db.checkpoint_and_truncate_wal().unwrap();
+            }
+        }
+        db.sync().unwrap();
+    }
+    let cp_wal_bytes = std::fs::metadata(&wal_path_cp).unwrap().len();
+
+    // Timed repetitions for Checkpointed
+    let mut cp_samples = Vec::with_capacity(repetitions);
+    let mut cp_stats = None;
+    for _ in 0..repetitions {
+        let run_dir = tempfile::tempdir().unwrap();
+        let run_db = run_dir.path().join("run_cp.treedb");
+        let run_wal = std::path::PathBuf::from(format!("{}.wal", run_db.display()));
+        std::fs::copy(&path_cp, &run_db).unwrap();
+        std::fs::copy(&wal_path_cp, &run_wal).unwrap();
+
+        let mut pm = PageManager::open(&run_db).unwrap();
+        let mut lm = LogManager::open(&run_wal).unwrap();
+        let start = Instant::now();
+        let stats = RecoveryEngine::recover(&mut pm, &mut lm).unwrap();
+        let elapsed = start.elapsed().as_nanos() as u64;
+        cp_samples.push(elapsed);
+        cp_stats = Some(stats);
+    }
+    let cp_final_stats = cp_stats.unwrap();
+
+    runner.record(BenchmarkResult::from_samples(
+        "WAL & Txn",
+        Box::leak(format!("aries_recovery_checkpointed_{label}").into_boxed_str()),
+        records_count,
+        repetitions,
+        cp_samples,
+        format!(
+            "Checkpointed recovery of {} ops (cp every {}, WAL: {} KB, redo: {}, undo: {}, {} reps)",
+            records_count,
+            checkpoint_interval,
+            cp_wal_bytes / 1024,
+            cp_final_stats.redo_count,
+            cp_final_stats.undo_count,
+            repetitions
+        ),
+    ));
 }

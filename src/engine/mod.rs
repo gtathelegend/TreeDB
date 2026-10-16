@@ -315,13 +315,14 @@ impl TreeDb {
         let snapshot = self.snapshot_registry.register(commit_seq);
         let isolation_context = IsolationContext::new(isolation_level, txn_id, snapshot);
 
+        let initial_root = self.tree.root_page_id();
         let header = self.buffer_pool.page_manager().header().clone();
 
         Ok(Transaction::new_with_isolation(
             self,
             txn_id,
             isolation_context,
-            header.root_page_id,
+            initial_root,
             header.freelist_head,
             header.free_page_count,
             header.page_count,

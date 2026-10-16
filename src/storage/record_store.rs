@@ -362,29 +362,34 @@ impl RecordStore {
     ) -> Result<(PageId, RecordPage)> {
         if self.last_page_id != INVALID_PAGE_ID {
             let page = buffer_pool.fetch_page(self.last_page_id)?;
-            let rp = match RecordPage::deserialize(page) {
-                Ok(rp) => rp,
-                Err(e) => {
-                    let _ = buffer_pool.unpin_page(self.last_page_id, false);
-                    return Err(e);
-                }
-            };
-            buffer_pool.unpin_page(self.last_page_id, false)?;
-
-            if rp.can_fit(required_space) {
-                Ok((self.last_page_id, rp))
+            let is_record = page.page_type() == PageType::Record;
+            let rp_res = if is_record {
+                RecordPage::deserialize(page)
             } else {
-                let new_page_id = buffer_pool.allocate_page(PageType::Record)?;
-                buffer_pool.unpin_page(new_page_id, true)?;
-                self.last_page_id = new_page_id;
-                Ok((new_page_id, RecordPage::new()))
+                Err(Error::PageCorruption {
+                    page_id: self.last_page_id,
+                    reason: "not a record page",
+                })
+            };
+
+            match rp_res {
+                Ok(rp) => {
+                    buffer_pool.unpin_page(self.last_page_id, false)?;
+                    if rp.can_fit(required_space) {
+                        return Ok((self.last_page_id, rp));
+                    }
+                }
+                Err(_) => {
+                    let _ = buffer_pool.unpin_page(self.last_page_id, false);
+                    self.last_page_id = INVALID_PAGE_ID;
+                }
             }
-        } else {
-            let new_page_id = buffer_pool.allocate_page(PageType::Record)?;
-            buffer_pool.unpin_page(new_page_id, true)?;
-            self.last_page_id = new_page_id;
-            Ok((new_page_id, RecordPage::new()))
         }
+
+        let new_page_id = buffer_pool.allocate_page(PageType::Record)?;
+        buffer_pool.unpin_page(new_page_id, true)?;
+        self.last_page_id = new_page_id;
+        Ok((new_page_id, RecordPage::new()))
     }
 
     /// Retrieves an owned copy of the record bytes associated with `record_id`.

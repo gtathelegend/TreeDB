@@ -108,8 +108,13 @@ impl PageManager {
 
     /// Writes an individual page to its corresponding disk offset.
     pub fn write_page(&mut self, page: &Page) -> Result<()> {
-        let page_id = page.id();
-        if page_id >= self.header.page_count {
+        self.write_page_at(page.id(), page)
+    }
+
+    /// Writes a page directly to the specified `page_id` offset on disk,
+    /// preventing accidental overwrite of `HEADER_PAGE_ID`.
+    pub fn write_page_at(&mut self, page_id: PageId, page: &Page) -> Result<()> {
+        if page_id == HEADER_PAGE_ID || page_id >= self.header.page_count {
             return Err(Error::InvalidPage(page_id));
         }
 

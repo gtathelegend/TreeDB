@@ -362,7 +362,7 @@ impl BufferPool {
                     wal.flush(lsn)?;
                 }
             }
-            self.page_manager.write_page(page)?;
+            self.page_manager.write_page_at(page_id, page)?;
             self.stats.dirty_flushes += 1;
             frame.dirty = false;
         }
@@ -501,7 +501,8 @@ impl BufferPool {
         self.access_counter += 1;
         let frame = &mut self.frames[frame_id];
         frame.page_id = Some(new_page_id);
-        frame.before_image = Some([0u8; PAGE_SIZE]);
+        let free_page = Page::new(new_page_id, PageType::Free);
+        frame.before_image = Some(*free_page.as_bytes());
         frame.page = Some(new_page);
         frame.pin_count = 1;
         frame.dirty = true;
@@ -697,7 +698,7 @@ impl BufferPool {
                         let mut page = self.page_manager.read_page(pid)?;
                         if off + len <= page.as_bytes().len() {
                             page.as_bytes_mut()[off..off + len].copy_from_slice(before_image);
-                            self.page_manager.write_page(&page)?;
+                            self.page_manager.write_page_at(pid, &page)?;
                         }
                     }
 
@@ -714,7 +715,7 @@ impl BufferPool {
                     } else if pid < self.page_manager.page_count() {
                         if let Ok(mut page) = self.page_manager.read_page(pid) {
                             page.set_lsn(clr_lsn);
-                            let _ = self.page_manager.write_page(&page);
+                            let _ = self.page_manager.write_page_at(pid, &page);
                         }
                     }
                 }
