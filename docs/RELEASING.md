@@ -59,24 +59,32 @@ Verify that `cargo test -j 2` executes and passes all test cases with **0 failur
 
 ---
 
-## 3. Registry Immutability & State Verification
+## 3. Authoritative Registry Verification & Immutability
 
 Package versions on crates.io are **permanently immutable**. Once a version is published, it can never be overwritten, modified, or re-uploaded with different contents—even if yanked.
 
-Before building release artifacts or creating release tags, verify whether the target version has already been published to the registry:
+> **CRITICAL**: Inspecting registry state is strictly a read-only verification step. It does not constitute or imply authorization to publish.
 
-```bash
-# Query crates.io for existing published versions of treedb
-cargo search treedb
-```
+Do not rely solely on `cargo search treedb` to establish whether a specific version exists; `cargo search` is a fuzzy, cached keyword index that does not guarantee real-time per-version precision.
 
-Alternatively, query the crates.io public web API:
-```bash
-curl -s https://crates.io/api/v1/crates/treedb
-```
+### 3.1 Authoritative Registry Lookup
+Before building release artifacts or creating release tags, check the exact version on crates.io:
 
+* **Authoritative API Query for Target Version**:
+  ```bash
+  # Returns HTTP 200 with metadata if version 0.1.0 exists; HTTP 404 if not yet published
+  curl -s -o /dev/null -w "%{http_code}\n" https://crates.io/api/v1/crates/treedb/0.1.0
+  ```
+* **Listing All Published Versions**:
+  ```bash
+  curl -s https://crates.io/api/v1/crates/treedb | jq '.versions[].num'
+  ```
+* **Authoritative Web Inspection**:
+  Visit `https://crates.io/crates/treedb` in a browser.
+
+### 3.2 Registry Disposition Rules
 * **If the target version (e.g. `0.1.0`) is already present on crates.io**:
-  Attempting to republish will fail. If the existing registry artifact differs from the current commit, the version in `Cargo.toml` must be incremented (e.g., to `0.1.1` or `0.2.0`) before proceeding.
+  Cargo will reject any attempt to re-upload under this version. If the published artifact differs from the current commit, the version in `Cargo.toml` must be incremented (e.g., to `0.1.1` or `0.2.0`) before proceeding.
 * **If the target version is not yet published**:
   Proceed to packaging and artifact verification.
 
@@ -100,8 +108,8 @@ Verify that `target/package/treedb-<version>.crate` satisfies repository hygiene
 * Excludes development workflows (`.github/`), local paths, temporary files (`*.treedb`, `*.treedb.wal`, `*.restore_journal`), and target directories.
 * The package compiles and verifies hermetically within `target/package/`.
 
-### 4.2 Artifact Provenance & SHA-256 Checksum
-Generate the cryptographic checksum of the packaged `.crate` artifact:
+### 4.2 Fresh Artifact Provenance & SHA-256 Checksum
+The cryptographic checksum **must always be recalculated freshly** for the exact `.crate` artifact being released. Never assume or reuse a previously recorded checksum after modifying source files, editing documentation, or rebuilding:
 
 * **On POSIX (Linux/macOS)**:
   ```bash
@@ -112,30 +120,28 @@ Generate the cryptographic checksum of the packaged `.crate` artifact:
   Get-FileHash -Algorithm SHA256 target/package/treedb-0.1.0.crate | Format-List
   ```
 
-Record the generated SHA-256 hash in release records. Note that a checksum identifies a specific generated artifact; it does not constitute an assertion of multi-environment reproducible build identity unless independently compiled and compared across clean environments.
+Record the freshly computed SHA-256 hash in release records. Note that a checksum identifies a specific generated artifact; it does not constitute an assertion of multi-environment reproducible build identity unless independently compiled and compared across clean environments.
 
 ---
 
-## 5. Tagging Safety & Tag-Target Verification
+## 5. Tag Semantics, Safety & Target Verification
 
 Tagging must occur only after all quality gates pass, registry state is verified, and artifact checksums are recorded.
 
-### 5.1 Historical Tag Status & Tag Conflict Rules
+### 5.1 Historical Tag Status & Tag Preservation
 * In this repository, the tag `v0.1.0` historically exists at commit `2f912c2e24b095976a6a5d6340a6b536b2707c9a`.
-* **DO NOT FORCE-MOVE TAGS (`git tag -f`)**: Force-moving existing release tags breaks downstream developer clones, creates conflicting Git object graphs, and disrupts automated CI/CD mirrors.
-* If a release candidate is being tagged, use a distinct pre-release tag:
-  ```bash
-  git tag -a v0.1.0-rc2 -m "release candidate: TreeDB v0.1.0-rc2"
-  ```
-* If final `v0.1.0` is explicitly authorized to be moved or created by team consensus (confirming the historical tag was purely internal and never published):
-  ```bash
-  # Delete the obsolete local marker tag only upon formal authorization
-  git tag -d v0.1.0
-  # Create the authorized release tag pointing to the current verified HEAD
-  git tag -a v0.1.0 -m "release: TreeDB v0.1.0"
-  ```
+* **PRESERVE THE HISTORICAL TAG**:
+  * Do **not** delete or recreate `v0.1.0` as the normal release procedure.
+  * Deleting a local tag (`git tag -d v0.1.0`) **does not remove the tag from any remote repository** or update other developers' clones. Recreating an existing tag locally creates divergent tag histories, causes `git fetch` rejection errors, and violates release immutability.
+  * **DO NOT FORCE-MOVE TAGS (`git tag -f`)**. Force-moving release tags is strictly prohibited.
+* **Recommended Tagging Policy**:
+  * For a release candidate evaluated on the current HEAD, use a distinct pre-release candidate tag:
+    ```bash
+    git tag -a v0.1.0-rc2 -m "release candidate: TreeDB v0.1.0-rc2"
+    ```
+  * For an official general availability release, bump the version in `Cargo.toml` to a clean, non-conflicting version (e.g. `0.1.1` or `0.2.0`), or only re-target `v0.1.0` if an authorized release governance decision explicitly resolves the historical tag conflict across all local and remote repositories.
 
-### 5.2 Annotated or Cryptographically Signed Tags
+### 5.2 Tag Creation (Annotated or Cryptographically Signed)
 * **Annotated Tag**:
   ```bash
   git tag -a <TAG_NAME> -m "release: TreeDB <VERSION>"
@@ -145,23 +151,31 @@ Tagging must occur only after all quality gates pass, registry state is verified
   git tag -s <TAG_NAME> -m "release: TreeDB <VERSION>"
   ```
 
-### 5.3 Post-Tag Verification
-Verify that the tag resolves precisely to the intended commit:
+### 5.3 Post-Tag Target Verification (Peeling to Commit)
+Annotated and signed tags in Git create their own unique tag objects with their own distinct object hashes. **Do not compare the raw annotated tag hash directly with HEAD.**
+
+Always peel the tag to its underlying commit object using the `^{commit}` syntax, and verify that it matches `git rev-parse HEAD` exactly:
+
 ```bash
-# Verify the tag target commit hash matches current HEAD
-git rev-parse <TAG_NAME>
+# 1. Resolve the underlying commit hash of the tag
+git rev-parse "<TAG_NAME>^{commit}"
+
+# 2. Resolve the current HEAD commit hash
 git rev-parse HEAD
 
-# Confirm log and tag description
-git log -1 <TAG_NAME>
-git describe --tags --exact-match
+# 3. Assert that both hashes are identical:
+test "$(git rev-parse "<TAG_NAME>^{commit}")" = "$(git rev-parse HEAD)" && echo "TAG TARGET VERIFIED" || echo "TAG TARGET MISMATCH"
+
+# 4. Confirm tag message and commit metadata
+git log -1 "<TAG_NAME>^{commit}"
+git describe --tags --exact-match "<TAG_NAME>^{commit}"
 ```
 
 ---
 
 ## 6. Publication & Distribution Sequence
 
-> **CRITICAL**: Publication to crates.io is permanent and irreversible. Do not execute publication without explicit stakeholder sign-off.
+> **CRITICAL**: Publication to crates.io is permanent and irreversible. Do not execute publication without explicit stakeholder authorization.
 
 Execute publication following this strict, sequential pipeline:
 
@@ -188,7 +202,13 @@ git push origin <TAG_NAME>
 ```
 
 > **WARNING ON `git push --tags`**:
-> **NEVER use `git push origin --tags`**. A blanket tag push uploads all local tags in your repository, which may inadvertently push experimental, obsolete, or unverified local tags to the public upstream remote. Always specify the exact tag name: `git push origin v0.1.0` or `git push origin v0.1.0-rc2`.
+> **NEVER use `git push origin --tags`**. A blanket tag push uploads all local tags in your repository, which may inadvertently push experimental, obsolete, or unverified local tags to the public upstream remote. Always specify the exact tag name: `git push origin <TAG_NAME>`.
+
+### Step 4: Verify Remote Tag Target
+Confirm that the upstream remote repository resolves the tag to the expected commit:
+```bash
+git ls-remote --tags origin <TAG_NAME>
+```
 
 ---
 
@@ -199,14 +219,14 @@ In the event that an unforeseen critical defect is discovered immediately follow
 1. **Yanking on Crates.io**:
    Yank the affected release to prevent new projects from resolving it as a dependency:
    ```bash
-   cargo yank --version 0.1.0
+   cargo yank --version <VERSION>
    ```
    *(Note: Yanking does not delete existing cargo locks or break projects that already depend on the version.)*
 2. **Hotfix Protocol**:
-   * Branch from the tagged release commit: `git checkout -b hotfix/0.1.1 <TAG_NAME>`.
+   * Branch from the tagged release commit: `git checkout -b hotfix/<NEW_VERSION> <TAG_NAME>`.
    * Apply targeted regression fix and verify with a named regression test.
-   * Bump `version = "0.1.1"` in `Cargo.toml`.
-   * Follow the complete quality-gate process before releasing `v0.1.1`.
+   * Bump `version = "<NEW_VERSION>"` in `Cargo.toml`.
+   * Follow the complete quality-gate process before releasing `<NEW_VERSION>`.
 
 ---
 

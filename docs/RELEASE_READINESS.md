@@ -96,8 +96,11 @@ The following limitations are explicitly documented and govern the operational u
 
 ## 3. Final Release Readiness Assessment
 
-* **Overall Status**: **READY FOR LOCAL RELEASE CANDIDATE** (`v0.1.0`).
+* **Overall Status**: **READY FOR LOCAL RELEASE CANDIDATE** (`v0.1.0-rc2` / proposed stable release).
 * **Blockers Identified**: **0** (Zero functional, durability, packaging, or lint blockers remain).
-* **Recommendations**:
-  * Tag `v0.1.0` is currently frozen at commit `2f912c2e24b095976a6a5d6340a6b536b2707c9a` and must remain untouched.
-  * Release candidate testing confirms `v0.1.0` meets all defined durability and operational contracts for its intended single-node, single-writer scope.
+* **Tag Governance & Preservation Recommendations**:
+  * Historical tag `v0.1.0` remains frozen at commit `2f912c2e24b095976a6a5d6340a6b536b2707c9a` and must remain untouched. Deleting a local tag does not remove remote tags or update other clones.
+  * For pre-release evaluation, use a distinct pre-release candidate tag such as `v0.1.0-rc2`. For a general availability release, bump `version` in `Cargo.toml` to a clean version (e.g. `0.1.1` or `0.2.0`), unless an authorized stakeholder governance decision explicitly resolves the historical tag conflict.
+  * When verifying annotated release tags, always peel the tag object to its commit using `git rev-parse "<TAG_NAME>^{commit}"` and assert equality with `git rev-parse HEAD`. Do not compare the raw annotated tag object hash directly with HEAD.
+  * When pushing release tags, push strictly the authorized tag (`git push origin <TAG_NAME>`) and never use blanket `git push origin --tags`.
+  * Release candidate testing confirms TreeDB meets all defined durability and operational contracts for its intended single-node, single-writer scope.
