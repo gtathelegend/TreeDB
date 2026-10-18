@@ -98,7 +98,7 @@ WAL File (.treedb.wal)       Database File (.treedb)
 
 * **Current Version:** `v0.1.0` (General Availability Release Packaging)
 * **Release Candidate:** `v0.1.0-rc1` (frozen at commit `22dfc2ef6647f9b4f778dd5bde91d142e0ecc867`)
-* **Test Suite:** **2,080 passing tests** across 90 test binaries (0 failures, 0 warnings, 0 ignored)
+* **Test Suite:** **2,105 passing tests** across 91 test-bearing binaries (48 unit + 2,057 integration across 90 suites; 0 failures, 0 warnings, 0 ignored)
 * **Language & Safety:** 100% Safe Rust (`#![forbid(unsafe_code)]`; zero `unsafe` blocks)
 * **Durability:** Write-Ahead Logging (WAL) with PageLSN ordering and ARIES crash recovery certified
 * **Distribution Packaging:** Clean, verified Cargo package (`cargo package`) containing zero extraneous artifacts

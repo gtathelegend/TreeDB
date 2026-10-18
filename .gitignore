@@ -1,5 +1,7 @@
 /target
 **/*.rs.bk
 *.treedb
+*.treedb.wal
 *.treedb-journal
 *.treedb-wal
+*.restore_journal

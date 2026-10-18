@@ -45,7 +45,7 @@ Status Classifications:
 
 | Check | Command | Result | Evidence / Notes |
 | :--- | :--- | :---: | :--- |
-| **Full Test Suite** | `cargo test -j 2` | **PASS** | **2,080 tests passed across 90 test binaries** (0 failed, 0 ignored). |
+| **Full Test Suite** | `cargo test -j 2` | **PASS** | **2,105 tests passed across 91 test-bearing binaries** (48 unit tests + 2,057 integration tests across 90 integration test suites, 0 failed, 0 ignored). |
 | **Post-Recovery Invariant Suite** | `cargo test --test post_recovery_storage_invariants` | **PASS** | 20 integration tests passed in 0.17s. |
 | **WAL Recovery Certification** | `cargo test --test wal_crash_recovery_certification` | **PASS** | 32 integration tests passed in 0.19s. |
 | **Code Formatting** | `cargo fmt --all -- --check` | **PASS** | Codebase 100% compliant with Rust formatting guidelines. |
@@ -56,7 +56,7 @@ Status Classifications:
 
 | Item | Status | Verification Evidence / Citation |
 | :--- | :---: | :--- |
-| **Package Verification** | **PASS** | `cargo package --allow-dirty`: Generated `treedb-0.1.0.crate` (413 KB compressed, 216 files) cleanly in 36.00s. |
+| **Package Verification** | **PASS** | `cargo package`: Generated `treedb-0.1.0.crate` (1.1 MiB compressed, 218 files) cleanly in 6.23s. |
 | **Package Manifest** | **PASS** | `Cargo.toml`: Valid metadata (`name`, `version = "0.1.0"`, `license = "MIT"`, `repository`, `keywords`, `categories`, `readme`). |
 | **License Compliance** | **PASS** | `LICENSE-MIT` present in workspace root and declared in `Cargo.toml`. |
 | **Repository Cleanliness** | **PASS** | `.gitignore` properly excludes `target/`, temporary database files (`*.treedb`, `*.treedb.wal`, `*.restore_journal`), and artifacts. |
