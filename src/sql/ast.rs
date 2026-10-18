@@ -965,11 +965,11 @@ impl fmt::Display for WindowFunction {
 pub enum WindowFrameBound {
     /// UNBOUNDED PRECEDING
     UnboundedPreceding,
-    /// <n> PRECEDING
+    /// `<n>` PRECEDING
     Preceding(u64),
     /// CURRENT ROW
     CurrentRow,
-    /// <n> FOLLOWING
+    /// `<n>` FOLLOWING
     Following(u64),
     /// UNBOUNDED FOLLOWING
     UnboundedFollowing,
