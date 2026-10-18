@@ -56,7 +56,7 @@ Status Classifications:
 
 | Item | Status | Verification Evidence / Citation |
 | :--- | :---: | :--- |
-| **Package Verification** | **PASS** | `cargo package`: Generated `treedb-0.1.0.crate` (1.1 MiB compressed, 218 files) cleanly in 6.23s. |
+| **Package Verification** | **PASS** | `cargo package`: Generated `treedb-0.1.0.crate` (1.1 MiB compressed, 220 files) cleanly in 27.28s. |
 | **Package Manifest** | **PASS** | `Cargo.toml`: Valid metadata (`name`, `version = "0.1.0"`, `license = "MIT"`, `repository`, `keywords`, `categories`, `readme`). |
 | **License Compliance** | **PASS** | `LICENSE-MIT` present in workspace root and declared in `Cargo.toml`. |
 | **Repository Cleanliness** | **PASS** | `.gitignore` properly excludes `target/`, temporary database files (`*.treedb`, `*.treedb.wal`, `*.restore_journal`), and artifacts. |
