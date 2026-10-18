@@ -177,7 +177,7 @@ Phase 72 executes a comprehensive correctness and hardening audit of TreeDB's tr
 - **16 Failure Boundaries**: Tested failure injection covering before mutation, version allocation, payload logging, metadata updates, primary/secondary index modification, overflow page allocation, record slot reclamation, freelist updates, WAL commit logging, durable flush, header persistence, and vacuum phases.
 - **Matrix & Differential Suite**: Dedicated integration suite (`tests/transaction_atomicity.rs`, 34 tests) with independent differential reference model running 4 fixed seeds (`42`, `1337`, `2026`, `9999`) across 25 transaction rounds each.
 - **Idempotency**: Repeated recovery validated as strictly idempotent without `CommitSeq` regression.
-- Complete documentation is available in [TRANSACTION_ATOMICITY.md](file:///d:/Projects/TreeDB/docs/TRANSACTION_ATOMICITY.md).
+- Complete documentation is available in [TRANSACTION_ATOMICITY.md](TRANSACTION_ATOMICITY.md).
 
 ---
 
@@ -192,5 +192,5 @@ Phase 73 completes a unified cross-layer consistency verification engine (`TreeD
   - MVCC Chains & Overflow Pages: Validates `xmin`/`xmax`/`created_at`/`deleted_at` monotonic invariants, `prev_version` links, absence of cycles, and overflow page chain integrity.
   - WAL & Commit Sequences: Verifies WAL record decodability, CRC32 integrity, LSN ordering, and non-regressing `CommitSeq` sequences without silently applying recovery.
 - **Read-Only Invariant**: Enforces zero persistent side-effects; verified by byte-for-byte file equality across verification runs.
-- Complete documentation is available in [STORAGE_CONSISTENCY.md](file:///d:/Projects/TreeDB/docs/STORAGE_CONSISTENCY.md).
+- Complete documentation is available in [STORAGE_CONSISTENCY.md](STORAGE_CONSISTENCY.md).
 

@@ -41,13 +41,15 @@ use treedb::TreeDb;
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct Ctx {
+    _dir: tempfile::TempDir,
     db_path: PathBuf,
     wal_path: PathBuf,
 }
 
 impl Ctx {
     fn new(label: &str) -> Self {
-        let db_path = PathBuf::from(format!(
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(format!(
             "test_covering_{}_{}_{}.treedb",
             label,
             std::process::id(),
@@ -59,7 +61,11 @@ impl Ctx {
         let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(&wal_path);
-        Self { db_path, wal_path }
+        Self {
+            _dir: dir,
+            db_path,
+            wal_path,
+        }
     }
 
     fn open(&self) -> TreeDb {

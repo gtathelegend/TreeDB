@@ -105,7 +105,7 @@ Phase 70 introduces explicit, snapshot-safe physical reclamation of historical v
 - **Overflow Reclamation**: Overflow chains belonging to reclaimed versions are returned to the PageManager freelist via `RecordStore::delete_and_count`.
 - **Empty Page Recycling**: Completely empty slotted record pages are recycled back to the database freelist via `RecordStore::try_free_empty_record_page`.
 - **Index Cleanup**: Obsolete secondary and covering index entries referencing reclaimed `RecordId`s are removed atomically with the physical version.
-- Detailed architecture is documented in [MVCC_VACUUM.md](file:///d:/Projects/TreeDB/docs/MVCC_VACUUM.md).
+- Detailed architecture is documented in [MVCC_VACUUM.md](MVCC_VACUUM.md).
 
 ---
 
@@ -115,7 +115,7 @@ Phase 71 introduces an explicit write-intent tracking and commit-validation laye
 - **Write-Set Tracking**: Transactions record `RowWriteIntent` records mapping logical rows `(table, key)` to operation kinds, targeted version IDs, and new version IDs.
 - **Commit Validation**: Before writing a `Commit` record to the WAL, write intents are validated against current committed head versions to detect write-write conflicts, stale version modifications, and unique index collisions.
 - **Atomic Abort on Conflict**: Conflicting transactions are automatically aborted without leaving uncommitted physical versions or corrupting version chain links.
-- Detailed architecture is documented in [MVCC_CONFLICTS.md](file:///d:/Projects/TreeDB/docs/MVCC_CONFLICTS.md).
+- Detailed architecture is documented in [MVCC_CONFLICTS.md](MVCC_CONFLICTS.md).
 
 ---
 
@@ -125,7 +125,7 @@ Phase 72 verifies the physical storage and allocator invariants across crash bou
 - **Slotted Version Chains**: Uncommitted version insertions are undone by ARIES recovery; version chain links (`prev_version`) are restored to valid prior versions.
 - **Overflow Chain Consistency**: Interrupted multi-page overflow allocations or deallocations leave no dangling chains, unreferenced overflow pages, or freelist leaks.
 - **Page Allocator Integrity**: Recovery reconciles `PageManager` freelist headers with physical page types on disk; no page is simultaneously allocated and free.
-- Detailed architecture is documented in [TRANSACTION_ATOMICITY.md](file:///d:/Projects/TreeDB/docs/TRANSACTION_ATOMICITY.md).
+- Detailed architecture is documented in [TRANSACTION_ATOMICITY.md](TRANSACTION_ATOMICITY.md).
 ---
 
 ## 11. Phase 73: Storage Consistency Verification & Cross-Layer Invariant Enforcement
@@ -135,4 +135,4 @@ Phase 73 implements a non-mutating, cross-layer consistency verification engine 
 - **Strict Read-Only Guarantee**: Verification never modifies persistent database bytes, records, headers, or version chains (enforced by byte-for-byte file equality checks).
 - **Cross-Layer Invariants**: Validates bi-directional consistency between primary B+ Tree live heads and `RecordStore` versions, secondary index entries and referenced record column values, covering index payload projections, and ensures no page is simultaneously free and referenced by a live structure.
 - **Resource Bounds & Bounded Audits**: Configurable resource budgets (`max_pages`, `max_records`, `max_index_entries`, `max_version_chain_depth`, `max_overflow_chain_depth`, `max_issues`) prevent runaway verification on corrupted or infinite-loop chains.
-- Detailed architecture is documented in [STORAGE_CONSISTENCY.md](file:///d:/Projects/TreeDB/docs/STORAGE_CONSISTENCY.md).
+- Detailed architecture is documented in [STORAGE_CONSISTENCY.md](STORAGE_CONSISTENCY.md).

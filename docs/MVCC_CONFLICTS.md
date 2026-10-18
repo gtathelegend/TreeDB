@@ -37,7 +37,8 @@ The engine distinguishes six distinct categories:
 
 6. **WriteSetValidationFailure**:
    The transaction's accumulated write intent cannot be safely validated or applied at commit time due to internal consistency failures or pre-commit checks.
-   * *Diagnostic Context*: eason.
+   * *Diagnostic Context*: 
+eason.
 
 Every category produces structured errors with descriptive fields and methods Error::is_conflict() and Error::conflict_category().
 
@@ -47,7 +48,8 @@ Every category produces structured errors with descriptive fields and methods Er
 
 Write intent is tracked in TransactionWriteSet using strongly typed RowWriteIntent records:
 
-`ust
+`
+ust
 pub struct RowWriteIntent {
     pub table: String,
     pub key: Key,
@@ -175,5 +177,5 @@ Phase 72 verifies that transaction commit validation and conflict aborts compose
 - **Pre-Commit Abort Durability**: An aborted or conflicting transaction never logs a `Commit` record. Crash recovery safely undoes any partial mutations.
 - **Post-Commit Durability**: Once the commit record is flushed to storage, all changes remain durable across restarts, with secondary and unique indexes intact.
 - **Failure-Injection Matrix**: Tested across 16 deterministic failure boundaries including before mutation, after version allocation, during slot reclaim, before/after commit flush, and during vacuum.
-- Complete documentation is available in [TRANSACTION_ATOMICITY.md](file:///d:/Projects/TreeDB/docs/TRANSACTION_ATOMICITY.md).
+- Complete documentation is available in [TRANSACTION_ATOMICITY.md](TRANSACTION_ATOMICITY.md).
 

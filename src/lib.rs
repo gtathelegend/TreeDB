@@ -1,5 +1,7 @@
 //! TreeDB: A persistent single-node storage engine built from first principles in Rust.
 
+#![forbid(unsafe_code)]
+
 pub mod engine;
 pub mod error;
 pub mod index;

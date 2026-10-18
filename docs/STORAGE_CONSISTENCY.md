@@ -185,5 +185,5 @@ Phase 74 enhances offline file verification (`TreeDb::check_file`, `TreeDb::veri
 * **True Read-Only Pre-Recovery Inspection**: `verify_file` opens files via `TreeDb::open_read_only_unrecovered`, avoiding silent ARIES recovery side effects when inspecting raw pre-recovery disk images.
 * **Unapplied WAL Tail Detection**: When a database has suffered an ungraceful crash, `verify_file` detects unapplied log records beyond `last_checkpoint_lsn` and flags `ConsistencyIssueKind::UnappliedWalTail` with `ConsistencySeverity::Info`, explicitly documenting crash recovery as a prerequisite for offline consistency.
 * **Dual WAL Path Resolution**: Supports both `format!("{}.wal", db_path.display())` and `db_path.with_extension("wal")` conventions.
-* Detailed recovery certification architecture is documented in [RECOVERY_CERTIFICATION.md](file:///d:/Projects/TreeDB/docs/RECOVERY_CERTIFICATION.md).
+* Detailed recovery certification architecture is documented in [RECOVERY_CERTIFICATION.md](RECOVERY_CERTIFICATION.md).
 

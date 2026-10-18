@@ -9,24 +9,30 @@ use treedb::sql::{parse_statement, SetOperator, Statement};
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TestContext {
+    _dir: tempfile::TempDir,
     db_path: PathBuf,
     wal_path: PathBuf,
 }
 
 impl TestContext {
     fn new(name: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
         let count = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let db_path = PathBuf::from(format!(
+        let db_path = dir.path().join(format!(
             "test_set_ops_{name}_{}_{count}.treedb",
             std::process::id()
         ));
-        let wal_path = PathBuf::from(format!(
+        let wal_path = dir.path().join(format!(
             "test_set_ops_{name}_{}_{count}.treedb.wal",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&wal_path);
-        Self { db_path, wal_path }
+        Self {
+            _dir: dir,
+            db_path,
+            wal_path,
+        }
     }
 
     fn db(&self) -> TreeDb {

@@ -2,7 +2,7 @@
 name = "treedb"
 version = "0.1.0"
 edition = "2021"
-authors = ["TreeDB Contributors"]
+authors = ["Vedaang Sharma <info@vedaangsharma.in>"]
 description = "A persistent single-node storage engine built from first principles in Rust."
 license = "MIT OR Apache-2.0"
 readme = "README.md"

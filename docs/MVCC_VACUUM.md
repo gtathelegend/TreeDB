@@ -214,7 +214,7 @@ Vacuum operations interact cleanly with Phase 71 commit validation:
 * **Horizon Protection**: Vacuum never reclaims versions within the active snapshot horizon, ensuring transactions can always read their targeted historical versions.
 * **Unique Index Hygiene**: By purging obsolete historical index entries, vacuum prevents false unique index collisions on key re-insertions while maintaining correct commit-validation checks for live versions.
 * **Validation Invariance**: Vacuum runs do not mutate live committed head versions; consequently, an in-progress transaction validating against the committed head state remains consistent across vacuum runs.
-* See [MVCC_CONFLICTS.md](file:///d:/Projects/TreeDB/docs/MVCC_CONFLICTS.md) for complete details.
+* See [MVCC_CONFLICTS.md](MVCC_CONFLICTS.md) for complete details.
 
 ---
 
@@ -224,7 +224,7 @@ Phase 72 verifies that vacuum operations behave atomically under simulated failu
 * **Interrupted Index Cleanup**: If vacuum fails during secondary index pruning (`DuringVacuumIndexCleanup`), un-pruned entries are safely cleaned up on subsequent vacuum passes without corrupting live lookups.
 * **Interrupted Record Reclamation**: If vacuum is interrupted while reclaiming record slots or overflow chains (`DuringVacuumRecordReclaim`), physical pages and version chain cuts remain structurally valid.
 * **Interrupted Freelist Update**: If vacuum encounters a crash while returning empty record pages to the freelist (`DuringVacuumFreelistUpdate`), recovery safely reconciles disk state without freelist cycles or duplicate pages.
-* See [TRANSACTION_ATOMICITY.md](file:///d:/Projects/TreeDB/docs/TRANSACTION_ATOMICITY.md) for full failure injection details.
+* See [TRANSACTION_ATOMICITY.md](TRANSACTION_ATOMICITY.md) for full failure injection details.
 
 ---
 
@@ -234,4 +234,4 @@ Phase 73 introduces non-destructive, read-only cross-layer consistency verificat
 * Confirms that vacuum-reclaimed versions are no longer referenced by live primary or secondary index entries.
 * Confirms that reclaimed record and overflow pages added to the freelist do not appear in any active table ownership graph.
 * Guarantees that running consistency verification after vacuum never modifies the database file or triggers unintended vacuum side effects.
-* See [STORAGE_CONSISTENCY.md](file:///d:/Projects/TreeDB/docs/STORAGE_CONSISTENCY.md) for complete details.
+* See [STORAGE_CONSISTENCY.md](STORAGE_CONSISTENCY.md) for complete details.

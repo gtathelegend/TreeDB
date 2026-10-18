@@ -6,25 +6,21 @@ use treedb::query::optimizer::{AccessPath, SecondaryScanType};
 use treedb::TreeDb;
 
 struct TestContext {
+    _dir: tempfile::TempDir,
     db_path: PathBuf,
     wal_path: PathBuf,
 }
 
 impl TestContext {
     fn new(name: &str) -> Self {
-        let db_path = PathBuf::from(format!(
-            "test_optimizer_{}_{}_{}.treedb",
-            name,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(format!("test_optimizer_{name}.treedb"));
         let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(&wal_path);
-        Self { db_path, wal_path }
+        Self {
+            _dir: dir,
+            db_path,
+            wal_path,
+        }
     }
 
     fn db(&self) -> TreeDb {

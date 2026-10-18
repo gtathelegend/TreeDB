@@ -13,17 +13,27 @@ use treedb::sql::SelectStatement;
 use treedb::TreeDb;
 
 struct TestContext {
+    _dir: TempDir,
     db_path: PathBuf,
     wal_path: PathBuf,
 }
 
 impl TestContext {
     fn new(name: &str) -> Self {
-        let db_path = PathBuf::from(format!("test_common_subplan_{name}.treedb"));
-        let wal_path = PathBuf::from(format!("test_common_subplan_{name}.treedb.wal"));
+        let dir = TempDir::new().unwrap();
+        let db_path = dir
+            .path()
+            .join(format!("test_common_subplan_{name}.treedb"));
+        let wal_path = dir
+            .path()
+            .join(format!("test_common_subplan_{name}.treedb.wal"));
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(&wal_path);
-        Self { db_path, wal_path }
+        Self {
+            _dir: dir,
+            db_path,
+            wal_path,
+        }
     }
 
     fn db(&self) -> TreeDb {

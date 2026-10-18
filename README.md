@@ -1,114 +1,103 @@
 # TreeDB
 
-> **TreeDB — A persistent storage engine built from first principles in Rust.**
+[![Language](https://img.shields.io/badge/language-Rust%202021-orange.svg)](https://www.rust-lang.org/)
+[![Safety](https://img.shields.io/badge/safety-100%25%20Safe%20Rust-brightgreen.svg)](#safe-rust-guarantee)
+[![Tests](https://img.shields.io/badge/tests-2%2C105%20passed%20%7C%2091%20suites-blue.svg)](#running-tests)
+[![Durability](https://img.shields.io/badge/durability-ARIES%20Crash%20Recovery-purple.svg)](docs/DURABILITY_AND_RECOVERY.md)
+[![Release Candidate](https://img.shields.io/badge/status-v0.1.0--rc2%20staged-yellow.svg)](docs/RELEASE_READINESS.md)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-TreeDB is a single-node, disk-backed storage engine designed to demonstrate and explore database internals through a clean, modern, and production-disciplined implementation.
+> **TreeDB is a persistent, relational storage engine built from first principles in 100% Safe Rust (`#![forbid(unsafe_code)]`).**
 
-It is built for educational, research, and deep-systems exploration. It is not intended to compete with commercial production database engines, but rather to clearly demonstrate how storage engines operate under the hood.
+TreeDB is designed as a deep systems-programming research and educational engine. It implements the foundational components of a modern database management system—slotted-page storage, B+ tree indexing, buffer pool caching, Multi-Version Concurrency Control (MVCC), Write-Ahead Logging (WAL) with ARIES-style crash recovery, and a cost-based SQL query optimizer—without relying on external database libraries or unsafe memory transmutes.
 
 ---
 
 ## High-Level Architecture
 
+TreeDB enforces strict layer separation. Each layer communicates through explicit boundaries and contracts:
+
 ```text
-Application / CLI
-        │
-        ▼
-   TreeDB API (Implemented)
-        │
-        ▼
-     B+ Tree (Index: Key → RID)
-        │
-        ▼
-   Record Store (Heap: RID → Bytes)
-        │
-        ▼
-   Buffer Pool (Page Cache & Frame Table)
-        │
-   ┌────┴────────────────────────┐
-   │ (Write-Ahead Rule)          │
-   ▼                             ▼
-WAL Manager (Implemented)    Page Manager (Physical I/O)
-   │                             │
-   ▼                             ▼
-WAL File (.treedb.wal)       Database File (.treedb)
++-------------------------------------------------------------------------+
+|                            Application / CLI                            |
++-------------------------------------------------------------------------+
+                                     │
+                                     ▼
++-------------------------------------------------------------------------+
+|                  SQL Frontend & Query Execution Engine                  |
+|  • Pratt Precedence Parser     • Cost-Based Memo Optimizer              |
+|  • Cardinality & Histograms    • Volcano Iterator Execution Engine      |
+|  • Adaptive Join Reordering    • External Spill Sort / Hash / Aggregate |
++-------------------------------------------------------------------------+
+                                     │
+                                     ▼
++-------------------------------------------------------------------------+
+|             Transactions, MVCC & Cross-Layer Verification               |
+|  • ACID Multi-Statement Txns   • Monotonic Commit Sequence (CommitSeq)  |
+|  • Snapshot Isolation          • In-Page MVCC Version Chains            |
+|  • Online Background Vacuum    • Cross-Layer Consistency Auditor        |
++-------------------------------------------------------------------------+
+                                     │
+                                     ▼
++-------------------------------------------------------------------------+
+|                      Relational Catalog & Storage                       |
+|  • Schema & Index Metadata     • Slotted-Page Record Store              |
+|  • Primary B+ Tree Index       • Multi-Page Overflow Chains             |
+|  • Secondary & Covering Indexes• Persistent LIFO Freelist Space Reuse   |
++-------------------------------------------------------------------------+
+                                     │
+                                     ▼
++-------------------------------------------------------------------------+
+|                           Buffer Pool Manager                           |
+|  • Frame Table Lookup          • Clock Cache Eviction Policy            |
+|  • Pin / Unpin Lifecycle       • Write-Ahead Rule Enforcement           |
++-------------------------------------------------------------------------+
+                                     │
+                    ┌────────────────┴────────────────┐
+                    │ (PageLSN <= FlushedWAL_LSN)     │
+                    ▼                                 ▼
++---------------------------------------+ +-------------------------------+
+|              WAL Manager              | |          Page Manager         |
+|  • Physiological Redo/Undo Logging    | |  • 4,096-Byte Slotted Pages   |
+|  • 3-Phase ARIES Crash Recovery       | |  • Page 0 Database Header     |
+|  • Compensation Log Records (CLRs)    | |  • Synchronous Disk I/O       |
+|  • Fuzzy Checkpointing & Truncation   | |  • File Sync (sync_all)       |
++---------------------------------------+ +-------------------------------+
+                    │                                 │
+                    ▼                                 ▼
+       Write-Ahead Log (.treedb.wal)          Database File (.treedb)
 ```
 
 ---
 
-## Core Capabilities & Status
+## Core Systems Capabilities
 
-| Subsystem / Feature | Status | Description |
-| :--- | :--- | :--- |
-| **Database File & Header** | **Implemented** | 4096-byte pages, format verification, magic bytes `TREEDB01` (Version 2) |
-| **Page Manager** | **Implemented** | Page allocation, random-access I/O, file synchronization |
-| **Page Abstraction** | **Implemented** | 16-byte header with `PageLSN`, structural validation, 4080-byte payload |
-| **Buffer Pool Manager** | **Implemented** | LRU eviction, frame table, pin/unpin tracking, dirty flush, WAL ordering |
-| **B+ Tree Index (Search & Insert)** | **Implemented** | Dynamic insertion, node splitting, root elevation, point search |
-| **B+ Tree Index (Delete & Scan)** | **Implemented** | Deletion, leaf/internal rebalance, root collapse, range scan |
-| **Record Store** | **Implemented** | Slotted-page tuple format, variable-length records, local compaction |
-| **Multi-Page Overflow Records** | **Implemented** | Singly-linked overflow chains (`PageType::Overflow`), arbitrary value sizes, stable `RecordId`s, freelist recycling |
-| **TreeDB Engine API** | **Implemented** | High-level `TreeDb` interface for `put`, `get`, `delete`, `scan`, `sync` |
-| **Write-Ahead Logging** | **Implemented** | Monotonic `Lsn`, CRC32 log records, `.wal` file, durable syncing, WAL ordering on flush/evict |
-| **Crash Recovery (ARIES-Inspired)** | **Implemented** | 3-Phase recovery (Analysis, Redo, Undo with CLRs), restart-safe, deterministic fault injection, idempotence |
-| **Free-Page Recycling & Freelist** | **Implemented** | Persistent singly-linked freelist, $O(1)$ LIFO reuse, B+ Tree merge/collapse reclamation, integrity validation |
-| **Checkpointing & WAL Lifecycle** | **Implemented** | Synchronous checkpoints, durable Page 0 metadata, DPT Redo optimization, safe retention boundary, bounded WAL growth |
-| **WAL Lifecycle & Checkpoint Hardening** | **Implemented** | Fundamental retention invariant, active txn Undo preservation, monotonic LSN continuity, non-zero start LSN, crash-safe atomic replacement, .wal.bak fallback, 4-path equivalence |
-| **Transaction Manager & Atomic Multi-Op Txns** | **Implemented** | Explicit `Transaction<'db>` RAII API, multi-operation atomic commit/abort, CLR runtime rollback, drop safety, read-your-writes, crash recovery |
-| **Persistent Catalog & Schema Metadata** | **Implemented** | Stable monotonic `TableId`s, `TableMetadata`, `PageType::Catalog`, paged chaining, transactional create/drop, freelist reclamation, catalog validation |
-| **Typed Tables & Tuple Storage** | **Implemented** | Strong typing (`Boolean`, `Int64`, `UInt64`, `Float64`, `String`, `Bytes`), null bitmaps, canonical index key encoding, `Table<'a>` CRUD API, dynamic root synchronization |
-| **Query Execution & Expression Engine** | **Implemented** | Scalar expression AST, SQL 3-valued logic (3VL), composable operators (`Scan`, `Filter`, `Project`, `Sort`, `Limit`, `Offset`), PK point & range scan optimizations, programmatic `Query` builder |
-| **SQL Lexer, Parser & AST** | **Implemented** | Zero-dependency lexical scanner with byte-offset span tracking, Pratt precedence climbing parser, AST representation for scoped `SELECT` dialect |
-| **SQL Binding & Execution Engine** | **Implemented** | Semantic analysis, table/column name resolution, wildcard expansion, type checking, transaction-aware query execution |
-| **Persistent Secondary Indexes** | **Implemented** | Monotonic `IndexId`s, `IndexMetadata`, canonical order-preserving index key encoding, unique/non-unique composite keys, auto-maintenance on table mutations, query index access paths, catalog validation |
-| **Aggregation, GROUP BY & HAVING** | **Implemented** | `COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX`, single/multi-key `GROUP BY`, `HAVING` filter, deterministic `CanonicalValue` grouping, incremental accumulators, semantic validation |
-| **Relational JOINs** | **Implemented** | `INNER JOIN`, `LEFT JOIN` / `LEFT OUTER JOIN`, multi-table chained joins, table aliases, qualified/unqualified column ambiguity resolution, 3VL `ON` predicates, NULL padding, full query composition with WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET |
-| **Rule-Based Optimizer & Access-Path Planner** | **Implemented** | Decoupled logical/physical planning, deterministic access path selection (PK point/range, secondary index point/range, full scan), AND predicate decomposition, safe join pushdown, LEFT JOIN outer safety, residual filter preservation, plan inspection (`explain_sql`) |
-| **SQL DDL & DML Engine** | **Implemented** | `CREATE TABLE`, `DROP TABLE`, `INSERT INTO ... VALUES`, `UPDATE ... SET`, `DELETE FROM`, optimizer reuse for mutation access paths, transaction rollback, secondary index auto-maintenance, structured `StatementResult` |
-| **SQL Subqueries & Correlation** | **Implemented** | Scalar subqueries (0 rows -> `NULL`, 1 row -> value, >1 rows -> error), `IN` / `NOT IN` with SQL 3VL, `EXISTS` / `NOT EXISTS`, nested binding scopes, outer column references, subquery optimizer integration, uncorrelated pre-evaluation & materialization |
-| **Common Table Expressions (CTEs)** | **Implemented** | Non-recursive `WITH cte AS (...) SELECT ...`, multiple CTEs, dependency chains, explicit column renaming `cte(c1, c2)`, table shadowing, cycle detection, optimizer integration, statement-local in-memory materialization, transaction visibility |
-| **SQL Window Functions** | **Implemented** | Dedicated `WindowOperator`, ranking (`ROW_NUMBER`, `RANK`, `DENSE_RANK`), navigation (`LAG`, `LEAD`), value functions (`FIRST_VALUE`, `LAST_VALUE`), `PARTITION BY`, `ORDER BY`, `ROWS` frames, default framing, deterministic tie-breaking, CTE & JOIN composition |
-| **Recursive CTEs (WITH RECURSIVE)** | **Implemented** | Iterative `WITH RECURSIVE cte AS (anchor UNION ALL recursive) SELECT ...`, delta working-set loop, iteration & row limit safeguards, schema validation, mutual recursion rejection, composition with joins, filters, subqueries, and window functions |
-| **SQL Set Operations** | **Implemented** | `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`, precedence (`INTERSECT` > `UNION`/`EXCEPT`), parenthesized query expressions, `NULL = NULL` row identity equality, type coercion & output schema derivation from left operand, multiset arithmetic, subquery/CTE/JOIN/window/order-by integration |
-| **SQL Secondary-Index DDL** | **Implemented** | `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, single-column index specification, canonical `IndexKey` types, strict single-`NULL` uniqueness, persistent B+ Tree integration, existing row indexing, optimizer access-path visibility, transactional rollback & ARIES recovery |
-| **SQL EXPLAIN Query Introspection** | **Implemented** | `EXPLAIN <query>`, query plan introspection, deterministic physical plan formatting, scans, access paths, joins, filters, projections, sorts, window functions, CTEs, recursive CTEs, set operations, subqueries, no execution side-effects, transaction visibility |
-| **Query Statistics & Cost-Based Optimization** | **Implemented** | Table/column/index statistics collection (`collect_statistics`, `ANALYZE <table>;`), `StatsRegistry`, deterministic `CostModel`, `CardinalityEstimator` (equality, ranges, nulls, 3VL logic, equi-joins), cost-based access-path selection (PK lookup/range, secondary index lookup/range, full scan), bounded inner-join ordering (2–5 relations), EXPLAIN cost/row estimation, missing-stats fallback |
-| **Query Execution Metrics & Runtime Plan Diagnostics** | **Implemented** | Fine-grained physical operator metrics (`OperatorMetrics`, `QueryExecutionMetrics`), runtime row counters (examined, passed, rejected, joined, aggregated, sorted), `EXPLAIN ANALYZE <query>`, estimated vs. actual cardinality comparison, estimate error ratio, diagnostic-only wall-clock timing, explicit `execute_sql_with_metrics` API, transaction visibility & read-only safety, unsupported DML error rejection |
-| **Prepared Statements & Parameter Binding** | **Implemented** | Positional parameter syntax `?` (1-indexed), explicit `SqlExpr::Parameter` and `Expr::Parameter` AST/bound representation, parameter type inference from SQL context (`ParameterMetadata`), `PreparedStatement` lifecycle, validation of parameter counts and types, SQL 3VL NULL semantics, value-driven query optimization (PK point lookup, PK range scan, secondary index scan), DML prepared statements (`INSERT`, `UPDATE`, `DELETE`), subqueries, CTEs, recursive CTEs, JOINs, window functions, set operations, EXPLAIN & EXPLAIN ANALYZE parameter integration, SQL injection immunity |
-| **Physical Plan Cache & Prepared-Statement Reuse** | **Implemented** | Invalidation-aware, bounded, deterministic, parameter-sensitive physical plan cache (`PlanCache`, `PlanCacheKey`, `PlanValidity`, `PlanCacheStats`), monotonic generation counters (`catalog_generation`, `index_generation`, `statistics_generation`), multi-level invalidation on DDL and statistics (`CREATE`/`DROP TABLE`, `CREATE`/`DROP INDEX`, `ANALYZE`), transaction DDL isolation, LRU eviction, runtime-only zero-persistence architecture, `plan_cache_hit` execution metrics |
-| **External Sort & Spill-to-Disk Execution** | **Implemented** | Bounded in-memory sort with spill-to-disk execution (`ExternalSorter`, `SortConfig`, `TempRunFile`, `RunReader`, `SortExecutionMetrics`), deterministic binary run format, exact SQL ORDER BY semantics preservation (ASC/DESC, NULLS FIRST/LAST, multi-key, NaN total_cmp), stable sequence tie-breaking, multi-pass k-way merge, RAII temporary file cleanup, WAL and database page exclusion, EXPLAIN ANALYZE telemetry |
-| **External Aggregation & Spill-to-Disk GROUP BY** | **Implemented** | Bounded in-memory hash aggregation with partitioned spill-to-disk execution (`ExternalAggregator`, `AggregateConfig`, `TempAggregateFile`, `AggregateExecutionMetrics`), deterministic binary partition format, exact SQL grouping and aggregation semantics preservation (`COUNT(*)`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, NULL keys, Float64 NaN), algebraic state merging, multi-pass recursive sub-partitioning, RAII temporary file cleanup, WAL and database page exclusion, EXPLAIN ANALYZE telemetry |
-| **External Hash Join & Spill-to-Disk JOIN** | **Implemented** | Bounded in-memory hash join with partitioned spill-to-disk execution (`ExternalHashJoiner`, `JoinConfig`, `TempJoinFile`, `JoinExecutionMetrics`), deterministic binary partition format, exact SQL join semantics preservation (`INNER JOIN`, `LEFT JOIN`, composite equi-join keys, residual predicates, SQL 3VL `NULL != NULL`), salted multi-pass recursive sub-partitioning, RAII temporary file cleanup, WAL and database page exclusion, EXPLAIN ANALYZE telemetry |
-| **RIGHT & FULL OUTER JOINs & Generalized Planning** | **Implemented** | Generalized outer join execution (`RIGHT JOIN`, `RIGHT OUTER JOIN`, `FULL JOIN`, `FULL OUTER JOIN`), dual-side match bitset tracking, residual predicate gating, dynamic schema nullability derivation, spilled outer partition preservation, WHERE pushdown safety, plan caching & telemetry |
-| **Cost-Based Join Reordering & Join Enumeration** | **Implemented** | Deterministic cost-based join reordering inside safe `INNER JOIN` regions (`JoinGraph`, `JoinGraphRelation`, `JoinGraphPredicate`), subset Dynamic Programming ($O(n \cdot 2^n)$) for $N \le 8$, deterministic $O(n^2)$ greedy candidate fallback ($N > 8$), strict outer-join optimization barriers (`LEFT`, `RIGHT`, `FULL`), 5-tier deterministic tie-breaking, earliest legal predicate placement, plan caching & telemetry |
-| **Query Rewriter, Subquery Decorrelation & Explain Analyze** | **Implemented** | Safe derived-table flattening, predicate pushdown, subquery decorrelation (`EXISTS`, `NOT EXISTS`, `IN` to SEMI/ANTI joins), alias qualification mapping, 3VL NULL preservation, runtime plan execution telemetry, physical column pruning deferred |
-| **Cost-Based SEMI/ANTI Join Planning** | **Implemented** | Cost-based SEMI and ANTI join optimization and physical execution planning (`JoinStrategy::NestedLoop`, `Hash`, `IndexProbe`), index existence probes with tuple-fetch skipping, calibrated CPU/probe cost modeling, semi/anti cardinality estimation, plan cache invalidation tracking, SQL duplicate elimination and 3VL NULL isolation, comprehensive EXPLAIN ANALYZE runtime metrics |
-| **Composite Secondary Indexes** | **Implemented** | Multi-column persistent secondary indexes (`CREATE [UNIQUE] INDEX ... ON table (col1, col2)`), canonical lexicographical composite key encoding, leading-prefix scans, range scans, strict multi-column single-NULL uniqueness, atomic backfill, cost-based optimizer integration |
-| **Covering Indexes & Index-Only Execution** | **Implemented** | Covering secondary indexes with `INCLUDE (col3, col4)`, versioned `CoveredPayload` binary format, index-only physical operator (`IndexOnlyScan`), zero base-record fetches (`base_records_avoided`), residual predicate evaluation on covered values, ORDER BY, GROUP BY, window, and JOIN integration, comprehensive EXPLAIN ANALYZE metrics |
-| **Cost-Based Index Skip Scan** | **Implemented** | Cost-based skip scan over composite secondary indexes (`IndexSkipScan`, `IndexOnlySkipScan`), streaming distinct prefix enumeration (`distinct_prefix_values`), suffix probe matching, statistics-driven cost modeling, covering/index-only integration, safe ORDER BY and early LIMIT/OFFSET termination |
-| **MVCC & Version Chains** | **Implemented** | Slotted tuple delta chains, snapshot visibility filtering (`SnapshotId`, `CommitSeq`), non-blocking readers, transaction isolation, write-set tracking |
-| **Vacuum & Space Reclamation** | **Implemented** | Historical version pruning behind reclamation horizon, empty record page reclamation, overflow page deallocation, freelist recycling |
-| **Cross-Layer Consistency Verification** | **Implemented** | Non-destructive structural and logical audit (`verify_consistency`, `verify_file`, `check_file`), freelist cycle detection, index payload matching |
-| **Recovery & Checkpoint Certification** | **Implemented** | ARIES-inspired 3-phase recovery (Analysis, Redo, Undo with CLRs), fuzzy checkpoints, monotonic `CommitSeq` preservation, deterministic failure injection |
-| **Consistent Backup & Safe Restore** | **Implemented** | Self-describing CRC32 manifests (`treedb.manifest`), companion WAL inclusion, two-phase publication protocol (`RestoreJournal`), deterministic crash recovery |
+* **100% Safe Rust**: `#![forbid(unsafe_code)]` is enforced across all 91 test suites and the engine crate. Memory safety is guaranteed by Rust's type system and ownership model rather than runtime pointer manipulation.
+* **Slotted-Page Architecture**: 4,096-byte pages with explicit little-endian binary serialization. Supports variable-length records, local compaction, and chained overflow pages for multi-page tuples.
+* **B+ Tree Index Engine**: Primary index mapping `Key = u64` to `RecordId`s with dynamic node splits, borrows, and merges. Persistent secondary indexes support unique constraints, composite multi-column keys, and covering indexes (`INCLUDE`) for index-only scans.
+* **Buffer Pool & Cache**: Clock eviction policy, frame pinning, and strict enforcement of the write-ahead rule ($\text{PageLSN} \le \text{FlushedWAL\_LSN}$) before dirty frames reach disk.
+* **MVCC Snapshot Isolation**: In-page version chains with monotonic `CommitSeq` identifiers prevent dirty reads, non-repeatable reads, and phantom anomalies. Online background vacuuming safely prunes dead versions behind the active snapshot horizon.
+* **ARIES-Style Crash Recovery**: 3-phase recovery (Analysis, Redo from $\min(\text{recLSN})$, Undo of loser transactions via CLRs) guaranteeing recovery idempotence and resilience against crash-truncated log tails.
+* **Cost-Based SQL Optimizer**: Memo-based plan exploration, single- and multi-column histogram statistics, join reordering (subset DP and greedy heuristic), index access path selection, and plan caching.
+* **Bounded External Execution**: Spill-to-disk external sorting, partitioned hash aggregation, and partitioned hash joins when memory budgets are exceeded.
+* **Cross-Layer Consistency Auditor**: Non-destructive structural and logical audit tool (`verify_consistency`) that verifies page allocations, freelists, index references, and version chains.
 
 ---
 
 ## Release Status
 
-* **Current Version:** `v0.1.0` (General Availability Release Packaging)
-* **Release Candidate:** `v0.1.0-rc1` (frozen at commit `22dfc2ef6647f9b4f778dd5bde91d142e0ecc867`)
-* **Test Suite:** **2,105 passing tests** across 91 test-bearing binaries (48 unit + 2,057 integration across 90 suites; 0 failures, 0 warnings, 0 ignored)
-* **Language & Safety:** 100% Safe Rust (`#![forbid(unsafe_code)]`; zero `unsafe` blocks)
-* **Durability:** Write-Ahead Logging (WAL) with PageLSN ordering and ARIES crash recovery certified
-* **Distribution Packaging:** Clean, verified Cargo package (`cargo package`) containing zero extraneous artifacts
+* **Package Version**: `0.1.0` (Staged locally as candidate `v0.1.0-rc2`)
+* **Base RC Commit**: `e8876f20783ad7521ea027650c716bf9d4328efd`
+* **Automated Test Matrix**: **2,105 passing tests** across 91 test-bearing binaries (48 library unit tests + 2,057 integration tests; 0 failures, 0 warnings, 0 ignored).
+* **Quality Gates**: Strict Clippy (`-D warnings`), clean code formatting (`cargo fmt`), clean documentation (`cargo doc`), and hermetic cargo packaging (`cargo package`).
+* **Registry Status**: Unpublished internal release candidate; stable crates.io release reserved.
 
 ---
 
 ## Getting Started
 
 ### Prerequisites
-* Rust 1.80+ (Stable toolchain)
+* **Rust Toolchain**: Stable Rust 1.80+ (`rustc` and `cargo`).
 
 ### Building
 ```bash
@@ -116,49 +105,141 @@ cargo build --release
 ```
 
 ### Running Tests
+Execute the full regression suite using the repository's established test command:
 ```bash
-cargo test --all
+cargo test -j 2
 ```
 
-### Running the CLI
+### Running the Interactive CLI
+The included `treedb` CLI binary allows inspecting and manipulating database files:
 ```bash
-# Initialize a new database
-cargo run --bin treedb -- init test.treedb
+# Initialize a new database file
+cargo run --bin treedb -- init mydb.treedb
 
-# Inspect database file metadata
-cargo run --bin treedb -- info test.treedb
+# Inspect database file headers, page counts, and freelist state
+cargo run --bin treedb -- info mydb.treedb
 
 # Execute SQL DDL and DML statements
-cargo run --bin treedb -- query test.treedb "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT);"
-cargo run --bin treedb -- query test.treedb "INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25);"
-cargo run --bin treedb -- query test.treedb "SELECT name, age FROM users WHERE age >= 21 ORDER BY age DESC;"
+cargo run --bin treedb -- query mydb.treedb "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT);"
+cargo run --bin treedb -- query mydb.treedb "INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25);"
+cargo run --bin treedb -- query mydb.treedb "SELECT name, age FROM users WHERE age >= 21 ORDER BY age DESC;"
 ```
 
-### Minimal Rust Public API Example
+### Running Compile-Verified Examples
+The repository includes complete, runnable examples in the [`examples/`](examples) directory:
 
+```bash
+# 1. Low-level Key-Value storage, persistence, and consistency checks
+cargo run --example 01_kv_storage
+
+# 2. Relational SQL DDL, secondary indexes, filtering, joins, and aggregates
+cargo run --example 02_sql_relational
+
+# 3. ACID transactions, multi-statement rollback with CLRs, and read-your-writes
+cargo run --example 03_transactions_acid
+
+# 4. Cost-based optimizer, EXPLAIN, EXPLAIN ANALYZE, and execution telemetry
+cargo run --example 04_query_optimizer_and_metrics
+```
+
+---
+
+## Reproducible Benchmarking
+
+TreeDB includes a dedicated benchmark suite measuring micro-benchmarks, subsystem throughput, and scaling baselines.
+
+```bash
+# Display benchmark CLI options and categories
+cargo bench --bench benchmark_suite -- --help
+
+# Run B+ Tree indexing benchmarks (inserts, lookups, deletes across 1k, 10k, 50k keys)
+cargo bench --bench benchmark_suite -- --category bplus_tree
+
+# Run Buffer Pool caching and eviction benchmarks
+cargo bench --bench benchmark_suite -- --category buffer
+
+# Run Record Store inline and overflow read/write benchmarks
+cargo bench --bench benchmark_suite -- --category record
+
+# Run WAL and Transaction commit / recovery benchmarks
+cargo bench --bench benchmark_suite -- --category wal
+
+# Run SQL execution and query optimizer benchmarks
+cargo bench --bench benchmark_suite -- --category sql
+
+# Run dataset scale benchmarks (e.g. 2,000 or 20,000 keys) and export results to CSV
+cargo bench --bench benchmark_suite -- --category scale --scale 2000 --csv target/benchmarks.csv
+```
+
+---
+
+## Measured Performance Baselines
+
+The following baselines were measured on an Intel Core i7-1355U (NVMe SSD, NTFS, Windows 11, `--profile bench`) as documented in [docs/PERFORMANCE_BASELINE.md](docs/PERFORMANCE_BASELINE.md):
+
+| Subsystem | Workload / Operation | Scale | Throughput | Avg Latency | p99 Latency |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Buffer Pool** | Warm Cache Page Hit | 2,000 pages | **19,219,681 ops/s** | 52.0 ns | 100.0 ns |
+| **Buffer Pool** | Cold Cache Disk Read (I/O) | 2,000 pages | 33,703 ops/s | 29.67 µs | 299.1 µs |
+| **B+ Tree** | In-Memory Point Lookup | 10,000 keys | **1,260,104 ops/s** | 793.6 ns | 1.80 µs |
+| **B+ Tree** | Insert into Pre-populated Tree | 50,000 keys | 430,867 ops/s | 2.32 µs | 9.20 µs |
+| **Record Store** | 64B Record Read | 5,000 recs | **2,131,105 ops/s** | 469.2 ns | 1.20 µs |
+| **Record Store** | 8KB Overflow Record Read | 500 recs | 49,120 ops/s | 20.36 µs | 61.40 µs |
+| **WAL & Txn** | Single-Row Write Transaction | 200 rows | 2,266 txns/s | 441.3 µs | 1.03 ms |
+| **WAL & Txn** | Storage Durability Sync (`sync_all`)| 50 calls | 3,412 syncs/s | 293.1 µs | 752.5 µs |
+| **WAL & Txn** | ARIES Crash Recovery (1,000 logs) | 1,000 logs | 106.7 recov/s | 9.37 ms | 9.37 ms |
+| **SQL Engine** | PK Point Lookup | 2,000 rows | 2,395 queries/s | 417.6 µs | 901.0 µs |
+| **SQL Engine** | Plan Cache Hit Execution | 2,000 rows | **38,728 queries/s** | 25.8 µs | 48.4 µs |
+| **SQL Engine** | In-Memory Hash Join ($2000 \bowtie 4000$)| 4,000 rows | 28.4 queries/s | 35.23 ms | 55.29 ms |
+| **MVCC & Vac** | Version Chain Read (depth=5) | 500 rows | 3,236 queries/s | 309.0 µs | 610.9 µs |
+| **MVCC & Vac** | Online Vacuum (2,500 versions) | 500 rows | 11.9 vacuums/s | 83.93 ms | 83.93 ms |
+
+---
+
+## Minimal Public API Usage
+
+### 1. Key-Value Storage API
 ```rust
 use treedb::{TreeDb, Result};
 
 fn main() -> Result<()> {
-    // 1. Create a new database with a 64-page buffer pool (or use TreeDb::open for existing)
+    // Open or create a database with a 64-page buffer pool (256 KiB cache)
     let mut db = TreeDb::create("mydb.treedb", 64)?;
 
-    // 2. Execute DDL and DML statements
-    db.execute_statement("CREATE TABLE accounts (id INT PRIMARY KEY, owner TEXT, balance INT);")?;
-    db.execute_statement("INSERT INTO accounts VALUES (1, 'Alice', 1000), (2, 'Bob', 500);")?;
-
-    // 3. Query records
-    let res = db.execute_sql("SELECT owner, balance FROM accounts WHERE balance > 600;")?;
-    for row in res.rows() {
-        println!("Owner: {}, Balance: {}", row.values[0], row.values[1]);
+    // Insert, update, and lookup byte payloads mapped to 64-bit keys
+    db.put(42, b"Hello, TreeDB!")?;
+    if let Some(val) = db.get(42)? {
+        println!("Value: {}", String::from_utf8_lossy(&val));
     }
 
-    // 4. Force synchronization to disk
+    // Explicitly sync WAL and buffer pool to disk
     db.sync()?;
+    Ok(())
+}
+```
 
-    // 5. Run non-destructive consistency audit
-    let report = db.verify_consistency()?;
-    assert!(report.is_healthy());
+### 2. Relational SQL & ACID Transactions API
+```rust
+use treedb::{TreeDb, Result};
+
+fn main() -> Result<()> {
+    let mut db = TreeDb::create("company.treedb", 128)?;
+
+    // DDL: Create tables and indexes
+    db.execute_statement("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, balance INT);")?;
+    db.execute_statement("CREATE INDEX idx_name ON accounts (name);")?;
+
+    // Multi-statement atomic transaction
+    let mut txn = db.begin()?;
+    txn.execute_statement("INSERT INTO accounts VALUES (1, 'Alice', 1000);")?;
+    txn.execute_statement("INSERT INTO accounts VALUES (2, 'Bob',   500);")?;
+    txn.commit()?; // Persisted synchronously to WAL
+
+    // Query execution with Volcano iterator
+    let res = db.execute_sql("SELECT name, balance FROM accounts WHERE balance > 600;")?;
+    for row in res.rows() {
+        println!("Holder: {}, Balance: ${}", row.values[0], row.values[1]);
+    }
 
     Ok(())
 }
@@ -166,57 +247,78 @@ fn main() -> Result<()> {
 
 ---
 
-## Persistence & Crash Recovery Overview
+## Operational Scope & Explicit Disclosures
 
-TreeDB provides durable, recoverable single-node persistence:
-
-1. **Write-Ahead Logging (WAL)**: Mutations log redo and undo records before dirty in-memory pages are evicted or flushed. Flushed `Commit` records guarantee transaction durability.
-2. **ARIES-Inspired Recovery**: Upon restart or crash recovery, TreeDB runs:
-   * **Analysis**: Scans forward from the checkpoint LSN to rebuild active transaction and dirty page tables.
-   * **Redo**: Repeats history forward, ensuring all committed changes are replayed in storage.
-   * **Undo**: Rolls back active uncommitted transactions in reverse, logging Compensation Log Records (CLRs) for restart safety.
-3. **Fuzzy Checkpoints**: Flushes dirty pages, writes checkpoint records, and truncates obsolete WAL records while preserving active transaction undo segments.
-4. **Crash-Resilient Restore (`RestoreJournal`)**: Restoring multi-file database/WAL pairs coordinates through an on-disk journal (`.restore_journal`), guaranteeing that interrupted operations deterministically roll back to the original database or roll forward to the new database.
+1. **Single-Writer Operating Model**: Multi-reader concurrent transactions are supported via MVCC snapshots, but all write mutations (DML) and schema modifications (DDL) must serialize through a single engine instance. Concurrent multi-process access to the same file is unsupported.
+2. **Single-File WAL**: The write-ahead log operates as a single `.wal` file. Prefix truncation reclaims disk space during checkpoints, but multi-segment log rotation is not present in `v0.1.0`.
+3. **Drop vs. Sync Semantics**: Dropping `TreeDb` closes file handles without flushing dirty buffer-pool pages. Durability is maintained because all committed transactions are flushed and synced to the WAL; unwritten pages are replayed via ARIES Redo upon restart. For zero-replay clean shutdown, callers must explicitly execute `db.sync()?` or `db.checkpoint()?`.
+4. **Hardware & Power Loss**: Relies on storage controllers honoring `File::sync_all()`. Does not implement double-write page buffering; torn sector writes caused by hardware power loss require backup restoration.
 
 ---
 
-## Operational Constraints & Limitations
+## Comprehensive Documentation Index
 
-TreeDB is designed for single-node embedded storage exploration:
+### Architecture & Internals
+* [Systems Architecture & Engineering Portfolio](docs/SYSTEMS_PORTFOLIO.md) — Comprehensive technical briefing on architectural thesis, subsystems, and research value.
+* [Architecture Specification](docs/ARCHITECTURE.md) — Detailed layer-by-layer architectural decomposition.
+* [Design Decisions Log](docs/DESIGN_DECISIONS.md) — Architectural rationale, engineering trade-offs, and alternatives considered.
+* [On-Disk Storage Format](docs/STORAGE_FORMAT.md) — Byte-level specifications for headers, slotted pages, and records.
+* [B+ Tree Engine](docs/BPLUS_TREE.md) — Node splitting, rebalancing, leaf merging, and index layout.
+* [Buffer Pool Manager](docs/BUFFER_POOL.md) — Frame tables, clock eviction, and pin/unpin semantics.
+* [MVCC & Version Storage](docs/MVCC_STORAGE.md) — In-page version chains, commit sequences, and visibility.
 
-* **Single-Writer Exclusivity**: TreeDB assumes single-process, single-writer access. Concurrent uncoordinated multi-process writes are not supported.
-* **Offline Backups Only**: Backups must be performed when the database is quiescent (no active write transactions). Online hot backup during concurrent writes is not supported.
-* **No Heuristic Auto-Repair**: Damaged headers or corrupted pages fail loudly rather than attempting heuristic repair, preventing silent corruption.
+### Durability, WAL & Recovery
+* [Durability Contract & Crash Recovery](docs/DURABILITY_AND_RECOVERY.md) — Formal commit semantics, WAL ordering, and 3-phase ARIES recovery.
+* [Transaction Atomicity & Testing](docs/TRANSACTION_ATOMICITY.md) — CLR undo chains and deterministic failure injection.
+* [Cross-Layer Consistency Verification](docs/STORAGE_CONSISTENCY.md) — Structural integrity verification and freelist cycle detection.
+* [Consistent Backup & Restore](docs/BACKUP_RESTORE.md) — Two-phase restore journal protocol and CRC32 manifests.
+
+### Performance & Benchmarks
+* [Performance Baseline Report](docs/PERFORMANCE_BASELINE.md) — 1,200+ lines of empirical benchmark results across all subsystems.
+
+### Release Governance & Quality Gates
+* [Release Readiness Audit](docs/RELEASE_READINESS.md) — Quality gate checklist, test counts, and artifact provenance.
+* [Release Process & Handoff Guide](docs/RELEASING.md) — Candidate staging (`v0.1.0-rc2`) vs. crates.io stable publication procedures.
+* [Changelog](CHANGELOG.md) — Chronological history of additions, fixes, and architectural milestones.
 
 ---
 
-## Architectural Principles
+## Author & Maintainer
 
-1. **Correctness before performance:** Invariants are strictly verified through tests and structural validation before applying optimizations.
-2. **Explicit invariants:** Types and checks enforce internal limits and prevent corruption.
-3. **Strict layer separation:** Higher-level abstractions (B+ Tree, Buffer Pool) interact exclusively through clean lower-level interfaces.
-4. **Deterministic persistent format:** On-disk binary representation is explicitly specified with little-endian integer encoding.
-5. **Safe Rust ownership:** Avoiding unsafe code wherever possible by leveraging Rust's ownership model for lifecycle management.
-6. **Write-Ahead Durability:** Dirty pages are never flushed before their corresponding WAL records.
+TreeDB is designed and maintained by **Vedaang Sharma** ([info@vedaangsharma.in](mailto:info@vedaangsharma.in)).
+
+Inquiries regarding architecture, systems-programming research, or potential collaboration are welcome via email or through the project repository.
 
 ---
 
-## Documentation
+## Contributing
 
-* [Release Notes v0.1.0](docs/RELEASE_NOTES_v0.1.0.md)
-* [Release Candidate Validation](docs/RELEASE_CANDIDATE_VALIDATION.md)
-* [Release Candidate Audit](docs/RELEASE_CANDIDATE_AUDIT.md)
-* [Persistence Certification](docs/PERSISTENCE_CERTIFICATION.md)
-* [Backup & Restore Guide](docs/BACKUP_RESTORE.md)
-* [Cross-Layer Consistency Verification](docs/STORAGE_CONSISTENCY.md)
-* [Recovery & Checkpoint Certification](docs/RECOVERY_CERTIFICATION.md)
-* [Transaction Atomicity & Crash Testing](docs/TRANSACTION_ATOMICITY.md)
-* [Architecture Overview](docs/ARCHITECTURE.md)
-* [B+ Tree Index Engine](docs/BPLUS_TREE.md)
-* [Buffer Pool Manager](docs/BUFFER_POOL.md)
-* [On-Disk Storage Format](docs/STORAGE_FORMAT.md)
-* [Design Decisions](docs/DESIGN_DECISIONS.md)
-* [Project Roadmap](docs/ROADMAP.md)
+Contributions, discussions, and bug reports are welcome. All development takes place through [GitHub Issues](https://github.com/gtathelegend/TreeDB/issues) and [Pull Requests](https://github.com/gtathelegend/TreeDB/pulls).
+
+### Submitting Bug Reports
+When opening an issue, please provide:
+1. A minimal, self-contained reproducible example (code snippet or SQL sequence).
+2. Host environment details (OS, CPU architecture, filesystem type, Rust toolchain version `rustc --version`).
+3. Observed versus expected behavior, including panic backtraces or error messages.
+
+### Quality Gates & Verification
+Before submitting a pull request, ensure all local validation gates pass:
+```bash
+# Code formatting
+cargo fmt --all -- --check
+
+# Target compilation
+cargo check --all-targets
+
+# Strict linting (warnings treated as errors)
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Documentation generation
+cargo doc --no-deps
+
+# Regression test suite
+cargo test -j 2
+```
 
 ---
 
@@ -225,3 +327,4 @@ TreeDB is designed for single-node embedded storage exploration:
 Dual-licensed under either of:
 * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
 * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+

@@ -8,17 +8,21 @@ use treedb::query::operator::SortDirection;
 use treedb::TreeDb;
 
 struct TestContext {
+    _dir: tempfile::TempDir,
     db_path: PathBuf,
     wal_path: PathBuf,
 }
 
 impl TestContext {
     fn new(name: &str) -> Self {
-        let db_path = PathBuf::from(format!("test_agg_{name}.treedb"));
-        let wal_path = PathBuf::from(format!("test_agg_{name}.treedb.wal"));
-        let _ = fs::remove_file(&db_path);
-        let _ = fs::remove_file(&wal_path);
-        Self { db_path, wal_path }
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(format!("test_agg_{name}.treedb"));
+        let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
+        Self {
+            _dir: dir,
+            db_path,
+            wal_path,
+        }
     }
 
     fn db(&self) -> TreeDb {
@@ -34,8 +38,6 @@ impl Drop for TestContext {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.db_path);
         let _ = fs::remove_file(&self.wal_path);
-        let bak = PathBuf::from(format!("{}.bak", self.wal_path.display()));
-        let _ = fs::remove_file(&bak);
     }
 }
 
