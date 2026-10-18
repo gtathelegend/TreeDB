@@ -1,6 +1,7 @@
 #![allow(clippy::needless_borrow, clippy::manual_range_contains)]
 
 use std::path::PathBuf;
+use tempfile::tempdir;
 use treedb::engine::catalog::{IndexId, IndexMetadata, TableId};
 use treedb::engine::types::{Column, DataType, Schema, Value};
 use treedb::query::cardinality::CardinalityEstimator;
@@ -11,25 +12,22 @@ use treedb::query::stats::{
 use treedb::TreeDb;
 
 struct TestContext {
+    _dir: tempfile::TempDir,
     db_path: PathBuf,
+    #[allow(dead_code)]
     wal_path: PathBuf,
 }
 
 impl TestContext {
     fn new(name: &str) -> Self {
-        let db_path = PathBuf::from(format!(
-            "test_hist_stats_{}_{}_{}.treedb",
-            name,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join(format!("test_hist_stats_{name}.treedb"));
         let wal_path = PathBuf::from(format!("{}.wal", db_path.display()));
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(&wal_path);
-        Self { db_path, wal_path }
+        Self {
+            _dir: dir,
+            db_path,
+            wal_path,
+        }
     }
 
     fn db(&self) -> TreeDb {
@@ -38,13 +36,6 @@ impl TestContext {
         } else {
             TreeDb::create(&self.db_path, 64).unwrap()
         }
-    }
-}
-
-impl Drop for TestContext {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.db_path);
-        let _ = std::fs::remove_file(&self.wal_path);
     }
 }
 
