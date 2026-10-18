@@ -98,9 +98,10 @@ The following limitations are explicitly documented and govern the operational u
 
 * **Overall Status**: **READY FOR LOCAL RELEASE CANDIDATE** (`v0.1.0-rc2` / proposed stable release).
 * **Blockers Identified**: **0** (Zero functional, durability, packaging, or lint blockers remain).
-* **Tag Governance & Preservation Recommendations**:
+* **Tag Governance & Release Separation Recommendations**:
   * Historical tag `v0.1.0` remains frozen at commit `2f912c2e24b095976a6a5d6340a6b536b2707c9a` and must remain untouched. Deleting a local tag does not remove remote tags or update other clones.
-  * For pre-release evaluation, use a distinct pre-release candidate tag such as `v0.1.0-rc2`. For a general availability release, bump `version` in `Cargo.toml` to a clean version (e.g. `0.1.1` or `0.2.0`), unless an authorized stakeholder governance decision explicitly resolves the historical tag conflict.
+  * **Candidate Workflow vs. Publication**: Git tag names do not dictate the package version published by Cargo. Candidate staging (`v0.1.0-rc2`) must strictly omit `cargo publish`, as doing so would prematurely publish the stable `treedb 0.1.0` package declared in `Cargo.toml`.
+  * For pre-release evaluation, use candidate tag `v0.1.0-rc2` without publication. For an authorized stable release, follow the dedicated publication workflow only after authoritative crates.io registry verification.
   * When verifying annotated release tags, always peel the tag object to its commit using `git rev-parse "<TAG_NAME>^{commit}"` and assert equality with `git rev-parse HEAD`. Do not compare the raw annotated tag object hash directly with HEAD.
   * When pushing release tags, push strictly the authorized tag (`git push origin <TAG_NAME>`) and never use blanket `git push origin --tags`.
   * Release candidate testing confirms TreeDB meets all defined durability and operational contracts for its intended single-node, single-writer scope.
